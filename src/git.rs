@@ -215,11 +215,18 @@ impl GitRepo {
         const MAX_BYTES: u64 = 512 * 1024;
         const MAX_LINES: usize = 2_000;
 
-        let absolute_path = self.root.join(path);
-        let inspected = inspect_content_path(Some(&self.root), &absolute_path)?;
+        // Keep Git commands on the path spelling returned by Git, but use a
+        // canonical boundary for filesystem reads. Windows can represent the
+        // same worktree differently across those two APIs.
+        let content_root = self
+            .root
+            .canonicalize()
+            .with_context(|| format!("cannot resolve Git root {}", self.root.display()))?;
+        let absolute_path = content_root.join(path);
+        let inspected = inspect_content_path(Some(&content_root), &absolute_path)?;
         if inspected.kind == ContentPathKind::SymbolicLink && inspected.path == absolute_path {
             let Some((target, truncated)) = read_link_bounded(
-                &self.root,
+                &content_root,
                 &absolute_path,
                 usize::try_from(MAX_BYTES).unwrap_or(usize::MAX),
             )?
@@ -243,7 +250,7 @@ impl GitRepo {
             )]);
         }
 
-        let file = match open_regular(Some(&self.root), &absolute_path)? {
+        let file = match open_regular(Some(&content_root), &absolute_path)? {
             OpenRegular::Opened(file) => file,
             OpenRegular::Declined(changed) => {
                 return Ok(vec![format!(
