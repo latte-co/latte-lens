@@ -87,9 +87,6 @@ impl GitRepo {
         let Some(root) = git_path_from_output(&output.stdout) else {
             return Ok(None);
         };
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("cannot resolve Git root {}", root.display()))?;
 
         let git_dir_output = git_command()
             .args(["rev-parse", "--absolute-git-dir"])
@@ -99,9 +96,6 @@ impl GitRepo {
         ensure_success("resolve Git directory", &git_dir_output)?;
         let git_dir = git_path_from_output(&git_dir_output.stdout)
             .context("Git returned an empty Git directory path")?;
-        let git_dir = git_dir
-            .canonicalize()
-            .with_context(|| format!("cannot resolve Git directory {}", git_dir.display()))?;
 
         Ok(Some(Self { root, git_dir }))
     }

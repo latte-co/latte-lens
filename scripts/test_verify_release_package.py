@@ -315,8 +315,8 @@ class ReleasePackageVerifierTests(unittest.TestCase):
 
         with zipfile.ZipFile(archive) as source:
             parsed = source.infolist()[1]
-            self.assertEqual(parsed.filename, expected)
             self.assertIn(struct.pack("<H", 0x7075), parsed.extra)
+            self.assertIn(alias, parsed.extra)
         with self.assertRaises(AssertionError):
             verifier.verify_archive(archive, "latte-lens.exe")
 

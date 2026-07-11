@@ -7,7 +7,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use crate::{
     content_safety::{ensure_beneath, path_exists_without_following},
@@ -180,6 +180,11 @@ pub(crate) struct WorkerRuntime {
 
 impl WorkerRuntime {
     pub fn start(root: PathBuf, preview_registry: PreviewRegistry) -> Result<Self> {
+        // Content paths come from the canonical repository graph, so keep the
+        // worker boundary in the same representation on every platform.
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("cannot open workspace {}", root.display()))?;
         let shared = Arc::new(Shared {
             state: Mutex::new(SharedState {
                 prefer_refresh: true,
