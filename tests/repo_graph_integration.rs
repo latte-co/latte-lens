@@ -51,7 +51,19 @@ fn init(root: &Path) {
 
 fn commit_all(root: &Path, message: &str) {
     run(root, &["add", "--all"]);
-    run(root, &["commit", "--quiet", "-m", message]);
+    run(
+        root,
+        &[
+            "-c",
+            "user.name=Latte Lens Tests",
+            "-c",
+            "user.email=latte-lens@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
 }
 
 fn write(root: &Path, relative: &str, contents: &str) {

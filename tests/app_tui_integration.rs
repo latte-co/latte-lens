@@ -2236,7 +2236,11 @@ fn clickable_refresh_control_updates_the_current_git_changes_tree() {
             PathBuf::from("second-change.txt")
         ]
     );
-    assert!(app.last_error.is_none());
+    assert!(
+        app.last_error.is_none(),
+        "refresh left an application error: {:?}",
+        app.last_error
+    );
 }
 
 #[test]

@@ -2118,8 +2118,15 @@ fn repository_label(_root: &Path, snapshot: &RepoSnapshot) -> String {
         .workspace_relative
         .as_deref()
         .filter(|path| !path.as_os_str().is_empty())
-        .map(|path| path.display().to_string())
+        .map(display_workspace_path)
         .unwrap_or_else(|| ".".to_owned())
+}
+
+fn display_workspace_path(path: &Path) -> String {
+    path.iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn repository_detail(snapshot: &RepoSnapshot, change_count: usize) -> String {
@@ -2243,6 +2250,13 @@ mod tests {
             wrap_line_ranges("", 8),
             std::iter::once(0..0).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn workspace_paths_use_portable_ui_separators() {
+        let path = Path::new("modules").join("child").join("nested");
+
+        assert_eq!(display_workspace_path(&path), "modules/child/nested");
     }
 
     #[test]
