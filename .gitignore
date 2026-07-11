@@ -1,0 +1,7 @@
+/target
+/dist
+/log
+/.oh-my-code
+.DS_Store
+*.profraw
+__pycache__/

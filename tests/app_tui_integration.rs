@@ -1,0 +1,2431 @@
+mod support;
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use lattelens::{
+    app::{App, ContentMode, FocusPane, GitRowKind, TreeScope},
+    preview::{PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
+    ui,
+};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    style::{Color, Modifier},
+};
+use support::TestRepo;
+use unicode_width::UnicodeWidthStr;
+
+#[test]
+fn app_starts_from_nested_path_and_renders_both_panes() {
+    let fixture = TestRepo::new();
+    fixture.write("src/lib.rs", "pub fn original() {}\n");
+    fixture.commit_all("initial");
+    fixture.write("src/lib.rs", "pub fn changed() {}\n");
+    fixture.write("notes.txt", "untracked\n");
+
+    let mut app = App::new(fixture.root().join("src")).unwrap();
+    assert_eq!(
+        app.root.canonicalize().unwrap(),
+        fixture.root().join("src").canonicalize().unwrap()
+    );
+    assert_eq!(app.branch.as_deref(), Some("main"));
+    assert_eq!(app.changed_count, 1);
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(app.content_mode, ContentMode::Preview);
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("LATTE LENS"));
+    assert!(rendered.contains("Files"));
+    assert!(rendered.contains("1 Files"));
+    assert!(rendered.contains("2 Git changes"));
+    assert!(rendered.contains("Refresh"));
+    assert!(rendered.contains("Preview"));
+    assert!(!rendered.contains("1 TREE"));
+    assert!(app.ui_regions.tree_body.width < 100);
+    assert!(app.ui_regions.content_body.x > app.ui_regions.tree_body.x);
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("lib.rs")));
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line == "+pub fn changed() {}")
+    );
+}
+
+#[test]
+fn partial_scope_is_marked_without_painting_a_background() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
+    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    app.all_files_truncated = true;
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("1+ · PARTIAL"));
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    app.git_changes_truncated = true;
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("0+ · PARTIAL"));
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+}
+
+#[test]
+fn narrow_repository_layout_clips_labels_and_hitboxes_without_backgrounds() {
+    let fixture = TestRepo::new();
+    fixture.write(
+        "a-very-long-directory-name/a-very-long-file-name.txt",
+        "before\n",
+    );
+    fixture.commit_all("initial");
+    fixture.write(
+        "a-very-long-directory-name/a-very-long-file-name.txt",
+        "after\n",
+    );
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    let backend = TestBackend::new(32, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_end = app
+        .ui_regions
+        .tree_body
+        .x
+        .saturating_add(app.ui_regions.tree_body.width);
+    assert!(
+        app.ui_regions
+            .git_changes_tab
+            .x
+            .saturating_add(app.ui_regions.git_changes_tab.width)
+            <= tree_end
+    );
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+}
+
+#[test]
+fn keyboard_switches_tree_scope_without_hiding_right_content() {
+    let fixture = TestRepo::new();
+    fixture.write("a-clean.txt", "clean\n");
+    fixture.write("b-changed.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("b-changed.txt", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-clean.txt"))
+    );
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+
+    app.handle_key(key(KeyCode::Tab));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("b-changed.txt"))
+    );
+    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert!(app.content_lines.iter().any(|line| line == "+after"));
+
+    app.handle_key(key(KeyCode::BackTab));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-clean.txt"))
+    );
+    assert_eq!(app.content_mode, ContentMode::Preview);
+
+    app.handle_key(key(KeyCode::Char('2')));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.focused_pane, FocusPane::Content);
+}
+
+#[test]
+fn tree_top_up_focuses_scope_tabs_and_down_restores_tree_selection() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+}
+
+#[test]
+fn scope_tab_arrows_switch_scope_through_the_refresh_path() {
+    let fixture = TestRepo::new();
+    fixture.write("a-clean.txt", "clean\n");
+    fixture.write("b-changed.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("b-changed.txt", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-clean.txt"))
+    );
+
+    // This change happens after startup, so Right must enter Git Changes via
+    // the same refresh path as the existing scope controls.
+    fixture.write("z-untracked.txt", "new\n");
+    app.handle_key(key(KeyCode::Right));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    assert_eq!(app.changed_count, 2);
+    let changed_paths: Vec<_> = app
+        .visible_entries()
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    assert_eq!(
+        changed_paths,
+        [
+            PathBuf::from("b-changed.txt"),
+            PathBuf::from("z-untracked.txt")
+        ]
+    );
+    assert!(!changed_paths.contains(&PathBuf::from("a-clean.txt")));
+
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-clean.txt"))
+    );
+}
+
+#[test]
+fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
+    let fixture = TestRepo::new();
+    fixture.write("docs/clean.md", "clean\n");
+    fixture.write("src/nested/changed.rs", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("src/nested/changed.rs", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    // The scan remains complete, but the first All Files projection only
+    // exposes roots because directories default collapsed.
+    let raw_all_paths: Vec<_> = app
+        .all_entries
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    assert!(raw_all_paths.contains(&PathBuf::from("docs/clean.md")));
+    assert!(raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("docs"), PathBuf::from("src")]
+    );
+
+    // Opening one parent only reveals its direct rows; nested directories are
+    // still collapsed until explicitly opened.
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        visible_paths(&app),
+        [
+            PathBuf::from("docs"),
+            PathBuf::from("docs/clean.md"),
+            PathBuf::from("src"),
+        ]
+    );
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    // Git Changes starts with every required changed ancestor expanded.
+    let changed_paths = visible_paths(&app);
+    assert_eq!(
+        changed_paths,
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/nested"),
+            PathBuf::from("src/nested/changed.rs"),
+        ]
+    );
+    assert_eq!(app.content_mode, ContentMode::Diff);
+}
+
+#[test]
+fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
+    let fixture = TestRepo::new();
+    fixture.write("src/nested/file.txt", "fixture\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
+    );
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(
+        visible_paths(&app),
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/nested"),
+            PathBuf::from("top.txt"),
+        ]
+    );
+    assert_eq!(
+        app.content_lines,
+        [
+            "No changed files in this directory.",
+            "",
+            "Expanded · Enter or click to collapse."
+        ]
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/nested/file.txt"))
+    );
+    let rows_before_file_enter = visible_paths(&app);
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(visible_paths(&app), rows_before_file_enter);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/nested/file.txt"))
+    );
+}
+
+#[test]
+fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
+    let fixture = TestRepo::new();
+    fixture.write("src/nested/file.txt", "fixture\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(
+        app.content_lines,
+        [
+            "No changed files in this directory.",
+            "",
+            "Expanded · Enter or click to collapse."
+        ]
+    );
+    assert_eq!(
+        visible_paths(&app),
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/nested"),
+            PathBuf::from("top.txt"),
+        ]
+    );
+
+    // A single second click on the same directory closes it again; no double
+    // click path is required to toggle state.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
+    );
+
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    app.handle_mouse(mouse_down(tree_x, tree_y + 1));
+    let rows_before_file_click = visible_paths(&app);
+    app.handle_mouse(mouse_down(tree_x, tree_y + 2));
+
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/nested/file.txt"))
+    );
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(visible_paths(&app), rows_before_file_click);
+}
+
+#[test]
+fn refresh_preserves_scope_choices_and_defaults_new_directories() {
+    let fixture = TestRepo::new();
+    fixture.write("alpha/old.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("alpha/old.txt", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    // All Files keeps an explicit expansion through refresh, while a new
+    // directory remains collapsed.
+    app.handle_key(key(KeyCode::Enter));
+    fixture.write("beta/new.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    let all_after_refresh = visible_paths(&app);
+    assert!(all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
+    assert!(all_after_refresh.contains(&PathBuf::from("beta")));
+    assert!(!all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
+
+    // Git Changes starts expanded, retains a deliberate collapse, and opens a
+    // newly discovered changed directory by default.
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Home));
+    assert!(app.selected_git_row().is_some_and(|row| row.is_container()));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("alpha")));
+    app.handle_key(key(KeyCode::Enter));
+    fixture.write("gamma/new.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    let changed_after_refresh = visible_paths(&app);
+    assert!(changed_after_refresh.contains(&PathBuf::from("alpha")));
+    assert!(!changed_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
+    assert!(changed_after_refresh.contains(&PathBuf::from("beta/new.txt")));
+    assert!(changed_after_refresh.contains(&PathBuf::from("gamma/new.txt")));
+}
+
+#[test]
+fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
+    let fixture = TestRepo::new();
+    fixture.write("tracked.txt", "tracked\n");
+    fixture.commit_all("initial");
+    fixture.write("src/child.txt", "untracked\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/child.txt"))
+    );
+
+    // Keep All Files' child selection saved while refreshes in the other scope
+    // remove and later rediscover the parent. Rediscovery uses the new All
+    // Files default (collapsed), so restoring the child must select `src`.
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    fs::remove_dir_all(fixture.root().join("src")).unwrap();
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    fixture.write("src/child.txt", "returned\n");
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    app.set_tree_scope(TreeScope::AllFiles);
+
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert!(app.tree_state.offset() < app.visible_entries().len());
+    assert!(!visible_paths(&app).contains(&PathBuf::from("src/child.txt")));
+}
+
+#[test]
+fn entering_git_changes_refreshes_and_excludes_clean_files() {
+    let fixture = TestRepo::new();
+    fixture.write("a-clean.txt", "clean\n");
+    fixture.write("b-also-clean.txt", "clean\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    // Simulate an agent changing the worktree after Latte Lens has started.
+    fixture.write("z-new-change.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('2')));
+    settle(&mut app);
+
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(app.changed_count, 1);
+    let changed_paths: Vec<_> = app
+        .visible_entries()
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    assert_eq!(changed_paths, [PathBuf::from("z-new-change.txt")]);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("z-new-change.txt"))
+    );
+    assert_eq!(app.content_mode, ContentMode::Diff);
+}
+
+#[test]
+fn clean_root_repository_is_a_selectable_empty_git_changes_node() {
+    let fixture = TestRepo::new();
+    fixture.write("tracked.txt", "clean\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    assert_eq!(app.total_repository_count, 1);
+    assert_eq!(app.dirty_repository_count, 0);
+    assert_eq!(app.changed_count, 0);
+    assert_eq!(app.visible_git_rows().len(), 1);
+    let row = app.selected_git_row().expect("clean repository selection");
+    assert!(matches!(
+        row.kind,
+        GitRowKind::Repository {
+            change_count: 0,
+            ..
+        }
+    ));
+    assert_eq!(row.label, ".");
+    assert!(row.detail.contains("clean"));
+    assert!(row.detail.contains("0 files"));
+    assert_eq!(app.content_mode, ContentMode::Info);
+    assert!(app.content_lines[0].contains("0 changed files"));
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.visible_git_rows().len(), 1);
+    assert!(app.selected_git_row().is_some());
+    assert!(app.last_error.is_none());
+}
+
+#[test]
+fn non_git_workspace_lists_clean_and_dirty_descendant_repositories() {
+    let workspace = tempfile::tempdir().unwrap();
+    let clean = workspace.path().join("clean");
+    let dirty = workspace.path().join("dirty");
+    for root in [&clean, &dirty] {
+        init_repo(root);
+        write_file(root, "tracked.txt", "before\n");
+        git(root, &["add", "--all"]);
+        git(root, &["commit", "--quiet", "-m", "initial"]);
+    }
+    write_file(&dirty, "tracked.txt", "after\n");
+
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    assert_eq!(app.total_repository_count, 2);
+    assert_eq!(app.dirty_repository_count, 1);
+    assert_eq!(app.changed_count, 1);
+    let repositories: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .filter_map(|row| match row.kind {
+            GitRowKind::Repository { change_count, .. } => {
+                Some((row.label.as_str(), change_count, row.detail.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(repositories.len(), 2);
+    assert!(repositories.iter().any(|(label, count, detail)| {
+        *label == "clean" && *count == 0 && detail.contains("clean")
+    }));
+    assert!(
+        repositories
+            .iter()
+            .any(|(label, count, _)| *label == "dirty" && *count == 1)
+    );
+    assert_eq!(
+        app.visible_git_rows()
+            .iter()
+            .filter(|row| matches!(row.kind, GitRowKind::Change(_)))
+            .count(),
+        1
+    );
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    for (label, should_be_dirty) in [("clean", false), ("dirty", true)] {
+        let index = app
+            .visible_git_rows()
+            .iter()
+            .position(|row| row.label == label && matches!(row.kind, GitRowKind::Repository { .. }))
+            .unwrap();
+        let row_y = app.ui_regions.tree_inner.y + u16::try_from(index).unwrap();
+        let marker = (app.ui_regions.tree_inner.x..app.ui_regions.tree_inner.right())
+            .filter_map(|x| terminal.backend().buffer().cell((x, row_y)))
+            .find(|cell| cell.symbol() == "•");
+        if should_be_dirty {
+            let marker = marker.expect("dirty repository marker");
+            assert_eq!(marker.fg, Color::Rgb(196, 151, 126));
+        } else {
+            assert!(marker.is_none(), "clean repository must stay quiet");
+        }
+    }
+}
+
+#[test]
+fn recursive_clean_submodules_are_separate_empty_repository_nodes() {
+    let sources = tempfile::tempdir().unwrap();
+    let grand_source = sources.path().join("grand-source");
+    init_repo(&grand_source);
+    write_file(&grand_source, "grand.txt", "grand\n");
+    git(&grand_source, &["add", "--all"]);
+    git(&grand_source, &["commit", "--quiet", "-m", "grand initial"]);
+
+    let child_source = sources.path().join("child-source");
+    init_repo(&child_source);
+    write_file(&child_source, "child.txt", "child\n");
+    git(&child_source, &["add", "--all"]);
+    git(&child_source, &["commit", "--quiet", "-m", "child initial"]);
+    git_with_path(
+        &child_source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+        ],
+        &grand_source,
+        &["nested/grand"],
+    );
+    git(&child_source, &["add", "--all"]);
+    git(
+        &child_source,
+        &["commit", "--quiet", "-m", "add nested submodule"],
+    );
+
+    let parent = TestRepo::new();
+    git_with_path(
+        parent.root(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+        ],
+        &child_source,
+        &["modules/child"],
+    );
+    parent.commit_all("add child");
+    git(
+        parent.root(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--quiet",
+        ],
+    );
+
+    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    assert_eq!(app.total_repository_count, 3);
+    assert_eq!(app.dirty_repository_count, 0);
+    assert_eq!(app.changed_count, 0);
+    let repositories: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .filter(|row| matches!(row.kind, GitRowKind::Repository { .. }))
+        .map(|row| (row.depth, row.label.as_str(), row.detail.as_str()))
+        .collect();
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|(_, label, _)| *label)
+            .collect::<Vec<_>>(),
+        [".", "modules/child", "modules/child/nested/grand"]
+    );
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|(depth, _, _)| *depth)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(
+        repositories
+            .iter()
+            .all(|(_, _, detail)| detail.contains("clean"))
+    );
+    assert_eq!(app.visible_git_rows().len(), 3);
+}
+
+#[test]
+fn clean_deinitialized_submodule_stays_visible_without_inflating_dirty_count() {
+    let source = tempfile::tempdir().unwrap();
+    init_repo(source.path());
+    write_file(source.path(), "tracked.txt", "clean\n");
+    git(source.path(), &["add", "--all"]);
+    git(source.path(), &["commit", "--quiet", "-m", "initial"]);
+
+    let parent = TestRepo::new();
+    git_with_path(
+        parent.root(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+        ],
+        source.path(),
+        &["modules/child"],
+    );
+    parent.commit_all("add child");
+    git(
+        parent.root(),
+        &["submodule", "deinit", "--force", "--", "modules/child"],
+    );
+
+    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    assert_eq!(app.total_repository_count, 2);
+    assert_eq!(app.dirty_repository_count, 0);
+    assert_eq!(app.changed_count, 0);
+    let repositories: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .filter_map(|row| match row.kind {
+            GitRowKind::Repository {
+                kind, change_count, ..
+            } => Some((row.label.as_str(), row.detail.as_str(), kind, change_count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(repositories.len(), 2);
+    assert!(repositories.iter().any(|(label, detail, kind, count)| {
+        *label == "modules/child"
+            && detail.contains("submodule placeholder")
+            && detail.contains("uninitialized")
+            && detail.contains("clean")
+            && *kind == lattelens::repo_graph::RepoKind::SubmodulePlaceholder
+            && *count == 0
+    }));
+}
+
+#[test]
+fn non_git_directory_previews_text_and_has_an_empty_changes_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
+    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+
+    assert!(app.repo.is_none());
+    assert_eq!(app.changed_count, 0);
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert_eq!(app.content_lines, ["hello"]);
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    assert!(app.visible_entries().is_empty());
+    assert_eq!(app.content_mode, ContentMode::Info);
+    assert_eq!(
+        app.content_lines,
+        ["Workspace is not a Git repository and has no changed descendant repositories."]
+    );
+}
+
+#[test]
+fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owner() {
+    let fixture = TestRepo::new();
+    fixture.write("same.txt", "root before\n");
+    fixture.commit_all("root initial");
+    fixture.write("same.txt", "root after\n");
+
+    let nested = fixture.root().join("vendor/nested");
+    init_repo(&nested);
+    write_file(&nested, "same.txt", "nested before\n");
+    git(&nested, &["add", "--all"]);
+    git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
+    write_file(&nested, "same.txt", "nested after\n");
+
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(app.changed_count, 2);
+
+    let repository_labels: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .filter(|row| matches!(row.kind, lattelens::app::GitRowKind::Repository { .. }))
+        .map(|row| row.label.clone())
+        .collect();
+    assert_eq!(repository_labels, [".", "vendor/nested"]);
+    let changes: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .filter_map(|row| match &row.kind {
+            lattelens::app::GitRowKind::Change(change) => Some(change.path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].relative, changes[1].relative);
+    assert_ne!(changes[0].repo_id, changes[1].repo_id);
+    assert!(
+        app.visible_git_rows()
+            .iter()
+            .any(|row| row.detail.contains("untracked in parent"))
+    );
+
+    assert!(app.content_lines.iter().any(|line| line == "+root after"));
+    app.handle_key(key(KeyCode::Char('n')));
+    settle(&mut app);
+    assert!(app.content_lines.iter().any(|line| line == "+nested after"));
+    assert!(!app.content_lines.iter().any(|line| line == "+root after"));
+    let nested_selection = app
+        .selected_git_row()
+        .map(|row| row.identity.clone())
+        .unwrap();
+    fixture.write("another-root-change.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    assert_eq!(app.changed_count, 3);
+    assert_eq!(
+        app.selected_git_row().map(|row| &row.identity),
+        Some(&nested_selection)
+    );
+    assert!(app.content_lines.iter().any(|line| line == "+nested after"));
+
+    let backend = TestBackend::new(100, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+
+    app.handle_key(key(KeyCode::Home));
+    assert_eq!(app.visible_git_rows().len(), 5);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.visible_git_rows().len(), 1);
+    assert_eq!(app.changed_count, 3);
+    app.handle_mouse(mouse_down(
+        app.ui_regions.tree_inner.x,
+        app.ui_regions.tree_inner.y,
+    ));
+    assert_eq!(app.visible_git_rows().len(), 5);
+}
+
+#[test]
+fn git_changes_sorts_directories_before_files_at_each_level() {
+    let fixture = TestRepo::new();
+    let paths = [
+        "z-root.txt",
+        "a-root.txt",
+        "z-dir/middle.txt",
+        "a-dir/z-child.txt",
+        "a-dir/a-child.txt",
+        "a-dir/b-dir/inner.txt",
+    ];
+    for path in paths {
+        fixture.write(path, "before\n");
+    }
+    fixture.commit_all("initial tree order fixture");
+    for path in paths {
+        fixture.write(path, "after\n");
+    }
+
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    let rows: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .map(|row| (row.depth, row.label.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (0, "."),
+            (2, "a-dir"),
+            (3, "b-dir"),
+            (4, "inner.txt"),
+            (3, "a-child.txt"),
+            (3, "z-child.txt"),
+            (2, "z-dir"),
+            (3, "middle.txt"),
+            (2, "a-root.txt"),
+            (2, "z-root.txt"),
+        ]
+    );
+}
+
+#[test]
+fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isolated() {
+    let fixture = TestRepo::new();
+    fixture.write("src/shared.txt", "root before\n");
+    fixture.commit_all("root initial");
+    fixture.write("src/shared.txt", "root after\n");
+
+    let nested = fixture.root().join("nested");
+    init_repo(&nested);
+    write_file(&nested, "src/shared.txt", "nested before\n");
+    git(&nested, &["add", "--all"]);
+    git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
+    write_file(&nested, "src/shared.txt", "nested after\n");
+
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Down));
+    let root_directory = app
+        .selected_git_row()
+        .map(|row| row.identity.clone())
+        .unwrap();
+    assert_eq!(app.content_lines[0], "1 changed file in this directory.");
+
+    // Collapse and reopen only the root repo's `src`, then select the nested
+    // repo's independently identified `src` row.
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.visible_git_rows().len(), 5);
+    app.handle_key(key(KeyCode::Enter));
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down));
+    }
+    let nested_directory = app
+        .selected_git_row()
+        .map(|row| row.identity.clone())
+        .unwrap();
+    assert_ne!(root_directory, nested_directory);
+    assert_eq!(app.content_lines[0], "1 changed file in this directory.");
+
+    // Refresh selection and directory info by the complete repo+path identity.
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    assert_eq!(
+        app.selected_git_row().map(|row| &row.identity),
+        Some(&nested_directory)
+    );
+    assert_eq!(app.content_lines[0], "1 changed file in this directory.");
+
+    // Nested collapse must not hide the root repo's same-named descendant.
+    app.handle_key(key(KeyCode::Enter));
+    let visible_changes: Vec<_> = app
+        .visible_git_rows()
+        .iter()
+        .filter_map(|row| match &row.kind {
+            lattelens::app::GitRowKind::Change(change) => Some(change.path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(visible_changes.len(), 1);
+    assert!(visible_changes[0].repo_id.path() == fixture.root().canonicalize().unwrap());
+
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Down));
+    settle(&mut app);
+    assert!(app.content_lines.iter().any(|line| line == "+nested after"));
+    assert!(!app.content_lines.iter().any(|line| line == "+root after"));
+}
+
+#[test]
+fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_error_visible() {
+    let workspace = tempfile::tempdir().unwrap();
+    let nested = workspace.path().join("good-repo");
+    init_repo(&nested);
+    write_file(&nested, "changed.txt", "before\n");
+    git(&nested, &["add", "--all"]);
+    git(&nested, &["commit", "--quiet", "-m", "initial"]);
+    write_file(&nested, "changed.txt", "after\n");
+    fs::create_dir_all(workspace.path().join("bad-repo/.git")).unwrap();
+
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    assert_eq!(app.total_repository_count, 1);
+    assert_eq!(app.dirty_repository_count, 1);
+    assert_eq!(app.changed_count, 1);
+    assert!(app.repository_error_count > 0);
+    assert!(
+        app.visible_git_rows()
+            .iter()
+            .any(|row| row.label == "good-repo")
+    );
+    assert!(
+        app.visible_git_rows()
+            .iter()
+            .any(|row| row.label.contains("[error] bad-repo"))
+    );
+    assert!(app.content_lines.iter().any(|line| line == "+after"));
+
+    let backend = TestBackend::new(100, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("workspace not repo"));
+}
+
+#[test]
+fn submodule_pointer_internal_change_and_placeholder_are_separate_rows() {
+    let source = TestRepo::new();
+    source.write("tracked.txt", "source initial\n");
+    source.commit_all("source initial");
+
+    let parent = TestRepo::new();
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+        ])
+        .arg(source.root())
+        .arg("child")
+        .current_dir(parent.root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "submodule add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let modules = parent.root().join(".gitmodules");
+    let mut module_text = fs::read_to_string(&modules).unwrap();
+    module_text.push_str("\n[submodule \"missing\"]\n\tpath = missing\n\turl = ../missing\n");
+    fs::write(&modules, module_text).unwrap();
+    parent.commit_all("add submodule metadata");
+
+    let child = parent.root().join("child");
+    git(&child, &["config", "user.name", "Latte Lens Tests"]);
+    git(
+        &child,
+        &["config", "user.email", "lattelens@example.invalid"],
+    );
+    write_file(&child, "tracked.txt", "advanced child\n");
+    git(&child, &["add", "--all"]);
+    git(&child, &["commit", "--quiet", "-m", "advance child"]);
+    write_file(&child, "tracked.txt", "dirty inside child\n");
+
+    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(app.changed_count, 2);
+
+    assert!(app.visible_git_rows().iter().any(|row| {
+        matches!(row.kind, lattelens::app::GitRowKind::Pointer(_))
+            && row.label == "(submodule pointer)"
+    }));
+    assert!(app.visible_git_rows().iter().any(|row| {
+        row.label == "child"
+            && row.detail.contains("pointer changed")
+            && row.detail.contains("internal modified")
+    }));
+    assert!(app.visible_git_rows().iter().any(|row| {
+        row.label == "missing"
+            && row.detail.contains("submodule placeholder")
+            && row.detail.contains("uninitialized")
+    }));
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line.contains("diff --git a/child b/child"))
+    );
+
+    app.handle_key(key(KeyCode::Char('n')));
+    settle(&mut app);
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line == "+dirty inside child")
+    );
+    assert!(
+        !app.content_lines
+            .iter()
+            .any(|line| line.contains("a/child b/child"))
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SubmoduleProjectionState {
+    InternalOnly,
+    PointerOnly,
+    PointerAndInternal,
+}
+
+#[test]
+fn projected_submodule_change_count_matrix_is_stable_across_collapse_refresh_and_render() {
+    for (state, expected_changes, expected_files, expected_pointers) in [
+        (SubmoduleProjectionState::InternalOnly, 1, 1, 0),
+        (SubmoduleProjectionState::PointerOnly, 1, 0, 1),
+        (SubmoduleProjectionState::PointerAndInternal, 2, 1, 1),
+    ] {
+        let (_parent, mut app) = submodule_projection_fixture(state);
+
+        let file_rows = app
+            .visible_git_rows()
+            .iter()
+            .filter(|row| matches!(row.kind, GitRowKind::Change(_)))
+            .count();
+        let pointer_rows = app
+            .visible_git_rows()
+            .iter()
+            .filter(|row| matches!(row.kind, GitRowKind::Pointer(_)))
+            .count();
+        assert_eq!(file_rows, expected_files, "state: {state:?}");
+        assert_eq!(pointer_rows, expected_pointers, "state: {state:?}");
+        assert_eq!(app.changed_count, expected_changes, "state: {state:?}");
+        assert_eq!(app.scope_entry_count(), expected_changes);
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        let expected_label = if expected_changes == 1 {
+            "1 change".to_owned()
+        } else {
+            format!("{expected_changes} changes")
+        };
+        assert!(rendered.contains(&expected_label), "state: {state:?}");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.bg == Color::Reset)
+        );
+
+        app.handle_key(key(KeyCode::Home));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_git_rows().len(), 1, "state: {state:?}");
+        assert_eq!(app.changed_count, expected_changes, "state: {state:?}");
+        assert_eq!(app.scope_entry_count(), expected_changes);
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('r')));
+        settle(&mut app);
+        assert_eq!(app.changed_count, expected_changes, "state: {state:?}");
+        assert_eq!(app.scope_entry_count(), expected_changes);
+    }
+}
+
+#[test]
+fn app_rejects_files_and_missing_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("file.txt");
+    fs::write(&file, "not a directory\n").unwrap();
+
+    assert!(
+        App::new(file)
+            .err()
+            .expect("file path must fail")
+            .to_string()
+            .contains("is not a directory")
+    );
+    assert!(
+        App::new(directory.path().join("missing"))
+            .err()
+            .expect("missing path must fail")
+            .to_string()
+            .contains("cannot open")
+    );
+}
+
+#[test]
+fn empty_directory_has_no_selection_and_safe_navigation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+
+    assert!(app.all_entries.is_empty());
+    assert!(app.selected_entry().is_none());
+    assert_eq!(app.content_lines, ["This directory is empty."]);
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.selected_entry().is_none());
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+}
+
+#[test]
+fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection() {
+    let fixture = TestRepo::new();
+    fixture.write("src/lib.rs", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("src/lib.rs", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(
+        app.content_lines,
+        [
+            "1 changed file in this directory.",
+            "",
+            "Collapsed · Enter or click to expand."
+        ]
+    );
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert!(app.last_error.is_none());
+}
+
+#[test]
+fn refresh_failure_is_captured_for_the_footer() {
+    let fixture = TestRepo::new();
+    fixture.write("file.txt", "fixture\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    fs::remove_dir_all(fixture.root()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    assert!(
+        app.last_error
+            .as_deref()
+            .unwrap()
+            .contains("refresh failed")
+    );
+}
+
+#[test]
+fn selecting_a_removed_untracked_file_surfaces_diff_error() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "tracked\n");
+    fixture.commit_all("initial");
+    fixture.write("z-untracked.txt", "temporary\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::End));
+    fs::remove_file(fixture.root().join("z-untracked.txt")).unwrap();
+
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("z-untracked.txt"))
+    );
+    assert!(app.content_lines[0].contains("Unable to load diff"));
+}
+
+#[test]
+fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "before\n");
+    fixture.write("b.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("b.txt", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+    app.handle_key(key(KeyCode::Char('d')));
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    let selected = app.selected_relative_path();
+
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.content_scroll, 1);
+    assert_eq!(app.selected_relative_path(), selected);
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.content_scroll, 0);
+    assert_eq!(app.selected_relative_path(), selected);
+
+    app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(app.content_scroll, 12);
+    app.handle_key(key(KeyCode::PageUp));
+    assert_eq!(app.content_scroll, 0);
+
+    app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
+    assert_eq!(app.content_horizontal_scroll, 4);
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(app.content_horizontal_scroll, 4);
+    assert_eq!(app.selected_relative_path(), selected);
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.content_horizontal_scroll, 4);
+    assert_eq!(app.selected_relative_path(), selected);
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    app.handle_key(modified_key(KeyCode::Left, KeyModifiers::SHIFT));
+    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.selected_relative_path(), selected);
+
+    app.handle_key(key(KeyCode::Char('h')));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.should_quit());
+}
+
+#[test]
+fn error_footer_renders_without_hiding_split_panes() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
+    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    app.last_error = Some("refresh failed: fixture".to_owned());
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("refresh failed: fixture"));
+    assert!(rendered.contains("Files"));
+    assert!(rendered.contains("Preview"));
+}
+
+#[test]
+fn refresh_and_content_loading_are_visible_without_blocking_navigation() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let snapshot = app.all_entries.clone();
+
+    app.handle_key(key(KeyCode::Char('r')));
+    app.handle_key(key(KeyCode::Down));
+    assert!(app.is_refreshing());
+    assert!(app.is_content_loading());
+    assert_eq!(app.all_entries, snapshot);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Working"));
+    assert!(rendered.contains("LOADING"));
+    assert!(rendered.contains("Refreshing repository"));
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.should_quit());
+    settle(&mut app);
+}
+
+#[test]
+fn clean_source_defaults_to_numbered_text_preview() {
+    let fixture = TestRepo::new();
+    fixture.write("main.rs", "fn main() {\n    println!(\"latte\");\n}\n");
+    fixture.commit_all("initial");
+
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert!(app.content_show_line_numbers);
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Preview"));
+    assert!(rendered.contains("1 │"));
+    assert!(rendered.contains("println!"));
+}
+
+#[test]
+fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() {
+    let fixture = TestRepo::new();
+    fixture.write("long.txt", "abcdefghijklmnopqrstuvwxyz0123456789\nsecond\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert!(app.content_show_line_numbers);
+    assert_eq!(app.ui_regions.content_inner.width, 30);
+
+    let row_text = |row: u16| -> String {
+        (app.ui_regions.content_inner.x..app.ui_regions.content_inner.right())
+            .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+            .map(|cell| cell.symbol())
+            .collect()
+    };
+    let first_row = app.ui_regions.content_inner.y;
+    assert_eq!(row_text(first_row), "1 │ abcdefghijklmnopqrstuvwxyz");
+    assert!(row_text(first_row + 1).starts_with("  │ 0123456789"));
+    assert!(row_text(first_row + 2).starts_with("2 │ second"));
+
+    let text_x = app.ui_regions.content_inner.x + 4;
+    app.handle_mouse(mouse_down(text_x + 24, first_row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 3,
+        first_row + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 3,
+        first_row + 1,
+    ));
+    assert_eq!(app.selected_preview_text().as_deref(), Some("yz0123"));
+
+    app.handle_key(key(KeyCode::End));
+    assert_eq!(app.content_scroll, 2);
+    app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
+    assert_eq!(app.content_horizontal_scroll, 0);
+}
+
+#[test]
+fn changed_source_defaults_to_diff_but_can_toggle_preview() {
+    let fixture = TestRepo::new();
+    fixture.write("main.rs", "fn before() {}\n");
+    fixture.commit_all("initial");
+    fixture.write("main.rs", "fn after() {}\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line == "+fn after() {}")
+    );
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_lines, ["fn after() {}"]);
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Diff);
+}
+
+#[test]
+fn binary_file_explains_how_to_add_a_preview_provider() {
+    let fixture = TestRepo::new();
+    fixture.write("asset.bin", [b'a', 0, b'b']);
+    fixture.commit_all("initial");
+
+    let app = App::new(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert!(app.content_provider.is_none());
+    assert!(app.content_lines[0].contains("No preview provider accepted"));
+    assert!(app.content_lines[1].contains("PreviewProvider"));
+}
+
+#[test]
+fn app_accepts_a_custom_pdf_preview_provider() {
+    struct FakePdfProvider;
+
+    impl PreviewProvider for FakePdfProvider {
+        fn id(&self) -> &'static str {
+            "fake-pdf"
+        }
+
+        fn preview(&self, request: &PreviewRequest<'_>) -> anyhow::Result<Option<PreviewContent>> {
+            if request
+                .absolute_path
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some("pdf")
+            {
+                return Ok(Some(PreviewContent::new(vec!["PDF page one".to_owned()])));
+            }
+            Ok(None)
+        }
+    }
+
+    let fixture = TestRepo::new();
+    fixture.write("design.pdf", b"%PDF-1.7\0fixture");
+    fixture.commit_all("initial");
+    let mut registry = PreviewRegistry::with_builtins();
+    registry.register(FakePdfProvider);
+
+    let app = App::with_preview_registry(fixture.root().to_path_buf(), registry).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_provider.as_deref(), Some("fake-pdf"));
+    assert_eq!(app.content_lines, ["PDF page one"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn all_files_never_dispatches_an_external_file_symlink_to_a_provider() {
+    use std::os::unix::fs::symlink;
+
+    struct UnsafeReader {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PreviewProvider for UnsafeReader {
+        fn id(&self) -> &'static str {
+            "unsafe-reader"
+        }
+
+        fn preview(&self, request: &PreviewRequest<'_>) -> anyhow::Result<Option<PreviewContent>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let contents = fs::read_to_string(request.absolute_path)?;
+            Ok(Some(PreviewContent::new(vec![contents])))
+        }
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = "outside-workspace-secret-7f96";
+    let outside_file = outside.path().join("secret.txt");
+    fs::write(&outside_file, secret).unwrap();
+    symlink(&outside_file, workspace.path().join("a-link.txt")).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = PreviewRegistry::with_builtins();
+    registry.register(UnsafeReader {
+        calls: Arc::clone(&calls),
+    });
+
+    let app = App::with_preview_registry(workspace.path().to_path_buf(), registry).unwrap();
+    let content = app.content_lines.join("\n");
+
+    assert!(content.contains("symbolic link"));
+    assert!(content.contains("never follows symbolic links"));
+    assert!(!content.contains(secret));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn all_files_does_not_follow_a_symlink_to_an_internal_regular_file() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let target = workspace.path().join("z-target.txt");
+    fs::write(&target, "internal-target-content-1d61\n").unwrap();
+    symlink("z-target.txt", workspace.path().join("a-link.txt")).unwrap();
+
+    let app = App::new(workspace.path().to_path_buf()).unwrap();
+    let content = app.content_lines.join("\n");
+
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-link.txt"))
+    );
+    assert!(content.contains("symbolic link"));
+    assert!(!content.contains("internal-target-content-1d61"));
+}
+
+#[cfg(unix)]
+#[test]
+fn git_changes_preview_does_not_follow_a_changed_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestRepo::new();
+    fixture.write("inside.txt", "inside\n");
+    symlink("inside.txt", fixture.root().join("link.txt")).unwrap();
+    fixture.commit_all("initial symlink");
+
+    let outside = tempfile::tempdir().unwrap();
+    let secret = "changed-symlink-external-secret-97b8";
+    let outside_file = outside.path().join("secret.txt");
+    fs::write(&outside_file, secret).unwrap();
+    fs::remove_file(fixture.root().join("link.txt")).unwrap();
+    symlink(&outside_file, fixture.root().join("link.txt")).unwrap();
+
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    let content = app.content_lines.join("\n");
+
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert!(content.contains("symbolic link"));
+    assert!(!content.contains(secret));
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_preview_returns_promptly_with_a_safe_message() {
+    completes_within("FIFO preview and App drop", || {
+        let workspace = tempfile::tempdir().unwrap();
+        make_fifo(&workspace.path().join("pipe"));
+
+        let app = App::new(workspace.path().to_path_buf()).unwrap();
+        let content = app.content_lines.join("\n");
+        assert!(content.contains("FIFO (named pipe)"));
+        assert!(content.contains("reads only regular files"));
+        drop(app);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn untracked_symlink_to_fifo_diff_and_worker_drop_return_promptly() {
+    use std::os::unix::fs::symlink;
+
+    completes_within("untracked symlink diff and WorkerRuntime drop", || {
+        let fixture = TestRepo::new();
+        let outside = tempfile::tempdir().unwrap();
+        let fifo = outside.path().join("pipe");
+        make_fifo(&fifo);
+        symlink(&fifo, fixture.root().join("pipe-link")).unwrap();
+
+        let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+        app.set_tree_scope(TreeScope::GitChanges);
+        app.wait_for_background();
+        let diff = app.content_lines.join("\n");
+        assert!(diff.contains("── UNTRACKED ──"));
+        assert!(diff.contains("new file mode 120000"));
+        assert!(diff.contains(&format!("+{}", fifo.display())));
+        drop(app);
+    });
+}
+
+#[test]
+fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
+    let fixture = TestRepo::new();
+    fixture.write("file.txt", "hello\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let tree_heading = terminal
+        .backend()
+        .buffer()
+        .cell((app.ui_regions.tree_body.x, app.ui_regions.tree_body.y))
+        .unwrap();
+    assert_eq!(tree_heading.symbol(), "●");
+    assert_eq!(tree_heading.fg, Color::Rgb(200, 184, 224));
+    assert!(!tree_heading.modifier.contains(Modifier::REVERSED));
+    assert!(!tree_heading.modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(tree_heading.bg, Color::Reset);
+    let selected_row = terminal
+        .backend()
+        .buffer()
+        .cell((app.ui_regions.tree_inner.x, app.ui_regions.tree_inner.y))
+        .unwrap();
+    assert_eq!(selected_row.symbol(), "▌");
+    assert_eq!(selected_row.bg, Color::Reset);
+    assert!(!selected_row.modifier.contains(Modifier::REVERSED));
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("● Files"));
+    assert!(rendered.contains("Tree"));
+    assert!(!rendered.contains("┌"));
+    assert!(!rendered.contains("┐"));
+
+    app.handle_key(key(KeyCode::Char('l')));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let content_heading = terminal
+        .backend()
+        .buffer()
+        .cell((
+            app.ui_regions.content_body.x + 1,
+            app.ui_regions.content_body.y,
+        ))
+        .unwrap();
+    assert_eq!(content_heading.symbol(), "●");
+    assert_eq!(content_heading.fg, Color::Rgb(200, 184, 224));
+    assert!(!content_heading.modifier.contains(Modifier::REVERSED));
+    assert!(!content_heading.modifier.contains(Modifier::UNDERLINED));
+    let unfocused_tree_heading = terminal
+        .backend()
+        .buffer()
+        .cell((app.ui_regions.tree_body.x, app.ui_regions.tree_body.y))
+        .unwrap();
+    assert_ne!(unfocused_tree_heading.symbol(), "●");
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("● Preview"));
+    assert!(rendered.contains("Content"));
+
+    app.content_scroll = 99;
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("hello"));
+
+    app.handle_key(key(KeyCode::Char('h')));
+    app.handle_key(key(KeyCode::Up));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let active_tab = terminal
+        .backend()
+        .buffer()
+        .cell((
+            app.ui_regions.all_files_tab.x,
+            app.ui_regions.all_files_tab.y,
+        ))
+        .unwrap();
+    assert_eq!(active_tab.symbol(), "●");
+    assert!(active_tab.modifier.contains(Modifier::BOLD));
+    assert!(active_tab.modifier.contains(Modifier::UNDERLINED));
+    assert!(!active_tab.modifier.contains(Modifier::REVERSED));
+    let inactive_tab = terminal
+        .backend()
+        .buffer()
+        .cell((
+            app.ui_regions.git_changes_tab.x + 2,
+            app.ui_regions.git_changes_tab.y,
+        ))
+        .unwrap();
+    assert_eq!(inactive_tab.symbol(), "2");
+    assert!(!inactive_tab.modifier.contains(Modifier::UNDERLINED));
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("● 1 Files"));
+    assert!(rendered.contains("Tabs"));
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+
+    let backend = TestBackend::new(200, 20);
+    let mut wide_terminal = Terminal::new(backend).unwrap();
+    wide_terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 44);
+    assert_eq!(app.ui_regions.content_body.x, 45);
+}
+
+#[test]
+fn all_files_uses_a_small_aligned_change_gutter() {
+    let fixture = TestRepo::new();
+    fixture.write("changed-dir/nested.txt", "before nested\n");
+    fixture.write("root.txt", "before root\n");
+    fixture.commit_all("initial");
+    fixture.write("changed-dir/nested.txt", "after nested\n");
+    fixture.write("root.txt", "after root\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let hint_x = app
+        .ui_regions
+        .tree_inner
+        .x
+        .saturating_add(app.ui_regions.tree_inner.width)
+        .saturating_sub(2);
+    let directory_hint = terminal
+        .backend()
+        .buffer()
+        .cell((hint_x, app.ui_regions.tree_inner.y))
+        .unwrap();
+    assert_eq!(directory_hint.symbol(), "•");
+    assert_eq!(UnicodeWidthStr::width(directory_hint.symbol()), 1);
+    assert_eq!(directory_hint.fg, Color::Rgb(196, 151, 126));
+    assert!(!directory_hint.modifier.contains(Modifier::BOLD));
+    assert_eq!(directory_hint.bg, Color::Reset);
+
+    let file_hint = terminal
+        .backend()
+        .buffer()
+        .cell((hint_x, app.ui_regions.tree_inner.y + 1))
+        .unwrap();
+    assert_eq!(file_hint.symbol(), "ᴍ");
+    assert_eq!(UnicodeWidthStr::width(file_hint.symbol()), 1);
+    assert_eq!(file_hint.fg, Color::Rgb(196, 151, 126));
+    assert!(!file_hint.modifier.contains(Modifier::BOLD));
+    assert_eq!(file_hint.bg, Color::Reset);
+
+    let trailing_spacer = terminal
+        .backend()
+        .buffer()
+        .cell((hint_x + 1, app.ui_regions.tree_inner.y))
+        .unwrap();
+    assert_eq!(trailing_spacer.symbol(), " ");
+    assert_eq!(hint_x, app.ui_regions.tree_inner.right() - 2);
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let changed_row = app
+        .visible_git_rows()
+        .iter()
+        .position(|row| row.status.is_some())
+        .unwrap();
+    let git_hint = terminal
+        .backend()
+        .buffer()
+        .cell((
+            app.ui_regions.tree_inner.right() - 2,
+            app.ui_regions.tree_inner.y + u16::try_from(changed_row).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(git_hint.symbol(), "ᴍ");
+    assert_eq!(UnicodeWidthStr::width(git_hint.symbol()), 1);
+    assert!(!git_hint.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn divider_drag_resizes_tree_with_minimum_tree_and_content_widths() {
+    let fixture = TestRepo::new();
+    fixture.write("file.txt", "hello\n");
+    fixture.commit_all("initial");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 36);
+    let drag_row = app.ui_regions.divider.y + 2;
+    app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 50);
+    assert_eq!(app.ui_regions.divider.x, 50);
+    assert_eq!(app.ui_regions.content_body.x, 51);
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((app.ui_regions.divider.x, drag_row))
+            .unwrap()
+            .symbol(),
+        "┃"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((app.ui_regions.divider.x, drag_row))
+            .unwrap()
+            .symbol(),
+        "│"
+    );
+
+    app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 28);
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, drag_row));
+
+    app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 99, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 75);
+    assert_eq!(app.ui_regions.content_body.width, 24);
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 99, drag_row));
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 75);
+    assert_eq!(app.ui_regions.content_body.width, 24);
+}
+
+#[test]
+fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
+    let fixture = TestRepo::new();
+    fixture.write("a-clean.txt", "hello\n");
+    fixture.write("b-changed.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("b-changed.txt", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.x, 0);
+    assert_eq!(app.ui_regions.content_body.x, 29);
+    assert_eq!(app.ui_regions.content_body.width, 51);
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset),
+        "the UI must inherit the terminal background"
+    );
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let focused_tab = terminal
+        .backend()
+        .buffer()
+        .cell((
+            app.ui_regions.all_files_tab.x + 2,
+            app.ui_regions.all_files_tab.y,
+        ))
+        .unwrap();
+    assert!(focused_tab.modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(focused_tab.bg, Color::Reset);
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Git changes"));
+    assert!(rendered.contains("Diff"));
+    assert!(rendered.contains("+after"));
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+}
+
+#[test]
+fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
+    let fixture = TestRepo::new();
+    fixture.write("a-clean.txt", "clean\n");
+    fixture.write("b-changed.txt", "before b\n");
+    fixture.write("c-changed.txt", "before c\n");
+    fixture.commit_all("initial");
+    fixture.write("b-changed.txt", "after b\n");
+    fixture.write("c-changed.txt", "after c\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
+
+    app.handle_mouse(mouse_down(
+        app.ui_regions.git_changes_tab.x,
+        app.ui_regions.git_changes_tab.y,
+    ));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("b-changed.txt"))
+    );
+    assert_eq!(app.content_mode, ContentMode::Diff);
+
+    app.handle_mouse(mouse_down(
+        app.ui_regions.tree_inner.x,
+        // Row zero is the selectable repository header.
+        app.ui_regions.tree_inner.y + 2,
+    ));
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("c-changed.txt"))
+    );
+    assert!(app.content_lines.iter().any(|line| line == "+after c"));
+
+    app.handle_mouse(mouse(
+        MouseEventKind::ScrollDown,
+        app.ui_regions.content_inner.x,
+        app.ui_regions.content_inner.y,
+    ));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(app.content_scroll, 3);
+
+    app.handle_mouse(mouse_down(
+        app.ui_regions.all_files_tab.x,
+        app.ui_regions.all_files_tab.y,
+    ));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    app.handle_mouse(mouse(
+        MouseEventKind::ScrollDown,
+        app.ui_regions.tree_inner.x,
+        app.ui_regions.tree_inner.y,
+    ));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("c-changed.txt"))
+    );
+}
+
+#[test]
+fn preview_mouse_drag_selects_visible_text_and_ctrl_c_queues_exact_copy() {
+    let fixture = TestRepo::new();
+    fixture.write("notes.txt", "alpha beta\nsecond line\nthird\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("Ctrl+C"));
+    let text_x = app.ui_regions.content_inner.x + 4;
+    let first_row = app.ui_regions.content_inner.y;
+    app.handle_mouse(mouse_down(text_x + 6, first_row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 10,
+        first_row + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 10,
+        first_row + 1,
+    ));
+
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(
+        app.selected_preview_text().as_deref(),
+        Some("beta\nsecond line")
+    );
+    assert_eq!(
+        app.clipboard_status.as_deref(),
+        Some("Copying 16 characters…")
+    );
+    app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.clipboard_status.as_deref(),
+        Some("Copying 16 characters…")
+    );
+    app.handle_key(modified_key(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.clipboard_status.as_deref(),
+        Some("Copying 16 characters…")
+    );
+    app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::SUPER));
+    assert_eq!(
+        app.clipboard_status.as_deref(),
+        Some("Copying 16 characters…")
+    );
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let first_selected_cell = terminal
+        .backend()
+        .buffer()
+        .cell((text_x + 6, first_row))
+        .unwrap();
+    assert_eq!(first_selected_cell.symbol(), "b");
+    assert!(first_selected_cell.modifier.contains(Modifier::REVERSED));
+    let line_number = terminal
+        .backend()
+        .buffer()
+        .cell((app.ui_regions.content_inner.x, first_row))
+        .unwrap();
+    assert!(!line_number.modifier.contains(Modifier::REVERSED));
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("Copying 16 characters"));
+
+    app.handle_mouse(mouse_down(
+        app.ui_regions.tree_inner.x,
+        app.ui_regions.tree_inner.y,
+    ));
+    assert!(app.selected_preview_text().is_none());
+}
+
+#[test]
+fn default_diff_content_can_be_mouse_selected_and_copied() {
+    let fixture = TestRepo::new();
+    fixture.write("changed.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("changed.txt", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    assert_eq!(app.content_mode, ContentMode::Diff);
+    let changed_line = app
+        .content_lines
+        .iter()
+        .position(|line| line == "+after")
+        .unwrap();
+    let row = app.ui_regions.content_inner.y + u16::try_from(changed_line).unwrap();
+    let column = app.ui_regions.content_inner.x;
+    app.handle_mouse(mouse_down(column + 1, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        column + 5,
+        row,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        column + 5,
+        row,
+    ));
+
+    assert_eq!(app.selected_content_text().as_deref(), Some("after"));
+    app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.clipboard_status.as_deref(),
+        Some("Copying 5 characters…")
+    );
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let selected = terminal.backend().buffer().cell((column + 1, row)).unwrap();
+    assert_eq!(selected.symbol(), "a");
+    assert!(selected.modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
+    let fixture = TestRepo::new();
+    fixture.write("src/lib.rs", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("src/lib.rs", "after\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Info);
+    assert_eq!(
+        app.content_lines,
+        [
+            "1 changed file in this directory.",
+            "",
+            "Collapsed \u{b7} Enter or click to expand."
+        ]
+    );
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let column = app.ui_regions.content_inner.x;
+    // Info content is rendered one row below content_inner, so line index 2 is
+    // visible at y + 3 rather than y + 2.
+    let row = app.ui_regions.content_inner.y + 3;
+    app.handle_mouse(mouse_down(column, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        column + 8,
+        row,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        column + 8,
+        row,
+    ));
+
+    assert_eq!(app.selected_content_text().as_deref(), Some("Collapsed"));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let selected = terminal.backend().buffer().cell((column, row)).unwrap();
+    assert_eq!(selected.symbol(), "C");
+    assert!(selected.modifier.contains(Modifier::REVERSED));
+    let row_above = terminal.backend().buffer().cell((column, row - 1)).unwrap();
+    assert!(!row_above.modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn clickable_refresh_control_updates_the_current_git_changes_tree() {
+    let fixture = TestRepo::new();
+    fixture.write("clean.txt", "clean\n");
+    fixture.commit_all("initial");
+    fixture.write("first-change.txt", "first\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    fixture.write("second-change.txt", "second\n");
+
+    app.handle_mouse(mouse_down(
+        app.ui_regions.refresh_button.x,
+        app.ui_regions.refresh_button.y,
+    ));
+    settle(&mut app);
+
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(app.changed_count, 2);
+    let changed_paths: Vec<_> = app
+        .visible_entries()
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    assert_eq!(
+        changed_paths,
+        [
+            PathBuf::from("first-change.txt"),
+            PathBuf::from("second-change.txt")
+        ]
+    );
+    assert!(app.last_error.is_none());
+}
+
+#[test]
+fn diff_mode_cycles_between_changed_files() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "before a\n");
+    fixture.write("b.txt", "clean\n");
+    fixture.write("c.txt", "before c\n");
+    fixture.commit_all("initial");
+    fixture.write("a.txt", "after a\n");
+    fixture.write("c.txt", "after c\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+    app.handle_key(key(KeyCode::Char('n')));
+    settle(&mut app);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("c.txt")));
+    assert!(app.content_lines.iter().any(|line| line == "+after c"));
+    app.handle_key(key(KeyCode::Char('N')));
+    settle(&mut app);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
+}
+
+fn mouse_down(column: u16, row: u16) -> MouseEvent {
+    mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+}
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn visible_paths(app: &App) -> Vec<PathBuf> {
+    app.visible_entries()
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect()
+}
+
+fn settle(app: &mut App) {
+    app.wait_for_background();
+}
+
+fn submodule_projection_fixture(state: SubmoduleProjectionState) -> (TestRepo, App) {
+    let source = TestRepo::new();
+    source.write("tracked.txt", "source initial\n");
+    source.commit_all("source initial");
+
+    let parent = TestRepo::new();
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+        ])
+        .arg(source.root())
+        .arg("child")
+        .current_dir(parent.root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "submodule add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parent.commit_all("add child");
+
+    let child = parent.root().join("child");
+    git(&child, &["config", "user.name", "Latte Lens Tests"]);
+    git(
+        &child,
+        &["config", "user.email", "lattelens@example.invalid"],
+    );
+    match state {
+        SubmoduleProjectionState::InternalOnly => {
+            write_file(&child, "tracked.txt", "internal only\n");
+        }
+        SubmoduleProjectionState::PointerOnly => {
+            write_file(&child, "tracked.txt", "advanced pointer\n");
+            git(&child, &["add", "--all"]);
+            git(&child, &["commit", "--quiet", "-m", "advance pointer"]);
+        }
+        SubmoduleProjectionState::PointerAndInternal => {
+            write_file(&child, "tracked.txt", "advanced pointer\n");
+            git(&child, &["add", "--all"]);
+            git(&child, &["commit", "--quiet", "-m", "advance pointer"]);
+            write_file(&child, "tracked.txt", "pointer and internal\n");
+        }
+    }
+
+    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    (parent, app)
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    let output = Command::new("mkfifo").arg(path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn completes_within(description: &'static str, operation: impl FnOnce() + Send + 'static) {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::mpsc::{self, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let outcome = catch_unwind(AssertUnwindSafe(operation));
+        let _ = sender.send(outcome);
+    });
+    match receiver.recv_timeout(Duration::from_secs(3)) {
+        Ok(outcome) => {
+            handle.join().expect("timeout fixture wrapper panicked");
+            if let Err(payload) = outcome {
+                resume_unwind(payload);
+            }
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            handle.join().expect("timeout fixture panicked");
+            panic!("{description} disconnected without reporting a result");
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("{description} exceeded the 3 second safety bound");
+        }
+    }
+}
+
+fn init_repo(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    git(root, &["-c", "init.defaultBranch=main", "init", "--quiet"]);
+    git(root, &["config", "user.name", "Latte Lens Tests"]);
+    git(root, &["config", "user.email", "lattelens@example.invalid"]);
+}
+
+fn write_file(root: &Path, relative: &str, contents: &str) {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, contents).unwrap();
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_with_path(root: &Path, before: &[&str], path: &Path, after: &[&str]) {
+    let output = Command::new("git")
+        .args(before)
+        .arg(path)
+        .args(after)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

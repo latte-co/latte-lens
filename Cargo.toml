@@ -1,0 +1,31 @@
+[package]
+name = "lattelens"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A repository viewer built for multi-agent terminals"
+license = "Apache-2.0"
+repository = "https://github.com/latte-co/lattelens"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ignore = "0.4"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+criterion = "0.7"
+tempfile = "3.20"
+
+[[bench]]
+name = "tree_scan"
+harness = false
