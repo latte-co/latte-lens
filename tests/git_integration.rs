@@ -24,7 +24,14 @@ fn discovers_repository_from_nested_directory_and_reads_branch() {
 
 #[test]
 fn discovery_preserves_root_boundary_whitespace_for_status_and_diff() {
-    let fixture = TestRepo::with_root_name("  repository root  ");
+    // Win32 normalizes trailing spaces in directory names, so exercise the
+    // portable leading boundary there and both boundaries on Unix.
+    let root_name = if cfg!(windows) {
+        "  repository root"
+    } else {
+        "  repository root  "
+    };
+    let fixture = TestRepo::with_root_name(root_name);
     fixture.write("tracked.txt", "original\n");
     fixture.commit_all("initial");
     fixture.write("tracked.txt", "changed\n");
@@ -33,7 +40,7 @@ fn discovery_preserves_root_boundary_whitespace_for_status_and_diff() {
 
     assert_eq!(
         repo.root().file_name(),
-        Some(std::ffi::OsStr::new("  repository root  "))
+        Some(std::ffi::OsStr::new(root_name))
     );
     assert_eq!(
         repo.root().canonicalize().unwrap(),
