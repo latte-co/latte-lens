@@ -6,11 +6,18 @@
 
 use std::{
     io::{Read, Seek, SeekFrom},
+    ops::Range,
     path::Path,
-    sync::Arc,
+    str::FromStr,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result};
+use syntect::{
+    easy::ScopeRangeIterator,
+    highlighting::ScopeSelectors,
+    parsing::{ParseState, ScopeStack, SyntaxSet},
+};
 
 use crate::content_safety::{
     ContentPathKind, OpenRegular, SafeFile, inspect_content_path, open_regular,
@@ -18,6 +25,27 @@ use crate::content_safety::{
 
 pub const DEFAULT_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_LINES: usize = 10_000;
+const MAX_HIGHLIGHT_LINE_BYTES: usize = 16 * 1024;
+
+/// Semantic class attached to a byte range in a source preview.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HighlightKind {
+    Comment,
+    String,
+    Keyword,
+    Function,
+    Type,
+    Number,
+    Constant,
+    Attribute,
+}
+
+/// A syntax-highlighted byte range within one logical preview line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HighlightSpan {
+    pub range: Range<usize>,
+    pub kind: HighlightKind,
+}
 
 /// Everything a provider needs to produce a bounded preview.
 #[derive(Clone, Copy, Debug)]
@@ -110,14 +138,17 @@ impl Seek for PreviewFile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreviewContent {
     pub lines: Vec<String>,
+    pub highlights: Vec<Vec<HighlightSpan>>,
     pub truncated: bool,
     pub show_line_numbers: bool,
 }
 
 impl PreviewContent {
     pub fn new(lines: Vec<String>) -> Self {
+        let highlights = vec![Vec::new(); lines.len()];
         Self {
             lines,
+            highlights,
             truncated: false,
             show_line_numbers: false,
         }
@@ -132,6 +163,13 @@ impl PreviewContent {
         self.show_line_numbers = show_line_numbers;
         self
     }
+
+    pub fn with_highlights(mut self, highlights: Vec<Vec<HighlightSpan>>) -> Self {
+        if highlights.len() == self.lines.len() {
+            self.highlights = highlights;
+        }
+        self
+    }
 }
 
 /// A resolved preview ready for the application or UI layer.
@@ -139,6 +177,7 @@ impl PreviewContent {
 pub struct Preview {
     pub provider_id: String,
     pub lines: Vec<String>,
+    pub highlights: Vec<Vec<HighlightSpan>>,
     pub truncated: bool,
     pub show_line_numbers: bool,
 }
@@ -227,6 +266,7 @@ impl PreviewRegistry {
                 return Ok(PreviewResolution::Preview(Preview {
                     provider_id: provider.id().to_owned(),
                     lines: content.lines,
+                    highlights: content.highlights,
                     truncated: content.truncated,
                     show_line_numbers: content.show_line_numbers,
                 }));
@@ -288,19 +328,141 @@ impl PreviewProvider for TextPreviewProvider {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
 
         let mut source_lines = text.lines();
-        let lines = source_lines
+        let lines: Vec<String> = source_lines
             .by_ref()
             .take(request.max_lines)
             .map(ToOwned::to_owned)
             .collect();
         let truncated_by_lines = source_lines.next().is_some();
 
+        let highlights = syntax_highlights(request.display_path, &lines).unwrap_or_default();
+
         Ok(Some(
             PreviewContent::new(lines)
+                .with_highlights(highlights)
                 .with_truncated(truncated_by_bytes || truncated_by_lines)
                 .with_line_numbers(true),
         ))
     }
+}
+
+fn syntax_highlights(path: &Path, lines: &[String]) -> Option<Vec<Vec<HighlightSpan>>> {
+    if lines
+        .iter()
+        .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
+        return None;
+    }
+
+    let syntax_set = syntax_set();
+    let syntax = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| syntax_set.find_syntax_by_extension(extension))
+        .or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| syntax_set.find_syntax_by_token(name))
+        })
+        .or_else(|| {
+            lines
+                .first()
+                .and_then(|line| syntax_set.find_syntax_by_first_line(line))
+        })?;
+    if syntax.name == "Plain Text" {
+        return None;
+    }
+
+    let mut parse_state = ParseState::new(syntax);
+    let mut scope_stack = ScopeStack::new();
+    let mut highlighted_lines = Vec::with_capacity(lines.len());
+    for line in lines {
+        let operations = parse_state.parse_line(line, syntax_set).ok()?;
+        let mut offset = 0;
+        let mut highlights: Vec<HighlightSpan> = Vec::new();
+        for (token, operation) in ScopeRangeIterator::new(&operations, line) {
+            scope_stack.apply(operation).ok()?;
+            let start = offset;
+            offset += token.len();
+            let Some(kind) = classify_scope(&scope_stack) else {
+                continue;
+            };
+            if start == offset {
+                continue;
+            }
+            if let Some(previous) = highlights.last_mut()
+                && previous.kind == kind
+                && previous.range.end == start
+            {
+                previous.range.end = offset;
+            } else {
+                highlights.push(HighlightSpan {
+                    range: start..offset,
+                    kind,
+                });
+            }
+        }
+        highlighted_lines.push(highlights);
+    }
+    Some(highlighted_lines)
+}
+
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(two_face::syntax::extra_no_newlines)
+}
+
+struct ScopeClassifiers {
+    comment: ScopeSelectors,
+    string: ScopeSelectors,
+    keyword: ScopeSelectors,
+    function: ScopeSelectors,
+    ty: ScopeSelectors,
+    number: ScopeSelectors,
+    constant: ScopeSelectors,
+    attribute: ScopeSelectors,
+}
+
+fn scope_classifiers() -> &'static ScopeClassifiers {
+    static CLASSIFIERS: OnceLock<ScopeClassifiers> = OnceLock::new();
+    CLASSIFIERS.get_or_init(|| ScopeClassifiers {
+        comment: selectors("comment"),
+        string: selectors("string"),
+        keyword: selectors(
+            "keyword, storage.modifier, storage.control, storage.type.function, \
+             storage.type.class, storage.type.struct, storage.type.enum, \
+             storage.type.interface, storage.type.trait",
+        ),
+        function: selectors("entity.name.function, support.function, variable.function"),
+        ty: selectors(
+            "entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, \
+             entity.name.interface, entity.name.trait, support.type, storage.type",
+        ),
+        number: selectors("constant.numeric"),
+        constant: selectors("constant, variable.language, support.constant"),
+        attribute: selectors("entity.other.attribute-name, meta.attribute"),
+    })
+}
+
+fn selectors(value: &str) -> ScopeSelectors {
+    ScopeSelectors::from_str(value).expect("built-in syntax scope selectors must be valid")
+}
+
+fn classify_scope(stack: &ScopeStack) -> Option<HighlightKind> {
+    let classifiers = scope_classifiers();
+    let scopes = stack.as_slice();
+    [
+        (&classifiers.comment, HighlightKind::Comment),
+        (&classifiers.string, HighlightKind::String),
+        (&classifiers.function, HighlightKind::Function),
+        (&classifiers.keyword, HighlightKind::Keyword),
+        (&classifiers.ty, HighlightKind::Type),
+        (&classifiers.number, HighlightKind::Number),
+        (&classifiers.attribute, HighlightKind::Attribute),
+        (&classifiers.constant, HighlightKind::Constant),
+    ]
+    .into_iter()
+    .find_map(|(selector, kind)| selector.does_match(scopes).map(|_| kind))
 }
 
 fn utf8_prefix(bytes: &[u8], truncated_by_bytes: bool) -> Option<&str> {
@@ -324,7 +486,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest, TextPreviewProvider,
+        HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest,
+        TextPreviewProvider,
     };
 
     #[test]
@@ -342,13 +505,50 @@ mod tests {
         assert_eq!(code_preview.provider_id, "text");
         assert_eq!(code_preview.lines[0], "fn main() {");
         assert!(code_preview.show_line_numbers);
+        assert!(
+            highlight_contains(&code_preview, 0, "fn", HighlightKind::Keyword),
+            "{:?}",
+            code_preview.highlights
+        );
+        assert!(highlight_contains(
+            &code_preview,
+            0,
+            "main",
+            HighlightKind::Function
+        ));
+        assert!(highlight_contains(
+            &code_preview,
+            1,
+            "\"latte\"",
+            HighlightKind::String
+        ));
 
         let text_preview = registry
             .preview(&PreviewRequest::new(&extensionless, Path::new("README")))?
             .expect("extensionless UTF-8 should be previewable");
         assert_eq!(text_preview.lines, ["Latte Lens", "看清每一次修改"]);
+        assert!(text_preview.highlights.iter().all(Vec::is_empty));
         assert!(!text_preview.truncated);
         Ok(())
+    }
+
+    fn highlight_contains(
+        preview: &super::Preview,
+        line_index: usize,
+        expected: &str,
+        kind: HighlightKind,
+    ) -> bool {
+        let Some(line) = preview.lines.get(line_index) else {
+            return false;
+        };
+        preview
+            .highlights
+            .get(line_index)
+            .into_iter()
+            .flatten()
+            .any(|highlight| {
+                highlight.kind == kind && line.get(highlight.range.clone()) == Some(expected)
+            })
     }
 
     #[test]
@@ -361,6 +561,57 @@ mod tests {
             .preview(&PreviewRequest::new(&binary, Path::new("image.bin")))?;
 
         assert!(preview.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unusually_long_source_lines_fall_back_to_plain_text() {
+        let lines = vec!["x".repeat(super::MAX_HIGHLIGHT_LINE_BYTES + 1)];
+
+        assert!(super::syntax_highlights(Path::new("main.rs"), &lines).is_none());
+    }
+
+    #[test]
+    fn highlights_typescript_and_tsx_sources() -> Result<()> {
+        let directory = tempdir()?;
+        let typescript = directory.path().join("greet.ts");
+        let tsx = directory.path().join("app.tsx");
+        fs::write(
+            &typescript,
+            "export function greet(name: string): string {\n    return `Hello ${name}`;\n}\n",
+        )?;
+        fs::write(
+            &tsx,
+            "export function App(): JSX.Element {\n    return <main>Hello</main>;\n}\n",
+        )?;
+        let registry = PreviewRegistry::with_builtins();
+
+        let typescript_preview = registry
+            .preview(&PreviewRequest::new(&typescript, Path::new("src/greet.ts")))?
+            .expect("TypeScript source should be previewable");
+        assert!(highlight_contains(
+            &typescript_preview,
+            0,
+            "function",
+            HighlightKind::Keyword
+        ));
+        assert!(highlight_contains(
+            &typescript_preview,
+            0,
+            "greet",
+            HighlightKind::Function
+        ));
+        assert!(
+            typescript_preview
+                .highlights
+                .iter()
+                .any(|line| !line.is_empty())
+        );
+
+        let tsx_preview = registry
+            .preview(&PreviewRequest::new(&tsx, Path::new("src/app.tsx")))?
+            .expect("TSX source should be previewable");
+        assert!(tsx_preview.highlights.iter().any(|line| !line.is_empty()));
         Ok(())
     }
 

@@ -15,9 +15,9 @@ try {
         throw "cargo metadata --locked failed"
     }
     $metadata = ($metadataJson -join "`n") | ConvertFrom-Json
-    $package = $metadata.packages | Where-Object { $_.name -eq "lattelens" } | Select-Object -First 1
+    $package = $metadata.packages | Where-Object { $_.name -eq "latte-lens" } | Select-Object -First 1
     if ($null -eq $package) {
-        throw "could not find the lattelens package in Cargo metadata"
+        throw "could not find the latte-lens package in Cargo metadata"
     }
 
     $hostLine = & rustc -vV | Where-Object { $_ -like "host: *" } | Select-Object -First 1
@@ -43,9 +43,9 @@ try {
     $buildArgs = @("build", "--release", "--locked")
     if ($BuildTarget) {
         $buildArgs += @("--target", $BuildTarget)
-        $binaryPath = Join-Path $targetDir "$BuildTarget/release/lattelens.exe"
+        $binaryPath = Join-Path $targetDir "$BuildTarget/release/latte-lens.exe"
     } else {
-        $binaryPath = Join-Path $targetDir "release/lattelens.exe"
+        $binaryPath = Join-Path $targetDir "release/latte-lens.exe"
     }
 
     & cargo @buildArgs
@@ -56,7 +56,7 @@ try {
         throw "release binary was not created at '$binaryPath'"
     }
 
-    $packageName = "lattelens-$($package.version)-$packageTarget"
+    $packageName = "latte-lens-$($package.version)-$packageTarget"
     $distDir = Join-Path $root "dist"
     $packageDir = Join-Path $distDir $packageName
     $archive = Join-Path $distDir "$packageName.zip"
@@ -67,7 +67,7 @@ try {
     Remove-Item -Force -ErrorAction SilentlyContinue $archive, $checksum
     New-Item -ItemType Directory -Path $packageDir | Out-Null
 
-    Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $packageDir "lattelens.exe")
+    Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $packageDir "latte-lens.exe")
     Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $packageDir
     Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination $packageDir
     Compress-Archive -LiteralPath $packageDir -DestinationPath $archive -CompressionLevel Optimal

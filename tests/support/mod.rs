@@ -42,7 +42,7 @@ impl TestRepo {
             root,
         };
         repo.git(&["config", "user.name", "Latte Lens Tests"]);
-        repo.git(&["config", "user.email", "lattelens@example.invalid"]);
+        repo.git(&["config", "user.email", "latte-lens@example.invalid"]);
         repo
     }
 

@@ -14,6 +14,7 @@ use crate::{
         App, ContentMode, ContentVisualRow, FocusPane, GitRowKind, GitTreeRow, TreeScope, UiRegions,
     },
     git::FileStatus,
+    preview::{HighlightKind, HighlightSpan},
     tree::FileEntry,
 };
 
@@ -560,6 +561,11 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         .filter_map(|visual_row| {
             let line = app.content_lines.get(visual_row.line_index)?;
             let segment = line.get(visual_row.byte_range.clone())?;
+            let highlights = app
+                .content_highlights
+                .get(visual_row.line_index)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let selection = visual_row_selection(app, visual_row);
             Some(match app.content_mode {
                 ContentMode::Diff => diff_line(segment, selection),
@@ -568,9 +574,13 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
                     line_number_width,
                     segment,
                     line.starts_with("… preview truncated"),
+                    visual_row.byte_range.start,
+                    highlights,
                     selection,
                 ),
-                ContentMode::Preview => preview_text_line(segment, selection),
+                ContentMode::Preview => {
+                    preview_text_line(segment, visual_row.byte_range.start, highlights, selection)
+                }
                 ContentMode::Info => Line::from(content_selection_spans(
                     segment,
                     selection,
@@ -732,6 +742,8 @@ fn preview_line(
     width: usize,
     line: &str,
     truncated: bool,
+    segment_start: usize,
+    highlights: &[HighlightSpan],
     selection: Option<Range<usize>>,
 ) -> Line<'static> {
     let text_style = if truncated {
@@ -744,7 +756,13 @@ fn preview_line(
         format!("{number:>width$} │ "),
         Style::default().fg(MUTED),
     )];
-    spans.extend(content_selection_spans(line, selection, text_style));
+    spans.extend(preview_content_spans(
+        line,
+        segment_start,
+        if truncated { &[] } else { highlights },
+        selection,
+        text_style,
+    ));
     Line::from(spans)
 }
 
@@ -758,12 +776,85 @@ fn visual_row_selection(app: &App, visual_row: &ContentVisualRow) -> Option<Rang
     )
 }
 
-fn preview_text_line(line: &str, selection: Option<Range<usize>>) -> Line<'static> {
-    Line::from(content_selection_spans(
+fn preview_text_line(
+    line: &str,
+    segment_start: usize,
+    highlights: &[HighlightSpan],
+    selection: Option<Range<usize>>,
+) -> Line<'static> {
+    Line::from(preview_content_spans(
         line,
+        segment_start,
+        highlights,
         selection,
         Style::default().fg(Color::Reset),
     ))
+}
+
+fn preview_content_spans(
+    line: &str,
+    segment_start: usize,
+    highlights: &[HighlightSpan],
+    selection: Option<Range<usize>>,
+    default_style: Style,
+) -> Vec<Span<'static>> {
+    let segment_end = segment_start.saturating_add(line.len());
+    let mut boundaries = vec![0, line.len()];
+    for highlight in highlights {
+        let start = highlight.range.start.max(segment_start);
+        let end = highlight.range.end.min(segment_end);
+        if start < end {
+            boundaries.push(start - segment_start);
+            boundaries.push(end - segment_start);
+        }
+    }
+    if let Some(selection) = selection
+        .as_ref()
+        .filter(|selection| selection.start < selection.end)
+    {
+        boundaries.push(selection.start.min(line.len()));
+        boundaries.push(selection.end.min(line.len()));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut spans = Vec::with_capacity(boundaries.len().saturating_sub(1));
+    for range in boundaries.windows(2) {
+        let start = range[0];
+        let end = range[1];
+        if start == end {
+            continue;
+        }
+        let absolute_start = segment_start.saturating_add(start);
+        let mut style = highlights
+            .iter()
+            .find(|highlight| highlight.range.contains(&absolute_start))
+            .map_or(default_style, |highlight| highlight_style(highlight.kind));
+        if selection
+            .as_ref()
+            .is_some_and(|selection| selection.contains(&start))
+        {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let Some(text) = line.get(start..end) else {
+            return vec![Span::styled(line.to_owned(), default_style)];
+        };
+        spans.push(Span::styled(text.to_owned(), style));
+    }
+    spans
+}
+
+fn highlight_style(kind: HighlightKind) -> Style {
+    match kind {
+        HighlightKind::Comment => Style::default().fg(SUBTLE).add_modifier(Modifier::ITALIC),
+        HighlightKind::String => Style::default().fg(PEACH),
+        HighlightKind::Keyword => Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        HighlightKind::Function => Style::default().fg(MINT),
+        HighlightKind::Type => Style::default().fg(ROSE),
+        HighlightKind::Number => Style::default().fg(PEACH),
+        HighlightKind::Constant => Style::default().fg(MINT),
+        HighlightKind::Attribute => Style::default().fg(LAVENDER),
+    }
 }
 
 fn content_selection_spans(
@@ -934,5 +1025,43 @@ mod tests {
 
         assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 7);
         assert_eq!(truncated, "目录文…");
+    }
+
+    #[test]
+    fn wrapped_preview_highlights_and_selection_share_byte_ranges() {
+        let spans = preview_content_spans(
+            "n mai",
+            1,
+            &[
+                HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                },
+                HighlightSpan {
+                    range: 3..7,
+                    kind: HighlightKind::Function,
+                },
+            ],
+            Some(2..4),
+            Style::default().fg(Color::Reset),
+        );
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "n mai"
+        );
+        assert_eq!(spans[0].style.fg, Some(LAVENDER));
+        assert_eq!(spans[2].style.fg, Some(MINT));
+        assert!(spans[2].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(spans[3].style.fg, Some(MINT));
+        assert!(!spans[3].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.style.bg.unwrap_or(Color::Reset) == Color::Reset)
+        );
     }
 }

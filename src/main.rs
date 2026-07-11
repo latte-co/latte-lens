@@ -2,7 +2,7 @@ use std::{io, path::PathBuf};
 
 use anyhow::Result;
 use clap::Parser;
-use lattelens::app::App;
+use latte_lens::app::App;
 use ratatui::crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -10,7 +10,7 @@ use ratatui::crossterm::{
 
 /// See what your agents are changing.
 #[derive(Debug, Parser)]
-#[command(name = "lattelens", version, about)]
+#[command(name = "latte-lens", version, about)]
 struct Cli {
     /// Repository or directory to inspect.
     #[arg(default_value = ".")]

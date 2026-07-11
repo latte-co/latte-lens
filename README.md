@@ -11,7 +11,7 @@ keyboard-driven TUI.
 - Collapsible repository tree that respects Git ignore rules
 - Staged, unstaged, deleted, renamed, and untracked file status
 - Colorized staged and working-tree diffs
-- Numbered previews for UTF-8 text, source code, and extensionless text files
+- Numbered, syntax-highlighted previews for recognized source files, with plain-text fallback
 - Extensible preview providers for formats such as PDF and Word
 - Side-by-side tree and content panes, so context stays visible while reading
 - A bounded file sidebar, single divider, and quiet focus/selection accents instead of boxed panels
@@ -27,8 +27,14 @@ keyboard-driven TUI.
 cargo run -- /path/to/repository
 ```
 
-The installed command is `lattelens`, matching the `lattecode` and `lattework`
-project family.
+Install the command from this checkout, then run it from anywhere:
+
+```bash
+make install
+latte-lens /path/to/repository
+```
+
+By default, Cargo installs `latte-lens` into `~/.cargo/bin`.
 
 Inside the TUI:
 
@@ -99,7 +105,7 @@ requests a fresh graph-aware snapshot.
 | Validation surface | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | Locked compile and unit/integration tests | CI | Not currently covered | CI |
-| Native release build, package, and SHA-256 checksum | CI (`.tar.gz`) | CI (`.tar.gz`) | CI (`.zip` containing `lattelens.exe`) |
+| Native release build, package, and SHA-256 checksum | CI (`.tar.gz`) | CI (`.tar.gz`) | CI (`.zip` containing `latte-lens.exe`) |
 | Interactive PTY E2E | CI (POSIX PTY) | CI (POSIX PTY) | Not currently covered |
 
 Windows CI covers the supported build, unit/integration test, and packaging
@@ -135,6 +141,15 @@ line number; wrapped continuation rows leave the number gutter blank. Scrolling
 and mouse selection follow the visual rows, while copied text preserves the
 original logical line without inserting display-only newlines. Diff remains
 unwrapped so horizontal structure and patch prefixes stay exact.
+
+Recognized source files highlight comments, strings, keywords, functions,
+types, numbers, constants, and attributes. The bundled grammar set includes
+TypeScript and TSX alongside common systems, scripting, web, configuration,
+and documentation formats. Language detection uses the file name or extension
+and falls back to a shebang when available. Highlighting is best-effort
+decoration: unknown languages, parser failures, and unusually long lines remain
+readable as plain text. Styles change foregrounds and modifiers only, so the
+terminal continues to own the canvas background.
 
 Drag across text in the right-hand content pane to create a visible selection
 and copy it when the mouse is released. `Ctrl+C` (or `Cmd+C` when the terminal
@@ -188,7 +203,7 @@ packages on Linux, macOS, and Windows.
 
 1. Tree search
 2. Background filesystem watching and diff cache
-3. Search, syntax-aware previews/diffs, and word-level highlights
+3. Search, syntax-aware diffs, and word-level change highlights
 4. Agent attribution: show which agent changed each file or hunk
 5. Worktree and session switching for multi-agent workflows
 

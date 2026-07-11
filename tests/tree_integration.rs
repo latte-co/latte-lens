@@ -2,7 +2,7 @@ mod support;
 
 use std::{collections::HashMap, path::Path};
 
-use lattelens::{
+use latte_lens::{
     git::FileStatus,
     tree::{FileEntry, changed_only, scan, scan_with_limit},
 };

@@ -8,7 +8,7 @@ version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 host=$(rustc -vV | sed -n 's/^host: //p')
 build_target=${BUILD_TARGET:-$host}
 target_dir=${CARGO_TARGET_DIR:-target}
-binary_name=lattelens
+binary_name=latte-lens
 binary_suffix=""
 
 if [[ -n "${BUILD_TARGET:-}" ]]; then
@@ -28,7 +28,7 @@ else
   cargo build --release --locked
 fi
 
-package_name="lattelens-${version}-${build_target}"
+package_name="latte-lens-${version}-${build_target}"
 package_dir="dist/$package_name"
 archive="dist/$package_name.tar.gz"
 checksum="$archive.sha256"

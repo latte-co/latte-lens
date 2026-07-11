@@ -12,8 +12,10 @@ A provider:
 2. Returns `PreviewContent` when it can render the file as terminal text.
 3. Respects `request.max_bytes` and `request.max_lines`.
 4. Sets `truncated` when output was capped.
-5. Never modifies the selected file or its repository.
-6. Uses `request.open_regular()` for file bytes instead of reopening
+5. Optionally attaches semantic `HighlightSpan` byte ranges with
+   `PreviewContent::with_highlights`; the outer vector must match `lines`.
+6. Never modifies the selected file or its repository.
+7. Uses `request.open_regular()` for file bytes instead of reopening
    `request.absolute_path` directly.
 
 Providers are queried in reverse registration order. Register a specialized
@@ -45,7 +47,7 @@ packages cover Linux, macOS, and Windows.
 
 ```rust
 use anyhow::Result;
-use lattelens::preview::{
+use latte_lens::preview::{
     PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest,
 };
 
@@ -98,6 +100,7 @@ applied asynchronously.
 - Images: produce metadata, OCR text, or a future terminal image payload.
 - Archives: list entries without extracting into the repository.
 
-The provider API intentionally returns terminal-neutral text today. A future
-preview payload enum can add images or structured pages while preserving the
-registry and application integration point.
+The provider API keeps text and semantic highlight ranges terminal-neutral;
+Ratatui styles are applied only in the UI. A future preview payload enum can
+add images or structured pages while preserving the registry and application
+integration point.

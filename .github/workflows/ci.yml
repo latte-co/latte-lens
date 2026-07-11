@@ -73,10 +73,10 @@ jobs:
         shell: pwsh
         run: ./scripts/build-release.ps1
       - name: Verify the Windows package
-        run: python scripts/verify-release-package.py "dist/*.zip" --binary lattelens.exe
+        run: python scripts/verify-release-package.py "dist/*.zip" --binary latte-lens.exe
       - uses: actions/upload-artifact@v7
         with:
-          name: lattelens-Windows-${{ runner.arch }}
+          name: latte-lens-Windows-${{ runner.arch }}
           path: |
             dist/*.zip
             dist/*.sha256
@@ -94,7 +94,7 @@ jobs:
       - run: make package-smoke
       - uses: actions/upload-artifact@v7
         with:
-          name: lattelens-${{ runner.os }}-${{ runner.arch }}
+          name: latte-lens-${{ runner.os }}-${{ runner.arch }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

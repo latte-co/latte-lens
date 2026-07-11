@@ -9,7 +9,7 @@ the user's worktree.
 ## Stack and commands
 
 - Rust 2024 edition; minimum supported Rust version is 1.88.
-- Run locally with `cargo run -- /path/to/repository`; the installed binary is `lattelens`.
+- Run locally with `cargo run -- /path/to/repository`; the installed binary is `latte-lens`.
 - Before handing off changes, run `make ci`. Run `make coverage` when testable production logic changes.
 
 ## Module map
@@ -28,6 +28,8 @@ the user's worktree.
 - Keep UI rendering free of filesystem and subprocess work.
 - Preview providers must respect request byte/line limits, decline unsupported
   files with `Ok(None)`, and never modify the selected file or repository.
+- Syntax highlighting is best-effort decoration. Keep highlight byte ranges on
+  UTF-8 boundaries, preserve plain-text fallback, and never change copied text.
 - Keep PDF, Word, image, and other heavyweight format dependencies in optional
   providers rather than the core crate.
 - Do not set a global or panel background color. Normal text and canvas cells

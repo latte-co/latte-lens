@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lattelens::tree;
+use latte_lens::tree;
 
 fn benchmark_tree_scan(criterion: &mut Criterion) {
     let directory = tempfile::tempdir().expect("create benchmark fixture");

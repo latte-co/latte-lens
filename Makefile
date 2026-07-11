@@ -3,7 +3,7 @@ SHELL := /bin/bash
 CARGO ?= cargo
 PYTHON ?= python3
 COVERAGE_MIN ?= 80
-BINARY := lattelens
+BINARY := latte-lens
 
 .DEFAULT_GOAL := help
 
@@ -61,7 +61,7 @@ package: ## Build a release archive and SHA-256 checksum
 package-smoke: package ## Build and verify the release archive contents and checksum
 	$(PYTHON) scripts/verify-release-package.py "dist/*.tar.gz" --binary $(BINARY)
 
-install: ## Install lattelens from this checkout
+install: ## Install latte-lens from this checkout
 	$(CARGO) install --path . --locked --force
 
 clean: ## Remove generated build and package artifacts

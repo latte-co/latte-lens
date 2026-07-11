@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use crate::{
     content_safety::{ensure_beneath, path_exists_without_following},
     git::StatusMap,
-    preview::{PreviewRegistry, PreviewRequest, PreviewResolution},
+    preview::{HighlightSpan, PreviewRegistry, PreviewRequest, PreviewResolution},
     repo_graph::{RepoChange, RepoGraph},
     tree::{self, ScanResult},
 };
@@ -58,6 +58,7 @@ pub(crate) struct RefreshSnapshot {
 pub(crate) struct ContentSnapshot {
     pub provider: Option<String>,
     pub lines: Vec<String>,
+    pub highlights: Vec<Vec<HighlightSpan>>,
     pub show_line_numbers: bool,
 }
 
@@ -188,7 +189,7 @@ impl WorkerRuntime {
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
-            .name("lattelens-io".to_owned())
+            .name("latte-lens-io".to_owned())
             .spawn(move || worker_loop(worker_shared, root, preview_registry))?;
         Ok(Self {
             shared,
@@ -429,6 +430,7 @@ fn execute_content(
                     change.original_path.as_deref(),
                     Some(change.status),
                 )?,
+                highlights: Vec::new(),
                 show_line_numbers: false,
             })
         }
@@ -462,6 +464,7 @@ fn execute_content(
                             format!("No preview provider accepted {}.", display_path.display()),
                             "Register a PreviewProvider to support this file type.".to_owned(),
                         ],
+                        highlights: Vec::new(),
                         show_line_numbers: false,
                     });
                 }
@@ -487,19 +490,23 @@ fn execute_content(
                             "Latte Lens reads only regular files and never follows symbolic links for content."
                                 .to_owned(),
                         ],
+                        highlights: Vec::new(),
                         show_line_numbers: false,
                     });
                 }
             };
             let mut lines = preview.lines;
+            let mut highlights = preview.highlights;
             if preview.truncated {
                 lines.push(format!(
                     "… preview truncated at {PREVIEW_MAX_BYTES} bytes or {PREVIEW_MAX_LINES} lines"
                 ));
+                highlights.push(Vec::new());
             }
             Ok(ContentSnapshot {
                 provider: Some(preview.provider_id),
                 lines,
+                highlights,
                 show_line_numbers: preview.show_line_numbers,
             })
         }
@@ -664,7 +671,10 @@ mod tests {
     fn init_test_repo(root: &Path) {
         test_git(root, &["-c", "init.defaultBranch=main", "init", "--quiet"]);
         test_git(root, &["config", "user.name", "Latte Lens Tests"]);
-        test_git(root, &["config", "user.email", "lattelens@example.invalid"]);
+        test_git(
+            root,
+            &["config", "user.email", "latte-lens@example.invalid"],
+        );
     }
 
     fn test_git(root: &Path, args: &[&str]) {

@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     clipboard,
     git::{FileStatus, GitRepo},
-    preview::{PreviewProvider, PreviewRegistry},
+    preview::{HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
         RepoRelationState, RepoSnapshot,
@@ -204,6 +204,7 @@ pub struct App {
     pub tree_scope: TreeScope,
     pub focused_pane: FocusPane,
     pub content_lines: Vec<String>,
+    pub content_highlights: Vec<Vec<HighlightSpan>>,
     pub content_scroll: usize,
     pub content_horizontal_scroll: usize,
     content_selection: Option<ContentSelection>,
@@ -284,6 +285,7 @@ impl App {
             tree_scope: TreeScope::AllFiles,
             focused_pane: FocusPane::Tree,
             content_lines: Vec::new(),
+            content_highlights: Vec::new(),
             content_scroll: 0,
             content_horizontal_scroll: 0,
             content_selection: None,
@@ -1691,6 +1693,7 @@ impl App {
             Ok(snapshot) => {
                 self.content_provider = snapshot.provider;
                 self.content_lines = snapshot.lines;
+                self.content_highlights = snapshot.highlights;
                 self.content_show_line_numbers = snapshot.show_line_numbers;
                 if self
                     .last_error
@@ -1717,6 +1720,7 @@ impl App {
         self.clipboard_status = None;
         self.content_mode = mode;
         self.content_provider = None;
+        self.content_highlights.clear();
         self.content_show_line_numbers = false;
     }
 
@@ -2472,6 +2476,7 @@ mod tests {
         ContentSnapshot {
             provider: None,
             lines: vec![line.to_owned()],
+            highlights: Vec::new(),
             show_line_numbers: false,
         }
     }

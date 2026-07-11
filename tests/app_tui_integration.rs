@@ -12,9 +12,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use lattelens::{
+use latte_lens::{
     app::{App, ContentMode, FocusPane, GitRowKind, TreeScope},
-    preview::{PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
+    preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
 };
 use ratatui::{
@@ -784,7 +784,7 @@ fn clean_deinitialized_submodule_stays_visible_without_inflating_dirty_count() {
             && detail.contains("submodule placeholder")
             && detail.contains("uninitialized")
             && detail.contains("clean")
-            && *kind == lattelens::repo_graph::RepoKind::SubmodulePlaceholder
+            && *kind == latte_lens::repo_graph::RepoKind::SubmodulePlaceholder
             && *count == 0
     }));
 }
@@ -832,7 +832,7 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
     let repository_labels: Vec<_> = app
         .visible_git_rows()
         .iter()
-        .filter(|row| matches!(row.kind, lattelens::app::GitRowKind::Repository { .. }))
+        .filter(|row| matches!(row.kind, latte_lens::app::GitRowKind::Repository { .. }))
         .map(|row| row.label.clone())
         .collect();
     assert_eq!(repository_labels, [".", "vendor/nested"]);
@@ -840,7 +840,7 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
         .visible_git_rows()
         .iter()
         .filter_map(|row| match &row.kind {
-            lattelens::app::GitRowKind::Change(change) => Some(change.path.clone()),
+            latte_lens::app::GitRowKind::Change(change) => Some(change.path.clone()),
             _ => None,
         })
         .collect();
@@ -997,7 +997,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
         .visible_git_rows()
         .iter()
         .filter_map(|row| match &row.kind {
-            lattelens::app::GitRowKind::Change(change) => Some(change.path.clone()),
+            latte_lens::app::GitRowKind::Change(change) => Some(change.path.clone()),
             _ => None,
         })
         .collect();
@@ -1083,7 +1083,7 @@ fn submodule_pointer_internal_change_and_placeholder_are_separate_rows() {
     git(&child, &["config", "user.name", "Latte Lens Tests"]);
     git(
         &child,
-        &["config", "user.email", "lattelens@example.invalid"],
+        &["config", "user.email", "latte-lens@example.invalid"],
     );
     write_file(&child, "tracked.txt", "advanced child\n");
     git(&child, &["add", "--all"]);
@@ -1096,7 +1096,7 @@ fn submodule_pointer_internal_change_and_placeholder_are_separate_rows() {
     assert_eq!(app.changed_count, 2);
 
     assert!(app.visible_git_rows().iter().any(|row| {
-        matches!(row.kind, lattelens::app::GitRowKind::Pointer(_))
+        matches!(row.kind, latte_lens::app::GitRowKind::Pointer(_))
             && row.label == "(submodule pointer)"
     }));
     assert!(app.visible_git_rows().iter().any(|row| {
@@ -1481,6 +1481,10 @@ fn changed_source_defaults_to_diff_but_can_toggle_preview() {
     settle(&mut app);
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert_eq!(app.content_lines, ["fn after() {}"]);
+    assert!(app.content_highlights[0].iter().any(|highlight| {
+        highlight.kind == HighlightKind::Function
+            && app.content_lines[0].get(highlight.range.clone()) == Some("after")
+    }));
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
     assert_eq!(app.content_mode, ContentMode::Diff);
@@ -2320,7 +2324,7 @@ fn submodule_projection_fixture(state: SubmoduleProjectionState) -> (TestRepo, A
     git(&child, &["config", "user.name", "Latte Lens Tests"]);
     git(
         &child,
-        &["config", "user.email", "lattelens@example.invalid"],
+        &["config", "user.email", "latte-lens@example.invalid"],
     );
     match state {
         SubmoduleProjectionState::InternalOnly => {
@@ -2390,7 +2394,10 @@ fn init_repo(root: &Path) {
     fs::create_dir_all(root).unwrap();
     git(root, &["-c", "init.defaultBranch=main", "init", "--quiet"]);
     git(root, &["config", "user.name", "Latte Lens Tests"]);
-    git(root, &["config", "user.email", "lattelens@example.invalid"]);
+    git(
+        root,
+        &["config", "user.email", "latte-lens@example.invalid"],
+    );
 }
 
 fn write_file(root: &Path, relative: &str, contents: &str) {

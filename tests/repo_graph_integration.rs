@@ -4,7 +4,7 @@ use std::{
     process::{Command, Output},
 };
 
-use lattelens::repo_graph::{
+use latte_lens::repo_graph::{
     DiscoveryOptions, DiscoveryTruncation, GitLayout, RepoGraph, RepoKind, RepoRelationState,
 };
 
@@ -43,7 +43,10 @@ fn init(root: &Path) {
     fs::create_dir_all(root).unwrap();
     run(root, &["-c", "init.defaultBranch=main", "init", "--quiet"]);
     run(root, &["config", "user.name", "Latte Lens Tests"]);
-    run(root, &["config", "user.email", "lattelens@example.invalid"]);
+    run(
+        root,
+        &["config", "user.email", "latte-lens@example.invalid"],
+    );
 }
 
 fn commit_all(root: &Path, message: &str) {
@@ -59,7 +62,7 @@ fn write(root: &Path, relative: &str, contents: &str) {
     fs::write(path, contents).unwrap();
 }
 
-fn snapshot_at<'a>(graph: &'a RepoGraph, root: &Path) -> &'a lattelens::repo_graph::RepoSnapshot {
+fn snapshot_at<'a>(graph: &'a RepoGraph, root: &Path) -> &'a latte_lens::repo_graph::RepoSnapshot {
     let canonical = root.canonicalize().unwrap();
     graph
         .repositories()

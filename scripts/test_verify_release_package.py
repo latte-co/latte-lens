@@ -25,7 +25,7 @@ sys.modules[_VERIFIER_SPEC.name] = verifier
 _VERIFIER_SPEC.loader.exec_module(verifier)
 
 
-PACKAGE = "lattelens-0.1.0-test-target"
+PACKAGE = "latte-lens-0.1.0-test-target"
 
 
 class ReleasePackageVerifierTests(unittest.TestCase):
@@ -131,7 +131,7 @@ class ReleasePackageVerifierTests(unittest.TestCase):
     ) -> Path:
         archive = self.root / f"{PACKAGE}.tar.gz"
         members = [
-            self.tar_member(f"{PACKAGE}/lattelens", binary),
+            self.tar_member(f"{PACKAGE}/latte-lens", binary),
             self.tar_member(f"{PACKAGE}/README.md", b"readme"),
         ]
         if include_root:
@@ -159,7 +159,7 @@ class ReleasePackageVerifierTests(unittest.TestCase):
         members = [
             binary_member
             or self.zip_member(
-                f"{PACKAGE}/lattelens.exe",
+                f"{PACKAGE}/latte-lens.exe",
                 binary,
                 create_system=create_system,
             ),
@@ -207,7 +207,7 @@ class ReleasePackageVerifierTests(unittest.TestCase):
                 create_system=0,
             ),
             self.zip_member(
-                f"{PACKAGE}/lattelens.exe",
+                f"{PACKAGE}/latte-lens.exe",
                 b"MZ executable",
                 create_system=0,
             ),
@@ -223,39 +223,39 @@ class ReleasePackageVerifierTests(unittest.TestCase):
 
     def assert_tar_rejected(self, extras: list[tuple[tarfile.TarInfo, bytes | None]]) -> None:
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(self.build_tar(extras=extras), "lattelens")
+            verifier.verify_archive(self.build_tar(extras=extras), "latte-lens")
 
     def assert_zip_rejected(self, extras: list[tuple[zipfile.ZipInfo, bytes]]) -> None:
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(self.build_zip(extras=extras), "lattelens.exe")
+            verifier.verify_archive(self.build_zip(extras=extras), "latte-lens.exe")
 
     def test_valid_tar_and_zip_are_accepted(self) -> None:
-        verifier.verify_archive(self.build_tar(), "lattelens")
-        verifier.verify_archive(self.build_zip(), "lattelens.exe")
-        verifier.verify_archive(self.build_tar(include_root=False), "lattelens")
+        verifier.verify_archive(self.build_tar(), "latte-lens")
+        verifier.verify_archive(self.build_zip(), "latte-lens.exe")
+        verifier.verify_archive(self.build_tar(include_root=False), "latte-lens")
         verifier.verify_archive(
             self.build_zip(include_root=False),
-            "lattelens.exe",
+            "latte-lens.exe",
         )
 
     def test_canonical_fat_windows_zip_metadata_is_accepted(self) -> None:
         allowed_timestamp = struct.pack("<HHBI", 0x5455, 5, 1, 0)
         binary = self.zip_member(
-            f"{PACKAGE}/lattelens.exe",
+            f"{PACKAGE}/latte-lens.exe",
             b"MZ executable",
             create_system=0,
             extra=allowed_timestamp,
         )
         verifier.verify_archive(
             self.build_zip(binary_member=binary, create_system=0),
-            "lattelens.exe",
+            "latte-lens.exe",
         )
 
     def test_canonical_classic_data_descriptors_are_accepted(self) -> None:
         archive = self.build_data_descriptor_zip()
         with zipfile.ZipFile(archive) as source:
             self.assertTrue(all(member.flag_bits & 0x08 for member in source.infolist()))
-        verifier.verify_archive(archive, "lattelens.exe")
+        verifier.verify_archive(archive, "latte-lens.exe")
 
     def test_unindexed_local_record_is_rejected(self) -> None:
         archive = self.build_zip(create_system=0)
@@ -264,29 +264,29 @@ class ReleasePackageVerifierTests(unittest.TestCase):
             self.assertEqual(
                 {member.filename for member in source.infolist() if not member.is_dir()},
                 {
-                    f"{PACKAGE}/lattelens.exe",
+                    f"{PACKAGE}/latte-lens.exe",
                     f"{PACKAGE}/README.md",
                     f"{PACKAGE}/LICENSE",
                 },
             )
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(archive, "lattelens.exe")
+            verifier.verify_archive(archive, "latte-lens.exe")
 
     def test_zip64_metadata_outside_release_boundary_is_rejected(self) -> None:
         zip64_extra = struct.pack("<HHQ", 0x0001, 8, 123)
         binary = self.zip_member(
-            f"{PACKAGE}/lattelens.exe",
+            f"{PACKAGE}/latte-lens.exe",
             b"MZ executable",
             extra=zip64_extra,
         )
         with self.assertRaises(AssertionError):
             verifier.verify_archive(
                 self.build_zip(binary_member=binary),
-                "lattelens.exe",
+                "latte-lens.exe",
             )
 
     def test_raw_nul_filename_alias_is_rejected(self) -> None:
-        expected = f"{PACKAGE}/lattelens.exe"
+        expected = f"{PACKAGE}/latte-lens.exe"
         raw_name = f"{expected}\0x"
         member, data = self.zip_member(expected, b"MZ executable")
         member.filename = raw_name
@@ -298,10 +298,10 @@ class ReleasePackageVerifierTests(unittest.TestCase):
             self.assertEqual(parsed.filename, expected)
             self.assertEqual(parsed.orig_filename, raw_name)
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(archive, "lattelens.exe")
+            verifier.verify_archive(archive, "latte-lens.exe")
 
     def test_unicode_path_traversal_alias_is_rejected(self) -> None:
-        expected = f"{PACKAGE}/lattelens.exe"
+        expected = f"{PACKAGE}/latte-lens.exe"
         original = expected.encode("utf-8")
         alias = b"../../escape.exe"
         payload = b"\x01" + struct.pack("<I", zlib.crc32(original)) + alias
@@ -318,10 +318,10 @@ class ReleasePackageVerifierTests(unittest.TestCase):
             self.assertEqual(parsed.filename, expected)
             self.assertIn(struct.pack("<H", 0x7075), parsed.extra)
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(archive, "lattelens.exe")
+            verifier.verify_archive(archive, "latte-lens.exe")
 
     def test_local_only_unicode_path_traversal_alias_is_rejected(self) -> None:
-        expected = f"{PACKAGE}/lattelens.exe"
+        expected = f"{PACKAGE}/latte-lens.exe"
         original = expected.encode("utf-8")
         alias = b"../../escape.exe"
         payload = b"\x01" + struct.pack("<I", zlib.crc32(original)) + alias
@@ -338,30 +338,30 @@ class ReleasePackageVerifierTests(unittest.TestCase):
             parsed = source.getinfo(expected)
             self.assertIn(struct.pack("<H", 0xCAFE), parsed.extra)
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(archive, "lattelens.exe")
+            verifier.verify_archive(archive, "latte-lens.exe")
 
     def test_malformed_zip_extra_field_is_rejected(self) -> None:
         binary = self.zip_member(
-            f"{PACKAGE}/lattelens.exe",
+            f"{PACKAGE}/latte-lens.exe",
             b"MZ executable",
             extra=b"\xff",
         )
         with self.assertRaises(AssertionError):
             verifier.verify_archive(
                 self.build_zip(binary_member=binary),
-                "lattelens.exe",
+                "latte-lens.exe",
             )
 
     def test_missing_expected_files_are_rejected(self) -> None:
         with self.assertRaises(AssertionError):
             verifier.verify_archive(
                 self.build_tar(include_license=False),
-                "lattelens",
+                "latte-lens",
             )
         with self.assertRaises(AssertionError):
             verifier.verify_archive(
                 self.build_zip(include_license=False),
-                "lattelens.exe",
+                "latte-lens.exe",
             )
 
     def test_extra_files_are_rejected(self) -> None:
@@ -372,7 +372,7 @@ class ReleasePackageVerifierTests(unittest.TestCase):
         symlink, _ = self.tar_member(f"{PACKAGE}/link", member_type=tarfile.SYMTYPE)
         symlink.linkname = "../../outside"
         hardlink, _ = self.tar_member(f"{PACKAGE}/hardlink", member_type=tarfile.LNKTYPE)
-        hardlink.linkname = f"{PACKAGE}/lattelens"
+        hardlink.linkname = f"{PACKAGE}/latte-lens"
         self.assert_tar_rejected([(symlink, None)])
         self.assert_tar_rejected([(hardlink, None)])
 
@@ -430,14 +430,14 @@ class ReleasePackageVerifierTests(unittest.TestCase):
 
     def test_zero_byte_binaries_are_rejected(self) -> None:
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(self.build_tar(binary=b""), "lattelens")
+            verifier.verify_archive(self.build_tar(binary=b""), "latte-lens")
         with self.assertRaises(AssertionError):
-            verifier.verify_archive(self.build_zip(binary=b""), "lattelens.exe")
+            verifier.verify_archive(self.build_zip(binary=b""), "latte-lens.exe")
 
     def test_bad_checksum_digest_and_filename_are_rejected(self) -> None:
         for archive, binary in (
-            (self.build_tar(), "lattelens"),
-            (self.build_zip(), "lattelens.exe"),
+            (self.build_tar(), "latte-lens"),
+            (self.build_zip(), "latte-lens.exe"),
         ):
             self.write_checksum(archive, digest="0" * 64)
             with self.assertRaises(AssertionError):

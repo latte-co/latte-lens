@@ -2,7 +2,7 @@ mod support;
 
 use std::{fs, path::Path, thread, time::Duration};
 
-use lattelens::git::{FileStatus, GitRepo};
+use latte_lens::git::{FileStatus, GitRepo};
 use support::TestRepo;
 
 #[test]

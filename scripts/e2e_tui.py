@@ -713,7 +713,7 @@ def main() -> int:
         print("PTY E2E is supported on Linux and macOS", file=sys.stderr)
         return 2
     if len(sys.argv) != 2:
-        print(f"usage: {sys.argv[0]} /path/to/lattelens", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} /path/to/latte-lens", file=sys.stderr)
         return 2
 
     binary = Path(sys.argv[1]).resolve()
@@ -729,7 +729,7 @@ def main() -> int:
         ).stdout
 
     try:
-        with tempfile.TemporaryDirectory(prefix="lattelens-e2e-") as directory:
+        with tempfile.TemporaryDirectory(prefix="latte-lens-e2e-") as directory:
             repository = Path(directory)
             create_fixture(repository)
             output = exercise(binary, repository)
