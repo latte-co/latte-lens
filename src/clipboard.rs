@@ -113,17 +113,16 @@ fn run_copy_command(program: &str, arguments: &[&str], text: &str) -> io::Result
         .stdin
         .take()
         .ok_or_else(|| io::Error::other(format!("{program} stdin is unavailable")))?;
-    stdin.write_all(text.as_bytes())?;
+    let write_result = stdin.write_all(text.as_bytes());
     drop(stdin);
 
     let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
+    if !status.success() {
+        return Err(io::Error::other(format!(
             "{program} exited with status {status}"
-        )))
+        )));
     }
+    write_result
 }
 
 fn osc52_sequence(text: &str) -> String {

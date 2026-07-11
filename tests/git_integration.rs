@@ -15,10 +15,7 @@ fn discovers_repository_from_nested_directory_and_reads_branch() {
     fs::create_dir_all(&nested).unwrap();
     let repo = GitRepo::discover(&nested).unwrap().expect("repository");
 
-    assert_eq!(
-        repo.root().canonicalize().unwrap(),
-        fixture.root().canonicalize().unwrap()
-    );
+    assert_eq!(repo.root(), fixture.root().canonicalize().unwrap());
     assert_eq!(repo.branch().unwrap(), "main");
 }
 
