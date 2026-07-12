@@ -5,5 +5,6 @@ pub mod git;
 pub mod preview;
 pub mod repo_graph;
 mod runtime;
+mod search;
 pub mod tree;
 pub mod ui;

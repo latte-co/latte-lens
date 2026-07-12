@@ -679,7 +679,7 @@ def exercise(binary: Path, repository: Path) -> bytes:
         )
         send_scroll_down(master_fd, 90, 10)
 
-        os.write(master_fd, b"q")
+        os.write(master_fd, b"qq")
         quit_deadline = time.monotonic() + TIMEOUT_SECONDS
         while process.poll() is None and time.monotonic() < quit_deadline:
             # A PTY has a bounded output buffer. Keep draining redraws while the
@@ -687,7 +687,7 @@ def exercise(binary: Path, repository: Path) -> bytes:
             read_available(master_fd, output, screen)
             time.sleep(0.02)
         if process.poll() is None:
-            raise AssertionError("TUI did not exit after receiving q")
+            raise AssertionError("TUI did not exit after receiving q twice")
         read_available(master_fd, output, screen)
         if process.returncode != 0:
             raise AssertionError(f"TUI exited with status {process.returncode}")

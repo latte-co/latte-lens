@@ -708,6 +708,7 @@ dependencies = [
  "ignore",
  "libc",
  "ratatui",
+ "regex",
  "syntect",
  "tempfile",
  "two-face",

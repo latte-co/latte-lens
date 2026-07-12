@@ -3,7 +3,7 @@ use std::{
     io,
     ops::Range,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -16,13 +16,14 @@ use ratatui::{
     layout::Rect,
     widgets::ListState,
 };
+use regex::RegexBuilder;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     clipboard,
     git::{FileStatus, GitRepo},
-    preview::{HighlightSpan, PreviewProvider, PreviewRegistry},
+    preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
         RepoRelationState, RepoSnapshot,
@@ -31,6 +32,7 @@ use crate::{
         ContentCompletion, ContentKind, ContentRequest, ContentTarget, RefreshCompletion,
         RefreshRequest, RefreshSnapshot, RequestGeneration, WorkerRuntime,
     },
+    search::{SearchEvent, SearchMatch, SearchOptions, SearchRequest, SearchRuntime},
     tree::{self, FileEntry},
     ui,
 };
@@ -117,6 +119,107 @@ pub enum FocusPane {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchMode {
+    Files,
+    Text,
+}
+
+impl SearchMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Files => "Find",
+            Self::Text => "Search",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchFocus {
+    #[default]
+    Input,
+    Results,
+    Content,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchResult {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub line_number: Option<usize>,
+    pub line: Option<String>,
+    pub match_range: Option<Range<usize>>,
+    source_match_range: Option<Range<usize>>,
+}
+
+#[derive(Clone)]
+struct SearchRestore {
+    focused_pane: FocusPane,
+    content_lines: Vec<String>,
+    content_highlights: Vec<Vec<HighlightSpan>>,
+    content_scroll: usize,
+    content_horizontal_scroll: usize,
+    content_selection: Option<ContentSelection>,
+    clipboard_status: Option<String>,
+    content_mode: ContentMode,
+    content_provider: Option<String>,
+    content_show_line_numbers: bool,
+    content_was_loading: bool,
+    last_error: Option<String>,
+}
+
+pub(crate) struct SearchState {
+    pub mode: SearchMode,
+    pub focus: SearchFocus,
+    pub query: String,
+    pub cursor: usize,
+    pub results: Vec<SearchResult>,
+    pub options: SearchOptions,
+    pub searching: bool,
+    pub truncated: bool,
+    pub scanned_files: usize,
+    pub error: Option<String>,
+    generation: u64,
+    due: Option<Instant>,
+    restore: SearchRestore,
+}
+
+#[derive(Clone, Debug)]
+struct SearchPreviewTarget {
+    generation: u64,
+    line_number: usize,
+    byte_range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreviewFindMatch {
+    line: usize,
+    range: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuitKey {
+    Q,
+    Escape,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuitConfirmation {
+    key: QuitKey,
+    deadline: Instant,
+}
+
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1_500);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PreviewFindState {
+    pub query: String,
+    pub cursor: usize,
+    matches: Vec<PreviewFindMatch>,
+    selected: usize,
+    pub case_sensitive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentMode {
     Info,
     Diff,
@@ -129,6 +232,14 @@ impl ContentMode {
             Self::Info => "INFO",
             Self::Diff => "DIFF",
             Self::Preview => "PREVIEW",
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Info => "Info",
+            Self::Diff => "Diff",
+            Self::Preview => "Preview",
         }
     }
 }
@@ -170,6 +281,19 @@ pub struct UiRegions {
     pub all_files_tab: Rect,
     pub git_changes_tab: Rect,
     pub refresh_button: Rect,
+    pub file_search_button: Rect,
+    pub text_search_button: Rect,
+    pub search_input: Rect,
+    pub search_close: Rect,
+    pub search_files_mode: Rect,
+    pub search_text_mode: Rect,
+    pub search_options: [Rect; 4],
+    pub preview_find_input: Rect,
+    pub preview_find_case: Rect,
+    pub preview_find_position: Rect,
+    pub preview_find_previous: Rect,
+    pub preview_find_next: Rect,
+    pub preview_find_close: Rect,
     pub tree_body: Rect,
     pub tree_inner: Rect,
     pub divider: Rect,
@@ -190,6 +314,14 @@ impl UiRegions {
 
     fn refresh_at(self, column: u16, row: u16) -> bool {
         contains(self.refresh_button, column, row)
+    }
+
+    fn file_search_at(self, column: u16, row: u16) -> bool {
+        contains(self.file_search_button, column, row)
+    }
+
+    fn text_search_at(self, column: u16, row: u16) -> bool {
+        contains(self.text_search_button, column, row)
     }
 }
 
@@ -239,7 +371,16 @@ pub struct App {
     runtime: WorkerRuntime,
     refresh_requests: RequestGeneration,
     content_requests: RequestGeneration,
+    search_runtime: SearchRuntime,
+    pub(crate) search: Option<SearchState>,
+    pub(crate) search_list_state: ListState,
+    pub(crate) preview_find: Option<PreviewFindState>,
+    search_generation: u64,
+    search_preview_target: Option<SearchPreviewTarget>,
+    recent_files: Vec<PathBuf>,
+    last_search_click: Option<(usize, Instant)>,
     last_refresh_error: Option<String>,
+    quit_confirmation: Option<QuitConfirmation>,
     should_quit: bool,
 }
 
@@ -274,6 +415,7 @@ impl App {
         let root = requested_root;
 
         let runtime = WorkerRuntime::start(root.clone(), preview_registry.clone())?;
+        let search_runtime = SearchRuntime::start(root.clone())?;
         let mut app = Self {
             root,
             repo: None,
@@ -318,7 +460,16 @@ impl App {
             runtime,
             refresh_requests: RequestGeneration::default(),
             content_requests: RequestGeneration::default(),
+            search_runtime,
+            search: None,
+            search_list_state: ListState::default(),
+            preview_find: None,
+            search_generation: 0,
+            search_preview_target: None,
+            recent_files: Vec::new(),
+            last_search_click: None,
             last_refresh_error: None,
+            quit_confirmation: None,
             should_quit: false,
         };
         app.request_refresh();
@@ -347,7 +498,12 @@ impl App {
             self.poll_background();
             terminal.draw(|frame| ui::draw(frame, self))?;
 
-            if event::poll(Duration::from_millis(250))? {
+            let poll_interval = if self.search.is_some() {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(250)
+            };
+            if event::poll(poll_interval)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key(key);
@@ -458,6 +614,12 @@ impl App {
     }
 
     pub fn selected_content_label(&self) -> String {
+        if let Some(result) = self.selected_search_result() {
+            return result.line_number.map_or_else(
+                || display_workspace_path(&result.path),
+                |line| format!("{}:{line}", display_workspace_path(&result.path)),
+            );
+        }
         match self.tree_scope {
             TreeScope::AllFiles => self
                 .selected_entry()
@@ -471,11 +633,18 @@ impl App {
     }
 
     pub fn selected_content_title(&self) -> &'static str {
+        if let Some(result) = self.selected_search_result() {
+            return if result.is_dir {
+                "Directory"
+            } else {
+                "Preview"
+            };
+        }
         let Some(row) = self.selected_git_row() else {
             return if self.selected_entry().is_some_and(|entry| entry.is_dir) {
                 "Directory"
             } else {
-                self.content_mode.label()
+                self.content_mode.title()
             };
         };
         match row.kind {
@@ -483,12 +652,16 @@ impl App {
             GitRowKind::Directory => "Directory",
             GitRowKind::Pointer(_) => "Submodule pointer",
             GitRowKind::Issue(_) => "Repository error",
-            GitRowKind::Change(_) => match self.content_mode {
-                ContentMode::Info => "Info",
-                ContentMode::Diff => "Diff",
-                ContentMode::Preview => "Preview",
-            },
+            GitRowKind::Change(_) => self.content_mode.title(),
         }
+    }
+
+    pub(crate) fn content_is_focused(&self) -> bool {
+        self.search
+            .as_ref()
+            .map_or(self.focused_pane == FocusPane::Content, |search| {
+                search.focus == SearchFocus::Content
+            })
     }
 
     pub fn content_selection_range(&self, line: usize) -> Option<Range<usize>> {
@@ -576,13 +749,56 @@ impl App {
 
     /// Apply one terminal key event to the same path used by the interactive loop.
     pub fn handle_key(&mut self, key: KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('c' | 'C'), modifiers)
-                if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        let copy_key = matches!(key.code, KeyCode::Char('c' | 'C'));
+        if copy_key && key.modifiers.contains(KeyModifiers::SUPER) {
+            self.quit_confirmation = None;
+            self.queue_selected_preview_copy();
+            return;
+        }
+        if copy_key && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit_confirmation = None;
+            if key.modifiers.contains(KeyModifiers::SHIFT) || self.selected_content_text().is_some()
             {
                 self.queue_selected_preview_copy();
+            } else {
+                self.should_quit = true;
             }
-            (KeyCode::Char('q') | KeyCode::Esc, _) => self.should_quit = true,
+            return;
+        }
+        if self.preview_find.is_some() {
+            self.quit_confirmation = None;
+            self.handle_preview_find_key(key);
+            return;
+        }
+        if self.search.is_some() {
+            self.quit_confirmation = None;
+            self.handle_search_key(key);
+            return;
+        }
+        if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
+            self.request_quit(QuitKey::Q);
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.request_quit(QuitKey::Escape);
+            return;
+        }
+        self.quit_confirmation = None;
+
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(SearchMode::Files),
+            (KeyCode::Char('f' | 'F'), modifiers)
+                if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+            {
+                self.open_search(SearchMode::Text);
+            }
+            (KeyCode::Char('f' | 'F'), KeyModifiers::CONTROL) => {
+                if self.content_mode == ContentMode::Preview {
+                    self.open_preview_find();
+                } else {
+                    self.open_search(SearchMode::Text);
+                }
+            }
             (KeyCode::Tab, _) => self.set_tree_scope(self.tree_scope.next()),
             (KeyCode::BackTab, _) => self.set_tree_scope(self.tree_scope.previous()),
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
@@ -610,12 +826,827 @@ impl App {
         }
     }
 
+    fn request_quit(&mut self, key: QuitKey) {
+        let now = Instant::now();
+        if self
+            .quit_confirmation
+            .is_some_and(|confirmation| confirmation.key == key && now <= confirmation.deadline)
+        {
+            self.should_quit = true;
+            self.quit_confirmation = None;
+            return;
+        }
+        self.quit_confirmation = Some(QuitConfirmation {
+            key,
+            deadline: now + QUIT_CONFIRM_WINDOW,
+        });
+    }
+
+    pub(crate) fn quit_confirmation_message(&self) -> Option<&'static str> {
+        let confirmation = self
+            .quit_confirmation
+            .filter(|confirmation| Instant::now() <= confirmation.deadline)?;
+        Some(match confirmation.key {
+            QuitKey::Q => "Press q again to quit · Ctrl+C quits immediately",
+            QuitKey::Escape => "Press Esc again to quit · Ctrl+C quits immediately",
+        })
+    }
+
+    pub fn open_search(&mut self, mode: SearchMode) {
+        if self.search.is_some() {
+            self.set_search_mode(mode);
+            return;
+        }
+        let restore = SearchRestore {
+            focused_pane: self.focused_pane,
+            content_lines: self.content_lines.clone(),
+            content_highlights: self.content_highlights.clone(),
+            content_scroll: self.content_scroll,
+            content_horizontal_scroll: self.content_horizontal_scroll,
+            content_selection: self.content_selection,
+            clipboard_status: self.clipboard_status.clone(),
+            content_mode: self.content_mode,
+            content_provider: self.content_provider.clone(),
+            content_show_line_numbers: self.content_show_line_numbers,
+            content_was_loading: self.is_content_loading(),
+            last_error: self.last_error.clone(),
+        };
+        self.search = Some(SearchState {
+            mode,
+            focus: SearchFocus::Input,
+            query: String::new(),
+            cursor: 0,
+            results: Vec::new(),
+            options: SearchOptions::default(),
+            searching: false,
+            truncated: false,
+            scanned_files: 0,
+            error: None,
+            generation: 0,
+            due: None,
+            restore,
+        });
+        self.search_list_state = ListState::default();
+        self.last_search_click = None;
+        self.rebuild_search_results();
+    }
+
+    pub const fn search_is_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn selected_search_result(&self) -> Option<&SearchResult> {
+        let index = self.search_list_state.selected()?;
+        self.search.as_ref()?.results.get(index)
+    }
+
+    pub fn search_mode(&self) -> Option<SearchMode> {
+        self.search.as_ref().map(|search| search.mode)
+    }
+
+    pub fn search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(|search| search.query.as_str())
+    }
+
+    pub fn search_results(&self) -> &[SearchResult] {
+        self.search
+            .as_ref()
+            .map_or(&[], |search| search.results.as_slice())
+    }
+
+    pub fn search_error(&self) -> Option<&str> {
+        self.search
+            .as_ref()
+            .and_then(|search| search.error.as_deref())
+    }
+
+    pub fn open_preview_find(&mut self) {
+        if self.content_mode != ContentMode::Preview {
+            self.clipboard_status = Some("Open a file preview before using Ctrl+F".to_owned());
+            return;
+        }
+        self.search = None;
+        self.search_runtime
+            .cancel(self.search_generation.saturating_add(1));
+        self.preview_find = Some(PreviewFindState::default());
+        self.focused_pane = FocusPane::Content;
+        self.clear_content_selection();
+    }
+
+    pub const fn preview_find_is_active(&self) -> bool {
+        self.preview_find.is_some()
+    }
+
+    pub fn preview_find_query(&self) -> Option<&str> {
+        self.preview_find.as_ref().map(|find| find.query.as_str())
+    }
+
+    pub fn preview_find_position(&self) -> Option<(usize, usize)> {
+        let find = self.preview_find.as_ref()?;
+        let count = find.matches.len();
+        Some((
+            usize::from(count > 0) + find.selected.min(count.saturating_sub(1)),
+            count,
+        ))
+    }
+
+    pub fn preview_find_highlights(&self, line: usize) -> Vec<HighlightSpan> {
+        let Some(find) = self.preview_find.as_ref() else {
+            return Vec::new();
+        };
+        find.matches
+            .iter()
+            .enumerate()
+            .filter(|(_, found)| found.line == line)
+            .map(|(index, found)| HighlightSpan {
+                range: found.range.clone(),
+                kind: if index == find.selected {
+                    HighlightKind::Search
+                } else {
+                    HighlightKind::SearchMatch
+                },
+            })
+            .collect()
+    }
+
+    fn handle_preview_find_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.preview_find = None,
+            (KeyCode::Char('f' | 'F'), modifiers)
+                if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+            {
+                self.preview_find = None;
+                self.open_search(SearchMode::Text);
+            }
+            (KeyCode::Enter | KeyCode::F(3), modifiers)
+                if modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.move_preview_find(-1);
+            }
+            (KeyCode::Enter | KeyCode::F(3) | KeyCode::Down, _) => {
+                self.move_preview_find(1);
+            }
+            (KeyCode::Up, _) => self.move_preview_find(-1),
+            (KeyCode::F(2), _) => {
+                if let Some(find) = &mut self.preview_find {
+                    find.case_sensitive = !find.case_sensitive;
+                }
+                self.rebuild_preview_find();
+            }
+            (KeyCode::Left, KeyModifiers::NONE) => self.move_preview_find_cursor(false),
+            (KeyCode::Right, KeyModifiers::NONE) => self.move_preview_find_cursor(true),
+            (KeyCode::Home, _) => {
+                if let Some(find) = &mut self.preview_find {
+                    find.cursor = 0;
+                }
+            }
+            (KeyCode::End, _) => {
+                if let Some(find) = &mut self.preview_find {
+                    find.cursor = find.query.len();
+                }
+            }
+            (KeyCode::Backspace, _) => self.delete_preview_find_character(false),
+            (KeyCode::Delete, _) => self.delete_preview_find_character(true),
+            (KeyCode::Char('u' | 'U'), KeyModifiers::CONTROL) => {
+                if let Some(find) = &mut self.preview_find {
+                    find.query.clear();
+                    find.cursor = 0;
+                }
+                self.rebuild_preview_find();
+            }
+            (KeyCode::Char('w' | 'W'), KeyModifiers::CONTROL) => {
+                self.delete_preview_find_word();
+            }
+            (KeyCode::Char(character), modifiers)
+                if !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                ) =>
+            {
+                if let Some(find) = &mut self.preview_find {
+                    find.query.insert(find.cursor, character);
+                    find.cursor += character.len_utf8();
+                }
+                self.rebuild_preview_find();
+            }
+            _ => {}
+        }
+    }
+
+    fn rebuild_preview_find(&mut self) {
+        let Some(find) = self.preview_find.as_ref() else {
+            return;
+        };
+        let query = find.query.clone();
+        let case_sensitive = find.case_sensitive;
+        let matches = if query.is_empty() {
+            Vec::new()
+        } else {
+            let pattern = RegexBuilder::new(&regex::escape(&query))
+                .case_insensitive(!case_sensitive)
+                .build()
+                .expect("an escaped literal is always a valid regex");
+            self.content_lines
+                .iter()
+                .enumerate()
+                .flat_map(|(line, content)| {
+                    pattern
+                        .find_iter(content)
+                        .map(move |found| PreviewFindMatch {
+                            line,
+                            range: found.range(),
+                        })
+                })
+                .take(10_000)
+                .collect()
+        };
+        if let Some(find) = &mut self.preview_find {
+            find.matches = matches;
+            find.selected = 0;
+        }
+        self.scroll_to_preview_find_match();
+    }
+
+    fn move_preview_find(&mut self, delta: isize) {
+        let Some(find) = &mut self.preview_find else {
+            return;
+        };
+        let count = find.matches.len();
+        if count == 0 {
+            return;
+        }
+        find.selected = if delta >= 0 {
+            (find.selected + delta as usize) % count
+        } else {
+            (find.selected + count - delta.unsigned_abs() % count) % count
+        };
+        self.scroll_to_preview_find_match();
+    }
+
+    fn scroll_to_preview_find_match(&mut self) {
+        let Some(found) = self
+            .preview_find
+            .as_ref()
+            .and_then(|find| find.matches.get(find.selected))
+        else {
+            return;
+        };
+        let line = found.line;
+        let width = self.ui_regions.content_inner.width.max(1);
+        self.content_scroll = self
+            .content_visual_rows(width)
+            .iter()
+            .position(|row| row.line_index == line)
+            .unwrap_or(line);
+    }
+
+    fn move_preview_find_cursor(&mut self, forward: bool) {
+        let Some(find) = &mut self.preview_find else {
+            return;
+        };
+        find.cursor = if forward {
+            find.query[find.cursor..]
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(find.query.len(), |(offset, _)| find.cursor + offset)
+        } else {
+            find.query[..find.cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(offset, _)| offset)
+        };
+    }
+
+    fn delete_preview_find_character(&mut self, forward: bool) {
+        let Some(find) = &mut self.preview_find else {
+            return;
+        };
+        let boundary = if forward {
+            find.query[find.cursor..]
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(find.query.len(), |(offset, _)| find.cursor + offset)
+        } else {
+            find.query[..find.cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(find.cursor, |(offset, _)| offset)
+        };
+        if forward {
+            find.query.drain(find.cursor..boundary);
+        } else {
+            find.query.drain(boundary..find.cursor);
+            find.cursor = boundary;
+        }
+        self.rebuild_preview_find();
+    }
+
+    fn delete_preview_find_word(&mut self) {
+        let Some(find) = &mut self.preview_find else {
+            return;
+        };
+        let before = &find.query[..find.cursor];
+        let trimmed = before.trim_end_matches(char::is_whitespace);
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        find.query.drain(start..find.cursor);
+        find.cursor = start;
+        self.rebuild_preview_find();
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_search(true),
+            (KeyCode::Char('f' | 'F'), KeyModifiers::CONTROL) => {
+                self.set_search_mode(SearchMode::Text);
+            }
+            (KeyCode::Char('p' | 'P'), KeyModifiers::CONTROL) => {
+                self.set_search_mode(SearchMode::Files);
+            }
+            (KeyCode::F(2), _) => self.toggle_search_option(|options| {
+                options.case_sensitive = !options.case_sensitive;
+            }),
+            (KeyCode::F(3), _) => self.toggle_search_option(|options| {
+                options.whole_word = !options.whole_word;
+            }),
+            (KeyCode::F(4), _) => self.toggle_search_option(|options| {
+                options.regex = !options.regex;
+            }),
+            (KeyCode::F(5), _) => self.toggle_search_option(|options| {
+                options.include_ignored = !options.include_ignored;
+            }),
+            (KeyCode::Tab, _) => {
+                if let Some(search) = &mut self.search {
+                    search.focus = match search.focus {
+                        SearchFocus::Input => SearchFocus::Results,
+                        SearchFocus::Results => SearchFocus::Content,
+                        SearchFocus::Content => SearchFocus::Input,
+                    };
+                }
+            }
+            (KeyCode::BackTab, _) => {
+                if let Some(search) = &mut self.search {
+                    search.focus = match search.focus {
+                        SearchFocus::Input => SearchFocus::Content,
+                        SearchFocus::Results => SearchFocus::Input,
+                        SearchFocus::Content => SearchFocus::Results,
+                    };
+                }
+            }
+            (KeyCode::Enter, KeyModifiers::CONTROL) => self.preview_search_selection(),
+            (KeyCode::Enter, _) => self.accept_search_selection(),
+            (code, modifiers)
+                if self
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.focus == SearchFocus::Content) =>
+            {
+                self.handle_content_key(KeyEvent::new(code, modifiers));
+            }
+            (KeyCode::Down, _) => self.move_search_selection(1),
+            (KeyCode::Up, _) => self.move_search_selection(-1),
+            (KeyCode::PageDown, _) => self.move_search_selection(10),
+            (KeyCode::PageUp, _) => self.move_search_selection(-10),
+            (KeyCode::Left, KeyModifiers::NONE) => self.move_search_cursor(false),
+            (KeyCode::Right, KeyModifiers::NONE) => self.move_search_cursor(true),
+            (KeyCode::Home, _) => {
+                if let Some(search) = &mut self.search {
+                    search.cursor = 0;
+                }
+            }
+            (KeyCode::End, _) => {
+                if let Some(search) = &mut self.search {
+                    search.cursor = search.query.len();
+                }
+            }
+            (KeyCode::Backspace, _) => self.delete_search_character(false),
+            (KeyCode::Delete, _) => self.delete_search_character(true),
+            (KeyCode::Char('u' | 'U'), KeyModifiers::CONTROL) => {
+                if let Some(search) = &mut self.search {
+                    search.focus = SearchFocus::Input;
+                    search.query.clear();
+                    search.cursor = 0;
+                }
+                self.rebuild_search_results();
+            }
+            (KeyCode::Char('w' | 'W'), KeyModifiers::CONTROL) => {
+                self.delete_search_word();
+            }
+            (KeyCode::Char(character), modifiers)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                if let Some(search) = &mut self.search {
+                    search.focus = SearchFocus::Input;
+                    search.query.insert(search.cursor, character);
+                    search.cursor += character.len_utf8();
+                }
+                self.rebuild_search_results();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_search_mode(&mut self, mode: SearchMode) {
+        let Some(search) = &mut self.search else {
+            self.open_search(mode);
+            return;
+        };
+        if search.mode == mode {
+            search.focus = SearchFocus::Input;
+            return;
+        }
+        search.mode = mode;
+        search.focus = SearchFocus::Input;
+        self.rebuild_search_results();
+    }
+
+    fn toggle_search_option(&mut self, update: impl FnOnce(&mut SearchOptions)) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if search.mode != SearchMode::Text {
+            return;
+        }
+        update(&mut search.options);
+        self.rebuild_search_results();
+    }
+
+    fn rebuild_search_results(&mut self) {
+        let Some(mode) = self.search.as_ref().map(|search| search.mode) else {
+            return;
+        };
+        match mode {
+            SearchMode::Files => self.rebuild_file_search_results(),
+            SearchMode::Text => self.schedule_text_search(),
+        }
+    }
+
+    fn rebuild_file_search_results(&mut self) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        let query = search.query.clone();
+        let case_sensitive = search.options.case_sensitive;
+        let mut scored: Vec<(usize, SearchResult)> = if query.is_empty() {
+            self.recent_files
+                .iter()
+                .filter_map(|path| {
+                    self.all_entries
+                        .iter()
+                        .find(|entry| &entry.relative == path && !entry.is_dir)
+                        .map(|entry| {
+                            (
+                                0,
+                                SearchResult {
+                                    path: entry.relative.clone(),
+                                    is_dir: false,
+                                    line_number: None,
+                                    line: None,
+                                    match_range: None,
+                                    source_match_range: None,
+                                },
+                            )
+                        })
+                })
+                .collect()
+        } else {
+            self.all_entries
+                .iter()
+                .filter_map(|entry| {
+                    file_search_score(&entry.relative, &query, case_sensitive).map(|score| {
+                        (
+                            score,
+                            SearchResult {
+                                path: entry.relative.clone(),
+                                is_dir: entry.is_dir,
+                                line_number: None,
+                                line: None,
+                                match_range: None,
+                                source_match_range: None,
+                            },
+                        )
+                    })
+                })
+                .collect()
+        };
+        scored.sort_by(|(left_score, left), (right_score, right)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| left.is_dir.cmp(&right.is_dir))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let truncated = scored.len() > crate::search::MAX_SEARCH_RESULTS;
+        let results: Vec<_> = scored
+            .into_iter()
+            .take(crate::search::MAX_SEARCH_RESULTS)
+            .map(|(_, result)| result)
+            .collect();
+        if let Some(search) = &mut self.search {
+            search.results = results;
+            search.searching = false;
+            search.truncated = truncated;
+            search.scanned_files = 0;
+            search.error = None;
+            search.due = None;
+        }
+        self.reset_search_selection();
+    }
+
+    fn schedule_text_search(&mut self) {
+        self.search_generation = self.search_generation.saturating_add(1);
+        let generation = self.search_generation;
+        self.search_runtime.cancel(generation);
+        let has_query = {
+            let Some(search) = &mut self.search else {
+                return;
+            };
+            search.results.clear();
+            search.generation = generation;
+            search.scanned_files = 0;
+            search.truncated = false;
+            search.error = None;
+            let has_query = !search.query.is_empty();
+            search.searching = has_query;
+            search.due = has_query.then(|| {
+                Instant::now()
+                    .checked_add(Duration::from_millis(150))
+                    .unwrap()
+            });
+            has_query
+        };
+        self.search_list_state = ListState::default();
+        self.search_preview_target = None;
+        if has_query {
+            self.set_info(vec!["Searching workspace content…".to_owned()]);
+        }
+    }
+
+    fn dispatch_search_if_due(&mut self) {
+        let request = self.search.as_mut().and_then(|search| {
+            let due = search.due?;
+            if Instant::now() < due {
+                return None;
+            }
+            search.due = None;
+            Some(SearchRequest {
+                generation: search.generation,
+                query: search.query.clone(),
+                options: search.options,
+            })
+        });
+        if let Some(request) = request {
+            self.search_runtime.search(request);
+        }
+    }
+
+    fn apply_search_events(&mut self) {
+        for event in self.search_runtime.take_events() {
+            match event {
+                SearchEvent::Batch {
+                    generation,
+                    matches,
+                    scanned_files,
+                } => {
+                    let Some(search) = &mut self.search else {
+                        continue;
+                    };
+                    if search.mode != SearchMode::Text || search.generation != generation {
+                        continue;
+                    }
+                    search.scanned_files = scanned_files;
+                    search
+                        .results
+                        .extend(matches.into_iter().map(search_result));
+                    if self.search_list_state.selected().is_none() && !search.results.is_empty() {
+                        self.search_list_state.select(Some(0));
+                        self.preview_search_selection();
+                    }
+                }
+                SearchEvent::Finished {
+                    generation,
+                    scanned_files,
+                    truncated,
+                    error,
+                } => {
+                    let Some(search) = &mut self.search else {
+                        continue;
+                    };
+                    if search.mode != SearchMode::Text || search.generation != generation {
+                        continue;
+                    }
+                    search.searching = false;
+                    search.scanned_files = scanned_files;
+                    search.truncated = truncated;
+                    search.error = error;
+                }
+            }
+        }
+    }
+
+    fn reset_search_selection(&mut self) {
+        let count = self
+            .search
+            .as_ref()
+            .map_or(0, |search| search.results.len());
+        self.search_list_state = ListState::default();
+        if count > 0 {
+            self.search_list_state.select(Some(0));
+            self.preview_search_selection();
+        }
+    }
+
+    fn move_search_selection(&mut self, delta: isize) {
+        let count = self
+            .search
+            .as_ref()
+            .map_or(0, |search| search.results.len());
+        if count == 0 {
+            return;
+        }
+        let current = self.search_list_state.selected().unwrap_or(0);
+        let next = current.saturating_add_signed(delta).min(count - 1);
+        self.search_list_state.select(Some(next));
+        if let Some(search) = &mut self.search {
+            search.focus = SearchFocus::Results;
+        }
+        self.preview_search_selection();
+    }
+
+    fn preview_search_selection(&mut self) {
+        let Some(result) = self.selected_search_result().cloned() else {
+            return;
+        };
+        if result.is_dir {
+            self.set_info(vec![format!("{} is a directory.", result.path.display())]);
+            return;
+        }
+        self.remember_recent_file(&result.path);
+        let generation = self.request_content(
+            ContentKind::Preview,
+            display_workspace_path(&result.path),
+            ContentTarget::Workspace(result.path.clone()),
+        );
+        self.search_preview_target =
+            result
+                .line_number
+                .zip(result.source_match_range)
+                .map(|(line_number, byte_range)| SearchPreviewTarget {
+                    generation,
+                    line_number,
+                    byte_range,
+                });
+    }
+
+    fn accept_search_selection(&mut self) {
+        let Some(result) = self.selected_search_result().cloned() else {
+            return;
+        };
+        self.search.take();
+        self.search_generation = self.search_generation.saturating_add(1);
+        self.search_runtime.cancel(self.search_generation);
+        self.last_search_click = None;
+        self.apply_tree_scope(TreeScope::AllFiles);
+        let mut parent = result.path.parent();
+        while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            self.all_files_expansion
+                .insert(directory.to_path_buf(), true);
+            parent = directory.parent();
+        }
+        self.rebuild_visible_rows();
+        if let Some(index) = self.visible_index_for_path(&result.path) {
+            self.tree_state.select(Some(index));
+            self.normalize_tree_state();
+            self.remember_current_selection();
+        }
+        if result.is_dir {
+            self.focused_pane = FocusPane::Tree;
+            self.load_selected_info();
+        } else {
+            self.focused_pane = FocusPane::Content;
+            self.remember_recent_file(&result.path);
+            let generation = self.request_content(
+                ContentKind::Preview,
+                display_workspace_path(&result.path),
+                ContentTarget::Workspace(result.path.clone()),
+            );
+            self.search_preview_target = result.line_number.zip(result.source_match_range).map(
+                |(line_number, byte_range)| SearchPreviewTarget {
+                    generation,
+                    line_number,
+                    byte_range,
+                },
+            );
+        }
+    }
+
+    fn close_search(&mut self, restore_content: bool) {
+        let Some(search) = self.search.take() else {
+            return;
+        };
+        self.search_generation = self.search_generation.saturating_add(1);
+        self.search_runtime.cancel(self.search_generation);
+        self.search_preview_target = None;
+        self.last_search_click = None;
+        if restore_content {
+            self.content_requests.invalidate();
+            self.runtime.cancel_pending_content();
+            self.focused_pane = search.restore.focused_pane;
+            self.content_lines = search.restore.content_lines;
+            self.content_highlights = search.restore.content_highlights;
+            self.content_scroll = search.restore.content_scroll;
+            self.content_horizontal_scroll = search.restore.content_horizontal_scroll;
+            self.content_selection = search.restore.content_selection;
+            self.clipboard_status = search.restore.clipboard_status;
+            self.content_mode = search.restore.content_mode;
+            self.content_provider = search.restore.content_provider;
+            self.content_show_line_numbers = search.restore.content_show_line_numbers;
+            self.last_error = search.restore.last_error;
+            if search.restore.content_was_loading {
+                self.load_scope_default_content();
+            }
+        }
+    }
+
+    fn move_search_cursor(&mut self, forward: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.focus = SearchFocus::Input;
+        search.cursor = if forward {
+            search.query[search.cursor..]
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(search.query.len(), |(offset, _)| search.cursor + offset)
+        } else {
+            search.query[..search.cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(offset, _)| offset)
+        };
+    }
+
+    fn delete_search_character(&mut self, forward: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.focus = SearchFocus::Input;
+        let boundary = if forward {
+            search.query[search.cursor..]
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(search.query.len(), |(offset, _)| search.cursor + offset)
+        } else {
+            search.query[..search.cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(search.cursor, |(offset, _)| offset)
+        };
+        if forward {
+            search.query.drain(search.cursor..boundary);
+        } else {
+            search.query.drain(boundary..search.cursor);
+            search.cursor = boundary;
+        }
+        self.rebuild_search_results();
+    }
+
+    fn delete_search_word(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let before = &search.query[..search.cursor];
+        let trimmed = before.trim_end_matches(char::is_whitespace);
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        search.query.drain(start..search.cursor);
+        search.cursor = start;
+        self.rebuild_search_results();
+    }
+
+    fn remember_recent_file(&mut self, path: &Path) {
+        self.recent_files.retain(|candidate| candidate != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        self.recent_files.truncate(20);
+    }
+
     /// Apply a mouse event using hit boxes captured during the latest draw.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.quit_confirmation = None;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.clipboard_status = None;
                 self.tree_resize_dragging = false;
+                if self.handle_preview_find_mouse_down(mouse) {
+                    return;
+                }
+                if self.handle_search_mouse_down(mouse) {
+                    return;
+                }
                 if self.ui_regions.refresh_at(mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
@@ -658,10 +1689,16 @@ impl App {
                     }
                 } else if contains(self.ui_regions.content_inner, mouse.column, mouse.row) {
                     self.focused_pane = FocusPane::Content;
+                    if let Some(search) = &mut self.search {
+                        search.focus = SearchFocus::Content;
+                    }
                     self.begin_content_selection(mouse);
                 } else if contains(self.ui_regions.content_body, mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Content;
+                    if let Some(search) = &mut self.search {
+                        search.focus = SearchFocus::Content;
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -683,6 +1720,130 @@ impl App {
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(mouse, 3),
             _ => {}
         }
+    }
+
+    fn handle_preview_find_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if self.preview_find.is_none() {
+            return false;
+        }
+        if contains(self.ui_regions.preview_find_close, mouse.column, mouse.row) {
+            self.preview_find = None;
+            return true;
+        }
+        if contains(
+            self.ui_regions.preview_find_previous,
+            mouse.column,
+            mouse.row,
+        ) {
+            self.move_preview_find(-1);
+            return true;
+        }
+        if contains(self.ui_regions.preview_find_next, mouse.column, mouse.row) {
+            self.move_preview_find(1);
+            return true;
+        }
+        if contains(self.ui_regions.preview_find_case, mouse.column, mouse.row) {
+            if let Some(find) = &mut self.preview_find {
+                find.case_sensitive = !find.case_sensitive;
+            }
+            self.rebuild_preview_find();
+            return true;
+        }
+        if contains(self.ui_regions.preview_find_input, mouse.column, mouse.row) {
+            if let Some(find) = &mut self.preview_find {
+                let query_column = usize::from(
+                    mouse
+                        .column
+                        .saturating_sub(self.ui_regions.preview_find_input.x),
+                )
+                .saturating_sub(6);
+                find.cursor = byte_index_at_display_column(&find.query, query_column);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn handle_search_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if self.ui_regions.file_search_at(mouse.column, mouse.row) {
+            self.open_search(SearchMode::Files);
+            return true;
+        }
+        if self.ui_regions.text_search_at(mouse.column, mouse.row) {
+            self.open_search(SearchMode::Text);
+            return true;
+        }
+        if self.search.is_none() {
+            return false;
+        }
+        if contains(self.ui_regions.search_close, mouse.column, mouse.row) {
+            self.close_search(true);
+            return true;
+        }
+        if contains(self.ui_regions.search_files_mode, mouse.column, mouse.row) {
+            self.set_search_mode(SearchMode::Files);
+            return true;
+        }
+        if contains(self.ui_regions.search_text_mode, mouse.column, mouse.row) {
+            self.set_search_mode(SearchMode::Text);
+            return true;
+        }
+        for (index, region) in self.ui_regions.search_options.into_iter().enumerate() {
+            if !contains(region, mouse.column, mouse.row) {
+                continue;
+            }
+            match index {
+                0 => self.toggle_search_option(|options| {
+                    options.case_sensitive = !options.case_sensitive;
+                }),
+                1 => self.toggle_search_option(|options| {
+                    options.whole_word = !options.whole_word;
+                }),
+                2 => self.toggle_search_option(|options| {
+                    options.regex = !options.regex;
+                }),
+                3 => self.toggle_search_option(|options| {
+                    options.include_ignored = !options.include_ignored;
+                }),
+                _ => unreachable!(),
+            }
+            return true;
+        }
+        if contains(self.ui_regions.search_input, mouse.column, mouse.row) {
+            if let Some(search) = &mut self.search {
+                search.focus = SearchFocus::Input;
+                let prefix_width = 2 + search.mode.label().chars().count() + 4;
+                let query_column =
+                    usize::from(mouse.column.saturating_sub(self.ui_regions.search_input.x))
+                        .saturating_sub(prefix_width);
+                search.cursor = byte_index_at_display_column(&search.query, query_column);
+            }
+            return true;
+        }
+        if contains(self.ui_regions.tree_inner, mouse.column, mouse.row) {
+            let visible_row = usize::from(mouse.row - self.ui_regions.tree_inner.y);
+            let index = self.search_list_state.offset().saturating_add(visible_row);
+            let count = self
+                .search
+                .as_ref()
+                .map_or(0, |search| search.results.len());
+            if index < count {
+                let double_click = self.last_search_click.is_some_and(|(previous, instant)| {
+                    previous == index && instant.elapsed() <= Duration::from_millis(400)
+                });
+                self.search_list_state.select(Some(index));
+                if let Some(search) = &mut self.search {
+                    search.focus = SearchFocus::Results;
+                }
+                self.preview_search_selection();
+                self.last_search_click = Some((index, Instant::now()));
+                if double_click {
+                    self.accept_search_selection();
+                }
+            }
+            return true;
+        }
+        contains(self.ui_regions.tree_body, mouse.column, mouse.row)
     }
 
     fn resize_tree_panel(&mut self, column: u16) {
@@ -914,6 +2075,10 @@ impl App {
         self.content_requests.is_loading()
     }
 
+    pub fn is_searching(&self) -> bool {
+        self.search.as_ref().is_some_and(|search| search.searching)
+    }
+
     fn handle_scope_tabs_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Left, KeyModifiers::NONE) => self.set_tree_scope(TreeScope::AllFiles),
@@ -970,10 +2135,17 @@ impl App {
 
     fn handle_mouse_scroll(&mut self, mouse: MouseEvent, delta: isize) {
         if contains(self.ui_regions.tree_body, mouse.column, mouse.row) {
+            if self.search.is_some() {
+                self.move_search_selection(delta);
+                return;
+            }
             self.focused_pane = FocusPane::Tree;
             self.move_selection(delta);
         } else if contains(self.ui_regions.content_body, mouse.column, mouse.row) {
             self.focused_pane = FocusPane::Content;
+            if let Some(search) = &mut self.search {
+                search.focus = SearchFocus::Content;
+            }
             self.scroll_content(delta, 0);
         } else {
             match self.focused_pane {
@@ -1124,6 +2296,13 @@ impl App {
     }
 
     pub fn poll_background(&mut self) {
+        if self
+            .quit_confirmation
+            .is_some_and(|confirmation| Instant::now() > confirmation.deadline)
+        {
+            self.quit_confirmation = None;
+        }
+        self.dispatch_search_if_due();
         let (refresh, content) = self.runtime.take_completions();
         if let Some(completion) = refresh {
             self.apply_refresh_completion(completion);
@@ -1131,6 +2310,7 @@ impl App {
         if let Some(completion) = content {
             self.apply_content_completion(completion);
         }
+        self.apply_search_events();
     }
 
     /// Wait until all currently requested work is reduced into application
@@ -1138,11 +2318,15 @@ impl App {
     /// embedders, and deterministic tests that do not own an event loop.
     #[doc(hidden)]
     pub fn wait_for_background(&mut self) {
-        while self.is_refreshing() || self.is_content_loading() {
-            if !self.runtime.wait_for_completion() {
-                self.last_error =
-                    Some("background worker stopped before completing work".to_owned());
-                break;
+        while self.is_refreshing() || self.is_content_loading() || self.is_searching() {
+            if self.is_refreshing() || self.is_content_loading() {
+                if !self.runtime.wait_for_completion() {
+                    self.last_error =
+                        Some("background worker stopped before completing work".to_owned());
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
             }
             self.poll_background();
         }
@@ -1241,6 +2425,9 @@ impl App {
 
         self.last_refresh_error = None;
         self.last_error = None;
+        if self.search.is_some() {
+            self.rebuild_search_results();
+        }
     }
 
     fn default_selection_index(&self) -> Option<usize> {
@@ -1641,6 +2828,8 @@ impl App {
             return;
         }
 
+        self.remember_recent_file(&relative);
+
         self.request_content(
             ContentKind::Preview,
             relative.display().to_string(),
@@ -1648,7 +2837,7 @@ impl App {
         );
     }
 
-    fn request_content(&mut self, kind: ContentKind, label: String, target: ContentTarget) {
+    fn request_content(&mut self, kind: ContentKind, label: String, target: ContentTarget) -> u64 {
         let generation = self.content_requests.begin();
         self.reset_content(match kind {
             ContentKind::Diff => ContentMode::Diff,
@@ -1660,6 +2849,7 @@ impl App {
             kind,
             target,
         });
+        generation
     }
 
     fn change_for_workspace_path(&self, relative: &Path) -> Option<RepoChange> {
@@ -1681,6 +2871,7 @@ impl App {
     }
 
     fn apply_content_completion(&mut self, completion: ContentCompletion) {
+        let generation = completion.generation;
         if !self.content_requests.accept(completion.generation) {
             return;
         }
@@ -1688,6 +2879,7 @@ impl App {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         };
+        let pending_preview_find = self.preview_find.take();
         self.reset_content(mode);
         match completion.result {
             Ok(snapshot) => {
@@ -1695,12 +2887,36 @@ impl App {
                 self.content_lines = snapshot.lines;
                 self.content_highlights = snapshot.highlights;
                 self.content_show_line_numbers = snapshot.show_line_numbers;
+                if let Some(target) = self
+                    .search_preview_target
+                    .take()
+                    .filter(|target| target.generation == generation)
+                {
+                    let line_index = target.line_number.saturating_sub(1);
+                    if let Some(line) = self.content_lines.get(line_index)
+                        && target.byte_range.end <= line.len()
+                    {
+                        if self.content_highlights.len() < self.content_lines.len() {
+                            self.content_highlights
+                                .resize_with(self.content_lines.len(), Vec::new);
+                        }
+                        self.content_highlights[line_index].push(HighlightSpan {
+                            range: target.byte_range,
+                            kind: HighlightKind::Search,
+                        });
+                        self.content_scroll = line_index;
+                    }
+                }
                 if self
                     .last_error
                     .as_deref()
                     .is_some_and(|error| error.starts_with("content failed:"))
                 {
                     self.last_error = None;
+                }
+                if mode == ContentMode::Preview {
+                    self.preview_find = pending_preview_find;
+                    self.rebuild_preview_find();
                 }
             }
             Err(error) => {
@@ -1714,6 +2930,7 @@ impl App {
     }
 
     fn reset_content(&mut self, mode: ContentMode) {
+        self.preview_find = None;
         self.content_scroll = 0;
         self.content_horizontal_scroll = 0;
         self.clear_content_selection();
@@ -1730,6 +2947,76 @@ impl App {
         self.reset_content(ContentMode::Info);
         self.content_lines = lines;
     }
+}
+
+fn search_result(found: SearchMatch) -> SearchResult {
+    SearchResult {
+        path: found.path,
+        is_dir: false,
+        line_number: Some(found.line_number),
+        line: Some(found.line),
+        match_range: Some(found.summary_range),
+        source_match_range: Some(found.byte_range),
+    }
+}
+
+fn file_search_score(path: &Path, query: &str, case_sensitive: bool) -> Option<usize> {
+    let raw_path = path.to_string_lossy().replace('\\', "/");
+    let raw_name = raw_path.rsplit('/').next().unwrap_or(&raw_path).to_owned();
+    let (path, name, query) = if case_sensitive {
+        (raw_path, raw_name, query.to_owned())
+    } else {
+        (
+            raw_path.to_lowercase(),
+            raw_name.to_lowercase(),
+            query.to_lowercase(),
+        )
+    };
+    if name == query {
+        return Some(0);
+    }
+    if name.starts_with(&query) {
+        return Some(10 + name.len().saturating_sub(query.len()));
+    }
+    if let Some(index) = path
+        .split('/')
+        .position(|component| component.starts_with(&query))
+    {
+        return Some(30 + index);
+    }
+    if let Some(index) = path.find(&query) {
+        return Some(60 + index);
+    }
+
+    let mut query_characters = query.chars();
+    let mut wanted = query_characters.next()?;
+    let mut first = None;
+    let mut matched = 0;
+    for (index, character) in path.chars().enumerate() {
+        if character != wanted {
+            continue;
+        }
+        first.get_or_insert(index);
+        matched += 1;
+        let Some(next) = query_characters.next() else {
+            let spread = index.saturating_sub(first.unwrap_or(0));
+            return Some(100 + spread + path.chars().count().saturating_sub(matched));
+        };
+        wanted = next;
+    }
+    None
+}
+
+fn byte_index_at_display_column(value: &str, target: usize) -> usize {
+    let mut width: usize = 0;
+    for (byte, grapheme) in value.grapheme_indices(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+        if target < width.saturating_add(grapheme_width) {
+            return byte;
+        }
+        width = width.saturating_add(grapheme_width);
+    }
+    value.len()
 }
 
 fn grapheme_bounds_at_column(line: &str, column: usize) -> (usize, usize) {
@@ -2122,7 +3409,7 @@ fn repository_label(_root: &Path, snapshot: &RepoSnapshot) -> String {
         .unwrap_or_else(|| ".".to_owned())
 }
 
-fn display_workspace_path(path: &Path) -> String {
+pub(crate) fn display_workspace_path(path: &Path) -> String {
     path.iter()
         .map(|component| component.to_string_lossy())
         .collect::<Vec<_>>()
@@ -2257,6 +3544,28 @@ mod tests {
         let path = Path::new("modules").join("child").join("nested");
 
         assert_eq!(display_workspace_path(&path), "modules/child/nested");
+    }
+
+    #[test]
+    fn file_search_prefers_names_prefixes_and_compact_subsequences() {
+        assert!(
+            file_search_score(Path::new("src/app.rs"), "app", false)
+                < file_search_score(Path::new("docs/app-notes.md"), "app", false)
+        );
+        assert!(file_search_score(Path::new("src/app_controller.rs"), "appc", false).is_some());
+        assert!(file_search_score(Path::new("src/lib.rs"), "app", false).is_none());
+        assert!(file_search_score(Path::new("src/App.rs"), "app", true).is_none());
+    }
+
+    #[test]
+    fn search_cursor_columns_preserve_wide_and_combining_graphemes() {
+        let query = "a拿e\u{301}";
+
+        assert_eq!(byte_index_at_display_column(query, 0), 0);
+        assert_eq!(byte_index_at_display_column(query, 1), 1);
+        assert_eq!(byte_index_at_display_column(query, 2), 1);
+        assert_eq!(byte_index_at_display_column(query, 3), 4);
+        assert_eq!(byte_index_at_display_column(query, 4), query.len());
     }
 
     #[test]

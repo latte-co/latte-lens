@@ -1,12 +1,11 @@
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
-use ignore::WalkBuilder;
 
 use crate::{
     content_safety::path_exists_without_following,
@@ -55,39 +54,51 @@ pub fn scan_with_limit(
     statuses: &StatusMap,
     max_entries: usize,
 ) -> Result<ScanResult> {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        // All Files is a filesystem view, so dotfiles and ignored paths stay
-        // visible. Only Git's internal metadata is outside this scope.
-        .standard_filters(false)
-        .sort_by_file_path(|left, right| left.cmp(right))
-        .filter_entry(|entry| entry.file_name() != ".git");
-
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
     let mut truncated = false;
-    for result in builder.build() {
-        let entry = result.with_context(|| format!("failed to scan {}", root.display()))?;
-        if entry.path() == root {
-            continue;
-        }
+    let mut directories = VecDeque::from([root.to_path_buf()]);
 
-        // Checking before insertion uses the next discovered path as proof
-        // that an exactly-full result is partial. A tree with exactly the cap
-        // remains complete.
-        if entries.len() == max_entries {
-            truncated = true;
-            break;
-        }
+    'scan: while let Some(directory) = directories.pop_front() {
+        let mut children = fs::read_dir(&directory)
+            .with_context(|| format!("failed to scan {}", directory.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("failed to scan {}", directory.display()))?;
+        children.sort_by_key(fs::DirEntry::file_name);
 
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .expect("walked paths stay below the root")
-            .to_path_buf();
-        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-        seen.insert(relative.clone());
-        entries.push(make_entry(relative, is_dir, true, statuses));
+        for child in children {
+            // All Files is a filesystem view, so dotfiles and ignored paths
+            // stay visible. Only Git's internal metadata is outside this scope.
+            if child.file_name() == ".git" {
+                continue;
+            }
+
+            // Checking before insertion uses the next discovered path as proof
+            // that an exactly-full result is partial. A tree with exactly the
+            // cap and no more descendants remains complete.
+            if entries.len() == max_entries {
+                truncated = true;
+                break 'scan;
+            }
+
+            let file_type = child.file_type().with_context(|| {
+                format!(
+                    "failed to inspect filesystem entry {}",
+                    child.path().display()
+                )
+            })?;
+            let is_dir = file_type.is_dir();
+            let path = child.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("scanned paths stay below the root")
+                .to_path_buf();
+            if is_dir {
+                directories.push_back(path);
+            }
+            seen.insert(relative.clone());
+            entries.push(make_entry(relative, is_dir, true, statuses));
+        }
     }
 
     // Deleted and renamed paths may no longer exist, but still belong in the tree.
@@ -236,6 +247,33 @@ mod tests {
         assert_eq!(relative_paths(&second_scan), expected);
         assert!(first_scan.truncated);
         assert!(second_scan.truncated);
+    }
+
+    #[test]
+    fn limited_scan_keeps_the_root_directory_shape_before_deep_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        for path in [
+            "a-heavy/one.txt",
+            "a-heavy/two.txt",
+            "z-late/child.txt",
+            "root-last.txt",
+        ] {
+            let path = directory.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "fixture").unwrap();
+        }
+
+        let scan = scan_with_limit(directory.path(), &HashMap::new(), 3).unwrap();
+
+        assert_eq!(
+            relative_paths(&scan),
+            [
+                PathBuf::from("a-heavy"),
+                PathBuf::from("z-late"),
+                PathBuf::from("root-last.txt"),
+            ]
+        );
+        assert!(scan.truncated);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::sync::{
 };
 
 use latte_lens::{
-    app::{App, ContentMode, FocusPane, GitRowKind, TreeScope},
+    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TreeScope},
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
 };
@@ -66,6 +66,39 @@ fn app_starts_from_nested_path_and_renders_both_panes() {
             .iter()
             .any(|line| line == "+pub fn changed() {}")
     );
+}
+
+#[test]
+fn quit_keys_confirm_while_ctrl_c_quits_without_a_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
+    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(!app.should_quit());
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("Press q again"));
+
+    app.handle_key(key(KeyCode::Char('h')));
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(
+        !app.should_quit(),
+        "a non-quit key must disarm confirmation"
+    );
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit());
+
+    let mut escape_app = App::new(directory.path().to_path_buf()).unwrap();
+    escape_app.handle_key(key(KeyCode::Esc));
+    assert!(!escape_app.should_quit());
+    escape_app.handle_key(key(KeyCode::Esc));
+    assert!(escape_app.should_quit());
+
+    let mut ctrl_c_app = App::new(directory.path().to_path_buf()).unwrap();
+    ctrl_c_app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(ctrl_c_app.should_quit());
 }
 
 #[test]
@@ -1341,6 +1374,8 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
     app.handle_key(key(KeyCode::Char('h')));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     app.handle_key(key(KeyCode::Esc));
+    assert!(!app.should_quit());
+    app.handle_key(key(KeyCode::Esc));
     assert!(app.should_quit());
 }
 
@@ -1392,6 +1427,8 @@ fn refresh_and_content_loading_are_visible_without_blocking_navigation() {
             .all(|cell| cell.bg == Color::Reset)
     );
 
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.should_quit());
     app.handle_key(key(KeyCode::Esc));
     assert!(app.should_quit());
     settle(&mut app);
@@ -2066,6 +2103,7 @@ fn preview_mouse_drag_selects_visible_text_and_ctrl_c_queues_exact_copy() {
         Some("Copying 16 characters…")
     );
     app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.should_quit());
     assert_eq!(
         app.clipboard_status.as_deref(),
         Some("Copying 16 characters…")
@@ -2264,6 +2302,239 @@ fn diff_mode_cycles_between_changed_files() {
     app.handle_key(key(KeyCode::Char('N')));
     settle(&mut app);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+}
+
+#[test]
+fn file_search_filters_previews_and_reveals_collapsed_paths() {
+    let fixture = TestRepo::new();
+    fixture.write("docs/readme.md", "documentation\n");
+    fixture.write("src/nested/app_controller.rs", "pub fn controller() {}\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('/')));
+    assert_eq!(app.search_mode(), Some(SearchMode::Files));
+    for character in "appc".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+
+    assert_eq!(app.search_results().len(), 1);
+    assert_eq!(
+        app.selected_search_result()
+            .map(|result| result.path.as_path()),
+        Some(Path::new("src/nested/app_controller.rs"))
+    );
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line.contains("controller"))
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert!(!app.search_is_active());
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/nested/app_controller.rs"))
+    );
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/nested/app_controller.rs")));
+}
+
+#[test]
+fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
+    let fixture = TestRepo::new();
+    fixture.write(".gitignore", "ignored/\n");
+    fixture.write("src/visible.rs", "first\nNeedle visible\nlast\n");
+    fixture.write("ignored/hidden.rs", "Needle hidden\n");
+    fixture.write("binary.bin", b"Needle\0binary");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let original_lines = app.content_lines.clone();
+
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+    assert_eq!(app.search_results().len(), 1);
+    assert_eq!(app.search_results()[0].path, Path::new("src/visible.rs"));
+    assert_eq!(app.search_results()[0].line_number, Some(2));
+    assert!(
+        app.content_highlights
+            .get(1)
+            .is_some_and(|spans| spans.iter().any(|span| span.kind == HighlightKind::Search))
+    );
+
+    app.handle_key(key(KeyCode::F(5)));
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 2);
+    assert!(
+        app.search_results()
+            .iter()
+            .any(|result| result.path == Path::new("ignored/hidden.rs"))
+    );
+    assert!(
+        app.search_results()
+            .iter()
+            .all(|result| result.path != Path::new("binary.bin"))
+    );
+
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.search_is_active());
+    assert_eq!(app.content_lines, original_lines);
+}
+
+#[test]
+fn preview_find_highlights_navigates_and_hands_off_to_workspace_search() {
+    let fixture = TestRepo::new();
+    fixture.write(
+        "example.ts",
+        "const Needle = 1;\nconst other = 2;\nconst needle = 3;\nNeedle();\n",
+    );
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    settle(&mut app);
+
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(app.preview_find_is_active());
+    assert!(!app.search_is_active());
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+
+    assert_eq!(app.preview_find_query(), Some("needle"));
+    assert_eq!(app.preview_find_position(), Some((1, 3)));
+    assert!(
+        app.preview_find_highlights(0)
+            .iter()
+            .any(|span| span.kind == HighlightKind::Search)
+    );
+    assert!(
+        app.preview_find_highlights(2)
+            .iter()
+            .any(|span| span.kind == HighlightKind::SearchMatch)
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.preview_find_position(), Some((2, 3)));
+    assert!(
+        app.preview_find_highlights(2)
+            .iter()
+            .any(|span| span.kind == HighlightKind::Search)
+    );
+
+    app.handle_key(key(KeyCode::F(2)));
+    assert_eq!(app.preview_find_position(), Some((1, 1)));
+    assert!(
+        app.preview_find_highlights(2)
+            .iter()
+            .any(|span| span.kind == HighlightKind::Search)
+    );
+
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert!(!app.preview_find_is_active());
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+}
+
+#[test]
+fn preview_find_mouse_controls_move_and_close_without_backgrounds() {
+    let fixture = TestRepo::new();
+    fixture.write("file.txt", "match one\nmatch two\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    settle(&mut app);
+    app.open_preview_find();
+    for character in "match".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Find"));
+    assert!(rendered.contains("1/2"));
+    let next = app.ui_regions.preview_find_next;
+    app.handle_mouse(mouse_down(next.x, next.y));
+    assert_eq!(app.preview_find_position(), Some((2, 2)));
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let close = app.ui_regions.preview_find_close;
+    app.handle_mouse(mouse_down(close.x, close.y));
+    assert!(!app.preview_find_is_active());
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+}
+
+#[test]
+fn preview_find_can_open_while_the_selected_file_is_loading() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "first file\n");
+    fixture.write("b.txt", "loading-safe needle\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::End));
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert!(app.is_content_loading());
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+
+    assert!(app.preview_find_is_active());
+    assert!(!app.search_is_active());
+    assert_eq!(app.preview_find_position(), Some((1, 1)));
+}
+
+#[test]
+fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
+    let fixture = TestRepo::new();
+    fixture.write("src/lib.rs", "pub fn library() {}\n");
+    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Find"));
+    assert!(rendered.contains("Text"));
+    let file_button = app.ui_regions.file_search_button;
+    assert!(file_button.width > 0);
+    app.handle_mouse(mouse_down(file_button.x, file_button.y));
+    assert_eq!(app.search_mode(), Some(SearchMode::Files));
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let text_mode = app.ui_regions.search_text_mode;
+    app.handle_mouse(mouse_down(text_mode.x, text_mode.y));
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Aa"));
+    assert!(rendered.contains("Word"));
+    assert!(rendered.contains(".*"));
+    assert!(rendered.contains("Ign"));
+    let close = app.ui_regions.search_close;
+    app.handle_mouse(mouse_down(close.x, close.y));
+    assert!(!app.search_is_active());
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
 }
 
 fn key(code: KeyCode) -> KeyEvent {

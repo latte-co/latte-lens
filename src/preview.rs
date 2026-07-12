@@ -38,6 +38,8 @@ pub enum HighlightKind {
     Number,
     Constant,
     Attribute,
+    SearchMatch,
+    Search,
 }
 
 /// A syntax-highlighted byte range within one logical preview line.

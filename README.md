@@ -48,23 +48,31 @@ Inside the TUI:
 | `tab` / `shift-tab` | Switch the left tree scope while retaining focus |
 | `h` / `l` | Focus the tree or content pane |
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
+| `/` / `ctrl-f` / `ctrl-shift-f` | Find files and directories, find in the current Preview, or search workspace text content |
 | `p` / `d` | Show Preview or Diff in the right pane |
 | `n` / `N` | Next or previous changed file in Diff |
 | `ctrl-d` / `ctrl-u` | Page through content |
 | `r` | Refresh repository state |
-| `q` | Quit |
+| `q` / `esc` | Press twice within 1.5 seconds to quit; `esc` closes an active search first |
+| `ctrl-c` | Quit immediately when no content is selected; copy the current selection otherwise |
 
 Mouse controls:
 
 - Click `Files` or `Git changes` to switch the left tree dataset; entering Git Changes refreshes it first.
 - Click `Refresh` in the header (or press `r`) to re-scan the repository without leaving the current view.
+- Click `Find` or `Text` in the Files heading to open file or workspace text search. Search results preview on one click and reveal in Files on double click.
+- In search, use `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` to include ignored content. `Enter` reveals a result and `Esc` restores the prior view.
+- While searching, `Ctrl+P` switches to file search and `Ctrl+F` switches to text search.
+- In a file Preview, `Ctrl+F` opens an in-preview find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` for workspace text search.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
 
 All Files remains bounded by the selected workspace, includes dotfiles and
 ignored paths, excludes only Git's internal `.git` metadata, and begins with
-directories collapsed. Git Changes discovers repositories below that boundary,
+directories collapsed. Its bounded scan visits shallow directories first, so a
+large generated subtree cannot hide later workspace roots when deeper results
+become partial. Git Changes discovers repositories below that boundary,
 groups each visible repository under a selectable header, and shows only its
 changed files and required directories. Repository and Git-change directories default
 expanded; clean irrelevant leaves are hidden, while relationship, submodule,
@@ -92,12 +100,14 @@ as a complete or clean repository view.
 - **System Git CLI** as the compatibility boundary for worktrees, user config,
   diff drivers, and future Git features
 - **ignore** for fast bounded filesystem walking with filters disabled in All Files
+- **regex** for bounded, cancellable workspace text search
 
 Repository discovery, Git status, tree scans, diffs, and previews run on a
-dedicated background worker. The event loop only submits bounded, coalesced
-requests and applies the latest completed generation, so stale refreshes or
-selections cannot replace newer state. Diff and Git-change preview requests
-carry their owning repository identity, including rename/copy source paths.
+dedicated background worker. Text searches use a separate cancellable worker
+so a large query cannot block refresh or preview. The event loop only applies
+the latest requested generation, so stale refreshes, selections, or searches
+cannot replace newer state. Diff and Git-change preview requests carry their
+owning repository identity, including rename/copy source paths.
 File watching is not implemented; entering Git Changes or pressing `r`
 requests a fresh graph-aware snapshot.
 
@@ -153,8 +163,11 @@ readable as plain text. Styles change foregrounds and modifiers only, so the
 terminal continues to own the canvas background.
 
 Drag across text in the right-hand content pane to create a visible selection
-and copy it when the mouse is released. `Ctrl+C` (or `Cmd+C` when the terminal
-forwards it) copies the selection again; `Ctrl+Shift+C` is also accepted.
+and copy it when the mouse is released. With a selection, `Ctrl+C` (or `Cmd+C`
+when the terminal forwards it) copies the selection again; `Ctrl+Shift+C` is
+also accepted. Without a selection, `Ctrl+C` exits immediately as a conventional
+terminal interrupt. `q` and `Esc` require a second matching press within 1.5
+seconds, so a stray navigation key cannot close the application.
 Preview, Diff, and informational content all
 support selection. Line-number gutters are excluded from copied previews,
 multi-line selections preserve newlines, and Unicode grapheme clusters remain
@@ -202,11 +215,10 @@ packages on Linux, macOS, and Windows.
 
 ## Next milestones
 
-1. Tree search
-2. Background filesystem watching and diff cache
-3. Search, syntax-aware diffs, and word-level change highlights
-4. Agent attribution: show which agent changed each file or hunk
-5. Worktree and session switching for multi-agent workflows
+1. Background filesystem watching and diff cache
+2. Syntax-aware diffs and word-level change highlights
+3. Agent attribution: show which agent changed each file or hunk
+4. Worktree and session switching for multi-agent workflows
 
 ## License
 

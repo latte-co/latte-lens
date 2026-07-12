@@ -17,6 +17,7 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+regex = "1.12"
 syntect = { version = "5.3", default-features = false, features = ["regex-fancy"] }
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2"
