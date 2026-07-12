@@ -9,11 +9,15 @@ use latte_lens::{
 use support::TestRepo;
 
 #[test]
-fn scan_honors_gitignore_keeps_hidden_files_and_excludes_git_metadata() {
+fn scan_keeps_hidden_and_ignored_paths_but_excludes_git_metadata() {
     let fixture = TestRepo::new();
     fixture.write(".gitignore", "ignored/\n*.log\n");
+    fixture.write(".ignore", "ignored-by-dotignore/\n");
+    fixture.write(".git/info/exclude", "ignored-by-git-info/\n");
     fixture.write("src/main.rs", "fn main() {}\n");
     fixture.write("ignored/private.txt", "secret\n");
+    fixture.write("ignored-by-dotignore/private.txt", "secret\n");
+    fixture.write("ignored-by-git-info/private.txt", "secret\n");
     fixture.write("debug.log", "noise\n");
     fixture.write(".visible-to-lens", "hidden by shell, not by lens\n");
 
@@ -28,9 +32,12 @@ fn scan_honors_gitignore_keeps_hidden_files_and_excludes_git_metadata() {
     assert!(paths.contains(&Path::new("src")));
     assert!(paths.contains(&Path::new("src/main.rs")));
     assert!(paths.contains(&Path::new(".visible-to-lens")));
+    assert!(paths.contains(&Path::new("ignored")));
+    assert!(paths.contains(&Path::new("ignored/private.txt")));
+    assert!(paths.contains(&Path::new("ignored-by-dotignore/private.txt")));
+    assert!(paths.contains(&Path::new("ignored-by-git-info/private.txt")));
+    assert!(paths.contains(&Path::new("debug.log")));
     assert!(!paths.iter().any(|path| path.starts_with(".git")));
-    assert!(!paths.iter().any(|path| path.starts_with("ignored")));
-    assert!(!paths.contains(&Path::new("debug.log")));
 }
 
 #[test]

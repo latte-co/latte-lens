@@ -18,7 +18,7 @@ fn benchmark_tree_scan(criterion: &mut Criterion) {
         }
     }
 
-    criterion.bench_function("scan 1k file ignored-aware tree", |bencher| {
+    criterion.bench_function("scan 1k file unfiltered tree", |bencher| {
         bencher.iter(|| tree::scan(directory.path(), &HashMap::new()).unwrap())
     });
 }

@@ -57,10 +57,9 @@ pub fn scan_with_limit(
 ) -> Result<ScanResult> {
     let mut builder = WalkBuilder::new(root);
     builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        // All Files is a filesystem view, so dotfiles and ignored paths stay
+        // visible. Only Git's internal metadata is outside this scope.
+        .standard_filters(false)
         .sort_by_file_path(|left, right| left.cmp(right))
         .filter_entry(|entry| entry.file_name() != ".git");
 

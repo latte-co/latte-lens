@@ -62,10 +62,11 @@ Mouse controls:
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
 
-All Files remains bounded by the selected workspace and begins with directories
-collapsed. Git Changes discovers repositories below that boundary, groups each
-visible repository under a selectable header, and shows only its changed files
-and required directories. Repository and Git-change directories default
+All Files remains bounded by the selected workspace, includes dotfiles and
+ignored paths, excludes only Git's internal `.git` metadata, and begins with
+directories collapsed. Git Changes discovers repositories below that boundary,
+groups each visible repository under a selectable header, and shows only its
+changed files and required directories. Repository and Git-change directories default
 expanded; clean irrelevant leaves are hidden, while relationship, submodule,
 placeholder, partial-discovery, and isolated repository-error states remain
 visible. Expansion and repo+row selection identities persist across successful
@@ -90,7 +91,7 @@ as a complete or clean repository view.
 - **Ratatui + Crossterm** for rendering and terminal input
 - **System Git CLI** as the compatibility boundary for worktrees, user config,
   diff drivers, and future Git features
-- **ignore** for fast filesystem walking with `.gitignore` support
+- **ignore** for fast bounded filesystem walking with filters disabled in All Files
 
 Repository discovery, Git status, tree scans, diffs, and previews run on a
 dedicated background worker. The event loop only submits bounded, coalesced
