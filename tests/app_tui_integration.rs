@@ -27,6 +27,33 @@ use support::TestRepo;
 use unicode_width::UnicodeWidthStr;
 
 #[test]
+fn startup_renders_before_the_initial_tree_snapshot_is_ready() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
+
+    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    assert!(app.is_initial_loading());
+    assert!(app.is_refreshing());
+    assert!(app.all_entries.is_empty());
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("loading workspace"));
+    assert!(rendered.contains("Scanning files"));
+    assert!(rendered.contains("Loading workspace"));
+
+    settle(&mut app);
+    assert!(!app.is_initial_loading());
+    assert!(
+        app.all_entries
+            .iter()
+            .any(|entry| entry.relative == Path::new("plain.txt"))
+    );
+}
+
+#[test]
 fn app_starts_from_nested_path_and_renders_both_panes() {
     let fixture = TestRepo::new();
     fixture.write("src/lib.rs", "pub fn original() {}\n");
@@ -34,7 +61,7 @@ fn app_starts_from_nested_path_and_renders_both_panes() {
     fixture.write("src/lib.rs", "pub fn changed() {}\n");
     fixture.write("notes.txt", "untracked\n");
 
-    let mut app = App::new(fixture.root().join("src")).unwrap();
+    let mut app = ready_app(fixture.root().join("src")).unwrap();
     assert_eq!(
         app.root.canonicalize().unwrap(),
         fixture.root().join("src").canonicalize().unwrap()
@@ -72,7 +99,7 @@ fn app_starts_from_nested_path_and_renders_both_panes() {
 fn quit_keys_confirm_while_ctrl_c_quits_without_a_selection() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
-    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -90,13 +117,13 @@ fn quit_keys_confirm_while_ctrl_c_quits_without_a_selection() {
     app.handle_key(key(KeyCode::Char('q')));
     assert!(app.should_quit());
 
-    let mut escape_app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut escape_app = ready_app(directory.path().to_path_buf()).unwrap();
     escape_app.handle_key(key(KeyCode::Esc));
     assert!(!escape_app.should_quit());
     escape_app.handle_key(key(KeyCode::Esc));
     assert!(escape_app.should_quit());
 
-    let mut ctrl_c_app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut ctrl_c_app = ready_app(directory.path().to_path_buf()).unwrap();
     ctrl_c_app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(ctrl_c_app.should_quit());
 }
@@ -105,7 +132,7 @@ fn quit_keys_confirm_while_ctrl_c_quits_without_a_selection() {
 fn partial_scope_is_marked_without_painting_a_background() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
-    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
     app.all_files_truncated = true;
 
     let backend = TestBackend::new(80, 20);
@@ -149,7 +176,7 @@ fn narrow_repository_layout_clips_labels_and_hitboxes_without_backgrounds() {
         "a-very-long-directory-name/a-very-long-file-name.txt",
         "after\n",
     );
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -186,7 +213,7 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     fixture.write("b-changed.txt", "before\n");
     fixture.commit_all("initial");
     fixture.write("b-changed.txt", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     assert_eq!(
         app.selected_relative_path(),
@@ -236,7 +263,7 @@ fn tree_top_up_focuses_scope_tabs_and_down_restores_tree_selection() {
     fixture.write("a.txt", "a\n");
     fixture.write("b.txt", "b\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
     app.handle_key(key(KeyCode::Up));
@@ -264,7 +291,7 @@ fn scope_tab_arrows_switch_scope_through_the_refresh_path() {
     fixture.write("b-changed.txt", "before\n");
     fixture.commit_all("initial");
     fixture.write("b-changed.txt", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::Up));
     assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
@@ -314,7 +341,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
     fixture.write("src/nested/changed.rs", "before\n");
     fixture.commit_all("initial");
     fixture.write("src/nested/changed.rs", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     // The scan remains complete, but the first All Files projection only
     // exposes roots because directories default collapsed.
@@ -362,7 +389,7 @@ fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
     fixture.write("src/nested/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     assert_eq!(
         visible_paths(&app),
@@ -422,7 +449,7 @@ fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
     fixture.write("src/nested/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -477,7 +504,7 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     fixture.write("alpha/old.txt", "before\n");
     fixture.commit_all("initial");
     fixture.write("alpha/old.txt", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     // All Files keeps an explicit expansion through refresh, while a new
     // directory remains collapsed.
@@ -515,7 +542,7 @@ fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
     fixture.write("tracked.txt", "tracked\n");
     fixture.commit_all("initial");
     fixture.write("src/child.txt", "untracked\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::Enter));
     app.handle_key(key(KeyCode::Down));
@@ -548,7 +575,7 @@ fn entering_git_changes_refreshes_and_excludes_clean_files() {
     fixture.write("a-clean.txt", "clean\n");
     fixture.write("b-also-clean.txt", "clean\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     // Simulate an agent changing the worktree after Latte Lens has started.
     fixture.write("z-new-change.txt", "new\n");
@@ -575,7 +602,7 @@ fn clean_root_repository_is_a_selectable_empty_git_changes_node() {
     let fixture = TestRepo::new();
     fixture.write("tracked.txt", "clean\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
@@ -617,7 +644,7 @@ fn non_git_workspace_lists_clean_and_dirty_descendant_repositories() {
     }
     write_file(&dirty, "tracked.txt", "after\n");
 
-    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    let mut app = ready_app(workspace.path().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -732,7 +759,7 @@ fn recursive_clean_submodules_are_separate_empty_repository_nodes() {
         ],
     );
 
-    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    let mut app = ready_app(parent.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -794,7 +821,7 @@ fn clean_deinitialized_submodule_stays_visible_without_inflating_dirty_count() {
         &["submodule", "deinit", "--force", "--", "modules/child"],
     );
 
-    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    let mut app = ready_app(parent.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -826,7 +853,7 @@ fn clean_deinitialized_submodule_stays_visible_without_inflating_dirty_count() {
 fn non_git_directory_previews_text_and_has_an_empty_changes_scope() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
-    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
 
     assert!(app.repo.is_none());
     assert_eq!(app.changed_count, 0);
@@ -857,7 +884,7 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
     git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
     write_file(&nested, "same.txt", "nested after\n");
 
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     assert_eq!(app.changed_count, 2);
@@ -948,7 +975,7 @@ fn git_changes_sorts_directories_before_files_at_each_level() {
         fixture.write(path, "after\n");
     }
 
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -988,7 +1015,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
     git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
     write_file(&nested, "src/shared.txt", "nested after\n");
 
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -1055,7 +1082,7 @@ fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_error_visible() {
     write_file(&nested, "changed.txt", "after\n");
     fs::create_dir_all(workspace.path().join("bad-repo/.git")).unwrap();
 
-    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    let mut app = ready_app(workspace.path().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -1123,7 +1150,7 @@ fn submodule_pointer_internal_change_and_placeholder_are_separate_rows() {
     git(&child, &["commit", "--quiet", "-m", "advance child"]);
     write_file(&child, "tracked.txt", "dirty inside child\n");
 
-    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    let mut app = ready_app(parent.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     assert_eq!(app.changed_count, 2);
@@ -1233,14 +1260,14 @@ fn app_rejects_files_and_missing_paths() {
     fs::write(&file, "not a directory\n").unwrap();
 
     assert!(
-        App::new(file)
+        ready_app(file)
             .err()
             .expect("file path must fail")
             .to_string()
             .contains("is not a directory")
     );
     assert!(
-        App::new(directory.path().join("missing"))
+        ready_app(directory.path().join("missing"))
             .err()
             .expect("missing path must fail")
             .to_string()
@@ -1251,7 +1278,7 @@ fn app_rejects_files_and_missing_paths() {
 #[test]
 fn empty_directory_has_no_selection_and_safe_navigation() {
     let directory = tempfile::tempdir().unwrap();
-    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
 
     assert!(app.all_entries.is_empty());
     assert!(app.selected_entry().is_none());
@@ -1273,7 +1300,7 @@ fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection
     fixture.write("src/lib.rs", "before\n");
     fixture.commit_all("initial");
     fixture.write("src/lib.rs", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
@@ -1294,7 +1321,7 @@ fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection
 fn refresh_failure_is_captured_for_the_footer() {
     let fixture = TestRepo::new();
     fixture.write("file.txt", "fixture\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     fs::remove_dir_all(fixture.root()).unwrap();
 
     app.handle_key(key(KeyCode::Char('r')));
@@ -1313,7 +1340,7 @@ fn selecting_a_removed_untracked_file_surfaces_diff_error() {
     fixture.write("a.txt", "tracked\n");
     fixture.commit_all("initial");
     fixture.write("z-untracked.txt", "temporary\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.handle_key(key(KeyCode::End));
     fs::remove_file(fixture.root().join("z-untracked.txt")).unwrap();
 
@@ -1333,7 +1360,7 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
     fixture.write("b.txt", "before\n");
     fixture.commit_all("initial");
     fixture.write("b.txt", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::Char('j')));
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
@@ -1383,7 +1410,7 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
 fn error_footer_renders_without_hiding_split_panes() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
-    let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
     app.last_error = Some("refresh failed: fixture".to_owned());
 
     let backend = TestBackend::new(80, 20);
@@ -1401,7 +1428,7 @@ fn refresh_and_content_loading_are_visible_without_blocking_navigation() {
     fixture.write("a.txt", "a\n");
     fixture.write("b.txt", "b\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let snapshot = app.all_entries.clone();
 
     app.handle_key(key(KeyCode::Char('r')));
@@ -1440,7 +1467,7 @@ fn clean_source_defaults_to_numbered_text_preview() {
     fixture.write("main.rs", "fn main() {\n    println!(\"latte\");\n}\n");
     fixture.commit_all("initial");
 
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert_eq!(app.content_provider.as_deref(), Some("text"));
     assert!(app.content_show_line_numbers);
@@ -1458,7 +1485,7 @@ fn clean_source_defaults_to_numbered_text_preview() {
 fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() {
     let fixture = TestRepo::new();
     fixture.write("long.txt", "abcdefghijklmnopqrstuvwxyz0123456789\nsecond\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(60, 12);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1504,7 +1531,7 @@ fn changed_source_defaults_to_diff_but_can_toggle_preview() {
     fixture.write("main.rs", "fn before() {}\n");
     fixture.commit_all("initial");
     fixture.write("main.rs", "fn after() {}\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
@@ -1533,7 +1560,7 @@ fn binary_file_explains_how_to_add_a_preview_provider() {
     fixture.write("asset.bin", [b'a', 0, b'b']);
     fixture.commit_all("initial");
 
-    let app = App::new(fixture.root().to_path_buf()).unwrap();
+    let app = ready_app(fixture.root().to_path_buf()).unwrap();
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert!(app.content_provider.is_none());
     assert!(app.content_lines[0].contains("No preview provider accepted"));
@@ -1568,7 +1595,7 @@ fn app_accepts_a_custom_pdf_preview_provider() {
     let mut registry = PreviewRegistry::with_builtins();
     registry.register(FakePdfProvider);
 
-    let app = App::with_preview_registry(fixture.root().to_path_buf(), registry).unwrap();
+    let app = ready_app_with_preview_registry(fixture.root().to_path_buf(), registry).unwrap();
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert_eq!(app.content_provider.as_deref(), Some("fake-pdf"));
     assert_eq!(app.content_lines, ["PDF page one"]);
@@ -1607,7 +1634,7 @@ fn all_files_never_dispatches_an_external_file_symlink_to_a_provider() {
         calls: Arc::clone(&calls),
     });
 
-    let app = App::with_preview_registry(workspace.path().to_path_buf(), registry).unwrap();
+    let app = ready_app_with_preview_registry(workspace.path().to_path_buf(), registry).unwrap();
     let content = app.content_lines.join("\n");
 
     assert!(content.contains("symbolic link"));
@@ -1626,7 +1653,7 @@ fn all_files_does_not_follow_a_symlink_to_an_internal_regular_file() {
     fs::write(&target, "internal-target-content-1d61\n").unwrap();
     symlink("z-target.txt", workspace.path().join("a-link.txt")).unwrap();
 
-    let app = App::new(workspace.path().to_path_buf()).unwrap();
+    let app = ready_app(workspace.path().to_path_buf()).unwrap();
     let content = app.content_lines.join("\n");
 
     assert_eq!(
@@ -1654,7 +1681,7 @@ fn git_changes_preview_does_not_follow_a_changed_symlink() {
     fs::remove_file(fixture.root().join("link.txt")).unwrap();
     symlink(&outside_file, fixture.root().join("link.txt")).unwrap();
 
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     app.handle_key(key(KeyCode::Char('p')));
@@ -1673,7 +1700,7 @@ fn fifo_preview_returns_promptly_with_a_safe_message() {
         let workspace = tempfile::tempdir().unwrap();
         make_fifo(&workspace.path().join("pipe"));
 
-        let app = App::new(workspace.path().to_path_buf()).unwrap();
+        let app = ready_app(workspace.path().to_path_buf()).unwrap();
         let content = app.content_lines.join("\n");
         assert!(content.contains("FIFO (named pipe)"));
         assert!(content.contains("reads only regular files"));
@@ -1693,7 +1720,7 @@ fn untracked_symlink_to_fifo_diff_and_worker_drop_return_promptly() {
         make_fifo(&fifo);
         symlink(&fifo, fixture.root().join("pipe-link")).unwrap();
 
-        let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+        let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
         app.set_tree_scope(TreeScope::GitChanges);
         app.wait_for_background();
         let diff = app.content_lines.join("\n");
@@ -1709,7 +1736,7 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
     let fixture = TestRepo::new();
     fixture.write("file.txt", "hello\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1821,7 +1848,7 @@ fn all_files_uses_a_small_aligned_change_gutter() {
     fixture.commit_all("initial");
     fixture.write("changed-dir/nested.txt", "after nested\n");
     fixture.write("root.txt", "after root\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1889,7 +1916,7 @@ fn divider_drag_resizes_tree_with_minimum_tree_and_content_widths() {
     let fixture = TestRepo::new();
     fixture.write("file.txt", "hello\n");
     fixture.commit_all("initial");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1950,7 +1977,7 @@ fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
     fixture.write("b-changed.txt", "before\n");
     fixture.commit_all("initial");
     fixture.write("b-changed.txt", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2008,7 +2035,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
     fixture.commit_all("initial");
     fixture.write("b-changed.txt", "after b\n");
     fixture.write("c-changed.txt", "after c\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -2072,7 +2099,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
 fn preview_mouse_drag_selects_visible_text_and_ctrl_c_queues_exact_copy() {
     let fixture = TestRepo::new();
     fixture.write("notes.txt", "alpha beta\nsecond line\nthird\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -2151,7 +2178,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
     fixture.write("changed.txt", "before\n");
     fixture.commit_all("initial");
     fixture.write("changed.txt", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -2199,7 +2226,7 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     fixture.write("src/lib.rs", "before\n");
     fixture.commit_all("initial");
     fixture.write("src/lib.rs", "after\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     assert_eq!(app.content_mode, ContentMode::Info);
     assert_eq!(
         app.content_lines,
@@ -2245,7 +2272,7 @@ fn clickable_refresh_control_updates_the_current_git_changes_tree() {
     fixture.write("clean.txt", "clean\n");
     fixture.commit_all("initial");
     fixture.write("first-change.txt", "first\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
@@ -2290,7 +2317,7 @@ fn diff_mode_cycles_between_changed_files() {
     fixture.commit_all("initial");
     fixture.write("a.txt", "after a\n");
     fixture.write("c.txt", "after c\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
@@ -2309,7 +2336,7 @@ fn file_search_filters_previews_and_reveals_collapsed_paths() {
     let fixture = TestRepo::new();
     fixture.write("docs/readme.md", "documentation\n");
     fixture.write("src/nested/app_controller.rs", "pub fn controller() {}\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::Char('/')));
     assert_eq!(app.search_mode(), Some(SearchMode::Files));
@@ -2348,7 +2375,7 @@ fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
     fixture.write("src/visible.rs", "first\nNeedle visible\nlast\n");
     fixture.write("ignored/hidden.rs", "Needle hidden\n");
     fixture.write("binary.bin", b"Needle\0binary");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let original_lines = app.content_lines.clone();
 
     app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -2365,6 +2392,11 @@ fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
             .get(1)
             .is_some_and(|spans| spans.iter().any(|span| span.kind == HighlightKind::Search))
     );
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("last Refresh"));
 
     app.handle_key(key(KeyCode::F(5)));
     settle(&mut app);
@@ -2392,7 +2424,7 @@ fn preview_find_highlights_navigates_and_hands_off_to_workspace_search() {
         "example.ts",
         "const Needle = 1;\nconst other = 2;\nconst needle = 3;\nNeedle();\n",
     );
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     settle(&mut app);
 
     assert_eq!(app.content_mode, ContentMode::Preview);
@@ -2444,7 +2476,7 @@ fn preview_find_highlights_navigates_and_hands_off_to_workspace_search() {
 fn preview_find_mouse_controls_move_and_close_without_backgrounds() {
     let fixture = TestRepo::new();
     fixture.write("file.txt", "match one\nmatch two\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     settle(&mut app);
     app.open_preview_find();
     for character in "match".chars() {
@@ -2480,7 +2512,7 @@ fn preview_find_can_open_while_the_selected_file_is_loading() {
     let fixture = TestRepo::new();
     fixture.write("a.txt", "first file\n");
     fixture.write("b.txt", "loading-safe needle\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::End));
     assert_eq!(app.content_mode, ContentMode::Preview);
@@ -2500,7 +2532,7 @@ fn preview_find_can_open_while_the_selected_file_is_loading() {
 fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
     let fixture = TestRepo::new();
     fixture.write("src/lib.rs", "pub fn library() {}\n");
-    let mut app = App::new(fixture.root().to_path_buf()).unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2569,6 +2601,21 @@ fn settle(app: &mut App) {
     app.wait_for_background();
 }
 
+fn ready_app(path: PathBuf) -> anyhow::Result<App> {
+    let mut app = App::new(path)?;
+    settle(&mut app);
+    Ok(app)
+}
+
+fn ready_app_with_preview_registry(
+    path: PathBuf,
+    registry: PreviewRegistry,
+) -> anyhow::Result<App> {
+    let mut app = App::with_preview_registry(path, registry)?;
+    settle(&mut app);
+    Ok(app)
+}
+
 fn submodule_projection_fixture(state: SubmoduleProjectionState) -> (TestRepo, App) {
     let source = TestRepo::new();
     source.write("tracked.txt", "source initial\n");
@@ -2618,7 +2665,7 @@ fn submodule_projection_fixture(state: SubmoduleProjectionState) -> (TestRepo, A
         }
     }
 
-    let mut app = App::new(parent.root().to_path_buf()).unwrap();
+    let mut app = ready_app(parent.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     (parent, app)

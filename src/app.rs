@@ -175,6 +175,7 @@ pub(crate) struct SearchState {
     pub results: Vec<SearchResult>,
     pub options: SearchOptions,
     pub searching: bool,
+    pub indexing: bool,
     pub truncated: bool,
     pub scanned_files: usize,
     pub error: Option<String>,
@@ -380,6 +381,7 @@ pub struct App {
     recent_files: Vec<PathBuf>,
     last_search_click: Option<(usize, Instant)>,
     last_refresh_error: Option<String>,
+    has_refresh_snapshot: bool,
     quit_confirmation: Option<QuitConfirmation>,
     should_quit: bool,
 }
@@ -426,7 +428,12 @@ impl App {
             tree_state: ListState::default(),
             tree_scope: TreeScope::AllFiles,
             focused_pane: FocusPane::Tree,
-            content_lines: Vec::new(),
+            content_lines: vec![
+                "Loading workspace…".to_owned(),
+                String::new(),
+                "The file tree and repository state are being scanned in the background."
+                    .to_owned(),
+            ],
             content_highlights: Vec::new(),
             content_scroll: 0,
             content_horizontal_scroll: 0,
@@ -469,15 +476,11 @@ impl App {
             recent_files: Vec::new(),
             last_search_click: None,
             last_refresh_error: None,
+            has_refresh_snapshot: false,
             quit_confirmation: None,
             should_quit: false,
         };
         app.request_refresh();
-        app.wait_for_refresh();
-        if let Some(error) = app.last_refresh_error.take() {
-            anyhow::bail!(error);
-        }
-        app.wait_for_background();
         Ok(app)
     }
 
@@ -879,6 +882,7 @@ impl App {
             results: Vec::new(),
             options: SearchOptions::default(),
             searching: false,
+            indexing: false,
             truncated: false,
             scanned_files: 0,
             error: None,
@@ -1346,6 +1350,7 @@ impl App {
         if let Some(search) = &mut self.search {
             search.results = results;
             search.searching = false;
+            search.indexing = false;
             search.truncated = truncated;
             search.scanned_files = 0;
             search.error = None;
@@ -1369,6 +1374,7 @@ impl App {
             search.error = None;
             let has_query = !search.query.is_empty();
             search.searching = has_query;
+            search.indexing = false;
             search.due = has_query.then(|| {
                 Instant::now()
                     .checked_add(Duration::from_millis(150))
@@ -1404,6 +1410,15 @@ impl App {
     fn apply_search_events(&mut self) {
         for event in self.search_runtime.take_events() {
             match event {
+                SearchEvent::Indexing { generation } => {
+                    let Some(search) = &mut self.search else {
+                        continue;
+                    };
+                    if search.mode != SearchMode::Text || search.generation != generation {
+                        continue;
+                    }
+                    search.indexing = true;
+                }
                 SearchEvent::Batch {
                     generation,
                     matches,
@@ -1416,6 +1431,7 @@ impl App {
                         continue;
                     }
                     search.scanned_files = scanned_files;
+                    search.indexing = false;
                     search
                         .results
                         .extend(matches.into_iter().map(search_result));
@@ -1437,6 +1453,7 @@ impl App {
                         continue;
                     }
                     search.searching = false;
+                    search.indexing = false;
                     search.scanned_files = scanned_files;
                     search.truncated = truncated;
                     search.error = error;
@@ -2071,6 +2088,10 @@ impl App {
         self.refresh_requests.is_loading()
     }
 
+    pub const fn is_initial_loading(&self) -> bool {
+        self.is_refreshing() && !self.has_refresh_snapshot
+    }
+
     pub const fn is_content_loading(&self) -> bool {
         self.content_requests.is_loading()
     }
@@ -2314,8 +2335,8 @@ impl App {
     }
 
     /// Wait until all currently requested work is reduced into application
-    /// state. The interactive loop never calls this; it is useful to startup,
-    /// embedders, and deterministic tests that do not own an event loop.
+    /// state. The interactive loop never calls this; it is useful to embedders
+    /// and deterministic tests that do not own an event loop.
     #[doc(hidden)]
     pub fn wait_for_background(&mut self) {
         while self.is_refreshing() || self.is_content_loading() || self.is_searching() {
@@ -2327,18 +2348,6 @@ impl App {
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(10));
-            }
-            self.poll_background();
-        }
-    }
-
-    fn wait_for_refresh(&mut self) {
-        while self.is_refreshing() {
-            if !self.runtime.wait_for_completion() {
-                let error = "background worker stopped before refresh completed".to_owned();
-                self.last_refresh_error = Some(error.clone());
-                self.last_error = Some(error);
-                break;
             }
             self.poll_background();
         }
@@ -2361,8 +2370,15 @@ impl App {
     }
 
     fn apply_refresh_snapshot(&mut self, snapshot: RefreshSnapshot) {
+        // The search worker already warms its first inventory at startup.
+        // Reindex only after later, user-requested refreshes so the initial
+        // tree scan does not trigger a duplicate full-workspace traversal.
+        if self.has_refresh_snapshot {
+            self.search_runtime.refresh_inventory();
+        }
         self.remember_current_selection();
         let changed_entries = tree::changed_only(&snapshot.scan.entries);
+        self.has_refresh_snapshot = true;
 
         self.branch = snapshot.branch;
         self.all_files_truncated = snapshot.scan.truncated;
@@ -3629,6 +3645,7 @@ mod tests {
             2,
         )
         .unwrap();
+        app.wait_for_background();
 
         assert_eq!(app.all_entries.len(), 2);
         assert!(app.all_files_truncated);

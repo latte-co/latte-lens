@@ -274,7 +274,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         " LATTE LENS ",
         Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
     )];
-    if app.total_repository_count > 0 {
+    if app.is_initial_loading() {
+        title.push(Span::styled(
+            "  loading workspace",
+            Style::default().fg(MUTED),
+        ));
+    } else if app.total_repository_count > 0 {
         let change_count = format_change_count(app.changed_count);
         title.push(Span::raw("  "));
         if let Some(branch) = app.branch.as_deref() {
@@ -385,7 +390,11 @@ fn draw_search(frame: &mut Frame, app: &mut App, input: Rect, status: Rect, rows
     let Some(search) = app.search.as_ref() else {
         return;
     };
-    let title = search.mode.label();
+    let title = if search.mode == SearchMode::Text {
+        "Text · last Refresh"
+    } else {
+        search.mode.label()
+    };
     let prefix_width = 2 + UnicodeWidthStr::width(title) + 4;
     let query_width = usize::from(input.width)
         .saturating_sub(prefix_width + 4)
@@ -452,13 +461,15 @@ fn draw_search(frame: &mut Frame, app: &mut App, input: Rect, status: Rect, rows
     );
     let detail = if let Some(error) = &search.error {
         format!("  {error}")
+    } else if search.indexing {
+        format!("  {} matches · Indexing…", search.results.len())
     } else if search.searching {
         format!("  {} matches · Searching…", search.results.len())
     } else if search.truncated {
         format!("  {}+ matches · PARTIAL", search.results.len())
     } else if search.mode == SearchMode::Text && !search.query.is_empty() {
         format!(
-            "  {} matches · {} files",
+            "  Last Refresh · {} matches · {} files",
             search.results.len(),
             search.scanned_files
         )
@@ -621,38 +632,47 @@ fn search_result_line(
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     let selected = app.tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
-    let items: Vec<ListItem> = match app.tree_scope {
-        TreeScope::AllFiles => app
-            .visible_entries()
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                ListItem::new(tree_line(
-                    app,
-                    entry,
-                    selected == Some(index),
-                    focused,
-                    rows.width,
-                ))
-            })
-            .collect(),
-        TreeScope::GitChanges => app
-            .visible_git_rows()
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                ListItem::new(git_tree_line(
-                    app,
-                    row,
-                    selected == Some(index),
-                    focused,
-                    rows.width,
-                ))
-            })
-            .collect(),
+    let items: Vec<ListItem> = if app.is_initial_loading() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  Scanning files…",
+            Style::default().fg(MINT),
+        )))]
+    } else {
+        match app.tree_scope {
+            TreeScope::AllFiles => app
+                .visible_entries()
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    ListItem::new(tree_line(
+                        app,
+                        entry,
+                        selected == Some(index),
+                        focused,
+                        rows.width,
+                    ))
+                })
+                .collect(),
+            TreeScope::GitChanges => app
+                .visible_git_rows()
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    ListItem::new(git_tree_line(
+                        app,
+                        row,
+                        selected == Some(index),
+                        focused,
+                        rows.width,
+                    ))
+                })
+                .collect(),
+        }
     };
     let entry_count = app.scope_entry_count();
-    let detail = if app.scope_is_truncated() {
+    let detail = if app.is_initial_loading() {
+        "loading…".to_owned()
+    } else if app.scope_is_truncated() {
         let noun = if app.tree_scope == TreeScope::GitChanges {
             "changes"
         } else {
@@ -1151,11 +1171,17 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(error.to_owned(), Style::default().fg(ROSE)),
         ])
     } else if app.is_refreshing() || app.is_content_loading() {
-        let status = match (app.is_refreshing(), app.is_content_loading()) {
-            (true, true) => "Refreshing repository graph · Loading content",
-            (true, false) => "Refreshing repository graph",
-            (false, true) => "Loading content",
-            (false, false) => unreachable!(),
+        let status = match (
+            app.is_initial_loading(),
+            app.is_refreshing(),
+            app.is_content_loading(),
+        ) {
+            (true, _, true) => "Scanning files and repositories · Loading content",
+            (true, _, false) => "Scanning files and repositories",
+            (false, true, true) => "Refreshing repository graph · Loading content",
+            (false, true, false) => "Refreshing repository graph",
+            (false, false, true) => "Loading content",
+            (false, false, false) => unreachable!(),
         };
         Line::from(vec![
             Span::styled(

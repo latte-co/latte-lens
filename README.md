@@ -108,6 +108,9 @@ so a large query cannot block refresh or preview. The event loop only applies
 the latest requested generation, so stale refreshes, selections, or searches
 cannot replace newer state. Diff and Git-change preview requests carry their
 owning repository identity, including rename/copy source paths.
+The terminal UI renders immediately at startup while the first file-tree and
+repository snapshot loads in the background; its loading state remains
+interactive, and the completed snapshot replaces it without restarting the UI.
 File watching is not implemented; entering Git Changes or pressing `r`
 requests a fresh graph-aware snapshot.
 
