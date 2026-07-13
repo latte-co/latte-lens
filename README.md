@@ -12,12 +12,13 @@ keyboard-driven TUI.
 
 - Collapsible, bounded workspace tree with lazy directory loading
 - Staged, unstaged, deleted, renamed, and untracked file status
-- Colorized staged and working-tree diffs
+- Colorized staged and working-tree diffs with old/new line numbers and emphasized additions/deletions
 - Numbered, syntax-highlighted previews for recognized source files, with plain-text fallback
 - Extensible preview providers for formats such as PDF and Word
 - Side-by-side tree and content panes, so context stays visible while reading
 - A bounded file sidebar, single divider, and quiet focus/selection accents instead of boxed panels
 - Left-pane tabs for the complete workspace tree or repository-grouped Git changes
+- IDEA-style file and workspace search popups that preserve each query, result list, and selection while hidden
 - Keyboard and mouse navigation across scope tabs, tree, and content, with clickable controls and wheel scrolling
 - Terminal-native background and default text colors
 - Automatic refresh when entering Git Changes, plus keyboard and clickable manual refresh
@@ -95,7 +96,9 @@ Inside the TUI:
 | `tab` / `shift-tab` | Switch the left tree scope while retaining focus |
 | `h` / `l` | Focus the tree or content pane |
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
-| `/` / `ctrl-f` / `ctrl-shift-f` | Find files and directories, find in the current Preview, or search workspace text content |
+| `/` / `ctrl-p` | Open the file popup |
+| `ctrl-f` | Find in the current Preview or Diff |
+| `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
 | `n` / `N` | Next or previous changed file in Diff |
 | `ctrl-d` / `ctrl-u` | Page through content |
@@ -107,10 +110,10 @@ Mouse controls:
 
 - Click `Files` or `Git changes` to switch the left tree dataset; entering Git Changes refreshes it first.
 - Click `Refresh` in the header (or press `r`) to re-scan the repository without leaving the current view.
-- Click `Find` or `Text` in the Files heading to open file or workspace text search. Search results preview on one click and reveal in Files on double click.
-- In search, use `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` to include ignored content. `Enter` reveals a result and `Esc` restores the prior view.
-- While searching, `Ctrl+P` switches to file search and `Ctrl+F` switches to text search.
-- In a file Preview, `Ctrl+F` opens an in-preview find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` for workspace text search.
+- Click `Open` or `Text` in the Files heading to open file or workspace text search. Search uses a centered popup whose width is independent of the Files pane; text matches show their path and source line separately.
+- In the popup, type directly, use `↑`/`↓` to preview results, and press `Enter` to open one. `Esc`, the close button, and opening a result hide the popup without clearing its query, results, selection, or scroll position. Reopening File or Text search restores that mode's previous session.
+- Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
+- In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.

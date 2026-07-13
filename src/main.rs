@@ -3,6 +3,10 @@ use std::{io, path::PathBuf};
 use anyhow::Result;
 use clap::Parser;
 use latte_lens::app::App;
+#[cfg(not(windows))]
+use ratatui::crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -22,23 +26,41 @@ fn main() -> Result<()> {
     let mut app = App::new(cli.path)?;
 
     ratatui::run(|terminal| -> io::Result<()> {
-        let _mouse_capture = MouseCaptureGuard::enable()?;
+        let _terminal_input = TerminalInputGuard::enable()?;
         app.run(terminal)
     })?;
     Ok(())
 }
 
-struct MouseCaptureGuard;
+struct TerminalInputGuard {
+    #[cfg(not(windows))]
+    keyboard_enhanced: bool,
+}
 
-impl MouseCaptureGuard {
+impl TerminalInputGuard {
     fn enable() -> io::Result<Self> {
-        execute!(io::stdout(), EnableMouseCapture)?;
-        Ok(Self)
+        let mut stdout = io::stdout();
+        execute!(stdout, EnableMouseCapture)?;
+        #[cfg(not(windows))]
+        let keyboard_enhanced = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+        Ok(Self {
+            #[cfg(not(windows))]
+            keyboard_enhanced,
+        })
     }
 }
 
-impl Drop for MouseCaptureGuard {
+impl Drop for TerminalInputGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let mut stdout = io::stdout();
+        #[cfg(not(windows))]
+        if self.keyboard_enhanced {
+            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        }
+        let _ = execute!(stdout, DisableMouseCapture);
     }
 }

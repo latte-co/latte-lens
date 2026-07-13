@@ -5,16 +5,17 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, ContentMode, ContentVisualRow, FocusPane, GitRowKind, GitTreeRow, SearchFocus,
-        SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
+        App, ContentMode, ContentVisualRow, FocusPane, GitRowKind, GitTreeRow, SearchMode,
+        SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
+    diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
     preview::{HighlightKind, HighlightSpan},
     tree::FileEntry,
@@ -34,8 +35,8 @@ const DEFAULT_MAX_TREE_WIDTH: u16 = 44;
 const ALL_FILES_TAB_LABEL: &str = "  1 Files ";
 const GIT_CHANGES_TAB_LABEL: &str = "  2 Git changes ";
 const REFRESH_LABEL: &str = " r  Refresh ";
-const FILE_SEARCH_LABEL: &str = "/ Find ";
-const TEXT_SEARCH_LABEL: &str = " ^⇧F Text ";
+const FILE_SEARCH_LABEL: &str = "/ Open ";
+const TEXT_SEARCH_LABEL: &str = " ^T Text ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
@@ -50,7 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Min(0),
     ])
     .areas(body);
-    let search_status_height = u16::from(app.search_is_active());
+    let search_status_height = 0;
     let [scope_tabs, tree_header, search_status, tree_rows] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -77,7 +78,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         scope_tabs,
         tree_body,
         tree_header,
-        search_status,
         tree_rows,
         divider,
         content_body: right,
@@ -87,13 +87,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, app, header);
     draw_scope_tabs(frame, app, scope_tabs);
     draw_divider(frame, divider, app.tree_resize_dragging());
-    if app.search_is_active() {
-        draw_search(frame, app, tree_header, search_status, tree_rows);
-    } else {
-        draw_tree(frame, app, tree_header, tree_rows);
-    }
+    draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
+    if app.search_is_active() {
+        dim_underlay(frame);
+        draw_search_popup(frame, app);
+    }
+}
+
+fn dim_underlay(frame: &mut Frame) {
+    let buffer = frame.buffer_mut();
+    let area = *buffer.area();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            buffer[(x, y)].modifier.insert(Modifier::DIM);
+        }
+    }
 }
 
 struct DrawAreas {
@@ -101,7 +111,6 @@ struct DrawAreas {
     scope_tabs: Rect,
     tree_body: Rect,
     tree_header: Rect,
-    search_status: Rect,
     tree_rows: Rect,
     divider: Rect,
     content_body: Rect,
@@ -115,7 +124,6 @@ fn regions(areas: DrawAreas) -> UiRegions {
         scope_tabs,
         tree_body,
         tree_header,
-        search_status,
         tree_rows,
         divider,
         content_body,
@@ -135,35 +143,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
     let refresh_x = header
         .x
         .saturating_add(header.width.saturating_sub(refresh_width));
-    let (file_search_button, text_search_button) = if search_status.height == 0 {
-        inactive_search_buttons(tree_header)
-    } else {
-        (Rect::default(), Rect::default())
-    };
-    let search_close = if search_status.height > 0 {
-        Rect::new(
-            tree_header
-                .x
-                .saturating_add(tree_header.width.saturating_sub(4)),
-            tree_header.y,
-            tree_header.width.min(4),
-            tree_header.height,
-        )
-    } else {
-        Rect::default()
-    };
-    let search_input = if search_status.height > 0 {
-        Rect::new(
-            tree_header.x,
-            tree_header.y,
-            tree_header.width.saturating_sub(search_close.width),
-            tree_header.height,
-        )
-    } else {
-        Rect::default()
-    };
-    let (search_files_mode, search_text_mode, search_options) =
-        active_search_controls(search_status);
+    let (file_search_button, text_search_button) = inactive_search_buttons(tree_header);
     let (
         preview_find_input,
         preview_find_case,
@@ -189,11 +169,14 @@ fn regions(areas: DrawAreas) -> UiRegions {
         refresh_button: Rect::new(refresh_x, header.y, refresh_width, header.height.min(1)),
         file_search_button,
         text_search_button,
-        search_input,
-        search_close,
-        search_files_mode,
-        search_text_mode,
-        search_options,
+        search_popup: Rect::default(),
+        search_input: Rect::default(),
+        search_clear: Rect::default(),
+        search_close: Rect::default(),
+        search_files_mode: Rect::default(),
+        search_text_mode: Rect::default(),
+        search_options: [Rect::default(); 4],
+        search_results: Rect::default(),
         preview_find_input,
         preview_find_case,
         preview_find_position,
@@ -386,55 +369,94 @@ fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_search(frame: &mut Frame, app: &mut App, input: Rect, status: Rect, rows: Rect) {
+fn draw_search_popup(frame: &mut Frame, app: &mut App) {
+    let popup = search_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+    let (mode, has_query) = app
+        .search
+        .as_ref()
+        .map(|search| (search.mode, !search.query.is_empty()))
+        .unwrap_or((SearchMode::Files, false));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(LAVENDER))
+        .title(Span::styled(
+            format!(" {} ", mode.label()),
+            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        ));
+    let block_inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let inner = inset_horizontal(block_inner, 1);
+    let [input_row, status, results, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let clear_width = if has_query { 8.min(input_row.width) } else { 0 };
+    let [input, clear] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(clear_width)]).areas(input_row);
+    let close_width = popup.width.min(8);
+    let close = Rect::new(
+        popup
+            .right()
+            .saturating_sub(close_width.saturating_add(1))
+            .max(popup.x),
+        popup.y,
+        close_width,
+        u16::from(popup.height > 0),
+    );
+    let (files, text, options) = active_search_controls(status);
+
+    app.ui_regions.search_popup = popup;
+    app.ui_regions.search_input = input;
+    app.ui_regions.search_clear = if has_query { clear } else { Rect::default() };
+    app.ui_regions.search_close = close;
+    app.ui_regions.search_files_mode = files;
+    app.ui_regions.search_text_mode = text;
+    app.ui_regions.search_options = if mode == SearchMode::Text {
+        options
+    } else {
+        [Rect::default(); 4]
+    };
+    app.ui_regions.search_results = results;
+
     let Some(search) = app.search.as_ref() else {
         return;
     };
-    let title = if search.mode == SearchMode::Text {
-        "Text · last Refresh"
-    } else {
-        search.mode.label()
-    };
-    let prefix_width = 2 + UnicodeWidthStr::width(title) + 4;
-    let query_width = usize::from(input.width)
-        .saturating_sub(prefix_width + 4)
-        .max(1);
+    let query_width = usize::from(input.width).saturating_sub(3).max(1);
     let (before, after) = search_query_window(&search.query, search.cursor, query_width);
-    let input_focused = search.focus == SearchFocus::Input;
     let mut input_spans = vec![
         Span::styled(
-            if input_focused { "● " } else { "  " },
-            Style::default().fg(if input_focused { LAVENDER } else { SUBTLE }),
-        ),
-        Span::styled(
-            format!("{title}  > "),
+            "> ",
             Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
         ),
         Span::styled(before, Style::default().fg(Color::Reset)),
     ];
-    if input_focused {
-        input_spans.push(Span::styled(
-            "│",
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
-        ));
-    }
+    input_spans.push(Span::styled(
+        "│",
+        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+    ));
     input_spans.push(Span::styled(after, Style::default().fg(Color::Reset)));
     frame.render_widget(Paragraph::new(Line::from(input_spans)), input);
-    let close = Rect::new(
-        input.x.saturating_add(input.width.saturating_sub(4)),
-        input.y,
-        input.width.min(4),
-        input.height,
-    );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            " [x]",
+            " Esc × ",
             Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         )),
         close,
     );
+    if !search.query.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " Clear ×",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )),
+            clear,
+        );
+    }
 
-    let (files, text, options) = active_search_controls(status);
     draw_search_toggle(frame, files, "File ", search.mode == SearchMode::Files);
     draw_search_toggle(frame, text, "Text ", search.mode == SearchMode::Text);
     let mut used_end = text.x.saturating_add(text.width);
@@ -469,7 +491,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, input: Rect, status: Rect, rows
         format!("  {}+ matches · PARTIAL", search.results.len())
     } else if search.mode == SearchMode::Text && !search.query.is_empty() {
         format!(
-            "  Last Refresh · {} matches · {} files",
+            "  last Refresh · {} matches · {} files",
             search.results.len(),
             search.scanned_files
         )
@@ -491,21 +513,68 @@ fn draw_search(frame: &mut Frame, app: &mut App, input: Rect, status: Rect, rows
     );
 
     let selected = app.search_list_state.selected();
-    let focused = search.focus == SearchFocus::Results;
     let items: Vec<ListItem> = search
         .results
         .iter()
         .enumerate()
-        .map(|(index, result)| {
-            ListItem::new(search_result_line(
-                result,
-                selected == Some(index),
-                focused,
-                rows.width,
-            ))
-        })
+        .map(|(index, result)| search_result_item(result, selected == Some(index), results.width))
         .collect();
-    frame.render_stateful_widget(List::new(items), rows, &mut app.search_list_state);
+    if items.is_empty() {
+        let empty = if search.query.is_empty() {
+            if search.mode == SearchMode::Files {
+                "Type a file name or path"
+            } else {
+                "Type text to search the workspace"
+            }
+        } else if search.searching || search.indexing {
+            "Searching…"
+        } else {
+            "No matches"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(empty, Style::default().fg(MUTED))),
+            results,
+        );
+    } else {
+        frame.render_stateful_widget(List::new(items), results, &mut app.search_list_state);
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "↑↓ select · Enter open · Ctrl+U clear · Esc close",
+            Style::default().fg(MUTED),
+        )),
+        help,
+    );
+}
+
+fn search_popup_area(area: Rect) -> Rect {
+    let available_width = area.width.saturating_sub(2);
+    let available_height = area.height.saturating_sub(2);
+    let width = if area.width < 72 {
+        available_width
+    } else {
+        area.width
+            .saturating_mul(4)
+            .saturating_div(5)
+            .max(64)
+            .min(available_width)
+    };
+    let height = if area.height < 16 {
+        available_height
+    } else {
+        area.height
+            .saturating_mul(3)
+            .saturating_div(4)
+            .max(12)
+            .min(available_height)
+    };
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
 }
 
 fn search_query_window(query: &str, cursor: usize, max_width: usize) -> (String, String) {
@@ -548,18 +617,9 @@ fn draw_search_toggle(frame: &mut Frame, area: Rect, label: &str, active: bool) 
     );
 }
 
-fn search_result_line(
-    result: &SearchResult,
-    selected: bool,
-    focused: bool,
-    width: u16,
-) -> Line<'static> {
-    let selection_style = if selected && focused {
+fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> ListItem<'static> {
+    let selection_style = if selected {
         Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default()
-            .fg(Color::Reset)
-            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Reset)
     };
@@ -571,11 +631,7 @@ fn search_result_line(
     let mut spans = vec![
         Span::styled(
             if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected && focused {
-                LAVENDER
-            } else {
-                SUBTLE
-            }),
+            Style::default().fg(if selected { LAVENDER } else { SUBTLE }),
         ),
         Span::styled(
             icon,
@@ -584,49 +640,40 @@ fn search_result_line(
     ];
     let leading_width = spans_width(&spans);
     let available = usize::from(width).saturating_sub(leading_width);
-    let location_width = if result.line.is_some() {
-        available
-            .saturating_mul(3)
-            .saturating_div(5)
-            .max(8)
-            .min(available)
-    } else {
-        available
-    };
-    let location = truncate_to_width(&location, location_width);
+    let location = truncate_to_width(&location, available);
     spans.push(Span::styled(location, selection_style));
+    let location_line = Line::from(spans);
     if let Some(line) = &result.line {
-        let remaining = usize::from(width).saturating_sub(spans_width(&spans) + 2);
-        if remaining > 4 {
-            spans.push(Span::raw("  "));
-            if let Some(range) = result
-                .match_range
-                .as_ref()
-                .filter(|range| range.end <= line.len())
-            {
-                spans.push(Span::styled(
-                    line[..range.start].to_owned(),
-                    Style::default().fg(MUTED),
-                ));
-                spans.push(Span::styled(
-                    line[range.clone()].to_owned(),
-                    Style::default()
-                        .fg(LAVENDER)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ));
-                spans.push(Span::styled(
-                    line[range.end..].to_owned(),
-                    Style::default().fg(MUTED),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    truncate_to_width(line, remaining),
-                    Style::default().fg(MUTED),
-                ));
-            }
+        let mut snippet = vec![Span::raw("    ")];
+        if let Some(range) = result
+            .match_range
+            .as_ref()
+            .filter(|range| range.end <= line.len())
+        {
+            snippet.push(Span::styled(
+                line[..range.start].to_owned(),
+                Style::default().fg(MUTED),
+            ));
+            snippet.push(Span::styled(
+                line[range.clone()].to_owned(),
+                Style::default()
+                    .fg(LAVENDER)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+            snippet.push(Span::styled(
+                line[range.end..].to_owned(),
+                Style::default().fg(MUTED),
+            ));
+        } else {
+            snippet.push(Span::styled(
+                truncate_to_width(line, usize::from(width).saturating_sub(4)),
+                Style::default().fg(MUTED),
+            ));
         }
+        ListItem::new(Text::from(vec![location_line, Line::from(snippet)]))
+    } else {
+        ListItem::new(location_line)
     }
-    Line::from(spans)
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
@@ -978,7 +1025,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             app.content_is_focused(),
         );
     }
-    let line_number_width = app.content_lines.len().max(1).to_string().len();
+    let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
     let lines: Vec<Line> = visual_rows
         .iter()
@@ -993,7 +1040,13 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             highlights.extend(app.preview_find_highlights(visual_row.line_index));
             let selection = visual_row_selection(app, visual_row);
             Some(match app.content_mode {
-                ContentMode::Diff => diff_line(segment, selection),
+                ContentMode::Diff => diff_line(
+                    segment,
+                    app.content_diff_lines.get(visual_row.line_index).copied(),
+                    line_number_width,
+                    visual_row.continuation,
+                    selection,
+                ),
                 ContentMode::Preview if app.content_show_line_numbers => preview_line(
                     (!visual_row.continuation).then_some(visual_row.line_index + 1),
                     line_number_width,
@@ -1102,7 +1155,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         let help = if area.width < 96 {
             "  type query  Enter/↓ next  Shift+Enter/↑ previous  F2 case  Esc close"
         } else {
-            "  type query  Enter/↓ next  Shift+Enter/↑ previous  F2 case  Esc close  Ctrl+Shift+F workspace"
+            "  type query  Enter/↓ next  Shift+Enter/↑ previous  F2 case  Esc close  Ctrl+T workspace"
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1117,22 +1170,17 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if let Some(search) = app.search.as_ref() {
-        let focus = match search.focus {
-            SearchFocus::Input => "Search",
-            SearchFocus::Results => "Results",
-            SearchFocus::Content => "Content",
-        };
         let help = if area.width < 96 {
-            "  type query  ↑↓ results  Enter open  Esc close  Tab focus"
+            "  type query  ↑↓ select  Enter open  Ctrl+U clear  Esc close"
         } else if search.mode == SearchMode::Text {
-            "  type query  ↑↓ results  Enter open  Ctrl+P files  F2 case  F3 word  F4 regex  F5 ignored  Esc close"
+            "  type query  ↑↓ select  Enter open  Ctrl+P files  F2 case  F3 word  F4 regex  F5 ignored  Ctrl+U clear  Esc close"
         } else {
-            "  type path  ↑↓ results  Enter open  Ctrl+Enter preview  Ctrl+Shift+F text search  Esc close"
+            "  type path  ↑↓ select  Enter open  Ctrl+T text search  Ctrl+U clear  Esc close"
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    format!(" {focus} "),
+                    " Search ",
                     Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(help, Style::default().fg(MUTED)),
@@ -1268,21 +1316,59 @@ fn status_color(status: FileStatus) -> Color {
     }
 }
 
-fn diff_line(line: &str, selection: Option<Range<usize>>) -> Line<'static> {
-    let style = if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().fg(MUTED)
-    } else if line.starts_with('+') {
-        Style::default().fg(MINT)
-    } else if line.starts_with('-') {
-        Style::default().fg(ROSE)
-    } else if line.starts_with("@@") {
-        Style::default().fg(LAVENDER)
-    } else if line.starts_with("diff ") || line.starts_with("index ") || line.starts_with('─') {
-        Style::default().fg(PEACH).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Reset)
+fn diff_line(
+    line: &str,
+    annotation: Option<DiffLineAnnotation>,
+    number_width: usize,
+    continuation: bool,
+    selection: Option<Range<usize>>,
+) -> Line<'static> {
+    let kind = annotation.map_or(DiffLineKind::Metadata, |annotation| annotation.kind);
+    let style = match kind {
+        DiffLineKind::Addition => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        DiffLineKind::Deletion => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        DiffLineKind::Hunk => Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        DiffLineKind::NoNewline => Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        DiffLineKind::Context => Style::default().fg(Color::Reset),
+        DiffLineKind::Metadata if line.starts_with("+++") || line.starts_with("---") => {
+            Style::default().fg(MUTED)
+        }
+        DiffLineKind::Metadata
+            if line.starts_with("diff ") || line.starts_with("index ") || line.starts_with('─') =>
+        {
+            Style::default().fg(PEACH).add_modifier(Modifier::BOLD)
+        }
+        DiffLineKind::Metadata => Style::default().fg(Color::Reset),
     };
-    Line::from(content_selection_spans(line, selection, style))
+    let annotation = annotation.filter(|_| !continuation);
+    let old_line = annotation
+        .and_then(|annotation| annotation.old_line)
+        .map(|line| line.to_string())
+        .unwrap_or_default();
+    let new_line = annotation
+        .and_then(|annotation| annotation.new_line)
+        .map(|line| line.to_string())
+        .unwrap_or_default();
+    let gutter_style = match kind {
+        DiffLineKind::Addition => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        DiffLineKind::Deletion => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        DiffLineKind::Hunk => Style::default().fg(LAVENDER),
+        _ => Style::default().fg(MUTED),
+    };
+    let mut spans = vec![Span::styled(
+        format!("{old_line:>number_width$} {new_line:>number_width$} │ "),
+        gutter_style,
+    )];
+    spans.extend(content_selection_spans(line, selection, style));
+    Line::from(spans)
 }
 
 fn preview_line(
@@ -1449,6 +1535,16 @@ fn inset_left(rect: Rect, amount: u16) -> Rect {
     )
 }
 
+fn inset_horizontal(rect: Rect, amount: u16) -> Rect {
+    let amount = amount.min(rect.width / 2);
+    Rect::new(
+        rect.x.saturating_add(amount),
+        rect.y,
+        rect.width.saturating_sub(amount.saturating_mul(2)),
+        rect.height,
+    )
+}
+
 fn inset_top(rect: Rect, amount: u16) -> Rect {
     let amount = amount.min(rect.height);
     Rect::new(
@@ -1503,6 +1599,22 @@ mod tests {
             search_query_window("拿铁.rs", "拿".len(), 8),
             ("拿".to_owned(), "铁.rs".to_owned())
         );
+    }
+
+    #[test]
+    fn search_popup_stays_inside_small_terminals() {
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(4, 2, 1, 1),
+            Rect::new(3, 5, 20, 8),
+            Rect::new(0, 0, 100, 24),
+        ] {
+            let popup = search_popup_area(area);
+            assert!(popup.x >= area.x);
+            assert!(popup.y >= area.y);
+            assert!(popup.right() <= area.right());
+            assert!(popup.bottom() <= area.bottom());
+        }
     }
 
     #[test]

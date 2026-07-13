@@ -275,7 +275,7 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     assert_eq!(app.focused_pane, FocusPane::Content);
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("a-clean.txt"))
+        Some(PathBuf::from("b-changed.txt"))
     );
     assert_eq!(app.content_mode, ContentMode::Preview);
 
@@ -365,7 +365,7 @@ fn scope_tab_arrows_switch_scope_through_the_refresh_path() {
     assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("a-clean.txt"))
+        Some(PathBuf::from("b-changed.txt"))
     );
 }
 
@@ -606,6 +606,174 @@ fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert!(app.tree_state.offset() < app.visible_entries().len());
     assert!(!visible_paths(&app).contains(&PathBuf::from("src/child.txt")));
+}
+
+#[test]
+fn scope_switch_tracks_changed_files_and_preserves_the_git_fallback() {
+    let fixture = TestRepo::new();
+    fixture.write("a-changed.txt", "before a\n");
+    fixture.write("b-clean.txt", "clean\n");
+    fixture.write("c-changed.txt", "before c\n");
+    fixture.commit_all("initial");
+    fixture.write("a-changed.txt", "after a\n");
+    fixture.write("c-changed.txt", "after c\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-changed.txt"))
+    );
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("c-changed.txt"))
+    );
+
+    // A selected changed file follows the scope switch back to Files.
+    app.set_tree_scope(TreeScope::AllFiles);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("c-changed.txt"))
+    );
+
+    // A clean Files selection must leave Git Changes on its prior choice.
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("b-clean.txt"))
+    );
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("c-changed.txt"))
+    );
+
+    // The refreshed status is authoritative. If the Files candidate looked
+    // changed in the old snapshot but is now clean, retain the prior Git row.
+    app.set_tree_scope(TreeScope::AllFiles);
+    app.handle_key(key(KeyCode::Up));
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-changed.txt"))
+    );
+    fixture.write("a-changed.txt", "before a\n");
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("c-changed.txt"))
+    );
+
+    // If that saved Git choice becomes clean too, keep the established
+    // changed-file-first fallback instead of following the clean Files row.
+    app.set_tree_scope(TreeScope::AllFiles);
+    fixture.write("a-changed.txt", "after a\n");
+    fixture.write("c-changed.txt", "before c\n");
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("b-clean.txt"))
+    );
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-changed.txt"))
+    );
+}
+
+#[test]
+fn scope_switch_reveals_a_nested_changed_file_in_both_trees() {
+    let fixture = TestRepo::new();
+    fixture.write("src/changed.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("src/changed.txt", "after\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Files starts with `src` collapsed. Git Changes selects the nested file;
+    // returning to Files must expand the path and select the file itself.
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/changed.txt"))
+    );
+    app.set_tree_scope(TreeScope::AllFiles);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/changed.txt"))
+    );
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/changed.txt")));
+
+    // Preserve a deliberate Git-tree collapse until the Files selection asks
+    // to reveal that changed file again.
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(!visible_paths(&app).contains(&PathBuf::from("src/changed.txt")));
+    app.set_tree_scope(TreeScope::AllFiles);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/changed.txt"))
+    );
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/changed.txt"))
+    );
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/changed.txt")));
+}
+
+#[test]
+fn scope_switch_keeps_same_named_changes_in_nested_repositories_isolated() {
+    let fixture = TestRepo::new();
+    fixture.write("src/shared.txt", "root before\n");
+    fixture.commit_all("root initial");
+    fixture.write("src/shared.txt", "root after\n");
+
+    let nested = fixture.root().join("nested");
+    init_repo(&nested);
+    write_file(&nested, "src/shared.txt", "nested before\n");
+    git(&nested, &["add", "--all"]);
+    git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
+    write_file(&nested, "src/shared.txt", "nested after\n");
+    let nested_root = nested.canonicalize().unwrap();
+
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    let nested_change_index = app
+        .visible_git_rows()
+        .iter()
+        .position(|row| {
+            matches!(
+                &row.kind,
+                GitRowKind::Change(change) if change.path.repo_id.path() == nested_root
+            )
+        })
+        .expect("nested repository change row");
+    app.tree_state.select(Some(nested_change_index));
+
+    app.set_tree_scope(TreeScope::AllFiles);
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("nested/src/shared.txt"))
+    );
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert!(matches!(
+        app.selected_git_row().map(|row| &row.kind),
+        Some(GitRowKind::Change(change)) if change.path.repo_id.path() == nested_root
+    ));
 }
 
 #[test]
@@ -1589,20 +1757,20 @@ fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
             .to_owned()
     };
     let first_row = (app.ui_regions.content_inner.y..app.ui_regions.content_inner.bottom())
-        .find(|&row| row_text(row) == "+abcdefghijklmnopqrstuvwxyz012")
+        .find(|&row| row_text(row) == "  1 │ +abcdefghijklmnopqrstuvw")
         .expect("long added diff line should start inside the content panel");
-    assert_eq!(row_text(first_row + 1), "3456789");
+    assert_eq!(row_text(first_row + 1), "    │ xyz0123456789");
 
-    let text_x = app.ui_regions.content_inner.x;
-    app.handle_mouse(mouse_down(text_x + 25, first_row));
+    let text_x = app.ui_regions.content_inner.x + 6;
+    app.handle_mouse(mouse_down(text_x + 1, first_row + 1));
     app.handle_mouse(mouse(
         MouseEventKind::Drag(MouseButton::Left),
-        text_x + 3,
+        text_x + 9,
         first_row + 1,
     ));
     app.handle_mouse(mouse(
         MouseEventKind::Up(MouseButton::Left),
-        text_x + 3,
+        text_x + 9,
         first_row + 1,
     ));
     assert_eq!(app.selected_content_text().as_deref(), Some("yz0123456"));
@@ -2274,23 +2442,57 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
     assert_eq!(app.content_mode, ContentMode::Diff);
-    let changed_line = app
-        .content_lines
-        .iter()
-        .position(|line| line == "+after")
-        .unwrap();
-    let row = app.ui_regions.content_inner.y + u16::try_from(changed_line).unwrap();
+    assert!(app.content_show_line_numbers);
     let column = app.ui_regions.content_inner.x;
-    app.handle_mouse(mouse_down(column + 1, row));
+    let row_text = |row: u16| -> String {
+        (column..app.ui_regions.content_inner.right())
+            .filter_map(|x| terminal.backend().buffer().cell((x, row)))
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    let deleted_row = (app.ui_regions.content_inner.y..app.ui_regions.content_inner.bottom())
+        .find(|&row| row_text(row).ends_with("-before"))
+        .unwrap();
+    let added_row = (app.ui_regions.content_inner.y..app.ui_regions.content_inner.bottom())
+        .find(|&row| row_text(row).ends_with("+after"))
+        .unwrap();
+    let deleted_number = terminal
+        .backend()
+        .buffer()
+        .cell((column, deleted_row))
+        .unwrap();
+    assert_eq!(deleted_number.symbol(), "1");
+    assert_eq!(deleted_number.fg, Color::LightRed);
+    assert!(deleted_number.modifier.contains(Modifier::BOLD));
+    let added_number = terminal
+        .backend()
+        .buffer()
+        .cell((column + 2, added_row))
+        .unwrap();
+    assert_eq!(added_number.symbol(), "1");
+    assert_eq!(added_number.fg, Color::LightGreen);
+    assert!(added_number.modifier.contains(Modifier::BOLD));
+    let added_marker = terminal
+        .backend()
+        .buffer()
+        .cell((column + 6, added_row))
+        .unwrap();
+    assert_eq!(added_marker.symbol(), "+");
+    assert_eq!(added_marker.fg, Color::LightGreen);
+    assert!(added_marker.modifier.contains(Modifier::BOLD));
+
+    app.handle_mouse(mouse_down(column + 7, added_row));
     app.handle_mouse(mouse(
         MouseEventKind::Drag(MouseButton::Left),
-        column + 5,
-        row,
+        column + 11,
+        added_row,
     ));
     app.handle_mouse(mouse(
         MouseEventKind::Up(MouseButton::Left),
-        column + 5,
-        row,
+        column + 11,
+        added_row,
     ));
 
     assert_eq!(app.selected_content_text().as_deref(), Some("after"));
@@ -2301,7 +2503,11 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
     );
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    let selected = terminal.backend().buffer().cell((column + 1, row)).unwrap();
+    let selected = terminal
+        .backend()
+        .buffer()
+        .cell((column + 7, added_row))
+        .unwrap();
     assert_eq!(selected.symbol(), "a");
     assert!(selected.modifier.contains(Modifier::REVERSED));
 }
@@ -2455,6 +2661,198 @@ fn file_search_filters_previews_and_reveals_collapsed_paths() {
 }
 
 #[test]
+fn search_popup_preserves_each_mode_until_the_user_clears_it() {
+    let fixture = TestRepo::new();
+    fixture.write("src/app.rs", "pub fn needle_app() {}\n");
+    fixture.write("src/app_controller.rs", "pub fn needle_controller() {}\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('/')));
+    for character in "app".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Down));
+    let selected_file = app
+        .selected_search_result()
+        .map(|result| result.path.clone())
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert!(!app.search_is_active());
+
+    app.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(app.search_mode(), Some(SearchMode::Files));
+    assert_eq!(app.search_query(), Some("app"));
+    assert_eq!(
+        app.selected_search_result()
+            .map(|result| result.path.as_path()),
+        Some(selected_file.as_path())
+    );
+
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+    assert_eq!(app.search_query(), Some(""));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 2);
+    app.handle_key(key(KeyCode::Esc));
+
+    app.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(app.search_query(), Some("app"));
+    app.handle_key(key(KeyCode::Esc));
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.search_query(), Some("needle"));
+    assert_eq!(app.search_results().len(), 2);
+
+    app.handle_key(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(app.search_query(), Some(""));
+    assert!(app.search_results().is_empty());
+}
+
+#[test]
+fn search_popup_is_wider_than_the_tree_and_keeps_the_terminal_background() {
+    let fixture = TestRepo::new();
+    fixture.write("src/lib.rs", "pub fn searchable_library() {}\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    app.handle_key(key(KeyCode::Char('/')));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Open File"));
+    assert!(app.ui_regions.search_popup.width > app.ui_regions.tree_body.width);
+    assert!(app.ui_regions.search_results.width > app.ui_regions.tree_inner.width);
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .is_some_and(|cell| cell.modifier.contains(Modifier::DIM))
+    );
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((app.ui_regions.search_popup.x, app.ui_regions.search_popup.y))
+            .is_some_and(|cell| !cell.modifier.contains(Modifier::DIM))
+    );
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg == Color::Reset)
+    );
+}
+
+#[test]
+fn ctrl_t_opens_workspace_search_when_the_terminal_cannot_report_ctrl_shift_f() {
+    let fixture = TestRepo::new();
+    fixture.write("src/lib.rs", "searchable\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+}
+
+#[test]
+fn a_refresh_reuses_the_saved_text_query_but_updates_its_results() {
+    let fixture = TestRepo::new();
+    fixture.write("first.txt", "needle one\n");
+    fixture.write("second.txt", "nothing yet\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    let selected_before_refresh = app
+        .selected_search_result()
+        .map(|result| result.path.clone())
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc));
+
+    fixture.write("second.txt", "needle two\n");
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    settle(&mut app);
+
+    assert_eq!(app.search_query(), Some("needle"));
+    assert_eq!(app.search_results().len(), 2);
+    assert_eq!(
+        app.selected_search_result()
+            .map(|result| result.path.as_path()),
+        Some(selected_before_refresh.as_path())
+    );
+}
+
+#[test]
+fn opening_a_search_result_keeps_changed_files_in_git_and_reveals_clean_files_in_files() {
+    let fixture = TestRepo::new();
+    fixture.write("changed.txt", "before changed-marker\n");
+    fixture.write("clean.txt", "clean-marker\n");
+    fixture.commit_all("initial");
+    fixture.write("changed.txt", "after changed-marker\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    for character in "changed-marker".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("changed.txt"))
+    );
+
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    app.handle_key(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for character in "clean-marker".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("clean.txt"))
+    );
+}
+
+#[test]
 fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
     let fixture = TestRepo::new();
     fixture.write(".gitignore", "ignored/\n");
@@ -2464,7 +2862,10 @@ fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let original_lines = app.content_lines.clone();
 
-    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    app.handle_key(modified_key(
+        KeyCode::Char('F'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     for character in "needle".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
@@ -2559,6 +2960,30 @@ fn preview_find_highlights_navigates_and_hands_off_to_workspace_search() {
 }
 
 #[test]
+fn ctrl_f_finds_in_the_current_diff_instead_of_opening_workspace_search() {
+    let fixture = TestRepo::new();
+    fixture.write("changed.txt", "before needle\n");
+    fixture.commit_all("initial");
+    fixture.write("changed.txt", "after needle\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Diff);
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+
+    assert!(app.preview_find_is_active());
+    assert!(!app.search_is_active());
+    assert!(
+        app.preview_find_position()
+            .is_some_and(|(_, count)| count > 0)
+    );
+}
+
+#[test]
 fn preview_find_mouse_controls_move_and_close_without_backgrounds() {
     let fixture = TestRepo::new();
     fixture.write("file.txt", "match one\nmatch two\n");
@@ -2624,7 +3049,7 @@ fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains("Find"));
+    assert!(rendered.contains("Open"));
     assert!(rendered.contains("Text"));
     let file_button = app.ui_regions.file_search_button;
     assert!(file_button.width > 0);
@@ -2635,6 +3060,9 @@ fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
     let text_mode = app.ui_regions.search_text_mode;
     app.handle_mouse(mouse_down(text_mode.x, text_mode.y));
     assert_eq!(app.search_mode(), Some(SearchMode::Text));
+    for character in "library".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
@@ -2642,6 +3070,11 @@ fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
     assert!(rendered.contains("Word"));
     assert!(rendered.contains(".*"));
     assert!(rendered.contains("Ign"));
+    let clear = app.ui_regions.search_clear;
+    assert!(clear.width > 0);
+    app.handle_mouse(mouse_down(clear.x, clear.y));
+    assert_eq!(app.search_query(), Some(""));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let close = app.ui_regions.search_close;
     app.handle_mouse(mouse_down(close.x, close.y));
     assert!(!app.search_is_active());

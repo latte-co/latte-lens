@@ -9,6 +9,13 @@ Text-search results are a snapshot of the workspace at the last successful
 **Refresh**. Changes made afterward are not included until Refresh is run
 again; the text-search header is labeled `last Refresh`.
 
+File and text search keep separate in-memory popup sessions. Hiding a popup or
+opening one of its results preserves that mode's query, results, selected item,
+and list position for the next open. `Ctrl+U` and the clickable `Clear` control
+explicitly reset the current query. A successful Refresh invalidates saved
+results; reopening a non-empty saved text query reruns it against the new
+snapshot and restores the prior result when that identity still exists.
+
 To collect a reproducible local timing over 2,000 small source files, run:
 
 ```sh

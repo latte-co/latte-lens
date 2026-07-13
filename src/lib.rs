@@ -1,6 +1,7 @@
 pub mod app;
 mod clipboard;
 mod content_safety;
+mod diff;
 pub mod git;
 pub mod preview;
 pub mod repo_graph;
