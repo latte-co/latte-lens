@@ -23,29 +23,63 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: latte-lens-linux
+            target: x86_64-unknown-linux-gnu
+            artifact_name: latte-lens-linux-x86_64
             run_full_quality_gate: true
-          - os: macos-latest
-            artifact_name: latte-lens-macos
+            run_native_e2e: false
+            install_cross_linker: false
+            linker: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: latte-lens-linux-aarch64
             run_full_quality_gate: false
+            run_native_e2e: false
+            install_cross_linker: true
+            linker: aarch64-linux-gnu-gcc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: latte-lens-macos-aarch64
+            run_full_quality_gate: false
+            run_native_e2e: true
+            install_cross_linker: false
+            linker: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: latte-lens-macos-x86_64
+            run_full_quality_gate: false
+            run_native_e2e: false
+            install_cross_linker: false
+            linker: ""
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install the Linux ARM64 cross-linker
+        if: matrix.install_cross_linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
       - name: Run the quality gate
         if: matrix.run_full_quality_gate
         run: make ci
       - name: Run the macOS TUI end-to-end check
-        if: ${{ !matrix.run_full_quality_gate }}
+        if: matrix.run_native_e2e
         run: make e2e
       - name: Build and verify the native package
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
         run: make package-smoke
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact_name }}-${{ runner.arch }}
+          name: ${{ matrix.artifact_name }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
@@ -67,6 +101,8 @@ jobs:
         run: ./scripts/build-release.ps1
       - name: Verify the Windows package
         run: python scripts/verify-release-package.py "dist/*.zip" --binary latte-lens.exe
+      - name: Test the PowerShell installer with the Windows package
+        run: python -m unittest scripts/test_install_windows.py
       - uses: actions/upload-artifact@v7
         with:
           name: latte-lens-windows-${{ runner.arch }}
@@ -106,8 +142,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cp install.sh install.ps1 dist/
           cd dist
-          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+          find . -maxdepth 1 -type f \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name 'install.sh' -o -name 'install.ps1' \) -print0 \
             | LC_ALL=C sort -z \
             | xargs -0 sha256sum > SHA256SUMS.txt
       - name: Generate release notes and contributors

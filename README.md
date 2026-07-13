@@ -21,7 +21,60 @@ keyboard-driven TUI.
 - Automatic refresh when entering Git Changes, plus keyboard and clickable manual refresh
 - Graceful directory-tree mode outside Git repositories
 
+## Install
+
+| Platform | Architectures | Installer |
+| --- | --- | --- |
+| Linux | x64, ARM64 | POSIX shell |
+| macOS | x64, Apple Silicon | POSIX shell |
+| Windows | x64 | PowerShell |
+
+### Linux and macOS
+
+Install the latest GitHub release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh | sh
+latte-lens /path/to/repository
+```
+
+The installer detects the operating system and architecture, downloads the
+matching release archive, verifies its SHA-256 checksum, and installs the
+binary to `~/.local/bin`. Until the first stable release exists, it falls back
+to the newest preview and prints a warning.
+
+Pin a release or change the destination when needed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh \
+  | LATTE_LENS_VERSION=v0.1.0-beta.2 LATTE_LENS_INSTALL_DIR=/custom/bin sh
+```
+
+### Windows
+
+Run this from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/latte-co/latte-lens/main/install.ps1 | iex
+latte-lens C:\path\to\repository
+```
+
+The PowerShell installer downloads and verifies the Windows x64 package,
+installs it to `%LOCALAPPDATA%\Programs\latte-lens\bin`, and adds that directory
+to the current user's `PATH`. Open a new terminal if `latte-lens` is not yet
+available in the current session.
+
+Pin a release or change the destination before running the installer:
+
+```powershell
+$env:LATTE_LENS_VERSION = "v0.1.0-beta.2"
+$env:LATTE_LENS_INSTALL_DIR = "C:\Tools\latte-lens"
+irm https://raw.githubusercontent.com/latte-co/latte-lens/main/install.ps1 | iex
+```
+
 ## Run it
+
+Build and run directly from a checkout:
 
 ```bash
 cargo run -- /path/to/repository
