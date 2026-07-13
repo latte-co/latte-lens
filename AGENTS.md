@@ -6,7 +6,7 @@ Latte Lens is a read-only terminal repository viewer. It may inspect files and
 invoke read-only Git commands, but it must not stage, reset, discard, or rewrite
 the user's worktree.
 
-- Package: `latte-lens` `0.1.0-beta.4` (`Cargo.toml` is the version source of truth).
+- Package: `latte-lens` `0.1.0-beta.5` (`Cargo.toml` is the version source of truth).
 - Language: Rust 2024 edition on stable Rust, with MSRV 1.88.
 - Terminal stack: Ratatui 0.30 over Crossterm, with Clap 4.5 for the CLI.
 - Content stack: system Git for repository state, `ignore` and `regex` for search,

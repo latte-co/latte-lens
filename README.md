@@ -62,7 +62,7 @@ available in the current session.
 Pin a release or change the destination before running the installer:
 
 ```powershell
-$env:LATTE_LENS_VERSION = "v0.1.0-beta.4"
+$env:LATTE_LENS_VERSION = "v0.1.0-beta.5"
 $env:LATTE_LENS_INSTALL_DIR = "C:\Tools\latte-lens"
 irm https://raw.githubusercontent.com/latte-co/latte-lens/main/install.ps1 | iex
 ```
