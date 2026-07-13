@@ -65,6 +65,23 @@ function Receive-File {
     } -UseBasicParsing
 }
 
+function Get-Sha256 {
+    param([string]$FilePath)
+
+    $stream = [IO.File]::OpenRead($FilePath)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = $algorithm.ComputeHash($stream)
+            return ([BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Resolve-Release {
     if (-not [string]::IsNullOrWhiteSpace($Version)) {
         $requestedTag = if ($Version.StartsWith("v", [StringComparison]::Ordinal)) {
@@ -187,7 +204,7 @@ function Install-LatteLens {
         if ($expected -notmatch '^[0-9a-f]{64}$') {
             throw "invalid checksum file for $archiveName"
         }
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+        $actual = Get-Sha256 $archive
         if ($actual -ne $expected) {
             throw "checksum verification failed for $archiveName"
         }
