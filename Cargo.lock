@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "latte-lens"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "anyhow",
  "base64",
