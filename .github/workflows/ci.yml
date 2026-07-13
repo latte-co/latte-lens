@@ -72,6 +72,8 @@ jobs:
         run: ./scripts/build-release.ps1
       - name: Verify the Windows package
         run: python scripts/verify-release-package.py "dist/*.zip" --binary latte-lens.exe
+      - name: Test the PowerShell installer with the Windows package
+        run: python -m unittest scripts/test_install_windows.py
       - uses: actions/upload-artifact@v7
         with:
           name: latte-lens-Windows-${{ runner.arch }}
