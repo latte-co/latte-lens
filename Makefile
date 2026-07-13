@@ -7,7 +7,7 @@ BINARY := latte-lens
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup fmt fmt-check check lint test e2e coverage coverage-html bench ci build release package package-smoke install clean
+.PHONY: help setup fmt fmt-check check lint test script-test e2e coverage coverage-html bench ci build release package package-smoke install clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Latte Lens engineering commands:\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -31,6 +31,9 @@ lint: ## Run Clippy with warnings denied
 test: ## Run unit and integration tests
 	$(CARGO) test --all-targets --locked
 
+script-test: ## Run release automation tests
+	$(PYTHON) -m unittest scripts/test_generate_release_notes.py scripts/test_verify_release_package.py
+
 e2e: ## Build and exercise the real TUI through a pseudo-terminal
 	$(CARGO) build --locked
 	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY)
@@ -47,7 +50,7 @@ coverage-html: ## Generate an HTML coverage report
 bench: ## Run performance benchmarks
 	$(CARGO) bench --locked
 
-ci: fmt-check check lint test e2e ## Run the same quality gate used by CI
+ci: fmt-check check lint test script-test e2e ## Run the same quality gate used by CI
 
 build: ## Build a debug binary
 	$(CARGO) build --locked

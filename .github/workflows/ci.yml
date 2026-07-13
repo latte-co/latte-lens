@@ -23,9 +23,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: make fmt-check check lint test
-      - name: Test release package verification
-        run: python3 -m unittest scripts/test_verify_release_package.py
+      - run: make fmt-check check lint test script-test
 
   msrv:
     runs-on: ubuntu-latest

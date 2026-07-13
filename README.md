@@ -221,8 +221,9 @@ packages on Linux, macOS, and Windows.
 Pushing a version tag creates a GitHub Release automatically. The release
 workflow runs the Linux quality gate, verifies the native Linux, macOS, and
 Windows packages, uploads every package and its SHA-256 sidecar, then generates
-GitHub's release notes from merged pull requests. It also adds a
-`SHA256SUMS.txt` manifest covering every downloadable archive.
+text release notes from the commits since the previous published release and
+lists the contributors to those commits. It also adds a `SHA256SUMS.txt`
+manifest covering every downloadable archive.
 
 The tag must exactly match the version in `Cargo.toml`, with a `v` prefix:
 

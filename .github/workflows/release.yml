@@ -81,6 +81,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Verify the tag matches the package version
         id: version
         shell: bash
@@ -108,6 +110,29 @@ jobs:
           find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
             | LC_ALL=C sort -z \
             | xargs -0 sha256sum > SHA256SUMS.txt
+      - name: Generate release notes and contributors
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag=""
+          release_tags=$(mktemp)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[].tag_name' > "$release_tags"
+
+          while IFS= read -r candidate; do
+            [[ "$candidate" == "$TAG" ]] && continue
+            if git rev-parse --verify "${candidate}^{commit}" >/dev/null 2>&1 \
+              && git merge-base --is-ancestor "${candidate}^{commit}" "${TAG}^{commit}"; then
+              previous_tag=$candidate
+              break
+            fi
+          done < "$release_tags"
+
+          scripts/generate-release-notes.sh "$TAG" RELEASE_NOTES.md "$previous_tag"
+          cat RELEASE_NOTES.md
       - name: Create GitHub Release and upload packages
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,12 +144,12 @@ jobs:
           if [[ "$VERSION" == *-* ]]; then
             gh release create "$TAG" dist/* \
               --verify-tag \
-              --generate-notes \
+              --notes-file RELEASE_NOTES.md \
               --prerelease \
               --title "Latte Lens $VERSION"
           else
             gh release create "$TAG" dist/* \
               --verify-tag \
-              --generate-notes \
+              --notes-file RELEASE_NOTES.md \
               --title "Latte Lens $VERSION"
           fi
