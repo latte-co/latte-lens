@@ -35,20 +35,12 @@ Install the latest GitHub release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh | sh
-latte-lens /path/to/repository
 ```
 
 The installer detects the operating system and architecture, downloads the
 matching release archive, verifies its SHA-256 checksum, and installs the
 binary to `~/.local/bin`. Until the first stable release exists, it falls back
 to the newest preview and prints a warning.
-
-Pin a release or change the destination when needed:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh \
-  | LATTE_LENS_VERSION=v0.1.0-beta.2 LATTE_LENS_INSTALL_DIR=/custom/bin sh
-```
 
 ### Windows
 
