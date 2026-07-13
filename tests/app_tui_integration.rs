@@ -54,6 +54,41 @@ fn startup_renders_before_the_initial_tree_snapshot_is_ready() {
 }
 
 #[test]
+fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("arbitrary-workspace");
+    fs::create_dir_all(workspace.join("one/two/child")).unwrap();
+    fs::write(workspace.join("one/two/deep.txt"), "deep\n").unwrap();
+    fs::write(workspace.join("one/two/child/nested.txt"), "nested\n").unwrap();
+
+    let mut app = ready_app(workspace).unwrap();
+    let initial_paths: Vec<_> = app
+        .all_entries
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    assert!(initial_paths.contains(&PathBuf::from("one/two")));
+    assert!(!initial_paths.contains(&PathBuf::from("one/two/deep.txt")));
+    assert_eq!(visible_paths(&app), [PathBuf::from("one")]);
+
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(app.is_directory_loading());
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line.contains("Loading"))
+    );
+    settle(&mut app);
+    assert!(!app.is_directory_loading());
+    assert!(visible_paths(&app).contains(&PathBuf::from("one/two/deep.txt")));
+    assert!(visible_paths(&app).contains(&PathBuf::from("one/two/child")));
+    assert!(!visible_paths(&app).contains(&PathBuf::from("one/two/child/nested.txt")));
+}
+
+#[test]
 fn app_starts_from_nested_path_and_renders_both_panes() {
     let fixture = TestRepo::new();
     fixture.write("src/lib.rs", "pub fn original() {}\n");
@@ -351,7 +386,14 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
         .map(|entry| entry.relative.clone())
         .collect();
     assert!(raw_all_paths.contains(&PathBuf::from("docs/clean.md")));
-    assert!(raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
+    assert!(raw_all_paths.contains(&PathBuf::from("src/nested")));
+    assert!(!raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
+    assert!(
+        app.all_entries
+            .iter()
+            .find(|entry| entry.relative == Path::new("src/nested"))
+            .is_some_and(|entry| entry.contains_changes)
+    );
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("docs"), PathBuf::from("src")]
@@ -386,7 +428,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
 #[test]
 fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
     let fixture = TestRepo::new();
-    fixture.write("src/nested/file.txt", "fixture\n");
+    fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
@@ -404,7 +446,7 @@ fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
         visible_paths(&app),
         [
             PathBuf::from("src"),
-            PathBuf::from("src/nested"),
+            PathBuf::from("src/file.txt"),
             PathBuf::from("top.txt"),
         ]
     );
@@ -426,11 +468,9 @@ fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
 
     app.handle_key(key(KeyCode::Enter));
     app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Enter));
-    app.handle_key(key(KeyCode::Down));
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("src/nested/file.txt"))
+        Some(PathBuf::from("src/file.txt"))
     );
     let rows_before_file_enter = visible_paths(&app);
 
@@ -439,14 +479,14 @@ fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
     assert_eq!(visible_paths(&app), rows_before_file_enter);
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("src/nested/file.txt"))
+        Some(PathBuf::from("src/file.txt"))
     );
 }
 
 #[test]
 fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
     let fixture = TestRepo::new();
-    fixture.write("src/nested/file.txt", "fixture\n");
+    fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
@@ -471,7 +511,7 @@ fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
         visible_paths(&app),
         [
             PathBuf::from("src"),
-            PathBuf::from("src/nested"),
+            PathBuf::from("src/file.txt"),
             PathBuf::from("top.txt"),
         ]
     );
@@ -485,14 +525,13 @@ fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
     );
 
     app.handle_mouse(mouse_down(tree_x, tree_y));
-    app.handle_mouse(mouse_down(tree_x, tree_y + 1));
     let rows_before_file_click = visible_paths(&app);
-    app.handle_mouse(mouse_down(tree_x, tree_y + 2));
+    app.handle_mouse(mouse_down(tree_x, tree_y + 1));
 
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("src/nested/file.txt"))
+        Some(PathBuf::from("src/file.txt"))
     );
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert_eq!(visible_paths(&app), rows_before_file_click);
@@ -1444,7 +1483,7 @@ fn refresh_and_content_loading_are_visible_without_blocking_navigation() {
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("Working"));
     assert!(rendered.contains("LOADING"));
-    assert!(rendered.contains("Refreshing repository"));
+    assert!(rendered.contains("Refreshing workspace"));
     assert!(
         terminal
             .backend()
@@ -2382,7 +2421,7 @@ fn diff_mode_cycles_between_changed_files() {
 fn file_search_filters_previews_and_reveals_collapsed_paths() {
     let fixture = TestRepo::new();
     fixture.write("docs/readme.md", "documentation\n");
-    fixture.write("src/nested/app_controller.rs", "pub fn controller() {}\n");
+    fixture.write("src/app_controller.rs", "pub fn controller() {}\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::Char('/')));
@@ -2396,7 +2435,7 @@ fn file_search_filters_previews_and_reveals_collapsed_paths() {
     assert_eq!(
         app.selected_search_result()
             .map(|result| result.path.as_path()),
-        Some(Path::new("src/nested/app_controller.rs"))
+        Some(Path::new("src/app_controller.rs"))
     );
     assert!(
         app.content_lines
@@ -2410,9 +2449,9 @@ fn file_search_filters_previews_and_reveals_collapsed_paths() {
     assert_eq!(app.tree_scope, TreeScope::AllFiles);
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("src/nested/app_controller.rs"))
+        Some(PathBuf::from("src/app_controller.rs"))
     );
-    assert!(visible_paths(&app).contains(&PathBuf::from("src/nested/app_controller.rs")));
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/app_controller.rs")));
 }
 
 #[test]

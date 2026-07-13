@@ -6,9 +6,11 @@ Latte Lens is a repository viewer designed for multi-agent terminals. It keeps
 the working tree, source preview, and Git diff visible in one fast,
 keyboard-driven TUI.
 
+![Latte Lens showing a bounded workspace tree and README preview](docs/assets/latte-lens-workspace-preview.png)
+
 ## Current prototype
 
-- Collapsible repository tree that respects Git ignore rules
+- Collapsible, bounded workspace tree with lazy directory loading
 - Staged, unstaged, deleted, renamed, and untracked file status
 - Colorized staged and working-tree diffs
 - Numbered, syntax-highlighted previews for recognized source files, with plain-text fallback
@@ -115,9 +117,10 @@ Mouse controls:
 
 All Files remains bounded by the selected workspace, includes dotfiles and
 ignored paths, excludes only Git's internal `.git` metadata, and begins with
-directories collapsed. Its bounded scan visits shallow directories first, so a
-large generated subtree cannot hide later workspace roots when deeper results
-become partial. Git Changes discovers repositories below that boundary,
+directories collapsed. Every workspace starts with only the first two path
+components loaded. Directories at that boundary are enumerated asynchronously,
+one level at a time, when expanded, so a drive root and an ordinary directory
+with a very large subtree follow the same bounded startup path. Git Changes discovers repositories below that boundary,
 groups each visible repository under a selectable header, and shows only its
 changed files and required directories. Repository and Git-change directories default
 expanded; clean irrelevant leaves are hidden, while relationship, submodule,
@@ -133,7 +136,8 @@ styles without painting a background or enclosing each pane in a box.
 Latte Lens does not paint its own canvas background, so it follows the host
 terminal theme—including embedded terminals such as herdr.
 
-Filesystem traversal is capped at 50,000 entries to keep refreshes bounded.
+Each filesystem traversal is capped at 50,000 entries to keep refreshes and
+on-demand directory loads bounded.
 When that cap omits additional paths, both tree scopes show an entry count with
 `+` and `PARTIAL`; empty partial results are described as partial rather than
 as a complete or clean repository view.
@@ -147,9 +151,13 @@ as a complete or clean repository view.
 - **ignore** for fast bounded filesystem walking with filters disabled in All Files
 - **regex** for bounded, cancellable workspace text search
 
-Repository discovery, Git status, tree scans, diffs, and previews run on a
-dedicated background worker. Text searches use a separate cancellable worker
-so a large query cannot block refresh or preview. The event loop only applies
+Repository discovery, Git status, tree scans, lazy directory loads, diffs, and
+previews run on a dedicated background worker. Startup repository discovery
+uses the same two-level boundary; opening Git Changes explicitly requests the
+full bounded repository graph. Text searches use a separate cancellable worker,
+and build their full candidate inventory only after the first text query, so a
+large query cannot block refresh or preview or turn startup into a second eager
+walk. The event loop only applies
 the latest requested generation, so stale refreshes, selections, or searches
 cannot replace newer state. Diff and Git-change preview requests carry their
 owning repository identity, including rename/copy source paths.

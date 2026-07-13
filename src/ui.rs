@@ -685,6 +685,8 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         } else {
             format!("{entry_count}+ · PARTIAL")
         }
+    } else if app.scope_has_unloaded_directories() {
+        format!("{entry_count} loaded")
     } else if app.tree_scope == TreeScope::GitChanges {
         let change_count = format_change_count(entry_count);
         format!(
@@ -829,7 +831,9 @@ fn tree_line(
 ) -> Line<'static> {
     let indent = "  ".repeat(entry.depth);
     let icon = if entry.is_dir {
-        if app.directory_is_expanded(entry) {
+        if app.directory_is_loading(entry) {
+            "… "
+        } else if app.directory_is_expanded(entry) {
             "▾ "
         } else {
             "▸ "
@@ -1172,18 +1176,23 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("  ", Style::default()),
             Span::styled(error.to_owned(), Style::default().fg(ROSE)),
         ])
-    } else if app.is_refreshing() || app.is_content_loading() {
+    } else if app.is_refreshing() || app.is_directory_loading() || app.is_content_loading() {
         let status = match (
             app.is_initial_loading(),
             app.is_refreshing(),
+            app.is_directory_loading(),
             app.is_content_loading(),
         ) {
-            (true, _, true) => "Scanning files and repositories · Loading content",
-            (true, _, false) => "Scanning files and repositories",
-            (false, true, true) => "Refreshing repository graph · Loading content",
-            (false, true, false) => "Refreshing repository graph",
-            (false, false, true) => "Loading content",
-            (false, false, false) => unreachable!(),
+            (true, _, _, true) => "Scanning initial directories · Loading content",
+            (true, _, _, false) => "Scanning initial directories",
+            (false, true, true, true) => "Refreshing workspace · Loading directory and content",
+            (false, true, true, false) => "Refreshing workspace · Loading directory",
+            (false, true, false, true) => "Refreshing workspace · Loading content",
+            (false, true, false, false) => "Refreshing workspace",
+            (false, false, true, true) => "Loading directory and content",
+            (false, false, true, false) => "Loading directory",
+            (false, false, false, true) => "Loading content",
+            (false, false, false, false) => unreachable!(),
         };
         Line::from(vec![
             Span::styled(

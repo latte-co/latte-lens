@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::Path};
 
 use latte_lens::{
     git::FileStatus,
-    tree::{FileEntry, changed_only, scan, scan_with_limit},
+    tree::{FileEntry, changed_only, scan, scan_directory, scan_with_depth, scan_with_limit},
 };
 use support::TestRepo;
 
@@ -93,6 +93,60 @@ fn limited_scan_reports_partial_results_and_keeps_status_paths_visible() {
     assert_eq!(scan.entries[0].relative, Path::new("changed.txt"));
     assert!(scan.entries[0].exists);
     assert!(scan.entries[0].status.is_some());
+}
+
+#[test]
+fn shallow_scan_stops_at_the_configured_depth_and_loads_boundaries_on_demand() {
+    let fixture = TestRepo::new();
+    fixture.write("one/two/deep.txt", "deep\n");
+    fixture.write("one/two/child/nested.txt", "nested\n");
+    let statuses = HashMap::from([(
+        Path::new("one/two/deep.txt").to_path_buf(),
+        FileStatus {
+            index: '?',
+            worktree: '?',
+        },
+    )]);
+
+    let initial = scan_with_depth(fixture.root(), &statuses, 50_000, 2).unwrap();
+    let initial_paths: Vec<_> = initial
+        .entries
+        .iter()
+        .map(|entry| entry.relative.as_path())
+        .collect();
+
+    assert!(initial_paths.contains(&Path::new("one")));
+    assert!(initial_paths.contains(&Path::new("one/two")));
+    assert!(!initial_paths.contains(&Path::new("one/two/deep.txt")));
+    assert!(entry(&initial.entries, "one/two").contains_changes);
+    assert_eq!(
+        initial.unloaded_directories,
+        [Path::new("one/two").to_path_buf()].into_iter().collect()
+    );
+    assert!(!initial.truncated);
+
+    let loaded = scan_directory(
+        fixture.root(),
+        Path::new("one/two"),
+        &HashMap::new(),
+        50_000,
+    )
+    .unwrap();
+    let loaded_paths: Vec<_> = loaded
+        .entries
+        .iter()
+        .map(|entry| entry.relative.as_path())
+        .collect();
+    assert_eq!(
+        loaded_paths,
+        [Path::new("one/two/child"), Path::new("one/two/deep.txt")]
+    );
+    assert_eq!(
+        loaded.unloaded_directories,
+        [Path::new("one/two/child").to_path_buf()]
+            .into_iter()
+            .collect()
+    );
 }
 
 #[test]

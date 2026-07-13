@@ -29,8 +29,9 @@ use crate::{
         RepoRelationState, RepoSnapshot,
     },
     runtime::{
-        ContentCompletion, ContentKind, ContentRequest, ContentTarget, RefreshCompletion,
-        RefreshRequest, RefreshSnapshot, RequestGeneration, WorkerRuntime,
+        ContentCompletion, ContentKind, ContentRequest, ContentTarget, DirectoryCompletion,
+        DirectoryRequest, RefreshCompletion, RefreshRequest, RefreshSnapshot, RequestGeneration,
+        WorkerRuntime,
     },
     search::{SearchEvent, SearchMatch, SearchOptions, SearchRequest, SearchRuntime},
     tree::{self, FileEntry},
@@ -361,6 +362,9 @@ pub struct App {
     all_files_selection: Option<PathBuf>,
     git_changes_selection: Option<GitRowIdentity>,
     all_files_expansion: HashMap<PathBuf, bool>,
+    unloaded_directories: HashSet<PathBuf>,
+    loading_directories: HashSet<PathBuf>,
+    tree_epoch: u64,
     git_changes_expansion: HashMap<GitRowIdentity, bool>,
     // This is the single selectable/renderable tree dataset. The raw vectors
     // above remain canonical scan results for their respective scopes.
@@ -458,6 +462,9 @@ impl App {
             all_files_selection: None,
             git_changes_selection: None,
             all_files_expansion: HashMap::new(),
+            unloaded_directories: HashSet::new(),
+            loading_directories: HashSet::new(),
+            tree_epoch: 0,
             git_changes_expansion: HashMap::new(),
             visible_rows: Vec::new(),
             visible_changed_entries: Vec::new(),
@@ -480,7 +487,7 @@ impl App {
             quit_confirmation: None,
             should_quit: false,
         };
-        app.request_refresh();
+        app.request_refresh(false);
         Ok(app)
     }
 
@@ -563,6 +570,10 @@ impl App {
         }
     }
 
+    pub fn scope_has_unloaded_directories(&self) -> bool {
+        self.tree_scope == TreeScope::AllFiles && !self.unloaded_directories.is_empty()
+    }
+
     pub fn selected_entry(&self) -> Option<&FileEntry> {
         let index = self.tree_state.selected()?;
         match self.tree_scope {
@@ -593,6 +604,10 @@ impl App {
                 .map(|row| self.git_row_is_expanded(row))
                 .unwrap_or(true),
         }
+    }
+
+    pub(crate) fn directory_is_loading(&self, entry: &FileEntry) -> bool {
+        entry.is_dir && self.loading_directories.contains(&entry.relative)
     }
 
     pub fn selected_relative_path(&self) -> Option<PathBuf> {
@@ -816,7 +831,9 @@ impl App {
             }
             (KeyCode::Char('h'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             (KeyCode::Char('l'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
-            (KeyCode::Char('r'), _) => self.request_refresh(),
+            (KeyCode::Char('r'), _) => {
+                self.request_refresh(self.tree_scope == TreeScope::GitChanges);
+            }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
             (KeyCode::Char('d'), KeyModifiers::NONE) => self.load_selected_diff(),
             (KeyCode::Char('n'), KeyModifiers::NONE) if self.content_mode == ContentMode::Diff => {
@@ -1671,7 +1688,7 @@ impl App {
                 if self.ui_regions.refresh_at(mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
-                    self.request_refresh();
+                    self.request_refresh(self.tree_scope == TreeScope::GitChanges);
                     return;
                 }
                 if contains(self.ui_regions.divider, mouse.column, mouse.row) {
@@ -2051,7 +2068,7 @@ impl App {
             && self.tree_scope != TreeScope::GitChanges
             && self.git_changes_selection.is_none();
         if scope == TreeScope::GitChanges {
-            self.request_refresh();
+            self.request_refresh(true);
         }
 
         self.apply_tree_scope(scope);
@@ -2098,6 +2115,10 @@ impl App {
 
     pub const fn is_content_loading(&self) -> bool {
         self.content_requests.is_loading()
+    }
+
+    pub fn is_directory_loading(&self) -> bool {
+        !self.loading_directories.is_empty()
     }
 
     pub fn is_searching(&self) -> bool {
@@ -2265,8 +2286,24 @@ impl App {
             .copied()
             .unwrap_or(false);
         self.all_files_expansion.insert(relative.clone(), !expanded);
+        if !expanded {
+            self.request_directory_load(relative.clone());
+        }
         self.rebuild_visible_rows();
         self.restore_visible_selection(Some(relative));
+    }
+
+    fn request_directory_load(&mut self, relative: PathBuf) {
+        if !self.unloaded_directories.contains(&relative)
+            || !self.loading_directories.insert(relative.clone())
+        {
+            return;
+        }
+        self.runtime.request_directory(DirectoryRequest {
+            tree_epoch: self.tree_epoch,
+            relative,
+            scan_entry_limit: self.scan_entry_limit,
+        });
     }
 
     fn select_changed(&mut self, delta: isize) {
@@ -2310,13 +2347,19 @@ impl App {
         }
     }
 
-    fn request_refresh(&mut self) {
+    fn request_refresh(&mut self, full_repository_discovery: bool) {
         self.remember_current_selection();
         let generation = self.refresh_requests.begin();
         self.last_refresh_error = None;
         self.runtime.request_refresh(RefreshRequest {
             generation,
             scan_entry_limit: self.scan_entry_limit,
+            scan_depth: tree::DEFAULT_INITIAL_SCAN_DEPTH,
+            repo_scan_depth: if full_repository_discovery {
+                crate::repo_graph::DEFAULT_MAX_DISCOVERY_DEPTH
+            } else {
+                tree::DEFAULT_INITIAL_SCAN_DEPTH.saturating_sub(1)
+            },
         });
     }
 
@@ -2328,9 +2371,12 @@ impl App {
             self.quit_confirmation = None;
         }
         self.dispatch_search_if_due();
-        let (refresh, content) = self.runtime.take_completions();
+        let (refresh, directories, content) = self.runtime.take_completions();
         if let Some(completion) = refresh {
             self.apply_refresh_completion(completion);
+        }
+        for completion in directories {
+            self.apply_directory_completion(completion);
         }
         if let Some(completion) = content {
             self.apply_content_completion(completion);
@@ -2343,8 +2389,12 @@ impl App {
     /// and deterministic tests that do not own an event loop.
     #[doc(hidden)]
     pub fn wait_for_background(&mut self) {
-        while self.is_refreshing() || self.is_content_loading() || self.is_searching() {
-            if self.is_refreshing() || self.is_content_loading() {
+        while self.is_refreshing()
+            || self.is_directory_loading()
+            || self.is_content_loading()
+            || self.is_searching()
+        {
+            if self.is_refreshing() || self.is_directory_loading() || self.is_content_loading() {
                 if !self.runtime.wait_for_completion() {
                     self.last_error =
                         Some("background worker stopped before completing work".to_owned());
@@ -2374,24 +2424,34 @@ impl App {
     }
 
     fn apply_refresh_snapshot(&mut self, snapshot: RefreshSnapshot) {
-        // The search worker already warms its first inventory at startup.
-        // Reindex only after later, user-requested refreshes so the initial
-        // tree scan does not trigger a duplicate full-workspace traversal.
+        // Search indexing is lazy. A later refresh only invalidates an
+        // existing inventory; rebuilding waits until the next text query.
         if self.has_refresh_snapshot {
             self.search_runtime.refresh_inventory();
         }
         self.remember_current_selection();
-        let changed_entries = tree::changed_only(&snapshot.scan.entries);
+        let tree::ScanResult {
+            entries,
+            truncated,
+            unloaded_directories,
+        } = snapshot.scan;
+        let changed_entries = tree::changed_only(&entries);
         self.has_refresh_snapshot = true;
+        self.tree_epoch = self
+            .tree_epoch
+            .checked_add(1)
+            .expect("tree snapshot epoch exhausted");
+        self.loading_directories.clear();
 
         self.branch = snapshot.branch;
-        self.all_files_truncated = snapshot.scan.truncated;
+        self.all_files_truncated = truncated;
         // Git status paths are synthesized into the filtered tree, but that
         // tree still comes from the bounded filesystem traversal. Keep the
         // conservative partial marker in both views instead of claiming the
         // filesystem-derived Git projection is complete.
-        self.git_changes_truncated = snapshot.scan.truncated;
-        self.all_entries = snapshot.scan.entries;
+        self.git_changes_truncated = truncated;
+        self.all_entries = entries;
+        self.unloaded_directories = unloaded_directories;
         self.changed_entries = changed_entries;
         if let Some(graph) = snapshot.graph {
             self.repo = graph
@@ -2427,10 +2487,30 @@ impl App {
             debug_assert_eq!(self.changed_count, snapshot.projected_change_count);
             self.repo_graph = Some(graph);
         } else {
+            self.repo = None;
             self.changed_count = 0;
+            self.total_repository_count = 0;
+            self.dirty_repository_count = 0;
+            self.repository_error_count = 0;
+            self.repository_graph_truncated = false;
             self.git_rows.clear();
+            self.repo_graph = None;
         }
         self.reconcile_expansion_state();
+        let expanded_boundaries: Vec<PathBuf> = self
+            .unloaded_directories
+            .iter()
+            .filter(|path| {
+                self.all_files_expansion
+                    .get(*path)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for directory in expanded_boundaries {
+            self.request_directory_load(directory);
+        }
         self.tree_state = ListState::default();
         self.rebuild_visible_rows();
 
@@ -2448,6 +2528,51 @@ impl App {
         if self.search.is_some() {
             self.rebuild_search_results();
         }
+    }
+
+    fn apply_directory_completion(&mut self, completion: DirectoryCompletion) {
+        if completion.tree_epoch != self.tree_epoch {
+            return;
+        }
+        self.loading_directories.remove(&completion.relative);
+        let scan = match completion.result {
+            Ok(scan) => scan,
+            Err(error) => {
+                self.last_error = Some(format!(
+                    "directory scan failed at {}: {error}",
+                    completion.relative.display()
+                ));
+                return;
+            }
+        };
+
+        self.unloaded_directories.remove(&completion.relative);
+        self.unloaded_directories.extend(scan.unloaded_directories);
+        self.all_files_truncated |= scan.truncated;
+        for entry in scan.entries {
+            if let Some(existing) = self
+                .all_entries
+                .iter_mut()
+                .find(|existing| existing.relative == entry.relative)
+            {
+                *existing = entry;
+            } else {
+                self.all_entries.push(entry);
+            }
+        }
+        self.all_entries.sort_by(|left, right| {
+            tree::compare_tree_paths(&left.relative, left.is_dir, &right.relative, right.is_dir)
+        });
+        self.changed_entries = tree::changed_only(&self.all_entries);
+        self.reconcile_expansion_state();
+        self.rebuild_visible_rows();
+        match self.tree_scope {
+            TreeScope::AllFiles => self.restore_visible_selection(Some(completion.relative)),
+            TreeScope::GitChanges => {
+                self.restore_git_selection(self.git_changes_selection.clone());
+            }
+        }
+        self.last_error = None;
     }
 
     fn default_selection_index(&self) -> Option<usize> {
@@ -2748,7 +2873,11 @@ impl App {
             count => format!("{count} changed files in this directory."),
         };
         let action = if expanded {
-            "Expanded · Enter or click to collapse."
+            if self.loading_directories.contains(&relative) {
+                "Loading this directory…"
+            } else {
+                "Expanded · Enter or click to collapse."
+            }
         } else {
             "Collapsed · Enter or click to expand."
         };
@@ -3790,6 +3919,7 @@ mod tests {
             scan: ScanResult {
                 entries: Vec::new(),
                 truncated: false,
+                unloaded_directories: HashSet::new(),
             },
             graph: Some(graph),
             existing_changes: HashSet::new(),
@@ -3812,6 +3942,7 @@ mod tests {
             scan: ScanResult {
                 entries: Vec::new(),
                 truncated: false,
+                unloaded_directories: HashSet::new(),
             },
         }
     }

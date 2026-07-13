@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard},
@@ -10,10 +10,12 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 
 use crate::{
-    content_safety::{ensure_beneath, path_exists_without_following},
+    content_safety::{
+        ContentPathKind, ensure_beneath, inspect_content_path, path_exists_without_following,
+    },
     git::StatusMap,
     preview::{HighlightSpan, PreviewRegistry, PreviewRequest, PreviewResolution},
-    repo_graph::{RepoChange, RepoGraph},
+    repo_graph::{DiscoveryOptions, RepoChange, RepoGraph},
     tree::{self, ScanResult},
 };
 
@@ -29,6 +31,15 @@ pub(crate) enum ContentKind {
 #[derive(Debug)]
 pub(crate) struct RefreshRequest {
     pub generation: u64,
+    pub scan_entry_limit: usize,
+    pub scan_depth: usize,
+    pub repo_scan_depth: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectoryRequest {
+    pub tree_epoch: u64,
+    pub relative: PathBuf,
     pub scan_entry_limit: usize,
 }
 
@@ -66,6 +77,13 @@ pub(crate) struct ContentSnapshot {
 pub(crate) struct RefreshCompletion {
     pub generation: u64,
     pub result: Result<RefreshSnapshot, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectoryCompletion {
+    pub tree_epoch: u64,
+    pub relative: PathBuf,
+    pub result: Result<ScanResult, String>,
 }
 
 #[derive(Debug)]
@@ -119,6 +137,44 @@ impl<T> RequestSlot<T> {
 }
 
 #[derive(Debug, Default)]
+struct DirectoryQueue {
+    active: bool,
+    pending: VecDeque<DirectoryRequest>,
+}
+
+impl DirectoryQueue {
+    fn submit(&mut self, request: DirectoryRequest) {
+        if !self.pending.iter().any(|pending| {
+            pending.tree_epoch == request.tree_epoch && pending.relative == request.relative
+        }) {
+            self.pending.push_back(request);
+        }
+    }
+
+    fn start_next(&mut self) -> Option<DirectoryRequest> {
+        if self.active {
+            return None;
+        }
+        let request = self.pending.pop_front()?;
+        self.active = true;
+        Some(request)
+    }
+
+    fn complete(&mut self) {
+        debug_assert!(self.active);
+        self.active = false;
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    fn has_work(&self) -> bool {
+        self.active || !self.pending.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct RequestGeneration {
     next: u64,
     latest_requested: u64,
@@ -161,11 +217,12 @@ impl RequestGeneration {
 struct SharedState {
     shutdown: bool,
     refresh: RequestSlot<RefreshRequest>,
+    directory: DirectoryQueue,
     content: RequestSlot<ContentRequest>,
     completed_refresh: Option<RefreshCompletion>,
+    completed_directories: VecDeque<DirectoryCompletion>,
     completed_content: Option<ContentCompletion>,
     preview_registry_update: Option<PreviewRegistry>,
-    prefer_refresh: bool,
 }
 
 struct Shared {
@@ -186,10 +243,7 @@ impl WorkerRuntime {
             .canonicalize()
             .with_context(|| format!("cannot open workspace {}", root.display()))?;
         let shared = Arc::new(Shared {
-            state: Mutex::new(SharedState {
-                prefer_refresh: true,
-                ..SharedState::default()
-            }),
+            state: Mutex::new(SharedState::default()),
             changed: Condvar::new(),
         });
         let worker_shared = Arc::clone(&shared);
@@ -205,6 +259,12 @@ impl WorkerRuntime {
     pub fn request_refresh(&self, request: RefreshRequest) {
         let mut state = self.lock_state();
         state.refresh.submit(request);
+        self.shared.changed.notify_one();
+    }
+
+    pub fn request_directory(&self, request: DirectoryRequest) {
+        let mut state = self.lock_state();
+        state.directory.submit(request);
         self.shared.changed.notify_one();
     }
 
@@ -225,10 +285,17 @@ impl WorkerRuntime {
         self.shared.changed.notify_one();
     }
 
-    pub fn take_completions(&self) -> (Option<RefreshCompletion>, Option<ContentCompletion>) {
+    pub fn take_completions(
+        &self,
+    ) -> (
+        Option<RefreshCompletion>,
+        Vec<DirectoryCompletion>,
+        Option<ContentCompletion>,
+    ) {
         let mut state = self.lock_state();
         (
             state.completed_refresh.take(),
+            state.completed_directories.drain(..).collect(),
             state.completed_content.take(),
         )
     }
@@ -239,8 +306,9 @@ impl WorkerRuntime {
         let mut state = self.lock_state();
         while !state.shutdown
             && state.completed_refresh.is_none()
+            && state.completed_directories.is_empty()
             && state.completed_content.is_none()
-            && (state.refresh.has_work() || state.content.has_work())
+            && (state.refresh.has_work() || state.directory.has_work() || state.content.has_work())
         {
             state = self
                 .shared
@@ -248,7 +316,9 @@ impl WorkerRuntime {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        state.completed_refresh.is_some() || state.completed_content.is_some()
+        state.completed_refresh.is_some()
+            || !state.completed_directories.is_empty()
+            || state.completed_content.is_some()
     }
 
     fn lock_state(&self) -> MutexGuard<'_, SharedState> {
@@ -265,6 +335,7 @@ impl Drop for WorkerRuntime {
             let mut state = self.lock_state();
             state.shutdown = true;
             state.refresh.cancel_pending();
+            state.directory.cancel_pending();
             state.content.cancel_pending();
             self.shared.changed.notify_all();
         }
@@ -276,11 +347,13 @@ impl Drop for WorkerRuntime {
 
 enum Work {
     Refresh(RefreshRequest),
+    Directory(DirectoryRequest),
     Content(ContentRequest),
 }
 
 fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: PreviewRegistry) {
     let mut graph = None;
+    let mut statuses = StatusMap::new();
     loop {
         let work = {
             let mut state = shared
@@ -289,6 +362,7 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             while !state.shutdown
                 && state.refresh.pending.is_none()
+                && state.directory.pending.is_empty()
                 && state.content.pending.is_none()
                 && state.preview_registry_update.is_none()
             {
@@ -313,15 +387,33 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
             Work::Refresh(request) => {
                 let generation = request.generation;
                 let result = catch_worker_error(|| execute_refresh(&root, request));
-                if let Ok(snapshot) = &result {
-                    graph = snapshot.graph.clone();
-                }
+                let result = result.map(|executed| {
+                    graph = executed.snapshot.graph.clone();
+                    statuses = executed.statuses;
+                    executed.snapshot
+                });
                 let mut state = shared
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.refresh.complete();
                 state.completed_refresh = Some(RefreshCompletion { generation, result });
+                shared.changed.notify_all();
+            }
+            Work::Directory(request) => {
+                let tree_epoch = request.tree_epoch;
+                let relative = request.relative.clone();
+                let result = catch_worker_error(|| execute_directory(&root, &statuses, request));
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.directory.complete();
+                state.completed_directories.push_back(DirectoryCompletion {
+                    tree_epoch,
+                    relative,
+                    result,
+                });
                 shared.changed.notify_all();
             }
             Work::Content(request) => {
@@ -347,28 +439,29 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
 }
 
 fn take_next_work(state: &mut SharedState) -> Option<Work> {
-    let both_pending = state.refresh.pending.is_some() && state.content.pending.is_some();
-    let work = if state.prefer_refresh {
-        state
-            .refresh
-            .start_next()
-            .map(Work::Refresh)
-            .or_else(|| state.content.start_next().map(Work::Content))
-    } else {
-        state
-            .content
-            .start_next()
-            .map(Work::Content)
-            .or_else(|| state.refresh.start_next().map(Work::Refresh))
-    };
-    if both_pending {
-        state.prefer_refresh = !state.prefer_refresh;
+    if let Some(request) = state.refresh.start_next() {
+        return Some(Work::Refresh(request));
     }
-    work
+    if let Some(request) = state.directory.start_next() {
+        return Some(Work::Directory(request));
+    }
+    state.content.start_next().map(Work::Content)
 }
 
-fn execute_refresh(root: &std::path::Path, request: RefreshRequest) -> Result<RefreshSnapshot> {
-    let graph = RepoGraph::discover(root)?;
+struct ExecutedRefresh {
+    snapshot: RefreshSnapshot,
+    statuses: StatusMap,
+}
+
+fn execute_refresh(root: &std::path::Path, request: RefreshRequest) -> Result<ExecutedRefresh> {
+    let graph = RepoGraph::discover_with_options(
+        root,
+        DiscoveryOptions {
+            max_entries: crate::repo_graph::DEFAULT_MAX_DISCOVERY_ENTRIES,
+            max_repositories: crate::repo_graph::DEFAULT_MAX_REPOSITORIES,
+            max_depth: request.repo_scan_depth,
+        },
+    )?;
     let statuses = workspace_statuses(root, &graph);
     let primary = graph.repositories().iter().find(|snapshot| {
         matches!(
@@ -393,14 +486,35 @@ fn execute_refresh(root: &std::path::Path, request: RefreshRequest) -> Result<Re
         })
         .map(|change| change.path.clone())
         .collect();
-    let scan = tree::scan_with_limit(root, &statuses, request.scan_entry_limit)?;
-    Ok(RefreshSnapshot {
-        branch,
-        projected_change_count,
-        scan,
-        graph: Some(graph),
-        existing_changes,
+    let scan = tree::scan_with_depth(
+        root,
+        &statuses,
+        request.scan_entry_limit,
+        request.scan_depth,
+    )?;
+    Ok(ExecutedRefresh {
+        snapshot: RefreshSnapshot {
+            branch,
+            projected_change_count,
+            scan,
+            graph: Some(graph),
+            existing_changes,
+        },
+        statuses,
     })
+}
+
+fn execute_directory(
+    root: &std::path::Path,
+    statuses: &StatusMap,
+    request: DirectoryRequest,
+) -> Result<ScanResult> {
+    let absolute = root.join(&request.relative);
+    let inspected = inspect_content_path(Some(root), &absolute)?;
+    if inspected.kind != ContentPathKind::Directory || inspected.path != absolute {
+        anyhow::bail!("{} is not a readable directory", request.relative.display());
+    }
+    tree::scan_directory(root, &request.relative, statuses, request.scan_entry_limit)
 }
 
 fn execute_content(
@@ -658,9 +772,12 @@ mod tests {
             RefreshRequest {
                 generation: 1,
                 scan_entry_limit: tree::DEFAULT_MAX_ENTRIES,
+                scan_depth: tree::DEFAULT_INITIAL_SCAN_DEPTH,
+                repo_scan_depth: crate::repo_graph::DEFAULT_MAX_DISCOVERY_DEPTH,
             },
         )
         .unwrap();
+        let snapshot = snapshot.snapshot;
         let graph = snapshot.graph.as_ref().unwrap();
         let raw_status_entries: usize = graph
             .repositories()

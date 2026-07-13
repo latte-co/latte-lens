@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashSet, VecDeque},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -13,6 +13,11 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
+/// Number of path components loaded below the selected workspace at startup.
+///
+/// Deeper directories remain visible as boundaries and are enumerated only
+/// when the user expands them.
+pub const DEFAULT_INITIAL_SCAN_DEPTH: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileEntry {
@@ -29,6 +34,8 @@ pub struct ScanResult {
     pub entries: Vec<FileEntry>,
     /// True when traversal discovered another entry after reaching its cap.
     pub truncated: bool,
+    /// Directories whose own entries have not been enumerated yet.
+    pub unloaded_directories: HashSet<PathBuf>,
 }
 
 impl FileEntry {
@@ -54,12 +61,35 @@ pub fn scan_with_limit(
     statuses: &StatusMap,
     max_entries: usize,
 ) -> Result<ScanResult> {
+    scan_with_depth(root, statuses, max_entries, usize::MAX)
+}
+
+/// Scan at most `max_depth` path components below `root`.
+///
+/// A depth of two includes `one/two`, but does not enumerate entries below a
+/// directory at that depth. Such directories are returned in
+/// `unloaded_directories` for on-demand loading.
+pub fn scan_with_depth(
+    root: &Path,
+    statuses: &StatusMap,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<ScanResult> {
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
     let mut truncated = false;
-    let mut directories = VecDeque::from([root.to_path_buf()]);
+    let mut unloaded_directories = HashSet::new();
+    let mut directories = VecDeque::from([(root.to_path_buf(), 0_usize)]);
 
-    'scan: while let Some(directory) = directories.pop_front() {
+    'scan: while let Some((directory, directory_depth)) = directories.pop_front() {
+        if directory_depth == max_depth {
+            if let Ok(relative) = directory.strip_prefix(root)
+                && !relative.as_os_str().is_empty()
+            {
+                unloaded_directories.insert(relative.to_path_buf());
+            }
+            continue;
+        }
         let mut children = fs::read_dir(&directory)
             .with_context(|| format!("failed to scan {}", directory.display()))?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -78,6 +108,11 @@ pub fn scan_with_limit(
             // cap and no more descendants remains complete.
             if entries.len() == max_entries {
                 truncated = true;
+                if let Ok(relative) = directory.strip_prefix(root)
+                    && !relative.as_os_str().is_empty()
+                {
+                    unloaded_directories.insert(relative.to_path_buf());
+                }
                 break 'scan;
             }
 
@@ -94,11 +129,26 @@ pub fn scan_with_limit(
                 .expect("scanned paths stay below the root")
                 .to_path_buf();
             if is_dir {
-                directories.push_back(path);
+                let child_depth = directory_depth.saturating_add(1);
+                if child_depth == max_depth {
+                    unloaded_directories.insert(relative.clone());
+                } else {
+                    directories.push_back((path, child_depth));
+                }
             }
             seen.insert(relative.clone());
             entries.push(make_entry(relative, is_dir, true, statuses));
         }
+    }
+
+    if truncated {
+        unloaded_directories.extend(directories.into_iter().filter_map(|(directory, _)| {
+            directory
+                .strip_prefix(root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        }));
     }
 
     // Deleted and renamed paths may no longer exist, but still belong in the tree.
@@ -110,18 +160,18 @@ pub fn scan_with_limit(
             .take()
             .filter(|directory| !directory.as_os_str().is_empty())
         {
-            if seen.insert(directory.clone()) {
-                entries.push(make_entry(
-                    directory.clone(),
-                    true,
-                    fs::symlink_metadata(root.join(&directory))
-                        .is_ok_and(|metadata| metadata.is_dir()),
-                    statuses,
-                ));
+            let directory_depth = directory.components().count();
+            if directory_depth <= max_depth && seen.insert(directory.clone()) {
+                let exists = fs::symlink_metadata(root.join(&directory))
+                    .is_ok_and(|metadata| metadata.is_dir());
+                if exists && directory_depth == max_depth {
+                    unloaded_directories.insert(directory.clone());
+                }
+                entries.push(make_entry(directory.clone(), true, exists, statuses));
             }
             parent = directory.parent().map(Path::to_path_buf);
         }
-        if !seen.contains(path) {
+        if path.components().count() <= max_depth && !seen.contains(path) {
             entries.push(make_entry(
                 path.clone(),
                 false,
@@ -134,7 +184,74 @@ pub fn scan_with_limit(
     entries.sort_by(|left, right| {
         compare_tree_paths(&left.relative, left.is_dir, &right.relative, right.is_dir)
     });
-    Ok(ScanResult { entries, truncated })
+    Ok(ScanResult {
+        entries,
+        truncated,
+        unloaded_directories,
+    })
+}
+
+/// Enumerate one directory for lazy tree expansion without walking into its
+/// child directories.
+pub fn scan_directory(
+    root: &Path,
+    relative: &Path,
+    statuses: &StatusMap,
+    max_entries: usize,
+) -> Result<ScanResult> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!(
+            "directory path {} escapes the scan root",
+            relative.display()
+        );
+    }
+    let directory = root.join(relative);
+    let mut children = fs::read_dir(&directory)
+        .with_context(|| format!("failed to scan {}", directory.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to scan {}", directory.display()))?;
+    children.sort_by_key(fs::DirEntry::file_name);
+
+    let mut entries = Vec::new();
+    let mut unloaded_directories = HashSet::new();
+    let mut truncated = false;
+    for child in children {
+        if child.file_name() == ".git" {
+            continue;
+        }
+        if entries.len() == max_entries {
+            truncated = true;
+            break;
+        }
+        let file_type = child.file_type().with_context(|| {
+            format!(
+                "failed to inspect filesystem entry {}",
+                child.path().display()
+            )
+        })?;
+        let is_dir = file_type.is_dir();
+        let path = child.path();
+        let child_relative = path
+            .strip_prefix(root)
+            .expect("lazily scanned paths stay below the root")
+            .to_path_buf();
+        if is_dir {
+            unloaded_directories.insert(child_relative.clone());
+        }
+        entries.push(make_entry(child_relative, is_dir, true, statuses));
+    }
+    entries.sort_by(|left, right| {
+        compare_tree_paths(&left.relative, left.is_dir, &right.relative, right.is_dir)
+    });
+    Ok(ScanResult {
+        entries,
+        truncated,
+        unloaded_directories,
+    })
 }
 
 /// Compare flattened tree paths in display order.
@@ -274,6 +391,12 @@ mod tests {
             ]
         );
         assert!(scan.truncated);
+        assert_eq!(
+            scan.unloaded_directories,
+            [PathBuf::from("a-heavy"), PathBuf::from("z-late")]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

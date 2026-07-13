@@ -66,7 +66,7 @@ pub(crate) enum SearchEvent {
 
 enum SearchCommand {
     Search(SearchRequest),
-    Reindex { epoch: u64 },
+    Reindex,
     Shutdown,
 }
 
@@ -154,8 +154,8 @@ impl SearchRuntime {
 
     pub(crate) fn refresh_inventory(&self) {
         self.inventory_ready.store(false, Ordering::Release);
-        let epoch = self.inventory_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = self.commands.send(SearchCommand::Reindex { epoch });
+        self.inventory_epoch.fetch_add(1, Ordering::AcqRel);
+        let _ = self.commands.send(SearchCommand::Reindex);
     }
 
     pub(crate) fn cancel(&self, next_generation: u64) {
@@ -186,11 +186,9 @@ fn search_loop(
     inventory_epoch: Arc<AtomicU64>,
     inventory_ready: Arc<AtomicBool>,
 ) {
-    // Warming happens before any query is executed. A search command received
-    // while this runs stays queued, so it can never observe a partial or stale
-    // candidate list.
-    let mut inventory = build_candidate_inventory(&root);
-    inventory_ready.store(true, Ordering::Release);
+    // Startup stays shallow: the first full candidate inventory is built only
+    // after the user submits a text query.
+    let mut inventory = CandidateInventory::default();
     // Keep the newest request until it has run against a ready inventory. A
     // refresh can arrive while an older refresh is rebuilding; dropping the
     // request in that gap leaves the UI waiting for an event that never comes.
@@ -198,25 +196,17 @@ fn search_loop(
     while let Ok(command) = commands.recv() {
         match command {
             SearchCommand::Search(request) => pending_request = Some(request),
-            SearchCommand::Reindex { epoch } => rebuild_inventory(
-                &root,
-                &mut inventory,
-                epoch,
-                &inventory_epoch,
-                &inventory_ready,
-            ),
+            SearchCommand::Reindex => {
+                inventory_ready.store(false, Ordering::Release);
+            }
             SearchCommand::Shutdown => break,
         }
         while let Ok(command) = commands.try_recv() {
             match command {
                 SearchCommand::Search(request) => pending_request = Some(request),
-                SearchCommand::Reindex { epoch } => rebuild_inventory(
-                    &root,
-                    &mut inventory,
-                    epoch,
-                    &inventory_epoch,
-                    &inventory_ready,
-                ),
+                SearchCommand::Reindex => {
+                    inventory_ready.store(false, Ordering::Release);
+                }
                 SearchCommand::Shutdown => return,
             }
         }
@@ -231,8 +221,12 @@ fn search_loop(
             let _ = events.send(SearchEvent::Indexing {
                 generation: request.generation,
             });
-            pending_request = Some(request);
-            continue;
+            inventory = build_candidate_inventory(&root);
+            if inventory_epoch.load(Ordering::Acquire) != epoch {
+                pending_request = Some(request);
+                continue;
+            }
+            inventory_ready.store(true, Ordering::Release);
         }
         execute_search(
             &root,
@@ -243,20 +237,6 @@ fn search_loop(
             &inventory_epoch,
             epoch,
         );
-    }
-}
-
-fn rebuild_inventory(
-    root: &Path,
-    inventory: &mut CandidateInventory,
-    epoch: u64,
-    inventory_epoch: &AtomicU64,
-    inventory_ready: &AtomicBool,
-) {
-    inventory_ready.store(false, Ordering::Release);
-    *inventory = build_candidate_inventory(root);
-    if inventory_epoch.load(Ordering::Acquire) == epoch {
-        inventory_ready.store(true, Ordering::Release);
     }
 }
 
@@ -517,6 +497,28 @@ mod tests {
     use std::{fs, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn startup_and_refresh_leave_full_inventory_work_until_a_query() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("fixture.rs"), "needle").unwrap();
+        let runtime = SearchRuntime::start(root.path().to_path_buf()).unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!runtime.inventory_ready.load(Ordering::Acquire));
+
+        runtime.search(SearchRequest {
+            generation: 1,
+            query: "needle".to_owned(),
+            options: SearchOptions::default(),
+        });
+        let _ = wait_for_finished(&runtime, 1);
+        assert!(runtime.inventory_ready.load(Ordering::Acquire));
+
+        runtime.refresh_inventory();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!runtime.inventory_ready.load(Ordering::Acquire));
+    }
 
     #[test]
     fn search_respects_options_ignores_and_binary_safety() {

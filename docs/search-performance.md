@@ -1,8 +1,9 @@
 # Content search performance check
 
-Text search builds two capped candidate inventories when the search runtime
-starts and after an accepted workspace refresh. Queries reuse the selected
-inventory; they do not traverse the workspace.
+Text search builds its two capped candidate inventories lazily, after the first
+text query. An accepted workspace refresh invalidates the inventory, but does
+not rebuild it until the next text query. Queries then reuse the selected
+inventory; repeated queries do not traverse the workspace.
 
 Text-search results are a snapshot of the workspace at the last successful
 **Refresh**. Changes made afterward are not included until Refresh is run
