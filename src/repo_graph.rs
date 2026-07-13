@@ -8,6 +8,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::git::{FileStatus, GitRepo, GitStatusEntry, SubmoduleStatus};
 
+/// Maximum number of directories considered while looking for Git worktrees.
+///
+/// Ordinary files and `.git` markers do not consume this budget. The existing
+/// name is retained because it is part of the public discovery API.
 pub const DEFAULT_MAX_DISCOVERY_ENTRIES: usize = 50_000;
 pub const DEFAULT_MAX_REPOSITORIES: usize = 1_024;
 pub const DEFAULT_MAX_DISCOVERY_DEPTH: usize = 128;
@@ -130,6 +134,9 @@ pub struct DiscoveryError {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryReport {
+    /// Number of directories considered for traversal.
+    ///
+    /// Ordinary files, symlinks, and `.git` markers are excluded.
     pub entries_scanned: usize,
     pub repositories_discovered: usize,
     pub truncations: Vec<DiscoveryTruncation>,
@@ -144,6 +151,9 @@ impl DiscoveryReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiscoveryOptions {
+    /// Maximum number of directories considered for traversal.
+    ///
+    /// Ordinary files, symlinks, and `.git` markers do not consume this budget.
     pub max_entries: usize,
     pub max_repositories: usize,
     pub max_depth: usize,
@@ -314,7 +324,7 @@ impl Discovery {
     fn walk_workspace(&mut self) {
         let mut queue = VecDeque::from([(self.workspace_root.clone(), 0_usize)]);
         let mut visited = HashSet::from([self.workspace_root.clone()]);
-        let mut entry_limit_reached = false;
+        let mut directory_limit_reached = false;
 
         while let Some((directory, depth)) = queue.pop_front() {
             if directory == self.workspace_root || has_git_marker(&directory) {
@@ -335,40 +345,24 @@ impl Discovery {
 
             // Directories queued before the cap are still inspected as
             // repository boundaries. Their contents are not enumerated, so
-            // the entry cap cannot silently erase an already-observed repo.
-            if entry_limit_reached {
+            // the directory cap cannot silently erase an already-observed repo.
+            if directory_limit_reached {
                 continue;
             }
 
-            let mut children = match fs::read_dir(&directory) {
-                // Membership at the global cap must not depend on filesystem
-                // enumeration order. Materialize and sort this one already-
-                // opened directory, then consume only the remaining budget.
-                // Traversal remains bounded: unselected directories are never
-                // opened, and queued boundaries are not enumerated after cap.
-                Ok(entries) => entries.collect::<Vec<_>>(),
+            let children = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
                 Err(error) => {
                     self.error(&directory, format!("cannot read directory: {error}"));
                     continue;
                 }
             };
-            children.sort_by(|left, right| match (left, right) {
-                (Ok(left), Ok(right)) => left.file_name().cmp(&right.file_name()),
-                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                (Err(_), Err(_)) => std::cmp::Ordering::Equal,
-            });
-
+            // Membership at the global cap must not depend on filesystem
+            // enumeration order. Keep only directories, then sort this one
+            // already-opened level before consuming the remaining budget.
+            // Ordinary files are never sorted or inspected beyond their type.
+            let mut directories = Vec::new();
             for child in children {
-                if self.report.entries_scanned == self.options.max_entries {
-                    self.push_truncation(DiscoveryTruncation::EntryLimit {
-                        limit: self.options.max_entries,
-                    });
-                    entry_limit_reached = true;
-                    break;
-                }
-                self.report.entries_scanned += 1;
-
                 let child = match child {
                     Ok(child) => child,
                     Err(error) => {
@@ -380,16 +374,30 @@ impl Discovery {
                     continue;
                 }
                 let path = child.path();
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
+                let file_type = match child.file_type() {
+                    Ok(file_type) => file_type,
                     Err(error) => {
                         self.error(&path, format!("cannot inspect entry: {error}"));
                         continue;
                     }
                 };
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                if file_type.is_symlink() || !file_type.is_dir() {
                     continue;
                 }
+                directories.push(child);
+            }
+            directories.sort_by_key(|child| child.file_name());
+
+            for child in directories {
+                let path = child.path();
+                if self.report.entries_scanned == self.options.max_entries {
+                    self.push_truncation(DiscoveryTruncation::EntryLimit {
+                        limit: self.options.max_entries,
+                    });
+                    directory_limit_reached = true;
+                    break;
+                }
+                self.report.entries_scanned += 1;
                 let canonical_path = match path.canonicalize() {
                     Ok(path) => path,
                     Err(error) => {

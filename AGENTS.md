@@ -185,7 +185,7 @@ ordering, ownership, truncation, or fallback semantics that callers must obey.
   reject stale results by generation/epoch before mutating application state.
 - Bound traversal and content work. Surface truncation/partial results instead
   of silently turning a large workspace into an unbounded scan.
-- Keep repository discovery bounded (50,000 entries, 1,024 repositories, and
+- Keep repository discovery bounded (50,000 directories, 1,024 repositories, and
   depth 128 by default) and text search bounded (50,000 candidates and 1,000
   results). Entering Git Changes may request a full but still bounded graph.
 - Use `PreviewRequest::open_regular()` and keep provider output within

@@ -541,6 +541,7 @@ fn discovery_limits_and_invalid_git_markers_are_explicit() {
     init(&valid);
     let invalid = workspace.path().join("b-invalid");
     fs::create_dir_all(invalid.join(".git")).unwrap();
+    fs::create_dir(workspace.path().join("c-unvisited")).unwrap();
     fs::write(workspace.path().join("z-file"), "fixture").unwrap();
 
     let graph = RepoGraph::discover_with_options(
@@ -608,9 +609,44 @@ fn repository_cap_is_explicit_and_git_internals_do_not_consume_the_entry_budget(
         },
     )
     .unwrap();
-    assert_eq!(complete.report().entries_scanned, 1);
+    assert_eq!(complete.report().entries_scanned, 0);
     assert!(!complete.report().is_truncated());
     assert_eq!(complete.repositories().len(), 1);
+}
+
+#[test]
+fn regular_files_do_not_consume_the_repository_discovery_budget() {
+    let workspace = tempfile::tempdir().unwrap();
+    for index in 0..100 {
+        fs::write(
+            workspace.path().join(format!("file-{index:03}.txt")),
+            "fixture",
+        )
+        .unwrap();
+    }
+    let nested = workspace.path().join("nested");
+    init(&nested);
+
+    let graph = RepoGraph::discover_with_options(
+        workspace.path(),
+        DiscoveryOptions {
+            max_entries: 1,
+            max_repositories: 8,
+            max_depth: 8,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(graph.report().entries_scanned, 1);
+    assert!(!graph.report().is_truncated());
+    assert_eq!(graph.repositories().len(), 1);
+    assert_eq!(
+        snapshot_at(&graph, &nested)
+            .node
+            .workspace_relative
+            .as_deref(),
+        Some(Path::new("nested"))
+    );
 }
 
 #[cfg(unix)]

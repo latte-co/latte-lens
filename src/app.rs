@@ -3314,7 +3314,7 @@ fn build_git_rows(
         let (path, message) = match truncation {
             DiscoveryTruncation::EntryLimit { limit } => (
                 root.to_path_buf(),
-                format!("Repository discovery stopped at the {limit}-entry limit."),
+                format!("Repository discovery stopped at the {limit}-directory limit."),
             ),
             DiscoveryTruncation::RepositoryLimit { limit } => (
                 root.to_path_buf(),
@@ -3900,7 +3900,7 @@ mod tests {
     #[test]
     fn repository_discovery_truncation_becomes_a_partial_selectable_row() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("entry.txt"), "fixture").unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
         let graph = RepoGraph::discover_with_options(
             directory.path(),
             DiscoveryOptions {
