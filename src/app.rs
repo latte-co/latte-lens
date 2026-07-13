@@ -684,7 +684,7 @@ impl App {
     }
 
     pub(crate) fn content_visual_rows(&self, width: u16) -> Vec<ContentVisualRow> {
-        let wrap_preview = self.content_mode == ContentMode::Preview;
+        let wrap_content = self.content_wraps_lines();
         let gutter_width = if self.content_show_line_numbers {
             self.content_lines.len().max(1).to_string().len() + 3
         } else {
@@ -695,7 +695,7 @@ impl App {
             .iter()
             .enumerate()
             .flat_map(|(line_index, line)| {
-                if wrap_preview {
+                if wrap_content {
                     wrap_line_ranges(line, text_width)
                         .into_iter()
                         .enumerate()
@@ -714,6 +714,10 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    pub(crate) const fn content_wraps_lines(&self) -> bool {
+        matches!(self.content_mode, ContentMode::Diff | ContentMode::Preview)
     }
 
     pub fn selected_preview_text(&self) -> Option<String> {
@@ -1955,7 +1959,7 @@ impl App {
             .min(visual_rows.len().saturating_sub(1));
         let visual_row = visual_rows.get(visual_row)?;
         let visible_column = usize::from(mouse.column.saturating_sub(rows.x));
-        let rendered_column = if self.content_mode == ContentMode::Preview {
+        let rendered_column = if self.content_wraps_lines() {
             visible_column
         } else {
             self.content_horizontal_scroll
@@ -2299,7 +2303,7 @@ impl App {
 
     fn scroll_content(&mut self, vertical: isize, horizontal: isize) {
         self.content_scroll = self.content_scroll.saturating_add_signed(vertical);
-        if self.content_mode != ContentMode::Preview {
+        if !self.content_wraps_lines() {
             self.content_horizontal_scroll = self
                 .content_horizontal_scroll
                 .saturating_add_signed(horizontal);

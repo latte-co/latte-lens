@@ -1383,14 +1383,14 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
     assert_eq!(app.content_scroll, 0);
 
     app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
-    assert_eq!(app.content_horizontal_scroll, 4);
+    assert_eq!(app.content_horizontal_scroll, 0);
     app.handle_key(key(KeyCode::Right));
     assert_eq!(app.focused_pane, FocusPane::Content);
-    assert_eq!(app.content_horizontal_scroll, 4);
+    assert_eq!(app.content_horizontal_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
     app.handle_key(key(KeyCode::Left));
     assert_eq!(app.focused_pane, FocusPane::Tree);
-    assert_eq!(app.content_horizontal_scroll, 4);
+    assert_eq!(app.content_horizontal_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
     app.handle_key(key(KeyCode::Right));
     assert_eq!(app.focused_pane, FocusPane::Content);
@@ -1521,6 +1521,53 @@ fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() 
 
     app.handle_key(key(KeyCode::End));
     assert_eq!(app.content_scroll, 2);
+    app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
+    assert_eq!(app.content_horizontal_scroll, 0);
+}
+
+#[test]
+fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
+    let fixture = TestRepo::new();
+    fixture.write("long.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("long.txt", "abcdefghijklmnopqrstuvwxyz0123456789\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    let backend = TestBackend::new(60, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.ui_regions.content_inner.width, 30);
+
+    let row_text = |row: u16| -> String {
+        (app.ui_regions.content_inner.x..app.ui_regions.content_inner.right())
+            .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    let first_row = (app.ui_regions.content_inner.y..app.ui_regions.content_inner.bottom())
+        .find(|&row| row_text(row) == "+abcdefghijklmnopqrstuvwxyz012")
+        .expect("long added diff line should start inside the content panel");
+    assert_eq!(row_text(first_row + 1), "3456789");
+
+    let text_x = app.ui_regions.content_inner.x;
+    app.handle_mouse(mouse_down(text_x + 25, first_row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 3,
+        first_row + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 3,
+        first_row + 1,
+    ));
+    assert_eq!(app.selected_content_text().as_deref(), Some("yz0123456"));
+
     app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
     assert_eq!(app.content_horizontal_scroll, 0);
 }

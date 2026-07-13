@@ -1014,7 +1014,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         app.content_scroll
             .min(visual_rows.len().saturating_sub(1))
             .min(u16::MAX as usize) as u16,
-        if app.content_mode == ContentMode::Preview {
+        if app.content_wraps_lines() {
             0
         } else {
             app.content_horizontal_scroll.min(u16::MAX as usize) as u16
@@ -1146,6 +1146,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  1/2 scope  r refresh  q×2 quit"
     } else if app.content_mode == ContentMode::Preview {
         "  ↑↓ scroll  ←→ focus  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  1/2 scope  p preview  d diff  r refresh  q×2 quit"
+    } else if app.content_mode == ContentMode::Diff {
+        "  ↑↓ scroll  ←→ focus  drag copies  Ctrl+C quit/copy selection  1/2 scope  p preview  d diff  r refresh  q×2 quit"
     } else {
         "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  1/2 scope  p preview  d diff  r refresh  q×2 quit"
     };
