@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package-unix:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: latte-lens-linux
+            run_full_quality_gate: true
+          - os: macos-latest
+            artifact_name: latte-lens-macos
+            run_full_quality_gate: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the quality gate
+        if: matrix.run_full_quality_gate
+        run: make ci
+      - name: Run the macOS TUI end-to-end check
+        if: ${{ !matrix.run_full_quality_gate }}
+        run: make e2e
+      - name: Build and verify the native package
+        run: make package-smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}-${{ runner.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  package-windows:
+    name: Package (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check all targets with Cargo.lock
+        run: cargo check --all-targets --locked
+      - name: Run unit and integration tests
+        run: cargo test --all-targets --locked
+      - name: Build the Windows package
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+      - name: Verify the Windows package
+        run: python scripts/verify-release-package.py "dist/*.zip" --binary latte-lens.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: latte-lens-windows-${{ runner.arch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [package-unix, package-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify the tag matches the package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME}
+          version=$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+
+          if [[ "$tag" != "v$version" ]]; then
+            echo "Release tag '$tag' must match Cargo.toml version 'v$version'." >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+      - name: Create GitHub Release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$VERSION" == *-* ]]; then
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --prerelease \
+              --title "Latte Lens $VERSION"
+          else
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Latte Lens $VERSION"
+          fi

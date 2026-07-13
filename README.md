@@ -216,6 +216,25 @@ gate on Linux, the POSIX PTY E2E test on Linux and macOS, checks Rust 1.88
 compatibility, enforces the 80% line-coverage floor, and validates release
 packages on Linux, macOS, and Windows.
 
+## Publishing a release
+
+Pushing a version tag creates a GitHub Release automatically. The release
+workflow runs the Linux quality gate, verifies the native Linux, macOS, and
+Windows packages, uploads every package and its SHA-256 sidecar, then generates
+GitHub's release notes from merged pull requests. It also adds a
+`SHA256SUMS.txt` manifest covering every downloadable archive.
+
+The tag must exactly match the version in `Cargo.toml`, with a `v` prefix:
+
+```bash
+# First update Cargo.toml to version = "0.1.1" and merge that change.
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+Tags with a pre-release suffix, such as `v0.2.0-beta.1`, are published as
+GitHub pre-releases rather than as the latest stable release.
+
 ## Next milestones
 
 1. Background filesystem watching and diff cache
