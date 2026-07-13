@@ -7,5 +7,6 @@ pub mod preview;
 pub mod repo_graph;
 mod runtime;
 mod search;
+mod text_layout;
 pub mod tree;
 pub mod ui;

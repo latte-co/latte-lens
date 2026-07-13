@@ -18,6 +18,7 @@ use crate::{
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
     preview::{HighlightKind, HighlightSpan},
+    text_layout::expand_tabs,
     tree::FileEntry,
 };
 
@@ -1045,6 +1046,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
                     app.content_diff_lines.get(visual_row.line_index).copied(),
                     line_number_width,
                     visual_row.continuation,
+                    visual_row.tab_origin,
                     selection,
                 ),
                 ContentMode::Preview if app.content_show_line_numbers => preview_line(
@@ -1063,6 +1065,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
                     segment,
                     selection,
                     Style::default().fg(MUTED),
+                    visual_row.tab_origin,
                 )),
             })
         })
@@ -1321,6 +1324,7 @@ fn diff_line(
     annotation: Option<DiffLineAnnotation>,
     number_width: usize,
     continuation: bool,
+    tab_origin: usize,
     selection: Option<Range<usize>>,
 ) -> Line<'static> {
     let kind = annotation.map_or(DiffLineKind::Metadata, |annotation| annotation.kind);
@@ -1367,7 +1371,7 @@ fn diff_line(
         format!("{old_line:>number_width$} {new_line:>number_width$} │ "),
         gutter_style,
     )];
-    spans.extend(content_selection_spans(line, selection, style));
+    spans.extend(content_selection_spans(line, selection, style, tab_origin));
     Line::from(spans)
 }
 
@@ -1453,6 +1457,7 @@ fn preview_content_spans(
     boundaries.dedup();
 
     let mut spans = Vec::with_capacity(boundaries.len().saturating_sub(1));
+    let mut display_column = 0;
     for range in boundaries.windows(2) {
         let start = range[0];
         let end = range[1];
@@ -1472,9 +1477,11 @@ fn preview_content_spans(
             style = style.add_modifier(Modifier::REVERSED);
         }
         let Some(text) = line.get(start..end) else {
-            return vec![Span::styled(line.to_owned(), default_style)];
+            return vec![expanded_span(line, 0, 0, default_style).0];
         };
-        spans.push(Span::styled(text.to_owned(), style));
+        let (span, next_column) = expanded_span(text, display_column, 0, style);
+        spans.push(span);
+        display_column = next_column;
     }
     spans
 }
@@ -1502,27 +1509,39 @@ fn content_selection_spans(
     line: &str,
     selection: Option<Range<usize>>,
     text_style: Style,
+    tab_origin: usize,
 ) -> Vec<Span<'static>> {
     let Some(selection) = selection.filter(|selection| selection.start < selection.end) else {
-        return vec![Span::styled(line.to_owned(), text_style)];
+        return vec![expanded_span(line, 0, tab_origin, text_style).0];
     };
     let Some(before) = line.get(..selection.start) else {
-        return vec![Span::styled(line.to_owned(), text_style)];
+        return vec![expanded_span(line, 0, tab_origin, text_style).0];
     };
     let Some(selected) = line.get(selection.clone()) else {
-        return vec![Span::styled(line.to_owned(), text_style)];
+        return vec![expanded_span(line, 0, tab_origin, text_style).0];
     };
     let Some(after) = line.get(selection.end..) else {
-        return vec![Span::styled(line.to_owned(), text_style)];
+        return vec![expanded_span(line, 0, tab_origin, text_style).0];
     };
-    vec![
-        Span::styled(before.to_owned(), text_style),
-        Span::styled(
-            selected.to_owned(),
-            text_style.add_modifier(Modifier::REVERSED),
-        ),
-        Span::styled(after.to_owned(), text_style),
-    ]
+    let (before, before_end) = expanded_span(before, 0, tab_origin, text_style);
+    let (selected, selected_end) = expanded_span(
+        selected,
+        before_end,
+        tab_origin,
+        text_style.add_modifier(Modifier::REVERSED),
+    );
+    let (after, _) = expanded_span(after, selected_end, tab_origin, text_style);
+    vec![before, selected, after]
+}
+
+fn expanded_span(
+    value: &str,
+    display_column: usize,
+    tab_origin: usize,
+    style: Style,
+) -> (Span<'static>, usize) {
+    let (expanded, next_column) = expand_tabs(value, display_column, tab_origin);
+    (Span::styled(expanded, style), next_column)
 }
 
 fn inset_left(rect: Rect, amount: u16) -> Rect {
@@ -1742,5 +1761,42 @@ mod tests {
                 .iter()
                 .all(|span| span.style.bg.unwrap_or(Color::Reset) == Color::Reset)
         );
+    }
+
+    #[test]
+    fn preview_and_diff_expand_tabs_without_losing_span_styles() {
+        let preview = preview_content_spans(
+            "\tField\tstring",
+            0,
+            &[HighlightSpan {
+                range: 1..6,
+                kind: HighlightKind::Type,
+            }],
+            None,
+            Style::default().fg(Color::Reset),
+        );
+        assert_eq!(
+            preview
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    Field   string"
+        );
+        assert_eq!(preview[1].style.fg, Some(ROSE));
+
+        let diff = content_selection_spans(
+            "+\tfield",
+            Some(1..2),
+            Style::default().fg(Color::LightGreen),
+            1,
+        );
+        assert_eq!(
+            diff.iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "+    field"
+        );
+        assert_eq!(diff[1].content.as_ref(), "    ");
+        assert!(diff[1].style.add_modifier.contains(Modifier::REVERSED));
     }
 }

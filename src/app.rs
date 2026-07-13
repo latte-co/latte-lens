@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     clipboard,
-    diff::{DiffLineAnnotation, annotate_diff, line_number_width},
+    diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
     git::{FileStatus, GitRepo},
     preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
@@ -35,6 +35,7 @@ use crate::{
         WorkerRuntime,
     },
     search::{SearchEvent, SearchMatch, SearchOptions, SearchRequest, SearchRuntime},
+    text_layout::grapheme_width_at,
     tree::{self, FileEntry},
     ui,
 };
@@ -306,6 +307,7 @@ pub(crate) struct ContentVisualRow {
     pub line_index: usize,
     pub byte_range: Range<usize>,
     pub continuation: bool,
+    pub tab_origin: usize,
 }
 
 impl ContentSelection {
@@ -755,14 +757,16 @@ impl App {
             .iter()
             .enumerate()
             .flat_map(|(line_index, line)| {
+                let tab_origin = self.content_tab_origin(line_index);
                 if wrap_content {
-                    wrap_line_ranges(line, text_width)
+                    wrap_line_ranges(line, text_width, tab_origin)
                         .into_iter()
                         .enumerate()
                         .map(move |(index, byte_range)| ContentVisualRow {
                             line_index,
                             byte_range,
                             continuation: index > 0,
+                            tab_origin: if index == 0 { tab_origin } else { 0 },
                         })
                         .collect::<Vec<_>>()
                 } else {
@@ -770,6 +774,7 @@ impl App {
                         line_index,
                         byte_range: 0..line.len(),
                         continuation: false,
+                        tab_origin,
                     }]
                 }
             })
@@ -798,6 +803,18 @@ impl App {
         } else {
             number_width.saturating_add(3)
         }
+    }
+
+    fn content_tab_origin(&self, line_index: usize) -> usize {
+        usize::from(
+            self.content_mode == ContentMode::Diff
+                && self.content_diff_lines.get(line_index).is_some_and(|line| {
+                    matches!(
+                        line.kind,
+                        DiffLineKind::Addition | DiffLineKind::Deletion | DiffLineKind::Context
+                    )
+                }),
+        )
     }
 
     pub fn selected_preview_text(&self) -> Option<String> {
@@ -2213,7 +2230,8 @@ impl App {
         let text_column = rendered_column.saturating_sub(gutter_width);
         let line = self.content_lines.get(visual_row.line_index)?;
         let segment = line.get(visual_row.byte_range.clone())?;
-        let (before, after) = grapheme_bounds_at_column(segment, text_column);
+        let (before, after) =
+            grapheme_bounds_at_column(segment, text_column, visual_row.tab_origin);
         Some((
             ContentPoint {
                 line: visual_row.line_index,
@@ -3561,12 +3579,12 @@ fn byte_index_at_display_column(value: &str, target: usize) -> usize {
     value.len()
 }
 
-fn grapheme_bounds_at_column(line: &str, column: usize) -> (usize, usize) {
+fn grapheme_bounds_at_column(line: &str, column: usize, tab_origin: usize) -> (usize, usize) {
     let mut display_column: usize = 0;
     for (byte, grapheme) in line.grapheme_indices(true) {
-        let width = UnicodeWidthStr::width(grapheme);
+        let width = grapheme_width_at(grapheme, display_column, tab_origin);
         let end = byte + grapheme.len();
-        if column < display_column.saturating_add(width.max(1)) {
+        if column < display_column.saturating_add(width) {
             return (byte, end);
         }
         display_column = display_column.saturating_add(width);
@@ -3574,7 +3592,7 @@ fn grapheme_bounds_at_column(line: &str, column: usize) -> (usize, usize) {
     (line.len(), line.len())
 }
 
-fn wrap_line_ranges(line: &str, width: usize) -> Vec<Range<usize>> {
+fn wrap_line_ranges(line: &str, width: usize, tab_origin: usize) -> Vec<Range<usize>> {
     if line.is_empty() {
         return std::iter::once(0..0).collect();
     }
@@ -3583,12 +3601,15 @@ fn wrap_line_ranges(line: &str, width: usize) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
     let mut used_width: usize = 0;
+    let mut current_tab_origin = tab_origin;
     for (byte, grapheme) in line.grapheme_indices(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+        let mut grapheme_width = grapheme_width_at(grapheme, used_width, current_tab_origin);
         if used_width > 0 && used_width.saturating_add(grapheme_width) > width {
             ranges.push(start..byte);
             start = byte;
             used_width = 0;
+            current_tab_origin = 0;
+            grapheme_width = grapheme_width_at(grapheme, used_width, current_tab_origin);
         }
         used_width = used_width.saturating_add(grapheme_width);
     }
@@ -4063,22 +4084,31 @@ mod tests {
     fn grapheme_columns_keep_wide_and_combining_characters_atomic() {
         let line = "a拿铁e\u{301}";
 
-        assert_eq!(grapheme_bounds_at_column(line, 0), (0, 1));
-        assert_eq!(grapheme_bounds_at_column(line, 1), (1, 4));
-        assert_eq!(grapheme_bounds_at_column(line, 2), (1, 4));
-        assert_eq!(grapheme_bounds_at_column(line, 3), (4, 7));
-        assert_eq!(grapheme_bounds_at_column(line, 5), (7, 10));
-        assert_eq!(grapheme_bounds_at_column(line, 6), (10, 10));
+        assert_eq!(grapheme_bounds_at_column(line, 0, 0), (0, 1));
+        assert_eq!(grapheme_bounds_at_column(line, 1, 0), (1, 4));
+        assert_eq!(grapheme_bounds_at_column(line, 2, 0), (1, 4));
+        assert_eq!(grapheme_bounds_at_column(line, 3, 0), (4, 7));
+        assert_eq!(grapheme_bounds_at_column(line, 5, 0), (7, 10));
+        assert_eq!(grapheme_bounds_at_column(line, 6, 0), (10, 10));
     }
 
     #[test]
     fn preview_wrap_ranges_preserve_grapheme_boundaries_and_empty_lines() {
-        assert_eq!(wrap_line_ranges("ab拿c", 3), [0..2, 2..6]);
-        assert_eq!(wrap_line_ranges("e\u{301}xy", 2), [0..4, 4..5]);
+        assert_eq!(wrap_line_ranges("ab拿c", 3, 0), [0..2, 2..6]);
+        assert_eq!(wrap_line_ranges("e\u{301}xy", 2, 0), [0..4, 4..5]);
         assert_eq!(
-            wrap_line_ranges("", 8),
+            wrap_line_ranges("", 8, 0),
             std::iter::once(0..0).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn tabs_use_visible_columns_for_selection_and_wrapping() {
+        assert_eq!(grapheme_bounds_at_column("\tfield", 0, 0), (0, 1));
+        assert_eq!(grapheme_bounds_at_column("\tfield", 3, 0), (0, 1));
+        assert_eq!(grapheme_bounds_at_column("\tfield", 4, 0), (1, 2));
+        assert_eq!(wrap_line_ranges("\t1234", 6, 0), [0..3, 3..5]);
+        assert_eq!(wrap_line_ranges("+\tab", 6, 1), [0..3, 3..4]);
     }
 
     #[test]

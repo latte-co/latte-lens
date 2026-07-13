@@ -1689,6 +1689,58 @@ fn clean_source_defaults_to_numbered_text_preview() {
 }
 
 #[test]
+fn go_tabs_render_as_indentation_but_copy_as_original_tabs() {
+    let fixture = TestRepo::new();
+    fixture.write(
+        "main.go",
+        "package main\n\nimport (\n\t\"time\"\n)\n\ntype Item struct {\n\tCreatedAt\ttime.Time\n}\n",
+    );
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    let content_x = app.ui_regions.content_inner.x;
+    let row_text = |row: u16| -> String {
+        (content_x..app.ui_regions.content_inner.right())
+            .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    let import_row = app.ui_regions.content_inner.y + 3;
+    let field_row = app.ui_regions.content_inner.y + 7;
+    assert!(row_text(import_row).starts_with("4 │     \"time\""));
+    assert!(row_text(field_row).starts_with("8 │     CreatedAt   time.Time"));
+
+    let text_x = content_x + 4;
+    app.handle_mouse(mouse_down(text_x + 1, import_row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 9,
+        import_row,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 9,
+        import_row,
+    ));
+    assert_eq!(app.selected_preview_text().as_deref(), Some("\t\"time\""));
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((text_x + 1, import_row))
+            .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+    );
+}
+
+#[test]
 fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() {
     let fixture = TestRepo::new();
     fixture.write("long.txt", "abcdefghijklmnopqrstuvwxyz0123456789\nsecond\n");
@@ -1777,6 +1829,52 @@ fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
 
     app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
     assert_eq!(app.content_horizontal_scroll, 0);
+}
+
+#[test]
+fn git_diff_tabs_keep_patch_markers_and_copy_original_tabs() {
+    let fixture = TestRepo::new();
+    fixture.write("tabbed.txt", "\tbefore\n");
+    fixture.commit_all("initial");
+    fixture.write("tabbed.txt", "\tafter\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let content_x = app.ui_regions.content_inner.x;
+    let row_text = |row: u16| -> String {
+        (content_x..app.ui_regions.content_inner.right())
+            .filter_map(|column| terminal.backend().buffer().cell((column, row)))
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    let deleted_row = (app.ui_regions.content_inner.y..app.ui_regions.content_inner.bottom())
+        .find(|&row| row_text(row).ends_with("-    before"))
+        .unwrap();
+    let added_row = (app.ui_regions.content_inner.y..app.ui_regions.content_inner.bottom())
+        .find(|&row| row_text(row).ends_with("+    after"))
+        .unwrap();
+    assert!(deleted_row < added_row);
+
+    let text_x = content_x + 6;
+    app.handle_mouse(mouse_down(text_x + 2, added_row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 9,
+        added_row,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 9,
+        added_row,
+    ));
+    assert_eq!(app.selected_content_text().as_deref(), Some("\tafter"));
 }
 
 #[test]

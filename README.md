@@ -206,11 +206,11 @@ the diff. Preview reads are capped by both bytes and lines. Content previews
 never follow symbolic links and decline FIFOs, sockets, devices, directories,
 and Windows reparse points before provider dispatch.
 
-Preview text wraps to the current pane width. A logical source line keeps one
-line number; wrapped continuation rows leave the number gutter blank. Scrolling
-and mouse selection follow the visual rows, while copied text preserves the
-original logical line without inserting display-only newlines. Diff remains
-unwrapped so horizontal structure and patch prefixes stay exact.
+Preview and diff text wrap to the current pane width. A logical source or diff
+line keeps one line-number entry; wrapped continuation rows leave the number
+gutter blank. Tabs render at four-column stops. Scrolling and mouse selection
+follow the visual rows, while copied text preserves the original tabs and
+logical lines without inserting display-only spaces or newlines.
 
 Recognized source files highlight comments, strings, keywords, functions,
 types, numbers, constants, and attributes. The bundled grammar set includes
