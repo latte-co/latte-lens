@@ -3765,7 +3765,7 @@ fn append_repository_rows(
             .as_ref()
             .is_some_and(RepoChange::submodule_pointer_changed),
     );
-    let detail = repository_detail(snapshot, direct_count + pointer_count);
+    let detail = repository_detail(snapshot);
     rows.push(GitTreeRow {
         identity: repo_identity.clone(),
         kind: GitRowKind::Repository {
@@ -3956,7 +3956,7 @@ pub(crate) fn display_workspace_path(path: &Path) -> String {
         .join("/")
 }
 
-fn repository_detail(snapshot: &RepoSnapshot, change_count: usize) -> String {
+fn repository_detail(snapshot: &RepoSnapshot) -> String {
     let mut parts = vec![repo_kind_label(snapshot.node.kind).to_owned()];
     if let Some(branch) = &snapshot.branch {
         parts.push(branch.clone());
@@ -4001,10 +4001,6 @@ fn repository_detail(snapshot: &RepoSnapshot, change_count: usize) -> String {
     if !repo_has_activity(snapshot) {
         parts.push("clean".to_owned());
     }
-    parts.push(format!(
-        "{change_count} file{}",
-        if change_count == 1 { "" } else { "s" }
-    ));
     parts.join(" · ")
 }
 

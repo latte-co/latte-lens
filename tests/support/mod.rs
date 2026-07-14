@@ -9,6 +9,9 @@ use std::{
 
 use tempfile::TempDir;
 
+#[cfg(feature = "agent-observability")]
+pub mod agent;
+
 pub struct TestRepo {
     _temp_dir: TempDir,
     root: PathBuf,

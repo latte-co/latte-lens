@@ -856,7 +856,7 @@ fn clean_root_repository_is_a_selectable_empty_git_changes_node() {
     ));
     assert_eq!(row.label, ".");
     assert!(row.detail.contains("clean"));
-    assert!(row.detail.contains("0 files"));
+    assert!(!row.detail.contains("files"));
     assert_eq!(app.content_mode, ContentMode::Info);
     assert!(app.content_lines[0].contains("0 changed files"));
 
@@ -2221,6 +2221,67 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
 }
 
 #[test]
+fn all_files_aligns_directory_and_file_labels_with_a_blank_file_disclosure_slot() {
+    let fixture = TestRepo::new();
+    fixture.write("folder/nested.txt", "nested\n");
+    fixture.write("plain.txt", "plain\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let directory_row = app
+        .visible_entries()
+        .iter()
+        .position(|entry| entry.relative == Path::new("folder"))
+        .unwrap();
+    let file_row = app
+        .visible_entries()
+        .iter()
+        .position(|entry| entry.relative == Path::new("plain.txt"))
+        .unwrap();
+    let directory_y = app.ui_regions.tree_inner.y + u16::try_from(directory_row).unwrap();
+    let file_y = app.ui_regions.tree_inner.y + u16::try_from(file_row).unwrap();
+    let label_start = |row, first_character| {
+        (app.ui_regions.tree_inner.x..app.ui_regions.tree_inner.right())
+            .find(|&column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, row))
+                    .is_some_and(|cell| cell.symbol() == first_character)
+            })
+            .unwrap()
+    };
+    let directory_label_x = label_start(directory_y, "f");
+    let file_label_x = label_start(file_y, "p");
+
+    assert_eq!(directory_label_x, file_label_x);
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((directory_label_x - 2, directory_y))
+            .unwrap()
+            .symbol(),
+        "▸"
+    );
+    for column in (file_label_x - 2)..file_label_x {
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((column, file_y))
+                .unwrap()
+                .symbol(),
+            " "
+        );
+    }
+}
+
+#[test]
 fn all_files_uses_a_small_aligned_change_gutter() {
     let fixture = TestRepo::new();
     fixture.write("changed-dir/nested.txt", "before nested\n");
@@ -2289,6 +2350,69 @@ fn all_files_uses_a_small_aligned_change_gutter() {
     assert_eq!(git_hint.symbol(), "ᴍ");
     assert_eq!(UnicodeWidthStr::width(git_hint.symbol()), 1);
     assert!(!git_hint.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn git_repository_change_count_stays_fixed_right_when_details_are_truncated() {
+    let fixture = TestRepo::new();
+    for index in 0..12 {
+        fixture.write(&format!("tracked-{index:02}.txt"), "before\n");
+    }
+    fixture.commit_all("initial");
+    fixture.git(&[
+        "checkout",
+        "--quiet",
+        "-b",
+        "feature/a-very-long-branch-name-for-sidebar-layout",
+    ]);
+    for index in 0..12 {
+        fixture.write(&format!("tracked-{index:02}.txt"), "after\n");
+    }
+
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    let repository_row = app
+        .visible_git_rows()
+        .iter()
+        .position(|row| {
+            matches!(
+                row.kind,
+                GitRowKind::Repository {
+                    change_count: 12,
+                    ..
+                }
+            )
+        })
+        .expect("dirty repository row");
+    assert!(
+        !app.visible_git_rows()[repository_row]
+            .detail
+            .contains("12 files")
+    );
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let row_y = app.ui_regions.tree_inner.y + u16::try_from(repository_row).unwrap();
+    let count_x = app.ui_regions.tree_inner.right() - 3;
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer.cell((count_x - 1, row_y)).unwrap().symbol(), " ");
+    assert_eq!(buffer.cell((count_x, row_y)).unwrap().symbol(), "1");
+    assert_eq!(buffer.cell((count_x + 1, row_y)).unwrap().symbol(), "2");
+    assert_eq!(buffer.cell((count_x + 2, row_y)).unwrap().symbol(), " ");
+    for column in count_x..=count_x + 1 {
+        assert_eq!(
+            buffer.cell((column, row_y)).unwrap().fg,
+            Color::Rgb(196, 151, 126)
+        );
+    }
+    let rendered_row = (app.ui_regions.tree_inner.x..app.ui_regions.tree_inner.right())
+        .map(|column| buffer.cell((column, row_y)).unwrap().symbol())
+        .collect::<String>();
+    assert!(rendered_row.contains('…'));
+    assert!(!rendered_row.contains("feature/a-very-long-branch-name-for-sidebar-layout"));
 }
 
 #[test]

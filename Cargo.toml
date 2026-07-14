@@ -7,6 +7,10 @@ description = "A repository viewer built for multi-agent terminals"
 license = "Apache-2.0"
 repository = "https://github.com/latte-co/latte-lens"
 
+[features]
+default = []
+agent-observability = []
+
 [[bin]]
 name = "latte-lens"
 path = "src/main.rs"

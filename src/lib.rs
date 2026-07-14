@@ -1,3 +1,5 @@
+#[cfg(any(feature = "agent-observability", test))]
+pub mod agent;
 pub mod app;
 mod clipboard;
 mod content_safety;
