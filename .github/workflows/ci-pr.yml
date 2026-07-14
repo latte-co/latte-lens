@@ -1,0 +1,185 @@
+name: ci-pr
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  static:
+    name: Static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-${{ runner.os }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: make fmt-check check lint script-test
+
+  test:
+    name: Unit and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-${{ runner.os }}
+          save-if: false
+      - run: make test
+
+  msrv:
+    name: MSRV (1.88.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-${{ runner.os }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo check --all-targets --locked
+
+  e2e:
+    name: E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-${{ runner.os }}
+          save-if: false
+      - run: make e2e
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: latte-lens-e2e-${{ runner.os }}
+          path: target/e2e-artifacts
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-${{ runner.os }}
+          save-if: false
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: make coverage
+
+  windows:
+    name: Windows tests and package
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-${{ runner.os }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Check all targets with Cargo.lock
+        run: cargo check --all-targets --locked
+      - name: Run unit and integration tests
+        run: cargo test --all-targets --locked
+      - name: Build the release binary
+        run: cargo build --release --locked
+      - name: Package the Windows release
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+      - name: Verify the Windows package
+        run: python scripts/verify-release-package.py "dist/*.zip" --binary latte-lens.exe
+      - name: Test the PowerShell installer with the Windows package
+        run: python -m unittest scripts/test_install_windows.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: latte-lens-Windows-${{ runner.arch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  package:
+    name: Package smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-${{ runner.os }}
+          save-if: false
+      - run: make package-smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: latte-lens-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [static, test, msrv, e2e, coverage, windows, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to pass
+        shell: bash
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "$STATIC_RESULT" \
+            "$TEST_RESULT" \
+            "$MSRV_RESULT" \
+            "$E2E_RESULT" \
+            "$COVERAGE_RESULT" \
+            "$WINDOWS_RESULT" \
+            "$PACKAGE_RESULT"; do
+            test "$result" = success
+          done

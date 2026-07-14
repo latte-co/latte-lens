@@ -790,10 +790,11 @@ fn git_tree_line(
     focused: bool,
     width: u16,
 ) -> Line<'static> {
-    let repository_has_changes = matches!(
-        &row.kind,
-        GitRowKind::Repository { change_count, .. } if *change_count > 0
-    );
+    let repository_change_count = match &row.kind {
+        GitRowKind::Repository { change_count, .. } => Some(*change_count),
+        _ => None,
+    };
+    let repository_has_changes = repository_change_count.is_some_and(|count| count > 0);
     let indent = "  ".repeat(row.depth);
     let icon = if row.is_container() {
         if app.git_row_is_expanded(row) {
@@ -854,15 +855,26 @@ fn git_tree_line(
             width,
         )
     } else if !row.detail.is_empty() {
-        let mut spans = spans;
-        spans.push(Span::styled(row.label.clone(), label_style));
+        let mut content = vec![Span::styled(row.label.clone(), label_style)];
         if repository_has_changes {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled("•", Style::default().fg(TREE_CHANGE_HINT)));
+            content.push(Span::raw(" "));
+            content.push(Span::styled("•", Style::default().fg(TREE_CHANGE_HINT)));
         }
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(row.detail.clone(), Style::default().fg(MUTED)));
-        Line::from(spans)
+        content.push(Span::raw("  "));
+        content.push(Span::styled(row.detail.clone(), Style::default().fg(MUTED)));
+        if let Some(change_count) = repository_change_count.filter(|count| *count > 0) {
+            tree_row_with_styled_hint(
+                spans,
+                content,
+                change_count.to_string(),
+                Style::default().fg(TREE_CHANGE_HINT),
+                width,
+            )
+        } else {
+            let mut spans = spans;
+            spans.extend(content);
+            Line::from(spans)
+        }
     } else {
         let mut spans = spans;
         spans.push(Span::styled(row.label.clone(), label_style));
@@ -878,7 +890,7 @@ fn tree_line(
     width: u16,
 ) -> Line<'static> {
     let indent = "  ".repeat(entry.depth);
-    let icon = if entry.is_dir {
+    let disclosure = if entry.is_dir {
         if app.directory_is_loading(entry) {
             "… "
         } else if app.directory_is_expanded(entry) {
@@ -887,7 +899,7 @@ fn tree_line(
             "▸ "
         }
     } else {
-        "· "
+        "  "
     };
     let selection_style = if selected && focused {
         Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
@@ -913,7 +925,7 @@ fn tree_line(
             }),
         ),
         Span::raw(indent),
-        Span::styled(icon, Style::default().fg(icon_color)),
+        Span::styled(disclosure, Style::default().fg(icon_color)),
     ];
     let label = entry.name();
     let label_style = if entry.exists || selected {
@@ -956,9 +968,25 @@ fn compact_tree_status_label(status: FileStatus) -> String {
 /// Keeps Git state in a quiet, fixed column instead of attaching it to names.
 /// The trailing cell leaves visual space before the Tree/content divider.
 fn tree_row_with_hint(
-    mut leading: Vec<Span<'static>>,
+    leading: Vec<Span<'static>>,
     label: String,
     label_style: Style,
+    hint: String,
+    hint_style: Style,
+    width: u16,
+) -> Line<'static> {
+    tree_row_with_styled_hint(
+        leading,
+        vec![Span::styled(label, label_style)],
+        hint,
+        hint_style,
+        width,
+    )
+}
+
+fn tree_row_with_styled_hint(
+    mut leading: Vec<Span<'static>>,
+    content: Vec<Span<'static>>,
     hint: String,
     hint_style: Style,
     width: u16,
@@ -966,16 +994,40 @@ fn tree_row_with_hint(
     let width = usize::from(width);
     let leading_width = spans_width(&leading);
     let hint_width = UnicodeWidthStr::width(hint.as_str());
-    let label_width = width.saturating_sub(leading_width + hint_width + 2);
-    let label = truncate_to_width(&label, label_width);
+    let content_width = width.saturating_sub(leading_width + hint_width + 2);
 
-    leading.push(Span::styled(label, label_style));
+    leading.extend(truncate_spans_to_width(content, content_width));
     let used_width = spans_width(&leading);
     let padding = width.saturating_sub(used_width + hint_width + 1).max(1);
     leading.push(Span::raw(" ".repeat(padding)));
     leading.push(Span::styled(hint, hint_style));
     leading.push(Span::raw(" "));
     Line::from(leading)
+}
+
+fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    if spans_width(&spans) <= max_width {
+        return spans;
+    }
+
+    let mut truncated = Vec::new();
+    let mut remaining = max_width;
+    for span in spans {
+        let span_width = span.width();
+        if span_width < remaining {
+            remaining -= span_width;
+            truncated.push(span);
+            continue;
+        }
+        if remaining > 0 {
+            truncated.push(Span::styled(
+                truncate_to_width_forced(span.content.as_ref(), remaining),
+                span.style,
+            ));
+        }
+        break;
+    }
+    truncated
 }
 
 fn spans_width(spans: &[Span<'_>]) -> usize {
@@ -986,6 +1038,10 @@ fn truncate_to_width(value: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(value) <= max_width {
         return value.to_owned();
     }
+    truncate_to_width_forced(value, max_width)
+}
+
+fn truncate_to_width_forced(value: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }

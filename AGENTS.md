@@ -103,6 +103,13 @@ Test behavior at the boundary being changed:
 - Real terminal behavior: run `make e2e`. The PTY harness is POSIX-only; CI runs
   it on Linux and macOS, while Windows runs locked check, test, and package
   verification without PTY coverage.
+- All changes follow `docs/testing/test-gates.md`. Files and Git Changes user journeys
+  remain blocking production-binary E2E coverage; feature-specific test suites
+  supplement this project-wide gate instead of replacing it.
+- Code Agent observability changes additionally follow
+  `docs/testing/code-agent-observability-test-gates.md`: keep C0-C2 tests synthetic,
+  keep the production adapter registry empty, and test reducer/contract behavior
+  below PTY level before adding a terminal journey.
 
 Do not weaken or delete timing/safety tests to make a change pass. Timing tests
 must assert the intended invariant with enough headroom for CI variance.
@@ -110,6 +117,9 @@ must assert the intended invariant with enough headroom for CI variance.
 ## 5. Git Workflow
 
 - The default branch is `main`; CI runs on pushes and pull requests.
+- All project changes must be delivered through a pull request. Never push
+  commits directly to `main`; create a topic branch, push that branch, open a
+  PR targeting `main`, and merge only after the `ci-pr` workflow passes.
 - Use Conventional Commit subjects recognized by
   `scripts/generate-release-notes.sh`: `feat:`, `fix:`, `perf:`, `docs:`,
   `build:`, `ci:`, and `test:`. Scopes and `!` are supported.
@@ -226,8 +236,15 @@ ordering, ownership, truncation, or fallback semantics that callers must obey.
 
 - `README.md` — product behavior, controls, platform support, architecture,
   engineering commands, installation, and release flow.
-- `docs/preview-providers.md` — preview-provider extension and content-safety
+- `docs/README.md` — Chinese documentation index and directory ownership.
+- `docs/design/code-agent-observability.md` — vendor-neutral Code Agent
+  observability architecture and phased design.
+- `docs/design/preview-providers.md` — preview-provider extension and content-safety
   contract.
-- `docs/search-performance.md` — lazy inventory, Refresh snapshot semantics,
+- `docs/testing/test-gates.md` — project-wide UT, integration, and production
+  E2E gates, including the blocking Files and Git Changes journey cards.
+- `docs/testing/code-agent-observability-test-gates.md` — blocking UT, contract,
+  headless E2E, and PTY E2E supplement for Code Agent observability.
+- `docs/engineering/search-performance.md` — lazy inventory, Refresh snapshot semantics,
   and the ignored-file timing regression test.
 - `LICENSE` — Apache License 2.0 terms.

@@ -127,9 +127,10 @@ with a very large subtree follow the same bounded startup path. Git Changes disc
 groups each visible repository under a selectable header, and shows only its
 changed files and required directories. Repository and Git-change directories default
 expanded; clean irrelevant leaves are hidden, while relationship, submodule,
-placeholder, partial-discovery, and isolated repository-error states remain
-visible. Expansion and repo+row selection identities persist across successful
-refreshes. Dirty repository headers use a quiet warm dot and label, while clean
+placeholder and isolated repository-error states remain visible. Repository
+discovery limits stay in the surrounding status UI instead of becoming
+selectable tree rows. Expansion and repo+row selection identities persist
+across successful refreshes. Dirty repository headers use a quiet warm dot and label, while clean
 repositories stay muted for fast scanning. In both scopes `p` and `d`
 explicitly switch the right-side content.
 The focused panel uses a
@@ -144,6 +145,10 @@ on-demand directory loads bounded.
 When that cap omits additional paths, both tree scopes show an entry count with
 `+` and `PARTIAL`; empty partial results are described as partial rather than
 as a complete or clean repository view.
+The intentional shallow repository scan used during startup is provisional, so
+it does not flash a partial warning while Git Changes loads the full bounded
+repository graph. Actual directory, repository, or full-depth limits still
+surface as partial status.
 
 ## Stack
 
@@ -243,7 +248,7 @@ inject a `PreviewRegistry` through `App::with_preview_registry`. Providers
 registered later have higher priority, so a PDF or Word provider can override
 the built-in text detector without changing the application or UI.
 
-See [docs/preview-providers.md](docs/preview-providers.md) for the provider
+See [docs/design/preview-providers.md](docs/design/preview-providers.md) for the provider
 contract and an integration example.
 
 ## Engineering commands
@@ -256,6 +261,11 @@ make ci
 
 It runs formatting, type checks, strict Clippy, unit and integration tests, then
 launches the real TUI in a pseudo-terminal for an end-to-end acceptance check.
+The project-wide test ownership and blocking Files, Git Changes, Search/Preview,
+and future Agent journey cards are defined in
+[docs/testing/test-gates.md](docs/testing/test-gates.md).
+The Chinese design, testing, and engineering documentation is indexed at
+[docs/README.md](docs/README.md).
 
 Additional commands:
 
