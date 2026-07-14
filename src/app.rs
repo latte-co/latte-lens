@@ -2631,11 +2631,7 @@ impl App {
             generation,
             scan_entry_limit: self.scan_entry_limit,
             scan_depth: tree::DEFAULT_INITIAL_SCAN_DEPTH,
-            repo_scan_depth: if full_repository_discovery {
-                crate::repo_graph::DEFAULT_MAX_DISCOVERY_DEPTH
-            } else {
-                tree::DEFAULT_INITIAL_SCAN_DEPTH.saturating_sub(1)
-            },
+            full_repository_discovery,
         });
     }
 
@@ -2705,6 +2701,7 @@ impl App {
         if self.has_refresh_snapshot {
             self.search_runtime.refresh_inventory();
         }
+        let full_repository_discovery = snapshot.full_repository_discovery;
         let pending_git_scope_path = self.pending_git_scope_path.take();
         let pending_git_scope_fallback = self.pending_git_scope_fallback.take();
         self.remember_current_selection();
@@ -2754,7 +2751,8 @@ impl App {
                 .filter(|snapshot| snapshot.status_error.is_some())
                 .count()
                 .saturating_add(graph.report().errors.len());
-            self.repository_graph_truncated = graph.report().is_truncated();
+            self.repository_graph_truncated =
+                repository_graph_is_truncated(&graph, full_repository_discovery);
             self.git_changes_truncated |= self.repository_graph_truncated;
             self.git_rows = build_git_rows(&self.root, &graph, &snapshot.existing_changes);
             self.changed_count = self
@@ -3724,34 +3722,13 @@ fn build_git_rows(
     for error in &graph.report().errors {
         rows.push(issue_row(root, error));
     }
-    for truncation in &graph.report().truncations {
-        let (path, message) = match truncation {
-            DiscoveryTruncation::EntryLimit { limit } => (
-                root.to_path_buf(),
-                format!("Repository discovery stopped at the {limit}-directory limit."),
-            ),
-            DiscoveryTruncation::RepositoryLimit { limit } => (
-                root.to_path_buf(),
-                format!("Repository discovery stopped at the {limit}-repository limit."),
-            ),
-            DiscoveryTruncation::DepthLimit { limit, path } => (
-                path.clone(),
-                format!("Repository discovery stopped at depth {limit}."),
-            ),
-        };
-        rows.push(GitTreeRow {
-            identity: GitRowIdentity::Issue(path.clone()),
-            kind: GitRowKind::Issue(message.clone()),
-            depth: 0,
-            label: format!("[partial] {}", compact_workspace_path(root, &path)),
-            detail: message,
-            status: None,
-            exists: true,
-            ancestors: Vec::new(),
-            file_entry: None,
-        });
-    }
     rows
+}
+
+fn repository_graph_is_truncated(graph: &RepoGraph, full_repository_discovery: bool) -> bool {
+    graph.report().truncations.iter().any(|truncation| {
+        full_repository_discovery || !matches!(truncation, DiscoveryTruncation::DepthLimit { .. })
+    })
 }
 
 struct GitChangeProjection<'a> {
@@ -4321,15 +4298,15 @@ mod tests {
     }
 
     #[test]
-    fn repository_discovery_truncation_becomes_a_partial_selectable_row() {
+    fn startup_depth_boundary_is_not_reported_as_partial() {
         let directory = tempfile::tempdir().unwrap();
-        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::create_dir_all(directory.path().join("nested/deeper")).unwrap();
         let graph = RepoGraph::discover_with_options(
             directory.path(),
             DiscoveryOptions {
-                max_entries: 0,
+                max_entries: 8,
                 max_repositories: 8,
-                max_depth: 8,
+                max_depth: 1,
             },
         )
         .unwrap();
@@ -4346,14 +4323,95 @@ mod tests {
             },
             graph: Some(graph),
             existing_changes: HashSet::new(),
+            full_repository_discovery: false,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        assert!(!app.repository_graph_truncated);
+        assert!(!app.git_changes_truncated);
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .all(|row| !row.label.starts_with("[partial]"))
+        );
+    }
+
+    #[test]
+    fn full_repository_truncation_sets_status_without_a_selectable_row() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("nested/deeper")).unwrap();
+        let graph = RepoGraph::discover_with_options(
+            directory.path(),
+            DiscoveryOptions {
+                max_entries: 8,
+                max_repositories: 8,
+                max_depth: 1,
+            },
+        )
+        .unwrap();
+        assert!(graph.report().is_truncated());
+
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
         });
         app.apply_tree_scope(TreeScope::GitChanges);
 
         assert!(app.repository_graph_truncated);
         assert!(app.git_changes_truncated);
-        assert!(app.visible_git_rows().iter().any(|row| {
-            matches!(row.kind, GitRowKind::Issue(_)) && row.label.starts_with("[partial]")
-        }));
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .all(|row| !row.label.starts_with("[partial]"))
+        );
+    }
+
+    #[test]
+    fn startup_hard_limit_still_sets_partial_status() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        let graph = RepoGraph::discover_with_options(
+            directory.path(),
+            DiscoveryOptions {
+                max_entries: 0,
+                max_repositories: 8,
+                max_depth: 1,
+            },
+        )
+        .unwrap();
+        assert!(graph.report().is_truncated());
+
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: false,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        assert!(app.repository_graph_truncated);
+        assert!(app.git_changes_truncated);
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .all(|row| !row.label.starts_with("[partial]"))
+        );
     }
 
     fn empty_snapshot() -> RefreshSnapshot {
@@ -4367,6 +4425,7 @@ mod tests {
                 truncated: false,
                 unloaded_directories: HashSet::new(),
             },
+            full_repository_discovery: true,
         }
     }
 

@@ -54,6 +54,34 @@ fn startup_renders_before_the_initial_tree_snapshot_is_ready() {
 }
 
 #[test]
+fn provisional_repository_scan_does_not_flash_partial_in_git_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("one/two/three")).unwrap();
+
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(!rendered.contains("PARTIAL"));
+    assert!(!rendered.contains("[partial]"));
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    assert!(app.is_refreshing());
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(!rendered.contains("PARTIAL"));
+    assert!(!rendered.contains("[partial]"));
+
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(!rendered.contains("PARTIAL"));
+    assert!(!rendered.contains("[partial]"));
+}
+
+#[test]
 fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand() {
     let parent = tempfile::tempdir().unwrap();
     let workspace = parent.path().join("arbitrary-workspace");

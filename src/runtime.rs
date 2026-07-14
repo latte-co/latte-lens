@@ -33,7 +33,7 @@ pub(crate) struct RefreshRequest {
     pub generation: u64,
     pub scan_entry_limit: usize,
     pub scan_depth: usize,
-    pub repo_scan_depth: usize,
+    pub full_repository_discovery: bool,
 }
 
 #[derive(Debug)]
@@ -63,6 +63,7 @@ pub(crate) struct RefreshSnapshot {
     pub scan: ScanResult,
     pub graph: Option<RepoGraph>,
     pub existing_changes: HashSet<crate::repo_graph::RepoPath>,
+    pub full_repository_discovery: bool,
 }
 
 #[derive(Debug)]
@@ -454,12 +455,17 @@ struct ExecutedRefresh {
 }
 
 fn execute_refresh(root: &std::path::Path, request: RefreshRequest) -> Result<ExecutedRefresh> {
+    let repo_scan_depth = if request.full_repository_discovery {
+        crate::repo_graph::DEFAULT_MAX_DISCOVERY_DEPTH
+    } else {
+        tree::DEFAULT_INITIAL_SCAN_DEPTH.saturating_sub(1)
+    };
     let graph = RepoGraph::discover_with_options(
         root,
         DiscoveryOptions {
             max_entries: crate::repo_graph::DEFAULT_MAX_DISCOVERY_ENTRIES,
             max_repositories: crate::repo_graph::DEFAULT_MAX_REPOSITORIES,
-            max_depth: request.repo_scan_depth,
+            max_depth: repo_scan_depth,
         },
     )?;
     let statuses = workspace_statuses(root, &graph);
@@ -499,6 +505,7 @@ fn execute_refresh(root: &std::path::Path, request: RefreshRequest) -> Result<Ex
             scan,
             graph: Some(graph),
             existing_changes,
+            full_repository_discovery: request.full_repository_discovery,
         },
         statuses,
     })
@@ -773,7 +780,7 @@ mod tests {
                 generation: 1,
                 scan_entry_limit: tree::DEFAULT_MAX_ENTRIES,
                 scan_depth: tree::DEFAULT_INITIAL_SCAN_DEPTH,
-                repo_scan_depth: crate::repo_graph::DEFAULT_MAX_DISCOVERY_DEPTH,
+                full_repository_discovery: true,
             },
         )
         .unwrap();
