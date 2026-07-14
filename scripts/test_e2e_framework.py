@@ -122,6 +122,48 @@ class SandboxTests(unittest.TestCase):
         finally:
             sandbox.cleanup()
 
+    def test_external_oracle_does_not_refresh_the_host_git_index(self) -> None:
+        sandbox = Sandbox("external-oracle-index-self-test")
+        try:
+            environment = sandbox.environment()
+            init_repository(sandbox.repository, environment)
+            tracked = sandbox.repository / "tracked.txt"
+            tracked.write_text("stable\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "tracked.txt"],
+                cwd=sandbox.repository,
+                env=environment,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "fixture"],
+                cwd=sandbox.repository,
+                env=environment,
+                check=True,
+                capture_output=True,
+            )
+
+            # Make the worktree stat data differ from the index while keeping
+            # the content clean, so an ordinary `git status` would refresh it.
+            tracked_stat = tracked.stat()
+            os.utime(
+                tracked,
+                ns=(tracked_stat.st_atime_ns, tracked_stat.st_mtime_ns + 5_000_000_000),
+            )
+            index = sandbox.repository / ".git" / "index"
+            index_before = (index.read_bytes(), index.stat().st_mtime_ns)
+
+            oracle = ExternalIsolationOracle(
+                host_cwd=sandbox.repository, host_home=sandbox.home
+            )
+
+            self.assertEqual(oracle._host_git_environment()["GIT_OPTIONAL_LOCKS"], "0")
+            self.assertTrue(oracle.verify()["host_checkout_unchanged"])
+            self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), index_before)
+        finally:
+            sandbox.cleanup()
+
 
 class ProcessEvidenceTests(unittest.TestCase):
     def _sleeping_session(self) -> PtySession:

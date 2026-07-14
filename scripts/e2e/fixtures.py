@@ -273,6 +273,10 @@ class ExternalIsolationOracle:
         for key in list(environment):
             if key.startswith("GIT_"):
                 environment.pop(key)
+        # The oracle must remain read-only itself. Without this, the first
+        # `git status` may refresh the host checkout's index stat cache and the
+        # next snapshot reports that self-induced write as an isolation leak.
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
         return environment
 
     def _checkout_root(self) -> Path | None:
@@ -297,7 +301,14 @@ class ExternalIsolationOracle:
             for name in ("HEAD", "index", "config", "packed-refs")
         }
         status = subprocess.run(
-            ["git", "status", "--porcelain=v2", "-z", "--untracked-files=no"],
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=no",
+            ],
             cwd=self.checkout_root,
             env=self._host_git_environment(),
             check=True,
