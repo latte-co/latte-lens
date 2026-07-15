@@ -266,9 +266,6 @@ struct QuitConfirmation {
 }
 
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1_500);
-// Mouse events are timestamped when the app processes them. Leave enough room
-// for a redraw between two physical clicks on slower or instrumented terminals.
-const SEARCH_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PreviewFindState {
@@ -2188,7 +2185,7 @@ impl App {
                 .map_or(0, |search| search.results.len());
             if index < count {
                 let double_click = self.last_search_click.is_some_and(|(previous, instant)| {
-                    previous == index && instant.elapsed() <= SEARCH_DOUBLE_CLICK_WINDOW
+                    previous == index && instant.elapsed() <= Duration::from_millis(400)
                 });
                 self.search_list_state.select(Some(index));
                 if let Some(search) = &mut self.search {

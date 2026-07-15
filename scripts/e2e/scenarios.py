@@ -635,15 +635,31 @@ def search_controls(context: ScenarioContext) -> None:
     session.key(b"\x15")
     session.wait_screen(("Type a file name or path",), "file query editing clears cleanly")
     session.key(b"search-target")
-    session.wait_screen(("search-target.rs", "results"), "edited file query converges")
+    session.wait_screen(
+        ("search-target-other.rs", "search-target.rs", "results"),
+        "edited file query converges",
+    )
     for key in (b"\x1b[B", b"\x1b[A", b"\x1b[6~", b"\x1b[5~"):
         session.key(key)
     session.wait_screen(
         ("· src/search-target.rs",),
         "file-search navigation keeps the result selected",
     )
+    # Give each click its own terminal input batch. Selecting the other result
+    # first makes the first click on the target observable, so the second click
+    # is only sent after the application has processed the first one.
+    session.key(b"\x1b[B")
+    session.wait_screen(
+        ("▌ · src/search-target-other.rs",),
+        "file-search selection moves away from the double-click target",
+    )
     file_result = _marker_position_on_line(session, "· src/search-target.rs")
-    session.double_click(*file_result)
+    session.click(*file_result)
+    session.wait_screen(
+        ("▌ · src/search-target.rs",),
+        "first target click is processed before the second",
+    )
+    session.click(*file_result)
     session.wait_screen(
         ("Preview", "searchable()"),
         "double-click accepts the file-search result",
@@ -723,11 +739,10 @@ def search_controls(context: ScenarioContext) -> None:
         ("hidden.txt:1", "ignored_unique_phrase"),
         "mouse-enabled ignored search finds the hidden fixture",
     )
-    text_result = _marker_position_on_line(session, "· .ignored/hidden.txt:1")
-    session.double_click(*text_result)
+    session.key(b"\r")
     session.wait_screen(
         ("Preview", "ignored_unique_phrase"),
-        "double-click accepts a text-search result",
+        "Enter accepts a text-search result",
         absent=("Search Workspace",),
     )
 

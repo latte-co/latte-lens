@@ -119,10 +119,22 @@ def create_search_fixture(root: Path, environment: dict[str, str]) -> None:
     (root / "src" / "search-target.rs").write_text(
         "pub fn searchable() {}\n// unique_workspace_phrase\n", encoding="utf-8"
     )
+    (root / "src" / "search-target-other.rs").write_text(
+        "pub fn other_search_target() {}\n", encoding="utf-8"
+    )
     (root / ".ignored" / "hidden.txt").write_text(
         "ignored_unique_phrase\n", encoding="utf-8"
     )
-    run("git", "add", ".gitignore", "docs/guide.txt", "src/search-target.rs", cwd=root, environment=environment)
+    run(
+        "git",
+        "add",
+        ".gitignore",
+        "docs/guide.txt",
+        "src/search-target.rs",
+        "src/search-target-other.rs",
+        cwd=root,
+        environment=environment,
+    )
     run("git", "commit", "-q", "-m", "search fixture", cwd=root, environment=environment)
 
 
