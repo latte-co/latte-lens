@@ -482,7 +482,11 @@ fn utf8_prefix(bytes: &[u8], truncated_by_bytes: bool) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        io::{Read, Seek, SeekFrom},
+        path::Path,
+    };
 
     use anyhow::Result;
     use tempfile::tempdir;
@@ -499,7 +503,7 @@ mod tests {
         let extensionless = directory.path().join("README");
         fs::write(&code, "fn main() {\n    println!(\"latte\");\n}\n")?;
         fs::write(&extensionless, "Latte Lens\n看清每一次修改\n")?;
-        let registry = PreviewRegistry::with_builtins();
+        let registry = PreviewRegistry::default();
 
         let code_preview = registry
             .preview(&PreviewRequest::new(&code, Path::new("src/main.rs")))?
@@ -531,6 +535,34 @@ mod tests {
         assert_eq!(text_preview.lines, ["Latte Lens", "看清每一次修改"]);
         assert!(text_preview.highlights.iter().all(Vec::is_empty));
         assert!(!text_preview.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn safely_opened_preview_files_report_size_and_support_reading_and_seeking() -> Result<()> {
+        let directory = tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let non_empty = root.join("notes.txt");
+        let empty = root.join("empty.txt");
+        fs::write(&non_empty, "latte")?;
+        fs::write(&empty, "")?;
+
+        let mut file = PreviewRequest::new(&non_empty, Path::new("notes.txt"))
+            .within_root(&root)
+            .open_regular()?
+            .expect("regular file should pass the content-safety gate");
+        assert_eq!(file.len(), 5);
+        assert!(!file.is_empty());
+        assert_eq!(file.seek(SeekFrom::Start(2))?, 2);
+        let mut suffix = String::new();
+        file.read_to_string(&mut suffix)?;
+        assert_eq!(suffix, "tte");
+
+        let empty = PreviewRequest::new(&empty, Path::new("empty.txt"))
+            .within_root(&root)
+            .open_regular()?
+            .expect("empty regular file should still be openable");
+        assert!(empty.is_empty());
         Ok(())
     }
 

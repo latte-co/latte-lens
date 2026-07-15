@@ -82,8 +82,8 @@ jobs:
           retention-days: 7
           compression-level: 1
 
-  coverage:
-    name: Coverage
+  coverage-unit:
+    name: Coverage - UT (93%)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -96,7 +96,27 @@ jobs:
           shared-key: stable-${{ runner.os }}
           save-if: false
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: make coverage
+      - run: make coverage-unit
+
+  coverage-e2e:
+    name: Coverage - E2E (85%)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: make coverage-e2e
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: latte-lens-coverage-e2e
+          path: target/llvm-cov-e2e/e2e-artifacts
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
 
   windows:
     name: Windows tests and package
@@ -157,7 +177,7 @@ jobs:
   gate:
     name: CI gate
     if: always()
-    needs: [static, test, msrv, e2e, coverage, windows, package]
+    needs: [static, test, msrv, e2e, coverage-unit, coverage-e2e, windows, package]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -168,7 +188,8 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
-          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          COVERAGE_UNIT_RESULT: ${{ needs['coverage-unit'].result }}
+          COVERAGE_E2E_RESULT: ${{ needs['coverage-e2e'].result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
@@ -178,7 +199,8 @@ jobs:
             "$TEST_RESULT" \
             "$MSRV_RESULT" \
             "$E2E_RESULT" \
-            "$COVERAGE_RESULT" \
+            "$COVERAGE_UNIT_RESULT" \
+            "$COVERAGE_E2E_RESULT" \
             "$WINDOWS_RESULT" \
             "$PACKAGE_RESULT"; do
             test "$result" = success

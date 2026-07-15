@@ -272,17 +272,23 @@ The Chinese design, testing, and engineering documentation is indexed at
 Additional commands:
 
 ```bash
-make coverage       # enforce at least 80% line coverage
-make coverage-html  # generate an inspectable HTML report
+make coverage       # enforce both independent coverage floors
+make coverage-unit  # enforce 93% on the direct unit-test responsibility surface
+make coverage-e2e   # enforce 85% on the production PTY interaction surface
+make coverage-html  # generate an inspectable all-target HTML report
 make bench          # run performance benchmarks
 make package        # create a release archive and SHA-256 checksum
 make package-smoke  # build and verify the archive payload and checksum
 ```
 
-`make setup` installs the optional local coverage command. CI runs the quality
-gate on Linux, the POSIX PTY E2E test on Linux and macOS, checks Rust 1.88
-compatibility, enforces the 80% line-coverage floor, and validates release
-packages on Linux, macOS, and Windows.
+`make setup` installs the optional local coverage command. The UT floor covers
+the Q1 support modules `clipboard.rs`, `diff.rs`, `preview.rs`, `search.rs`, and
+`text_layout.rs`; the E2E floor covers `app.rs`, `main.rs`, and `ui.rs` while
+exercising the production binary through a PTY. Integration and contract tests
+remain independent Q2 gates instead of being blended into either percentage.
+CI runs the quality gate on Linux, the POSIX PTY E2E test on Linux and macOS,
+checks Rust 1.88 compatibility, enforces both coverage floors, and validates
+release packages on Linux, macOS, and Windows.
 
 ## Publishing a release
 

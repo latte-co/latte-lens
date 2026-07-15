@@ -494,7 +494,11 @@ fn bounded_result_line(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{
+        fs,
+        sync::mpsc::RecvTimeoutError,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -776,16 +780,30 @@ mod tests {
 
     fn wait_for_finished(runtime: &SearchRuntime, generation: u64) -> Vec<SearchEvent> {
         let mut events = Vec::new();
-        for _ in 0..100 {
-            events.extend(runtime.take_events());
-            if events.iter().any(|event| {
-                matches!(event, SearchEvent::Finished { generation: current, .. } if *current == generation)
-            }) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = match runtime.events.recv_timeout(remaining) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("search generation {generation} did not finish; events: {events:?}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("search worker disconnected; events: {events:?}")
+                }
+            };
+            let finished = matches!(
+                event,
+                SearchEvent::Finished {
+                    generation: current,
+                    ..
+                } if current == generation
+            );
+            events.push(event);
+            if finished {
                 return events;
             }
-            thread::sleep(Duration::from_millis(10));
         }
-        panic!("search did not finish");
     }
 
     fn event_matches(events: &[SearchEvent]) -> Vec<SearchMatch> {
