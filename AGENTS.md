@@ -54,7 +54,9 @@ Run commands from the repository root.
 | `cargo run -- /path/to/workspace` | Start Latte Lens against a directory; omit the path to use `.`. |
 | `make build` | Build the debug binary with the lockfile. |
 | `make ci` | Run the complete local handoff gate: formatting, check, lint, Rust tests, script tests, and PTY E2E. |
-| `make coverage` | Enforce the default 80% line-coverage floor. |
+| `make coverage` | Enforce both independent coverage floors. |
+| `make coverage-unit` | Enforce 93% line coverage on the Q1 direct unit-test responsibility surface. |
+| `make coverage-e2e` | Enforce 85% line coverage on the production PTY interaction surface. |
 | `make bench` | Run Criterion benchmarks. |
 | `make release` | Build the optimized binary. |
 | `make package-smoke` | Build and verify the current platform's release archive and checksum. |

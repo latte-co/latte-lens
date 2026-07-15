@@ -373,6 +373,12 @@ class PtySession:
         os.write(self.master_fd, b"\x1b[<0;" + position + b"M")
         os.write(self.master_fd, b"\x1b[<0;" + position + b"m")
 
+    def double_click(self, column: int, row: int) -> None:
+        position = f"{column + 1};{row + 1}".encode()
+        down = b"\x1b[<0;" + position + b"M"
+        up = b"\x1b[<0;" + position + b"m"
+        os.write(self.master_fd, down + up + down + up)
+
     def click_marker(self, marker: str, *, offset: int = 0) -> None:
         position = self.screen.find(marker)
         if position is None:
@@ -390,6 +396,10 @@ class PtySession:
     def scroll_down(self, column: int, row: int) -> None:
         position = f"{column + 1};{row + 1}".encode()
         os.write(self.master_fd, b"\x1b[<65;" + position + b"M")
+
+    def scroll_up(self, column: int, row: int) -> None:
+        position = f"{column + 1};{row + 1}".encode()
+        os.write(self.master_fd, b"\x1b[<64;" + position + b"M")
 
     def quit_cleanly(self, timeout: float = DEFAULT_WAIT_SECONDS) -> None:
         self.key(b"qq")

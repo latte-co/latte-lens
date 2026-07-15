@@ -2,13 +2,17 @@ SHELL := /bin/bash
 
 CARGO ?= cargo
 PYTHON ?= python3
-COVERAGE_MIN ?= 80
+UT_COVERAGE_MIN ?= 93
+E2E_COVERAGE_MIN ?= 85
+UT_COVERAGE_IGNORE_REGEX ?= (/agent/|/(app|content_safety|git|main|repo_graph|runtime|tree|ui)\.rs$$)
+E2E_COVERAGE_IGNORE_REGEX ?= (/agent/|/(clipboard|content_safety|diff|git|preview|repo_graph|runtime|search|text_layout|tree)\.rs$$)
+E2E_COVERAGE_TARGET_DIR ?= target/llvm-cov-e2e
 BINARY := latte-lens
 E2E_ARTIFACT_DIR ?= target/e2e-artifacts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup fmt fmt-check check lint test installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e coverage coverage-html bench ci build release package package-smoke install clean
+.PHONY: help setup fmt fmt-check check lint test installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e coverage coverage-unit coverage-e2e coverage-html bench ci build release package package-smoke install clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Latte Lens engineering commands:\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -57,9 +61,22 @@ e2e: e2e-self-test ## Build and run every production TUI scenario
 	$(CARGO) build --locked
 	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY) --scenario all --artifact-dir $(E2E_ARTIFACT_DIR)
 
-coverage: ## Enforce the line coverage threshold (default: 80%)
+coverage: coverage-unit coverage-e2e ## Enforce the UT and production PTY E2E line-coverage floors
+
+coverage-unit: ## Enforce 93% line coverage for the direct unit-test responsibility surface
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "cargo-llvm-cov is missing; run 'make setup'"; exit 1; }
-	$(CARGO) llvm-cov --workspace --all-targets --all-features --locked --fail-under-lines $(COVERAGE_MIN)
+	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --workspace --all-features --lib --bins --locked \
+		--ignore-filename-regex '$(UT_COVERAGE_IGNORE_REGEX)' \
+		--fail-under-lines $(UT_COVERAGE_MIN)
+
+coverage-e2e: e2e-self-test ## Enforce 85% line coverage for the production PTY interaction surface
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "cargo-llvm-cov is missing; run 'make setup'"; exit 1; }
+	CARGO='$(CARGO)' PYTHON='$(PYTHON)' BINARY='$(BINARY)' \
+		E2E_COVERAGE_MIN='$(E2E_COVERAGE_MIN)' \
+		E2E_COVERAGE_IGNORE_REGEX='$(E2E_COVERAGE_IGNORE_REGEX)' \
+		E2E_COVERAGE_TARGET_DIR='$(E2E_COVERAGE_TARGET_DIR)' \
+		scripts/coverage-e2e.sh
 
 coverage-html: ## Generate an HTML coverage report
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "cargo-llvm-cov is missing; run 'make setup'"; exit 1; }

@@ -73,6 +73,7 @@ def wait_for_initial_files(session: PtySession) -> None:
 
 
 def _click_disclosure(session: PtySession, marker: str) -> None:
+    session.drain()
     divider = _interior_divider(session.screen) or session.screen.columns
     for row, cells in enumerate(session.screen.cells):
         line = "".join(cells[:divider])
@@ -94,6 +95,7 @@ def _click_disclosure(session: PtySession, marker: str) -> None:
 
 
 def _click_tree_row(session: PtySession, marker: str) -> None:
+    session.drain()
     divider = _interior_divider(session.screen) or session.screen.columns
     for row, cells in enumerate(session.screen.cells):
         line = "".join(cells[:divider])
@@ -102,6 +104,26 @@ def _click_tree_row(session: PtySession, marker: str) -> None:
             session.click(column, row)
             return
     raise E2EAssertionError("input_target", f"cannot find tree row for: {marker}")
+
+
+def _click_marker_on_line(
+    session: PtySession, marker: str, *, alongside: tuple[str, ...] = ()
+) -> None:
+    session.click(*_marker_position_on_line(session, marker, alongside=alongside))
+
+
+def _marker_position_on_line(
+    session: PtySession, marker: str, *, alongside: tuple[str, ...] = ()
+) -> tuple[int, int]:
+    session.drain()
+    for row, cells in enumerate(session.screen.cells):
+        line = "".join(cells)
+        if marker in line and all(companion in line for companion in alongside):
+            return line.index(marker), row
+    raise E2EAssertionError(
+        "input_target",
+        f"cannot find {marker!r} alongside {alongside!r}",
+    )
 
 
 def _interior_divider(screen: TerminalScreen) -> int | None:
@@ -252,6 +274,108 @@ def files_refresh(context: ScenarioContext) -> None:
         "Files refresh removes a file and preserves selected preview",
         absent=("refresh-added.txt",),
     )
+
+
+def keyboard_controls(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+
+    # Move through the explicit Tabs -> Tree -> Content focus model and both
+    # scope-tab arrow branches before exercising the global tab shortcuts.
+    session.key(b"\x1b[A")
+    session.wait_screen(("Tabs",), "Up from the first tree row focuses scope tabs")
+    session.key(b"\x1b[C")
+    session.wait_screen(("Git changes", "b-changed.rs", "Diff"), "Right tab selects Git Changes")
+    session.key(b"\x1b[D")
+    session.wait_screen(("Files", "a-dir", "Tabs"), "Left tab returns to Files")
+    session.key(b"\x1b[B")
+    session.wait_screen(("Tree",), "Down from tabs returns focus to the tree")
+    session.key(b"\t")
+    session.wait_screen(("Git changes", "Diff"), "Tab advances to Git Changes")
+    session.key(b"\x1b[Z")
+    session.wait_screen(("Files", "a-dir"), "BackTab returns to Files")
+
+    # Tree navigation covers bounded first/last selection, activation, and
+    # the transition into the content pane.
+    session.key(b"G")
+    session.wait_screen(("z-clean.rs", "Preview", "clean()"), "tree End selects the last file")
+    session.key(b"\x1b[C")
+    session.wait_screen(("Content",), "Right moves focus into content")
+    for key in (
+        b"j",
+        b"k",
+        b"\x1b[6~",
+        b"\x1b[5~",
+        b"\x04",
+        b"\x15",
+        b"\x1b[1;2C",
+        b"\x1b[1;2D",
+        b"G",
+        b"g",
+        b"\x1b[C",
+    ):
+        session.key(key)
+    session.key(b"\x1b[D")
+    session.key(b"g")
+    session.key(b"\r")
+    session.wait_screen(("▾ a-dir", "nested"), "tree Home and Enter expand the first directory")
+    _click_disclosure(session, "nested")
+    session.wait_screen(
+        ("b-changed.rs",),
+        "nested directory loading makes the changed file searchable",
+    )
+
+    # Wheel-up is separate from wheel-down in Crossterm and must route to the
+    # pointed pane, independent of the current keyboard focus.
+    tree_marker = session.screen.find("a-dir")
+    if tree_marker is None:
+        raise E2EAssertionError("input_target", "tree row is not visible for wheel routing")
+    session.scroll_up(*tree_marker)
+    content_column = min(session.screen.columns - 2, (_interior_divider(session.screen) or 40) + 8)
+    session.scroll_up(content_column, min(10, session.screen.rows - 3))
+
+    # Loading a diff from All Files must resolve the owning repository instead
+    # of assuming the workspace root. Cycling here covers the All Files branch
+    # of changed-file navigation before the Git Changes projection takes over.
+    session.key(b"/")
+    session.key(b"b-changed")
+    session.wait_screen(("b-changed.rs", "Open File"), "file search finds the changed file")
+    session.key(b"\r")
+    session.wait_screen(("Preview", "changed()"), "file search opens the changed preview")
+    session.key(b"d")
+    session.wait_screen(("Diff", "diff --git"), "All Files resolves the owning repository diff")
+    session.key(b"n")
+    session.wait_screen(("Diff", "diff --git"), "All Files cycles to its next changed entry")
+    session.key(b"N")
+    session.wait_screen(("Diff", "diff --git"), "All Files cycles to its previous changed entry")
+
+    # Changed-file navigation runs in both directions only while Diff owns the
+    # content pane. Preview/Diff toggles then return to the same owning change.
+    session.key(b"2")
+    session.wait_screen(("Git changes", "Diff", "diff --git"), "Git Changes is ready for change cycling")
+    session.wait_until(
+        lambda screen: "Refreshing workspace" not in screen.text() and "a-dir" in screen.text(),
+        "Git Changes refresh settles before directory interaction",
+    )
+    _click_tree_row(session, "a-dir")
+    session.wait_screen(
+        ("changed file", "directory"),
+        "Git directory selection renders its aggregate information",
+    )
+    session.key(b"\r")
+    session.wait_screen(("b-changed.rs",), "Git directory reopens after its information view")
+    _click_tree_row(session, "b-changed.rs")
+    session.wait_screen(("Diff", "diff --git"), "Git changed-file selection restores the diff")
+    session.key(b"n")
+    session.wait_screen(("Diff", "diff --git"), "n selects the next changed file")
+    session.key(b"N")
+    session.wait_screen(("Diff", "diff --git"), "N selects the previous changed file")
+    session.key(b"p")
+    session.wait_screen(("Preview",), "p loads the changed file preview")
+    session.key(b"d")
+    session.wait_screen(("Diff", "diff --git"), "d restores the owning diff")
+    session.click_marker("r  Refresh")
+    session.wait_screen(("Git changes", "Diff"), "mouse refresh preserves Git Changes")
 
 
 def git_navigation(context: ScenarioContext) -> None:
@@ -440,12 +564,145 @@ def search_preview(context: ScenarioContext) -> None:
     )
 
 
+def search_controls(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+
+    # Ctrl+F on directory info must explain why find is unavailable instead of
+    # opening a control that cannot search the current content mode.
+    session.key(b"\x06")
+    session.wait_screen(
+        ("Open a file preview or diff before using Ctrl+F",),
+        "Preview find explains its content precondition",
+    )
+
+    # Open the file picker through its real mouse hit box, exercise every query
+    # editing/navigation branch, then open a production preview by double click.
+    session.click_marker("/ Open")
+    session.wait_screen(("Open File", "File", "Text"), "mouse opens file search")
+    session.key(b"alpha beta")
+    session.key(b"\x1b[H")
+    session.key(b"\x1b[C")
+    session.key(b"\x1b[3~")
+    session.key(b"\x1b[F")
+    session.key(b"\x1b[D")
+    session.key(b"\x7f")
+    session.key(b"\x17")
+    session.key(b"\x15")
+    session.wait_screen(("Type a file name or path",), "file query editing clears cleanly")
+    session.key(b"search-target")
+    session.wait_screen(("search-target.rs", "results"), "edited file query converges")
+    for key in (b"\x1b[B", b"\x1b[A", b"\x1b[6~", b"\x1b[5~"):
+        session.key(key)
+    session.wait_screen(
+        ("· src/search-target.rs",),
+        "file-search navigation keeps the result selected",
+    )
+    file_result = _marker_position_on_line(session, "· src/search-target.rs")
+    session.double_click(*file_result)
+    session.wait_screen(
+        ("Preview", "searchable()"),
+        "double-click accepts the file-search result",
+        absent=("Open File",),
+    )
+
+    # Preview find keyboard and mouse controls share the production hit boxes.
+    session.key(b"\x06")
+    session.key(b"searchable")
+    session.wait_screen(("Find", "1/1"), "Preview find has one result")
+    session.key(b"\x1b[12~")
+    session.key(b"\x1b[A")
+    session.key(b"\x1b[B")
+    session.key(b"\x1b[H")
+    session.key(b"\x1b[C")
+    session.key(b"\x1b[3~")
+    session.key(b"\x1b[F")
+    session.key(b"\x1b[D")
+    session.key(b"\x7f")
+    session.key(b"\x17")
+    session.key(b"\x15")
+    session.wait_screen(("Find", "0/0"), "Preview find editing reaches an empty query")
+    session.key(b"searchable")
+    session.wait_screen(("Find", "1/1"), "Preview find query is restored")
+    _click_marker_on_line(session, "Aa", alongside=("Find", "1/1"))
+    _click_marker_on_line(session, "↑", alongside=("Find", "1/1"))
+    _click_marker_on_line(session, "↓", alongside=("Find", "1/1"))
+    _click_marker_on_line(session, "Find", alongside=("1/1",))
+    _click_marker_on_line(session, "[x]", alongside=("Find", "1/1"))
+    session.wait_screen(
+        ("Preview", "searchable()"),
+        "Preview find closes through its mouse control",
+        absent=(" Find ",),
+    )
+
+    # Handoff from Preview find to workspace search, then cover every text
+    # option through both keyboard and mouse controls.
+    session.key(b"\x06")
+    session.key(b"\x14")
+    session.wait_screen(("Search Workspace", "File", "Text"), "find hands off to text search")
+    search_modes = _marker_position_on_line(session, "File Text")
+    session.click(*search_modes)
+    session.wait_screen(("Open File",), "mouse switches search to files")
+    search_modes = _marker_position_on_line(session, "File Text")
+    session.click(search_modes[0] + len("File "), search_modes[1])
+    session.wait_screen(("Search Workspace",), "mouse switches search back to text")
+    session.key(b"unique_workspace_phrase")
+    session.wait_screen(
+        ("search-target.rs:2", "unique_workspace_phrase"),
+        "workspace query is ready for option controls",
+    )
+    for key in (b"\x1b[12~", b"\x1b[13~", b"\x1b[14~"):
+        session.key(key)
+    session.wait_screen(
+        ("search-target.rs:2", "unique_workspace_phrase"),
+        "case, word, and regex keyboard options preserve the exact match",
+    )
+    for marker in ("Aa", "Word", ".*", "Ign"):
+        _click_marker_on_line(session, marker, alongside=("File", "Text", "Aa", "Word", ".*", "Ign"))
+    session.wait_screen(
+        ("search-target.rs:2", "unique_workspace_phrase"),
+        "mouse search options preserve the result",
+    )
+    _click_marker_on_line(
+        session,
+        "unique_workspace_phrase",
+        alongside=("Clear",),
+    )
+    result = session.screen.find("search-target.rs:2")
+    if result is None:
+        raise E2EAssertionError("input_target", "text-search result is not visible")
+    session.scroll_down(*result)
+    _click_marker_on_line(session, "Clear ×")
+    session.wait_screen(("Type text to search the workspace",), "mouse clears text search")
+    session.key(b"ignored_unique_phrase")
+    session.wait_screen(
+        ("hidden.txt:1", "ignored_unique_phrase"),
+        "mouse-enabled ignored search finds the hidden fixture",
+    )
+    text_result = _marker_position_on_line(session, "· .ignored/hidden.txt:1")
+    session.double_click(*text_result)
+    session.wait_screen(
+        ("Preview", "ignored_unique_phrase"),
+        "double-click accepts a text-search result",
+        absent=("Search Workspace",),
+    )
+
+    # Inactive header buttons must remain mouse-addressable after a search
+    # session has restored its preview.
+    session.click_marker("^T Text")
+    session.wait_screen(("Search Workspace",), "mouse reopens text search from the header")
+    _click_marker_on_line(session, "Esc ×")
+    session.wait_screen(("Preview", "ignored_unique_phrase"), "mouse closes text search")
+
+
 CASES = (
     ScenarioCase("files-navigation", "files", create_navigation_fixture, files_navigation),
     ScenarioCase("files-refresh", "files", create_navigation_fixture, files_refresh),
+    ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
     ScenarioCase("search-preview", "search-preview", create_search_fixture, search_preview),
+    ScenarioCase("search-controls", "search-preview", create_search_fixture, search_controls),
 )
 
 

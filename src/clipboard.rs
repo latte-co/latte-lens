@@ -79,6 +79,14 @@ fn copy_with_native_command(text: &str) -> io::Result<()> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn copy_with_native_command(text: &str) -> io::Result<()> {
+    copy_with_native_command_runner(text, run_copy_command)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn copy_with_native_command_runner(
+    text: &str,
+    mut run: impl FnMut(&str, &[&str], &str) -> io::Result<()>,
+) -> io::Result<()> {
     let candidates: [(&str, &[&str]); 3] = [
         ("wl-copy", &[]),
         ("xclip", &["-selection", "clipboard"]),
@@ -86,7 +94,7 @@ fn copy_with_native_command(text: &str) -> io::Result<()> {
     ];
     let mut last_error = None;
     for (program, arguments) in candidates {
-        match run_copy_command(program, arguments, text) {
+        match run(program, arguments, text) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -253,5 +261,54 @@ mod tests {
 
         let error = run_copy_command("false", &[], "ignored").unwrap_err();
         assert!(error.to_string().contains("exited with status"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn native_clipboard_candidates_fall_through_in_order_and_keep_the_last_error() {
+        let mut attempts = Vec::new();
+        copy_with_native_command_runner("clipboard fixture", |program, arguments, text| {
+            attempts.push((
+                program.to_owned(),
+                arguments
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                text.to_owned(),
+            ));
+            if program == "xsel" {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!("{program} unavailable")))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            attempts,
+            [
+                (
+                    "wl-copy".to_owned(),
+                    Vec::new(),
+                    "clipboard fixture".to_owned()
+                ),
+                (
+                    "xclip".to_owned(),
+                    vec!["-selection".to_owned(), "clipboard".to_owned()],
+                    "clipboard fixture".to_owned(),
+                ),
+                (
+                    "xsel".to_owned(),
+                    vec!["--clipboard".to_owned(), "--input".to_owned()],
+                    "clipboard fixture".to_owned(),
+                ),
+            ]
+        );
+
+        let error = copy_with_native_command_runner("ignored", |program, _, _| {
+            Err(io::Error::other(format!("{program} unavailable")))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "xsel unavailable");
     }
 }

@@ -128,7 +128,9 @@ groups each visible repository under a selectable header, and shows only its
 changed files and required directories. Repository and Git-change directories default
 expanded; clean irrelevant leaves are hidden, while relationship, submodule,
 placeholder and isolated repository-error states remain visible. Repository
-discovery limits stay in the surrounding status UI instead of becoming
+headers use the repository directory name when only one repository is visible;
+multi-repository workspaces keep `.` for the workspace root and relative paths
+for descendants. Repository discovery limits stay in the surrounding status UI instead of becoming
 selectable tree rows. Expansion and repo+row selection identities persist
 across successful refreshes. Dirty repository headers use a quiet warm dot and label, while clean
 repositories stay muted for fast scanning. In both scopes `p` and `d`
@@ -270,17 +272,23 @@ The Chinese design, testing, and engineering documentation is indexed at
 Additional commands:
 
 ```bash
-make coverage       # enforce at least 80% line coverage
-make coverage-html  # generate an inspectable HTML report
+make coverage       # enforce both independent coverage floors
+make coverage-unit  # enforce 93% on the direct unit-test responsibility surface
+make coverage-e2e   # enforce 85% on the production PTY interaction surface
+make coverage-html  # generate an inspectable all-target HTML report
 make bench          # run performance benchmarks
 make package        # create a release archive and SHA-256 checksum
 make package-smoke  # build and verify the archive payload and checksum
 ```
 
-`make setup` installs the optional local coverage command. CI runs the quality
-gate on Linux, the POSIX PTY E2E test on Linux and macOS, checks Rust 1.88
-compatibility, enforces the 80% line-coverage floor, and validates release
-packages on Linux, macOS, and Windows.
+`make setup` installs the optional local coverage command. The UT floor covers
+the Q1 support modules `clipboard.rs`, `diff.rs`, `preview.rs`, `search.rs`, and
+`text_layout.rs`; the E2E floor covers `app.rs`, `main.rs`, and `ui.rs` while
+exercising the production binary through a PTY. Integration and contract tests
+remain independent Q2 gates instead of being blended into either percentage.
+CI runs the quality gate on Linux, the POSIX PTY E2E test on Linux and macOS,
+checks Rust 1.88 compatibility, enforces both coverage floors, and validates
+release packages on Linux, macOS, and Windows.
 
 ## Publishing a release
 
