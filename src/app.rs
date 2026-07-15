@@ -3706,6 +3706,7 @@ fn build_git_rows(
     let change_projection = GitChangeProjection {
         pointer_paths: &pointer_paths,
         existing_changes,
+        single_repository: snapshots.len() == 1,
     };
     let mut rows = Vec::new();
     for id in roots {
@@ -3734,6 +3735,7 @@ fn repository_graph_is_truncated(graph: &RepoGraph, full_repository_discovery: b
 struct GitChangeProjection<'a> {
     pointer_paths: &'a HashSet<RepoPath>,
     existing_changes: &'a HashSet<RepoPath>,
+    single_repository: bool,
 }
 
 fn append_repository_rows(
@@ -3775,7 +3777,7 @@ fn append_repository_rows(
             status_error: snapshot.status_error.clone(),
         },
         depth: repo_ancestors.len(),
-        label: repository_label(root, snapshot),
+        label: repository_label(root, snapshot, changes.single_repository),
         detail,
         status: None,
         exists: true,
@@ -3939,14 +3941,28 @@ fn display_relative_for_change(
         .map(Path::to_path_buf)
 }
 
-fn repository_label(_root: &Path, snapshot: &RepoSnapshot) -> String {
-    snapshot
+fn repository_label(root: &Path, snapshot: &RepoSnapshot, single_repository: bool) -> String {
+    if let Some(relative) = snapshot
         .node
         .workspace_relative
         .as_deref()
         .filter(|path| !path.as_os_str().is_empty())
-        .map(display_workspace_path)
-        .unwrap_or_else(|| ".".to_owned())
+    {
+        return display_workspace_path(relative);
+    }
+
+    if !single_repository {
+        return ".".to_owned();
+    }
+
+    snapshot
+        .node
+        .worktree
+        .file_name()
+        .or_else(|| root.file_name())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Repository".to_owned())
 }
 
 pub(crate) fn display_workspace_path(path: &Path) -> String {

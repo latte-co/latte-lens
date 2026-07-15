@@ -128,7 +128,9 @@ groups each visible repository under a selectable header, and shows only its
 changed files and required directories. Repository and Git-change directories default
 expanded; clean irrelevant leaves are hidden, while relationship, submodule,
 placeholder and isolated repository-error states remain visible. Repository
-discovery limits stay in the surrounding status UI instead of becoming
+headers use the repository directory name when only one repository is visible;
+multi-repository workspaces keep `.` for the workspace root and relative paths
+for descendants. Repository discovery limits stay in the surrounding status UI instead of becoming
 selectable tree rows. Expansion and repo+row selection identities persist
 across successful refreshes. Dirty repository headers use a quiet warm dot and label, while clean
 repositories stay muted for fast scanning. In both scopes `p` and `d`

@@ -854,7 +854,13 @@ fn clean_root_repository_is_a_selectable_empty_git_changes_node() {
             ..
         }
     ));
-    assert_eq!(row.label, ".");
+    let repository_name = fixture
+        .root()
+        .file_name()
+        .expect("fixture repository name")
+        .to_string_lossy();
+    assert_eq!(row.label, repository_name);
+    assert_ne!(row.label, ".");
     assert!(row.detail.contains("clean"));
     assert!(!row.detail.contains("files"));
     assert_eq!(app.content_mode, ContentMode::Info);
@@ -1219,10 +1225,15 @@ fn git_changes_sorts_directories_before_files_at_each_level() {
         .iter()
         .map(|row| (row.depth, row.label.as_str()))
         .collect();
+    let repository_name = fixture
+        .root()
+        .file_name()
+        .expect("fixture repository name")
+        .to_string_lossy();
+    assert_eq!(rows[0], (0, repository_name.as_ref()));
     assert_eq!(
-        rows,
+        &rows[1..],
         [
-            (0, "."),
             (2, "a-dir"),
             (3, "b-dir"),
             (4, "inner.txt"),
