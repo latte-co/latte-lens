@@ -503,6 +503,50 @@ def git_status_matrix(context: ScenarioContext) -> None:
     session.wait_screen(("Diff", "diff --git"), "changed file switches back to Diff")
 
 
+def git_review_state(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    session.key(b"2")
+    session.wait_until(
+        lambda screen: all(
+            marker in _line_with(screen, "worktree.txt")
+            for marker in ("○", "+1", "-1")
+        ),
+        "worktree diff row exposes unreviewed state and line counts",
+    )
+
+    _click_tree_row(session, "worktree.txt")
+    session.wait_screen(
+        ("worktree.txt", "+worktree after", "Space review"),
+        "reviewable worktree diff is fully loaded",
+    )
+    session.key(b" ")
+    session.wait_until(
+        lambda screen: "✓" in _line_with(screen, "worktree.txt")
+        and "1/6 reviewed" in screen.text(),
+        "Space marks the current diff version reviewed",
+    )
+
+    context.write_text("worktree.txt", "worktree after changed\nsecond line\n")
+    session.key(b"r")
+    session.wait_until(
+        lambda screen: all(
+            marker in _line_with(screen, "worktree.txt")
+            for marker in ("↻", "+2", "-1")
+        )
+        and "1 changed" in screen.text()
+        and "+worktree after changed" in screen.text(),
+        "refresh marks a reviewed file stale and loads its updated diff and line counts",
+    )
+    session.key(b" ")
+    session.wait_until(
+        lambda screen: "✓" in _line_with(screen, "worktree.txt")
+        and "1/6 reviewed" in screen.text()
+        and "1 changed" not in screen.text(),
+        "Space reviews the refreshed diff version",
+    )
+
+
 def search_preview(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
@@ -591,15 +635,31 @@ def search_controls(context: ScenarioContext) -> None:
     session.key(b"\x15")
     session.wait_screen(("Type a file name or path",), "file query editing clears cleanly")
     session.key(b"search-target")
-    session.wait_screen(("search-target.rs", "results"), "edited file query converges")
+    session.wait_screen(
+        ("search-target-other.rs", "search-target.rs", "results"),
+        "edited file query converges",
+    )
     for key in (b"\x1b[B", b"\x1b[A", b"\x1b[6~", b"\x1b[5~"):
         session.key(key)
     session.wait_screen(
         ("· src/search-target.rs",),
         "file-search navigation keeps the result selected",
     )
+    # Give each click its own terminal input batch. Selecting the other result
+    # first makes the first click on the target observable, so the second click
+    # is only sent after the application has processed the first one.
+    session.key(b"\x1b[B")
+    session.wait_screen(
+        ("▌ · src/search-target-other.rs",),
+        "file-search selection moves away from the double-click target",
+    )
     file_result = _marker_position_on_line(session, "· src/search-target.rs")
-    session.double_click(*file_result)
+    session.click(*file_result)
+    session.wait_screen(
+        ("▌ · src/search-target.rs",),
+        "first target click is processed before the second",
+    )
+    session.click(*file_result)
     session.wait_screen(
         ("Preview", "searchable()"),
         "double-click accepts the file-search result",
@@ -679,11 +739,10 @@ def search_controls(context: ScenarioContext) -> None:
         ("hidden.txt:1", "ignored_unique_phrase"),
         "mouse-enabled ignored search finds the hidden fixture",
     )
-    text_result = _marker_position_on_line(session, "· .ignored/hidden.txt:1")
-    session.double_click(*text_result)
+    session.key(b"\r")
     session.wait_screen(
         ("Preview", "ignored_unique_phrase"),
-        "double-click accepts a text-search result",
+        "Enter accepts a text-search result",
         absent=("Search Workspace",),
     )
 
@@ -701,6 +760,7 @@ CASES = (
     ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
+    ScenarioCase("git-review-state", "git-changes", create_git_matrix_fixture, git_review_state),
     ScenarioCase("search-preview", "search-preview", create_search_fixture, search_preview),
     ScenarioCase("search-controls", "search-preview", create_search_fixture, search_controls),
 )

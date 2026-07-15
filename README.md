@@ -13,6 +13,7 @@ keyboard-driven TUI.
 - Collapsible, bounded workspace tree with lazy directory loading
 - Staged, unstaged, deleted, renamed, and untracked file status
 - Colorized staged and working-tree diffs with old/new line numbers and emphasized additions/deletions
+- Per-file added/deleted line counts and review markers that become stale when the diff changes
 - Numbered, syntax-highlighted previews for recognized source files, with plain-text fallback
 - Extensible preview providers for formats such as PDF and Word
 - Side-by-side tree and content panes, so context stays visible while reading
@@ -100,6 +101,7 @@ Inside the TUI:
 | `ctrl-f` | Find in the current Preview or Diff |
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
+| `space` | Mark the displayed file diff reviewed; press again to clear the mark |
 | `n` / `N` | Next or previous changed file in Diff |
 | `ctrl-d` / `ctrl-u` | Page through content |
 | `r` | Refresh repository state |
@@ -135,6 +137,11 @@ selectable tree rows. Expansion and repo+row selection identities persist
 across successful refreshes. Dirty repository headers use a quiet warm dot and label, while clean
 repositories stay muted for fast scanning. In both scopes `p` and `d`
 explicitly switch the right-side content.
+Git Changes shows `+added -deleted` totals for each file. Reviewable files use
+`○` for unreviewed, `✓` for the currently displayed version reviewed, and `↻`
+when a later refresh finds that the staged or working-tree version changed.
+Review marks live only for the current Latte Lens process and never modify the
+viewed repository.
 The focused panel uses a
 lavender dot and title, the selected tree row uses a slim accent rail, and the
 footer begins with `Tabs`, `Tree`, or `Content`. These cues use terminal text

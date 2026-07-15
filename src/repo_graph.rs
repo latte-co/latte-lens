@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::git::{FileStatus, GitRepo, GitStatusEntry, SubmoduleStatus};
+use crate::git::{ChangeDetails, FileStatus, GitRepo, GitStatusEntry, SubmoduleStatus};
 
 /// Maximum number of directories considered while looking for Git worktrees.
 ///
@@ -174,6 +174,7 @@ pub struct RepoGraph {
     workspace_root: PathBuf,
     repositories: Vec<RepoSnapshot>,
     report: DiscoveryReport,
+    change_details: HashMap<RepoPath, ChangeDetails>,
 }
 
 impl RepoGraph {
@@ -209,6 +210,10 @@ impl RepoGraph {
         self.repositories
             .iter()
             .find(|snapshot| &snapshot.node.id == id)
+    }
+
+    pub(crate) fn change_details(&self, path: &RepoPath) -> Option<&ChangeDetails> {
+        self.change_details.get(path)
     }
 
     /// Count the semantic change rows projected by the repository-aware UI.
@@ -651,7 +656,13 @@ impl Discovery {
             }
         }
 
-        let mut snapshots: Vec<RepoSnapshot> = nodes.into_iter().map(snapshot).collect();
+        let builds: Vec<SnapshotBuild> = nodes.into_iter().map(snapshot).collect();
+        let mut change_details = HashMap::new();
+        let mut snapshots = Vec::with_capacity(builds.len());
+        for build in builds {
+            change_details.extend(build.change_details);
+            snapshots.push(build.snapshot);
+        }
         for snapshot in &mut snapshots {
             if snapshot.node.kind == RepoKind::Containing {
                 let prefix = self
@@ -663,6 +674,11 @@ impl Discovery {
                     .retain(|change| change.path.relative.starts_with(prefix));
             }
         }
+        let visible_status_paths: HashSet<RepoPath> = snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.changes.iter().map(|change| change.path.clone()))
+            .collect();
+        change_details.retain(|path, _| visible_status_paths.contains(path));
         apply_relationship_status(&mut snapshots);
         snapshots.sort_by(|left, right| left.node.id.cmp(&right.node.id));
         self.report.repositories_discovered = snapshots.len();
@@ -671,6 +687,7 @@ impl Discovery {
             workspace_root: self.workspace_root.clone(),
             repositories: snapshots,
             report: self.report.clone(),
+            change_details,
         })
     }
 
@@ -688,39 +705,66 @@ impl Discovery {
     }
 }
 
-fn snapshot(node: RepoNode) -> RepoSnapshot {
+struct SnapshotBuild {
+    snapshot: RepoSnapshot,
+    change_details: HashMap<RepoPath, ChangeDetails>,
+}
+
+fn snapshot(node: RepoNode) -> SnapshotBuild {
     let Some(repo) = node.repo.as_ref() else {
-        return RepoSnapshot {
-            node,
-            branch: None,
-            changes: Vec::new(),
-            suppressed_parent_changes: Vec::new(),
-            status_error: None,
+        return SnapshotBuild {
+            snapshot: RepoSnapshot {
+                node,
+                branch: None,
+                changes: Vec::new(),
+                suppressed_parent_changes: Vec::new(),
+                status_error: None,
+            },
+            change_details: HashMap::new(),
         };
     };
 
     let branch = repo.branch().ok();
-    match repo.status_entries() {
+    match repo.status_snapshots() {
         Ok(entries) => {
+            let change_details = repo
+                .change_details(&entries)
+                .into_iter()
+                .map(|(relative, details)| {
+                    (
+                        RepoPath {
+                            repo_id: node.id.clone(),
+                            relative,
+                        },
+                        details,
+                    )
+                })
+                .collect();
             let mut changes: Vec<RepoChange> = entries
                 .into_iter()
-                .map(|entry| repo_change(&node.id, entry))
+                .map(|snapshot| repo_change(&node.id, snapshot.entry))
                 .collect();
             changes.sort_by(|left, right| left.path.relative.cmp(&right.path.relative));
-            RepoSnapshot {
-                node,
-                branch,
-                changes,
-                suppressed_parent_changes: Vec::new(),
-                status_error: None,
+            SnapshotBuild {
+                snapshot: RepoSnapshot {
+                    node,
+                    branch,
+                    changes,
+                    suppressed_parent_changes: Vec::new(),
+                    status_error: None,
+                },
+                change_details,
             }
         }
-        Err(error) => RepoSnapshot {
-            node,
-            branch,
-            changes: Vec::new(),
-            suppressed_parent_changes: Vec::new(),
-            status_error: Some(format!("{error:#}")),
+        Err(error) => SnapshotBuild {
+            snapshot: RepoSnapshot {
+                node,
+                branch,
+                changes: Vec::new(),
+                suppressed_parent_changes: Vec::new(),
+                status_error: Some(format!("{error:#}")),
+            },
+            change_details: HashMap::new(),
         },
     }
 }

@@ -2885,6 +2885,96 @@ fn diff_mode_cycles_between_changed_files() {
 }
 
 #[test]
+fn diff_rows_show_line_stats_and_reviewed_versions_become_stale_after_refresh() {
+    let fixture = TestRepo::new();
+    fixture.write("review.txt", "old one\nold two\n");
+    fixture.commit_all("initial");
+    fixture.write("review.txt", "new one\nold two\nadded\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    let render = |app: &mut App| {
+        let backend = TestBackend::new(120, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+
+    let initial = render(&mut app);
+    assert!(initial.contains('○'));
+    assert!(initial.contains("+2"));
+    assert!(initial.contains("-1"));
+    assert!(initial.contains("0/1 reviewed"));
+
+    app.handle_key(key(KeyCode::Char(' ')));
+    let reviewed = render(&mut app);
+    assert!(reviewed.contains('✓'));
+    assert!(reviewed.contains("1/1 reviewed"));
+
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    assert!(render(&mut app).contains('✓'));
+
+    fixture.write(
+        "review.txt",
+        "newer first line\nold two\nadded\nsecond addition\n",
+    );
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+    let changed = render(&mut app);
+    assert!(changed.contains('↻'));
+    assert!(changed.contains("+3"));
+    assert!(changed.contains("-1"));
+    assert!(changed.contains("0/1 reviewed"));
+    assert!(changed.contains("1 changed"));
+
+    app.handle_key(key(KeyCode::Char(' ')));
+    assert!(render(&mut app).contains('✓'));
+    app.handle_key(key(KeyCode::Char(' ')));
+    assert!(render(&mut app).contains('○'));
+}
+
+#[test]
+fn staged_content_change_invalidates_review_even_when_line_counts_match() {
+    let fixture = TestRepo::new();
+    fixture.write("staged.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("staged.txt", "after one\n");
+    fixture.git(&["add", "staged.txt"]);
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char(' ')));
+
+    fixture.write("staged.txt", "after two\n");
+    fixture.git(&["add", "staged.txt"]);
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+
+    let backend = TestBackend::new(120, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains('↻'));
+    assert!(rendered.contains("+1"));
+    assert!(rendered.contains("-1"));
+}
+
+#[test]
 fn file_search_filters_previews_and_reveals_collapsed_paths() {
     let fixture = TestRepo::new();
     fixture.write("docs/readme.md", "documentation\n");
