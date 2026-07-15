@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     ops::Range,
     path::{Path, PathBuf},
@@ -23,6 +23,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     clipboard,
     diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
+    folding::{FoldAnchor, FoldRegion, FoldSource},
     git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
     preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
@@ -30,12 +31,12 @@ use crate::{
         RepoRelationState, RepoSnapshot,
     },
     runtime::{
-        ContentCompletion, ContentKind, ContentRequest, ContentTarget, DirectoryCompletion,
-        DirectoryRequest, RefreshCompletion, RefreshRequest, RefreshSnapshot, RequestGeneration,
-        WorkerRuntime,
+        ContentCompletion, ContentIdentity, ContentKind, ContentRequest, ContentTarget,
+        DirectoryCompletion, DirectoryRequest, RefreshCompletion, RefreshRequest, RefreshSnapshot,
+        RequestGeneration, WorkerRuntime,
     },
     search::{SearchEvent, SearchMatch, SearchOptions, SearchRequest, SearchRuntime},
-    text_layout::grapheme_width_at,
+    text_layout::{expand_tabs, grapheme_width_at},
     tree::{self, FileEntry},
     ui,
 };
@@ -172,7 +173,7 @@ struct SearchRestore {
     focused_pane: FocusPane,
     content_lines: Vec<String>,
     content_highlights: Vec<Vec<HighlightSpan>>,
-    content_scroll: usize,
+    content_viewport: ContentViewportRestore,
     content_horizontal_scroll: usize,
     content_selection: Option<ContentSelection>,
     clipboard_status: Option<String>,
@@ -180,8 +181,22 @@ struct SearchRestore {
     content_provider: Option<String>,
     content_show_line_numbers: bool,
     content_diff_lines: Vec<DiffLineAnnotation>,
+    content_identity: Option<ContentIdentity>,
+    content_fold_source: FoldSource,
+    content_fold_regions: Vec<FoldRegion>,
+    content_collapsed_folds: HashSet<FoldAnchor>,
+    content_cursor_line: usize,
+    content_successful: bool,
     content_was_loading: bool,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ContentViewportRestore {
+    line: Option<usize>,
+    byte_start: usize,
+    synthetic: bool,
+    effective_scroll: usize,
 }
 
 pub(crate) struct SearchState {
@@ -322,6 +337,17 @@ pub(crate) struct ContentVisualRow {
     pub byte_range: Range<usize>,
     pub continuation: bool,
     pub tab_origin: usize,
+    pub summary: Option<String>,
+    pub synthetic: bool,
+    pub fold_marker: FoldVisualMarker,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FoldVisualMarker {
+    #[default]
+    None,
+    Expanded,
+    Collapsed,
 }
 
 impl ContentSelection {
@@ -407,6 +433,14 @@ pub struct App {
     pub content_provider: Option<String>,
     pub content_show_line_numbers: bool,
     pub(crate) content_diff_lines: Vec<DiffLineAnnotation>,
+    content_identity: Option<ContentIdentity>,
+    content_fold_source: FoldSource,
+    content_fold_regions: Vec<FoldRegion>,
+    content_collapsed_folds: HashSet<FoldAnchor>,
+    content_cursor_line: usize,
+    content_successful: bool,
+    content_projection_width: u16,
+    fold_cache: VecDeque<(ContentIdentity, HashSet<FoldAnchor>)>,
     pub branch: Option<String>,
     pub changed_count: usize,
     pub total_repository_count: usize,
@@ -515,6 +549,14 @@ impl App {
             content_provider: None,
             content_show_line_numbers: false,
             content_diff_lines: Vec::new(),
+            content_identity: None,
+            content_fold_source: FoldSource::None,
+            content_fold_regions: Vec::new(),
+            content_collapsed_folds: HashSet::new(),
+            content_cursor_line: 0,
+            content_successful: false,
+            content_projection_width: 0,
+            fold_cache: VecDeque::new(),
             branch: None,
             changed_count: 0,
             total_repository_count: 0,
@@ -824,36 +866,136 @@ impl App {
         let wrap_content = self.content_wraps_lines();
         let gutter_width = self.content_gutter_width();
         let text_width = usize::from(width).saturating_sub(gutter_width).max(1);
-        self.content_lines
-            .iter()
-            .enumerate()
-            .flat_map(|(line_index, line)| {
-                let tab_origin = self.content_tab_origin(line_index);
-                if wrap_content {
-                    wrap_line_ranges(line, text_width, tab_origin)
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(index, byte_range)| ContentVisualRow {
-                            line_index,
-                            byte_range,
-                            continuation: index > 0,
-                            tab_origin: if index == 0 { tab_origin } else { 0 },
-                        })
-                        .collect::<Vec<_>>()
+        let mut rows = Vec::new();
+        let mut line_index = 0usize;
+        let mut region_index = 0usize;
+        while line_index < self.content_lines.len() {
+            while self
+                .content_fold_regions
+                .get(region_index)
+                .is_some_and(|region| region.start_line < line_index)
+            {
+                region_index += 1;
+            }
+            let region = self
+                .content_fold_regions
+                .get(region_index)
+                .filter(|region| region.start_line == line_index);
+            let collapsed =
+                region.is_some_and(|region| self.content_collapsed_folds.contains(&region.anchor));
+            let marker = match (region.is_some(), collapsed) {
+                (true, true) => FoldVisualMarker::Collapsed,
+                (true, false) => FoldVisualMarker::Expanded,
+                (false, _) => FoldVisualMarker::None,
+            };
+            let line = &self.content_lines[line_index];
+            let tab_origin = self.content_tab_origin(line_index);
+            let ranges = if wrap_content {
+                wrap_line_ranges(line, text_width, tab_origin)
+            } else {
+                std::iter::once(0..line.len()).collect()
+            };
+            for (index, byte_range) in ranges.into_iter().enumerate() {
+                rows.push(ContentVisualRow {
+                    line_index,
+                    byte_range,
+                    continuation: index > 0,
+                    tab_origin: if index == 0 { tab_origin } else { 0 },
+                    summary: None,
+                    synthetic: false,
+                    fold_marker: if index == 0 {
+                        marker
+                    } else {
+                        FoldVisualMarker::None
+                    },
+                });
+            }
+            if collapsed {
+                let hidden_lines = region
+                    .map(|region| region.end_line.saturating_sub(region.start_line))
+                    .unwrap_or_default();
+                let summary = fold_summary(hidden_lines, text_width);
+                let can_append = rows.last().is_some_and(|row| {
+                    let segment_width = line
+                        .get(row.byte_range.clone())
+                        .map_or(0, |segment| expand_tabs(segment, 0, row.tab_origin).1);
+                    segment_width.saturating_add(UnicodeWidthStr::width(summary.as_str()))
+                        <= text_width
+                });
+                if can_append {
+                    if let Some(row) = rows.last_mut() {
+                        row.summary = Some(summary);
+                    }
                 } else {
-                    vec![ContentVisualRow {
+                    rows.push(ContentVisualRow {
                         line_index,
-                        byte_range: 0..line.len(),
-                        continuation: false,
-                        tab_origin,
-                    }]
+                        byte_range: line.len()..line.len(),
+                        continuation: true,
+                        tab_origin: 0,
+                        summary: Some(summary),
+                        synthetic: true,
+                        fold_marker: FoldVisualMarker::None,
+                    });
                 }
-            })
-            .collect()
+                line_index =
+                    region.map_or(line_index + 1, |region| region.end_line.saturating_add(1));
+                continue;
+            }
+            line_index += 1;
+        }
+        rows
+    }
+
+    pub(crate) fn effective_content_scroll(&self, row_count: usize) -> usize {
+        self.content_scroll.min(row_count.saturating_sub(1))
+    }
+
+    pub(crate) fn prepare_content_width(&mut self, width: u16) {
+        let width = width.max(1);
+        if self.content_projection_width == 0 {
+            self.content_projection_width = width;
+            return;
+        }
+        if self.content_projection_width == width {
+            return;
+        }
+        let old_rows = self.content_visual_rows(self.content_projection_width);
+        let effective_scroll = self.effective_content_scroll(old_rows.len());
+        let top = old_rows
+            .get(effective_scroll)
+            .map(|row| (row.line_index, row.byte_range.start, row.synthetic));
+        self.content_projection_width = width;
+        if let Some((line, byte, synthetic)) = top {
+            let rows = self.content_visual_rows(width);
+            let line_len = self.content_lines.get(line).map_or(0, String::len);
+            self.content_scroll = rows
+                .iter()
+                .position(|row| viewport_row_matches(row, line, byte, synthetic, line_len))
+                .or_else(|| {
+                    if synthetic {
+                        rows.iter()
+                            .rposition(|row| row.line_index == line && !row.synthetic)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| rows.iter().position(|row| row.line_index == line))
+                .unwrap_or(effective_scroll.min(rows.len().saturating_sub(1)));
+        }
+        let row_count = self.content_visual_rows(width).len();
+        self.content_scroll = self.effective_content_scroll(row_count);
     }
 
     pub(crate) const fn content_wraps_lines(&self) -> bool {
         matches!(self.content_mode, ContentMode::Diff | ContentMode::Preview)
+    }
+
+    pub(crate) fn effective_content_horizontal_scroll(&self) -> usize {
+        if self.content_wraps_lines() {
+            0
+        } else {
+            self.content_horizontal_scroll.min(u16::MAX as usize)
+        }
     }
 
     pub(crate) fn content_line_number_width(&self) -> usize {
@@ -1044,11 +1186,20 @@ impl App {
     }
 
     fn capture_search_restore(&self) -> SearchRestore {
+        let width = self.ui_regions.content_inner.width.max(1);
+        let rows = self.content_visual_rows(width);
+        let effective_scroll = self.effective_content_scroll(rows.len());
+        let top = rows.get(effective_scroll);
         SearchRestore {
             focused_pane: self.focused_pane,
             content_lines: self.content_lines.clone(),
             content_highlights: self.content_highlights.clone(),
-            content_scroll: self.content_scroll,
+            content_viewport: ContentViewportRestore {
+                line: top.map(|row| row.line_index),
+                byte_start: top.map_or(0, |row| row.byte_range.start),
+                synthetic: top.is_some_and(|row| row.synthetic),
+                effective_scroll,
+            },
             content_horizontal_scroll: self.content_horizontal_scroll,
             content_selection: self.content_selection,
             clipboard_status: self.clipboard_status.clone(),
@@ -1056,6 +1207,12 @@ impl App {
             content_provider: self.content_provider.clone(),
             content_show_line_numbers: self.content_show_line_numbers,
             content_diff_lines: self.content_diff_lines.clone(),
+            content_identity: self.content_identity.clone(),
+            content_fold_source: self.content_fold_source,
+            content_fold_regions: self.content_fold_regions.clone(),
+            content_collapsed_folds: self.content_collapsed_folds.clone(),
+            content_cursor_line: self.content_cursor_line,
+            content_successful: self.content_successful,
             content_was_loading: self.is_content_loading(),
             last_error: self.last_error.clone(),
         }
@@ -1338,20 +1495,16 @@ impl App {
     }
 
     fn scroll_to_preview_find_match(&mut self) {
-        let Some(found) = self
+        let Some((line, byte)) = self
             .preview_find
             .as_ref()
             .and_then(|find| find.matches.get(find.selected))
+            .map(|found| (found.line, found.range.start))
         else {
             return;
         };
-        let line = found.line;
-        let width = self.ui_regions.content_inner.width.max(1);
-        self.content_scroll = self
-            .content_visual_rows(width)
-            .iter()
-            .position(|row| row.line_index == line)
-            .unwrap_or(line);
+        self.reveal_folded_line(line);
+        self.scroll_to_logical_line(line, byte);
     }
 
     fn move_preview_find_cursor(&mut self, forward: bool) {
@@ -1894,7 +2047,6 @@ impl App {
             self.focused_pane = restore.focused_pane;
             self.content_lines = restore.content_lines;
             self.content_highlights = restore.content_highlights;
-            self.content_scroll = restore.content_scroll;
             self.content_horizontal_scroll = restore.content_horizontal_scroll;
             self.content_selection = restore.content_selection;
             self.clipboard_status = restore.clipboard_status;
@@ -1902,7 +2054,14 @@ impl App {
             self.content_provider = restore.content_provider;
             self.content_show_line_numbers = restore.content_show_line_numbers;
             self.content_diff_lines = restore.content_diff_lines;
+            self.content_identity = restore.content_identity;
+            self.content_fold_source = restore.content_fold_source;
+            self.content_fold_regions = restore.content_fold_regions;
+            self.content_collapsed_folds = restore.content_collapsed_folds;
+            self.content_cursor_line = restore.content_cursor_line;
+            self.content_successful = restore.content_successful;
             self.last_error = restore.last_error;
+            self.restore_content_viewport(restore.content_viewport);
             if restore.content_was_loading {
                 self.load_scope_default_content();
             }
@@ -2041,6 +2200,9 @@ impl App {
                     }
                 } else if contains(self.ui_regions.content_inner, mouse.column, mouse.row) {
                     self.focused_pane = FocusPane::Content;
+                    if self.handle_fold_mouse_down(mouse) {
+                        return;
+                    }
                     self.begin_content_selection(mouse);
                 } else if contains(self.ui_regions.content_body, mouse.column, mouse.row) {
                     self.clear_content_selection();
@@ -2232,6 +2394,42 @@ impl App {
         });
     }
 
+    fn handle_fold_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if self.content_mode != ContentMode::Preview || !self.content_show_line_numbers {
+            return false;
+        }
+        let rows_area = self.content_text_rows();
+        if !contains(rows_area, mouse.column, mouse.row) {
+            return false;
+        }
+        let marker_column = rows_area
+            .x
+            .saturating_add(self.content_line_number_width() as u16)
+            .saturating_add(1);
+        if mouse.column != marker_column {
+            return false;
+        }
+        let visible = usize::from(mouse.row.saturating_sub(rows_area.y));
+        let rows = self.content_visual_rows(rows_area.width);
+        let effective_scroll = self.effective_content_scroll(rows.len());
+        let Some(row) = rows.get(effective_scroll.saturating_add(visible)) else {
+            return false;
+        };
+        if row.fold_marker == FoldVisualMarker::None {
+            return false;
+        }
+        self.content_cursor_line = row.line_index;
+        self.toggle_cursor_fold();
+        let new_rows = self.content_visual_rows(rows_area.width);
+        if let Some(index) = new_rows.iter().position(|row| {
+            row.line_index == self.content_cursor_line && row.fold_marker != FoldVisualMarker::None
+        }) {
+            self.content_scroll = index.saturating_sub(visible);
+            self.content_scroll = self.effective_content_scroll(new_rows.len());
+        }
+        true
+    }
+
     fn drag_content_selection(&mut self, mouse: MouseEvent) {
         let Some(selection) = self
             .content_selection
@@ -2288,18 +2486,12 @@ impl App {
             usize::from(mouse.row - rows.y).min(usize::from(rows.height.saturating_sub(1)))
         };
         let visual_rows = self.content_visual_rows(rows.width);
-        let visual_row = self
-            .content_scroll
-            .saturating_add(visible_row)
-            .min(visual_rows.len().saturating_sub(1));
-        let visual_row = visual_rows.get(visual_row)?;
+        let effective_scroll = self.effective_content_scroll(visual_rows.len());
+        let visual_row = visual_rows.get(effective_scroll.saturating_add(visible_row))?;
         let visible_column = usize::from(mouse.column.saturating_sub(rows.x));
-        let rendered_column = if self.content_wraps_lines() {
-            visible_column
-        } else {
-            self.content_horizontal_scroll
-                .saturating_add(visible_column)
-        };
+        let rendered_column = self
+            .effective_content_horizontal_scroll()
+            .saturating_add(visible_column);
         let gutter_width = self.content_gutter_width();
         let text_column = rendered_column.saturating_sub(gutter_width);
         let line = self.content_lines.get(visual_row.line_index)?;
@@ -2501,6 +2693,31 @@ impl App {
 
     fn handle_content_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
+            (KeyCode::Char('['), KeyModifiers::NONE)
+                if self.content_mode == ContentMode::Preview =>
+            {
+                self.jump_visible_fold(-1);
+            }
+            (KeyCode::Char(']'), KeyModifiers::NONE)
+                if self.content_mode == ContentMode::Preview =>
+            {
+                self.jump_visible_fold(1);
+            }
+            (KeyCode::Enter | KeyCode::Char(' '), KeyModifiers::NONE)
+                if self.content_mode == ContentMode::Preview =>
+            {
+                self.toggle_cursor_fold();
+            }
+            (KeyCode::Char('{'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if self.content_mode == ContentMode::Preview =>
+            {
+                self.collapse_all_folds();
+            }
+            (KeyCode::Char('}'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if self.content_mode == ContentMode::Preview =>
+            {
+                self.expand_all_folds();
+            }
             (KeyCode::Down | KeyCode::Char('j'), _) => self.scroll_content(1, 0),
             (KeyCode::Up | KeyCode::Char('k'), _) => self.scroll_content(-1, 0),
             (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -2513,12 +2730,16 @@ impl App {
             (KeyCode::Right, KeyModifiers::SHIFT) => self.scroll_content(0, 4),
             (KeyCode::Left, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             (KeyCode::Right, KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
-            (KeyCode::Home | KeyCode::Char('g'), _) => self.content_scroll = 0,
+            (KeyCode::Home | KeyCode::Char('g'), _) => {
+                self.content_scroll = 0;
+                self.sync_content_cursor_to_scroll();
+            }
             (KeyCode::End | KeyCode::Char('G'), _) => {
                 self.content_scroll = self
                     .content_visual_rows(self.ui_regions.content_inner.width)
                     .len()
                     .saturating_sub(1);
+                self.sync_content_cursor_to_scroll();
             }
             _ => {}
         }
@@ -2688,13 +2909,190 @@ impl App {
         }
     }
 
+    fn sync_content_cursor_to_scroll(&mut self) {
+        if self.content_mode != ContentMode::Preview {
+            return;
+        }
+        let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
+        self.content_scroll = self.effective_content_scroll(rows.len());
+        if let Some(row) = rows.get(self.content_scroll) {
+            self.content_cursor_line = row.line_index;
+        }
+    }
+
+    fn jump_visible_fold(&mut self, delta: isize) {
+        let width = self.ui_regions.content_inner.width.max(1);
+        let rows = self.content_visual_rows(width);
+        let markers: Vec<(usize, usize)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.fold_marker != FoldVisualMarker::None)
+            .map(|(index, row)| (index, row.line_index))
+            .collect();
+        if markers.is_empty() {
+            return;
+        }
+        let position = if delta >= 0 {
+            markers
+                .iter()
+                .position(|(_, line)| *line > self.content_cursor_line)
+                .unwrap_or(0)
+        } else {
+            markers
+                .iter()
+                .rposition(|(_, line)| *line < self.content_cursor_line)
+                .unwrap_or(markers.len() - 1)
+        };
+        self.content_scroll = markers[position].0;
+        self.content_cursor_line = markers[position].1;
+        self.clear_content_selection();
+    }
+
+    fn toggle_cursor_fold(&mut self) {
+        let Some(region) = self
+            .content_fold_regions
+            .iter()
+            .find(|region| region.start_line == self.content_cursor_line)
+        else {
+            return;
+        };
+        let anchor = region.anchor;
+        if !self.content_collapsed_folds.remove(&anchor) {
+            self.content_collapsed_folds.insert(anchor);
+        }
+        self.clear_content_selection();
+        self.scroll_to_logical_line(self.content_cursor_line, 0);
+    }
+
+    fn collapse_all_folds(&mut self) {
+        self.content_collapsed_folds
+            .extend(self.content_fold_regions.iter().map(|region| region.anchor));
+        self.clear_content_selection();
+        self.ensure_cursor_visible();
+    }
+
+    fn expand_all_folds(&mut self) {
+        self.content_collapsed_folds.clear();
+        self.clear_content_selection();
+        self.scroll_to_logical_line(self.content_cursor_line, 0);
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        if let Some(outer) = self
+            .content_fold_regions
+            .iter()
+            .filter(|region| {
+                self.content_collapsed_folds.contains(&region.anchor)
+                    && region.start_line < self.content_cursor_line
+                    && self.content_cursor_line <= region.end_line
+            })
+            .min_by_key(|region| region.start_line)
+        {
+            self.content_cursor_line = outer.start_line;
+        }
+        self.scroll_to_logical_line(self.content_cursor_line, 0);
+    }
+
+    fn reveal_folded_line(&mut self, line: usize) {
+        let hidden_by: Vec<FoldAnchor> = self
+            .content_fold_regions
+            .iter()
+            .filter(|region| {
+                region.start_line < line
+                    && line <= region.end_line
+                    && self.content_collapsed_folds.contains(&region.anchor)
+            })
+            .map(|region| region.anchor)
+            .collect();
+        for anchor in hidden_by {
+            self.content_collapsed_folds.remove(&anchor);
+        }
+    }
+
+    fn scroll_to_logical_line(&mut self, line: usize, byte: usize) {
+        let width = self.ui_regions.content_inner.width.max(1);
+        let rows = self.content_visual_rows(width);
+        let line_len = self.content_lines.get(line).map_or(0, String::len);
+        self.content_scroll = rows
+            .iter()
+            .position(|row| {
+                row.line_index == line
+                    && !row.synthetic
+                    && visual_row_contains_byte(row, byte, line_len)
+            })
+            .or_else(|| rows.iter().position(|row| row.line_index == line))
+            .unwrap_or(0);
+        self.content_cursor_line = rows
+            .get(self.content_scroll)
+            .map_or(line, |row| row.line_index);
+    }
+
+    fn cache_current_folds(&mut self) {
+        if !self.content_successful || !self.content_fold_source.allows_folding() {
+            return;
+        }
+        let Some(identity) = self.content_identity.clone() else {
+            return;
+        };
+        self.fold_cache
+            .retain(|(candidate, _)| candidate != &identity);
+        self.fold_cache
+            .push_front((identity, self.content_collapsed_folds.clone()));
+        self.fold_cache.truncate(64);
+    }
+
+    fn cached_folds(&self, identity: &ContentIdentity) -> HashSet<FoldAnchor> {
+        self.fold_cache
+            .iter()
+            .find(|(candidate, _)| candidate == identity)
+            .map_or_else(HashSet::new, |(_, folds)| folds.clone())
+    }
+
+    fn restore_content_viewport(&mut self, viewport: ContentViewportRestore) {
+        let width = self.ui_regions.content_inner.width.max(1);
+        self.content_projection_width = width;
+        let rows = self.content_visual_rows(width);
+        let restored = viewport.line.and_then(|line| {
+            let line_len = self.content_lines.get(line).map_or(0, String::len);
+            rows.iter()
+                .position(|row| {
+                    viewport_row_matches(
+                        row,
+                        line,
+                        viewport.byte_start,
+                        viewport.synthetic,
+                        line_len,
+                    )
+                })
+                .or_else(|| {
+                    if viewport.synthetic {
+                        rows.iter()
+                            .rposition(|row| row.line_index == line && !row.synthetic)
+                    } else {
+                        None
+                    }
+                })
+        });
+        self.content_scroll = restored
+            .unwrap_or(viewport.effective_scroll)
+            .min(rows.len().saturating_sub(1));
+    }
+
     fn scroll_content(&mut self, vertical: isize, horizontal: isize) {
-        self.content_scroll = self.content_scroll.saturating_add_signed(vertical);
+        let row_count = self
+            .content_visual_rows(self.ui_regions.content_inner.width.max(1))
+            .len();
+        self.content_scroll = self.effective_content_scroll(row_count);
+        self.content_scroll = self
+            .content_scroll
+            .saturating_add_signed(vertical)
+            .min(row_count.saturating_sub(1));
         if !self.content_wraps_lines() {
             self.content_horizontal_scroll = self
                 .content_horizontal_scroll
                 .saturating_add_signed(horizontal);
         }
+        self.sync_content_cursor_to_scroll();
     }
 
     fn request_refresh(&mut self, full_repository_discovery: bool) {
@@ -3500,6 +3898,7 @@ impl App {
         review_path: Option<RepoPath>,
     ) -> u64 {
         let generation = self.content_requests.begin();
+        self.cache_current_folds();
         self.reset_content(match kind {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
@@ -3550,9 +3949,24 @@ impl App {
         self.reset_content(mode);
         match completion.result {
             Ok(snapshot) => {
+                let cached = snapshot
+                    .identity
+                    .as_ref()
+                    .map_or_else(HashSet::new, |identity| self.cached_folds(identity));
                 self.content_provider = snapshot.provider;
                 self.content_lines = snapshot.lines;
                 self.content_highlights = snapshot.highlights;
+                self.content_identity = snapshot.identity;
+                self.content_fold_source = snapshot.fold_source;
+                self.content_fold_regions = snapshot.fold_regions;
+                let valid_anchors: HashSet<_> = self
+                    .content_fold_regions
+                    .iter()
+                    .map(|region| region.anchor)
+                    .collect();
+                self.content_collapsed_folds =
+                    cached.intersection(&valid_anchors).copied().collect();
+                self.content_successful = true;
                 self.content_show_line_numbers =
                     mode == ContentMode::Diff || snapshot.show_line_numbers;
                 self.content_diff_lines = if mode == ContentMode::Diff {
@@ -3563,11 +3977,11 @@ impl App {
                 if mode == ContentMode::Diff {
                     self.current_diff_path = completed_diff_path;
                 }
-                if let Some(target) = self
+                let search_target = self
                     .search_preview_target
                     .take()
-                    .filter(|target| target.generation == generation)
-                {
+                    .filter(|target| target.generation == generation);
+                if let Some(target) = search_target.as_ref() {
                     let line_index = target.line_number.saturating_sub(1);
                     if let Some(line) = self.content_lines.get(line_index)
                         && target.byte_range.end <= line.len()
@@ -3577,10 +3991,11 @@ impl App {
                                 .resize_with(self.content_lines.len(), Vec::new);
                         }
                         self.content_highlights[line_index].push(HighlightSpan {
-                            range: target.byte_range,
+                            range: target.byte_range.clone(),
                             kind: HighlightKind::Search,
                         });
-                        self.content_scroll = line_index;
+                        self.reveal_folded_line(line_index);
+                        self.scroll_to_logical_line(line_index, target.byte_range.start);
                     }
                 }
                 if self
@@ -3592,7 +4007,13 @@ impl App {
                 }
                 if mode == ContentMode::Preview {
                     self.preview_find = pending_preview_find;
-                    self.rebuild_preview_find();
+                    if search_target.is_none() {
+                        if self.preview_find.is_some() {
+                            self.rebuild_preview_find();
+                        } else {
+                            self.scroll_to_logical_line(0, 0);
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -3617,12 +4038,19 @@ impl App {
         self.content_show_line_numbers = false;
         self.content_diff_lines.clear();
         self.current_diff_path = None;
+        self.content_identity = None;
+        self.content_fold_source = FoldSource::None;
+        self.content_fold_regions.clear();
+        self.content_collapsed_folds.clear();
+        self.content_cursor_line = 0;
+        self.content_successful = false;
     }
 
     fn set_info(&mut self, lines: Vec<String>) {
         self.content_requests.invalidate();
         self.runtime.cancel_pending_content();
         self.pending_diff_path = None;
+        self.cache_current_folds();
         self.reset_content(ContentMode::Info);
         self.content_lines = lines;
     }
@@ -3753,6 +4181,39 @@ fn wrap_line_ranges(line: &str, width: usize, tab_origin: usize) -> Vec<Range<us
     }
     ranges.push(start..line.len());
     ranges
+}
+
+fn fold_summary(hidden_lines: usize, text_width: usize) -> String {
+    let full = format!(" … {hidden_lines} lines");
+    if UnicodeWidthStr::width(full.as_str()) <= text_width {
+        full
+    } else if text_width >= 2 {
+        " …".to_owned()
+    } else {
+        "…".to_owned()
+    }
+}
+
+fn visual_row_contains_byte(row: &ContentVisualRow, byte: usize, line_len: usize) -> bool {
+    row.byte_range.start <= byte
+        && (byte < row.byte_range.end || (byte == line_len && row.byte_range.end == line_len))
+}
+
+fn viewport_row_matches(
+    row: &ContentVisualRow,
+    line: usize,
+    byte: usize,
+    synthetic: bool,
+    line_len: usize,
+) -> bool {
+    if row.line_index != line || row.synthetic != synthetic {
+        return false;
+    }
+    if synthetic {
+        row.byte_range.start == byte
+    } else {
+        visual_row_contains_byte(row, byte, line_len)
+    }
 }
 
 fn repo_has_activity(snapshot: &RepoSnapshot) -> bool {
@@ -4204,7 +4665,10 @@ fn contains(rect: Rect, column: u16, row: u16) -> bool {
 mod tests {
     use std::fs;
 
+    use ratatui::{Terminal, backend::TestBackend};
+
     use super::*;
+    use crate::folding::fold_regions;
     use crate::repo_graph::DiscoveryOptions;
     use crate::runtime::{ContentSnapshot, RefreshSnapshot};
     use crate::tree::ScanResult;
@@ -4229,6 +4693,408 @@ mod tests {
             wrap_line_ranges("", 8, 0),
             std::iter::once(0..0).collect::<Vec<_>>()
         );
+    }
+
+    fn install_fold_fixture(app: &mut App, source: &str, path: &str) {
+        app.content_mode = ContentMode::Preview;
+        app.content_show_line_numbers = true;
+        app.content_lines = source.lines().map(ToOwned::to_owned).collect();
+        app.content_fold_regions = fold_regions(Path::new(path), &app.content_lines);
+        app.content_fold_source = FoldSource::BuiltinText;
+        app.content_successful = true;
+        app.ui_regions.content_inner = Rect::new(0, 0, 40, 12);
+        app.ui_regions.content_body = app.ui_regions.content_inner;
+        app.focused_pane = FocusPane::Content;
+    }
+
+    #[test]
+    fn collapsed_projection_keeps_original_bytes_and_uses_bounded_summaries() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(&mut app, "fn 拿铁() {\n\tlet value = 1;\n}", "fixture.rs");
+        let anchor = app.content_fold_regions[0].anchor;
+        app.content_collapsed_folds.insert(anchor);
+
+        let one = app.content_visual_rows(5);
+        assert_eq!(one.last().and_then(|row| row.summary.as_deref()), Some("…"));
+        let two = app.content_visual_rows(6);
+        assert_eq!(
+            two.last().and_then(|row| row.summary.as_deref()),
+            Some(" …")
+        );
+        let full = app.content_visual_rows(20);
+        assert_eq!(
+            full.last().and_then(|row| row.summary.as_deref()),
+            Some(" … 2 lines")
+        );
+        let rebuilt: String = full
+            .iter()
+            .filter(|row| row.line_index == 0 && !row.synthetic)
+            .filter_map(|row| app.content_lines[0].get(row.byte_range.clone()))
+            .collect();
+        assert_eq!(rebuilt, app.content_lines[0]);
+        assert!(full.iter().all(|row| row.line_index != 1));
+
+        app.content_lines.push("tail".to_owned());
+        app.content_selection = Some(ContentSelection {
+            anchor_before: ContentPoint { line: 0, byte: 0 },
+            anchor_after: ContentPoint { line: 0, byte: 1 },
+            head: ContentPoint { line: 3, byte: 4 },
+            dragging: false,
+            dragged: true,
+        });
+        assert_eq!(
+            app.selected_content_text().as_deref(),
+            Some("fn 拿铁() {\n\tlet value = 1;\n}\ntail")
+        );
+        assert!(!app.selected_content_text().unwrap().contains("lines"));
+    }
+
+    #[test]
+    fn tab_aware_fold_summary_uses_a_synthetic_row_when_expansion_would_clip() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(&mut app, "\tfn f() {\n\tlet value = 1;\n}", "fixture.rs");
+        app.content_collapsed_folds
+            .insert(app.content_fold_regions[0].anchor);
+
+        // 4 gutter columns leave 18 text columns. Treating the leading tab as
+        // zero-width would append the full summary and clip; tab expansion does not.
+        let rows = app.content_visual_rows(22);
+        assert!(rows.last().is_some_and(|row| row.synthetic));
+        assert_eq!(
+            rows.last().and_then(|row| row.summary.as_deref()),
+            Some(" … 2 lines")
+        );
+    }
+
+    #[test]
+    fn fold_keys_preserve_nested_state_and_find_reveals_strict_ancestors() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(
+            &mut app,
+            "impl Thing {\n fn outer() {\n  fn nested() {\n   let needle = 1;\n  }\n }\n}",
+            "fixture.rs",
+        );
+        app.collapse_all_folds();
+        let collapsed = app.content_collapsed_folds.clone();
+        assert!(collapsed.len() >= 3);
+
+        app.content_cursor_line = 0;
+        app.toggle_cursor_fold();
+        assert!(app.content_collapsed_folds.len() < collapsed.len());
+        assert!(
+            app.content_collapsed_folds
+                .iter()
+                .any(|anchor| collapsed.contains(anchor))
+        );
+
+        app.collapse_all_folds();
+        app.open_preview_find();
+        for character in "needle".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.preview_find_position(), Some((1, 1)));
+        assert!(app.content_collapsed_folds.iter().all(|anchor| {
+            app.content_fold_regions
+                .iter()
+                .find(|region| region.anchor == *anchor)
+                .is_none_or(|region| !(region.start_line < 3 && 3 <= region.end_line))
+        }));
+        assert_eq!(app.content_cursor_line, 3);
+    }
+
+    #[test]
+    fn fold_state_survives_search_restore_and_successful_preview_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("fold.rs"),
+            "fn folded() {\n let cached = true;\n}\n",
+        )
+        .unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+        app.focused_pane = FocusPane::Content;
+        app.collapse_all_folds();
+        let collapsed = app.content_collapsed_folds.clone();
+        assert!(!collapsed.is_empty());
+
+        app.open_search(SearchMode::Files);
+        app.close_search(true);
+        assert_eq!(app.content_collapsed_folds, collapsed);
+
+        app.load_selected_preview();
+        app.wait_for_background();
+        assert_eq!(app.content_collapsed_folds, collapsed);
+        assert!(
+            app.content_visual_rows(40)
+                .iter()
+                .any(|row| row.fold_marker == FoldVisualMarker::Collapsed)
+        );
+    }
+
+    #[test]
+    fn slash_search_restores_preview_folds_and_effective_viewport() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(
+            &mut app,
+            "fn folded() {\n let hidden = true;\n}\nfn tail() {\n let shown = true;\n}",
+            "fixture.rs",
+        );
+        app.collapse_all_folds();
+        let collapsed = app.content_collapsed_folds.clone();
+        let rows = app.content_visual_rows(40);
+        app.content_scroll = rows.len().saturating_sub(1);
+        let expected_scroll = app.effective_content_scroll(rows.len());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(
+            app.search.as_ref().map(|search| search.mode),
+            Some(SearchMode::Files)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.search.is_none());
+        assert_eq!(app.content_mode, ContentMode::Preview);
+        assert_eq!(app.content_collapsed_folds, collapsed);
+        assert_eq!(app.content_scroll, expected_scroll);
+    }
+
+    #[test]
+    fn effective_scroll_normalizes_huge_raw_offsets_before_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.txt"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(&mut app, "one\ntwo\nthree", "fixture.txt");
+        app.ui_regions.content_inner.width = 40;
+        let rows = app.content_visual_rows(40);
+        app.content_scroll = usize::MAX;
+
+        app.scroll_content(-1, 0);
+
+        assert_eq!(app.content_scroll, rows.len() - 2);
+        assert_eq!(app.content_cursor_line, rows[rows.len() - 2].line_index);
+    }
+
+    #[test]
+    fn resizing_preserves_the_top_logical_line() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(
+            &mut app,
+            "fn first_with_a_long_header_name() {\n let one = 1;\n}\nfn second_with_a_long_header_name() {\n let two = 2;\n}",
+            "fixture.rs",
+        );
+        app.content_projection_width = 18;
+        let old = app.content_visual_rows(18);
+        app.content_scroll = old.iter().position(|row| row.line_index == 3).unwrap();
+        app.prepare_content_width(50);
+        let new = app.content_visual_rows(50);
+        assert_eq!(new[app.content_scroll].line_index, 3);
+    }
+
+    #[test]
+    fn search_restore_reanchors_wrapped_viewport_at_the_new_width() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(
+            &mut app,
+            "fn a_very_long_function_header_for_wrapping() {\n let hidden = true;\n}",
+            "fixture.rs",
+        );
+        app.collapse_all_folds();
+        let collapsed = app.content_collapsed_folds.clone();
+        app.ui_regions.content_inner.width = 14;
+        app.content_projection_width = 14;
+        let old_rows = app.content_visual_rows(14);
+        let old_index = old_rows
+            .iter()
+            .position(|row| row.line_index == 0 && !row.synthetic && row.byte_range.start > 0)
+            .unwrap();
+        let anchor_byte = old_rows[old_index].byte_range.start;
+        app.content_scroll = old_index;
+
+        app.open_search(SearchMode::Files);
+        app.ui_regions.content_inner.width = 28;
+        app.prepare_content_width(28);
+        app.close_search(true);
+
+        let new_rows = app.content_visual_rows(28);
+        let restored = &new_rows[app.content_scroll];
+        assert_eq!(restored.line_index, 0);
+        assert!(visual_row_contains_byte(
+            restored,
+            anchor_byte,
+            app.content_lines[0].len()
+        ));
+        assert_eq!(app.content_collapsed_folds, collapsed);
+    }
+
+    #[test]
+    fn search_restore_maps_a_removed_synthetic_summary_to_the_last_source_row() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(
+            &mut app,
+            "fn long_fold_header() {\n let hidden = true;\n}",
+            "fixture.rs",
+        );
+        app.collapse_all_folds();
+        app.ui_regions.content_inner.width = 8;
+        app.content_projection_width = 8;
+        let old_rows = app.content_visual_rows(8);
+        app.content_scroll = old_rows.iter().position(|row| row.synthetic).unwrap();
+
+        app.open_search(SearchMode::Files);
+        app.ui_regions.content_inner.width = 80;
+        app.prepare_content_width(80);
+        app.close_search(true);
+
+        let new_rows = app.content_visual_rows(80);
+        assert!(!new_rows[app.content_scroll].synthetic);
+        assert_eq!(new_rows[app.content_scroll].line_index, 0);
+        assert_eq!(
+            app.content_scroll,
+            new_rows
+                .iter()
+                .rposition(|row| row.line_index == 0 && !row.synthetic)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn find_byte_at_wrap_boundary_selects_the_following_visual_row() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.txt"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        install_fold_fixture(&mut app, "abcdef", "fixture.txt");
+        app.ui_regions.content_inner.width = 7; // 4-column gutter + 3 text columns.
+        app.scroll_to_logical_line(0, 3);
+        let rows = app.content_visual_rows(7);
+        assert_eq!(rows[app.content_scroll].byte_range, 3..6);
+    }
+
+    #[test]
+    fn test_backend_renders_and_hits_rows_beyond_u16_scroll_without_aliasing() {
+        const AFTER_LIMIT_LINE: usize = 66_000;
+        const FINAL_LINE: usize = 70_000;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fixture.txt"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.content_requests.invalidate();
+        app.runtime.cancel_pending_content();
+        app.content_mode = ContentMode::Preview;
+        app.content_show_line_numbers = true;
+        app.focused_pane = FocusPane::Content;
+        app.content_lines = (0..=FINAL_LINE)
+            .map(|index| format!("row-{index}"))
+            .collect();
+        app.content_lines[AFTER_LIMIT_LINE] = "UNIQUE_AFTER_U16_LIMIT".to_owned();
+        app.content_lines[AFTER_LIMIT_LINE + 1] =
+            "wrapped metadata stays attached to its original logical source line across continuations"
+                .to_owned();
+        app.content_lines[FINAL_LINE] = "UNIQUE_FINAL_SENTINEL".to_owned();
+        app.content_highlights = vec![Vec::new(); app.content_lines.len()];
+        // A 100-column terminal produces a 54-column content inner area with
+        // the default tree width.
+        app.ui_regions.content_inner.width = 54;
+        app.content_projection_width = 54;
+        let visual_rows = app.content_visual_rows(54);
+        let after_limit_row = visual_rows
+            .iter()
+            .position(|row| row.line_index == AFTER_LIMIT_LINE)
+            .unwrap();
+        assert!(after_limit_row > usize::from(u16::MAX));
+        let wrapped: Vec<_> = visual_rows
+            .iter()
+            .filter(|row| row.line_index == AFTER_LIMIT_LINE + 1)
+            .collect();
+        assert!(wrapped.len() > 1);
+        assert!(wrapped[1].continuation);
+        assert_eq!(wrapped[1].line_index, AFTER_LIMIT_LINE + 1);
+
+        app.content_scroll = after_limit_row;
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let area = app.ui_regions.content_inner;
+        let top_row: String = (area.x..area.right())
+            .map(|column| terminal.backend().buffer()[(column, area.y)].symbol())
+            .collect();
+        assert!(top_row.contains("66001"), "{top_row:?}");
+        assert!(top_row.contains("UNIQUE_AFTER_U16_LIMIT"), "{top_row:?}");
+
+        let text_column = area.x.saturating_add(app.content_gutter_width() as u16);
+        let point = app
+            .content_point_bounds(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: text_column,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        assert_eq!(point.0.line, AFTER_LIMIT_LINE);
+        app.sync_content_cursor_to_scroll();
+        assert_eq!(app.content_cursor_line, AFTER_LIMIT_LINE);
+        drag_content(
+            &mut app,
+            text_column,
+            area.y,
+            text_column.saturating_add(6),
+            area.y,
+        );
+        assert!(
+            app.selected_content_text()
+                .is_some_and(|selected| selected.starts_with("UNIQUE"))
+        );
+
+        app.content_scroll = usize::MAX;
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let area = app.ui_regions.content_inner;
+        let final_top: String = (area.x..area.right())
+            .map(|column| terminal.backend().buffer()[(column, area.y)].symbol())
+            .collect();
+        assert!(final_top.contains("70001"), "{final_top:?}");
+        assert!(final_top.contains("UNIQUE_FINAL_SENTINEL"), "{final_top:?}");
+        assert!(!final_top.contains('▸'));
+        assert!(
+            app.content_point_bounds(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: text_column,
+                row: area.y.saturating_add(3),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_none(),
+            "blank rows below EOF must not alias the final source row"
+        );
+
+        app.content_horizontal_scroll = usize::MAX;
+        assert_eq!(app.effective_content_horizontal_scroll(), 0);
+        app.content_mode = ContentMode::Info;
+        assert_eq!(
+            app.effective_content_horizontal_scroll(),
+            usize::from(u16::MAX)
+        );
+        app.content_lines.clear();
+        app.content_highlights.clear();
+        app.content_scroll = usize::MAX;
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
     }
 
     #[test]
@@ -4587,6 +5453,9 @@ mod tests {
             lines: vec![line.to_owned()],
             highlights: Vec::new(),
             show_line_numbers: false,
+            identity: None,
+            fold_source: FoldSource::None,
+            fold_regions: Vec::new(),
         }
     }
 

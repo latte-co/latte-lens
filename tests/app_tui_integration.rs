@@ -54,6 +54,81 @@ fn startup_renders_before_the_initial_tree_snapshot_is_ready() {
 }
 
 #[test]
+fn preview_folding_renders_markers_and_find_reveals_hidden_body() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("fold.rs"),
+        "fn folded() {\n    let hidden_needle = 1;\n    println!(\"{}\", hidden_needle);\n}\n",
+    )
+    .unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(modified_key(KeyCode::Char('{'), KeyModifiers::SHIFT));
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains('▸'));
+    assert!(rendered.contains("lines"));
+    assert!(!rendered.contains("hidden_needle"));
+
+    let marker_index = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .position(|cell| cell.symbol() == "▸")
+        .unwrap();
+    let marker_column = u16::try_from(marker_index % 100).unwrap();
+    let marker_row = u16::try_from(marker_index / 100).unwrap();
+    app.handle_mouse(mouse_down(marker_column, marker_row.saturating_add(5)));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        rendered.contains('▸'),
+        "blank EOF rows must not alias the marker"
+    );
+
+    app.handle_mouse(mouse_down(marker_column, marker_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("hidden_needle"));
+
+    app.handle_key(modified_key(KeyCode::Char('{'), KeyModifiers::SHIFT));
+
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "hidden_needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("hidden_needle"));
+}
+
+#[test]
+fn huge_raw_content_scroll_renders_and_navigates_from_the_effective_end() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "one\ntwo\nthree\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('l')));
+    app.content_scroll = usize::MAX;
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("three"));
+
+    app.handle_key(key(KeyCode::Up));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("two"));
+    assert_ne!(app.content_scroll, usize::MAX);
+}
+
+#[test]
 fn provisional_repository_scan_does_not_flash_partial_in_git_changes() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir_all(directory.path().join("one/two/three")).unwrap();
@@ -1723,7 +1798,8 @@ fn clean_source_defaults_to_numbered_text_preview() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("Preview"));
-    assert!(rendered.contains("1 │"));
+    assert!(rendered.contains("1 ▾"));
+    assert!(rendered.contains("2 │"));
     assert!(rendered.contains("println!"));
 }
 

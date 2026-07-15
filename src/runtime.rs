@@ -2,7 +2,7 @@ use std::{
     any::Any,
     collections::{HashSet, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::{self, JoinHandle},
 };
@@ -13,6 +13,7 @@ use crate::{
     content_safety::{
         ContentPathKind, ensure_beneath, inspect_content_path, path_exists_without_following,
     },
+    folding::{FoldRegion, FoldSource, fold_regions},
     git::StatusMap,
     preview::{HighlightSpan, PreviewRegistry, PreviewRequest, PreviewResolution},
     repo_graph::{DiscoveryOptions, RepoChange, RepoGraph},
@@ -72,6 +73,33 @@ pub(crate) struct ContentSnapshot {
     pub lines: Vec<String>,
     pub highlights: Vec<Vec<HighlightSpan>>,
     pub show_line_numbers: bool,
+    pub identity: Option<ContentIdentity>,
+    pub fold_source: FoldSource,
+    pub fold_regions: Vec<FoldRegion>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ContentIdentity(PathBuf);
+
+impl ContentIdentity {
+    fn from_absolute(root: &Path, absolute: &Path) -> Option<Self> {
+        let relative = absolute.strip_prefix(root).ok()?;
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(value) => normalized.push(value),
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => return None,
+            }
+        }
+        (!normalized.as_os_str().is_empty()).then_some(Self(normalized))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 #[derive(Debug)]
@@ -558,6 +586,9 @@ fn execute_content(
                 )?,
                 highlights: Vec::new(),
                 show_line_numbers: false,
+                identity: None,
+                fold_source: FoldSource::None,
+                fold_regions: Vec::new(),
             })
         }
         ContentKind::Preview => {
@@ -581,8 +612,11 @@ fn execute_content(
             let preview_request = PreviewRequest::new(&absolute, &display_path)
                 .within_root(root)
                 .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES);
-            let preview = match registry.resolve(&preview_request)? {
-                PreviewResolution::Preview(preview) => preview,
+            let (preview, fold_source) = match registry.resolve(&preview_request)? {
+                PreviewResolution::Preview {
+                    preview,
+                    fold_source,
+                } => (preview, fold_source),
                 PreviewResolution::Unsupported => {
                     return Ok(ContentSnapshot {
                         provider: None,
@@ -592,6 +626,9 @@ fn execute_content(
                         ],
                         highlights: Vec::new(),
                         show_line_numbers: false,
+                        identity: None,
+                        fold_source: FoldSource::None,
+                        fold_regions: Vec::new(),
                     });
                 }
                 PreviewResolution::Unsafe {
@@ -618,11 +655,22 @@ fn execute_content(
                         ],
                         highlights: Vec::new(),
                         show_line_numbers: false,
+                        identity: None,
+                        fold_source: FoldSource::None,
+                        fold_regions: Vec::new(),
                     });
                 }
             };
+            let identity = ContentIdentity::from_absolute(root, &absolute);
             let mut lines = preview.lines;
             let mut highlights = preview.highlights;
+            let fold_regions = if fold_source.allows_folding() {
+                identity
+                    .as_ref()
+                    .map_or_else(Vec::new, |identity| fold_regions(identity.path(), &lines))
+            } else {
+                Vec::new()
+            };
             if preview.truncated {
                 lines.push(format!(
                     "… preview truncated at {PREVIEW_MAX_BYTES} bytes or {PREVIEW_MAX_LINES} lines"
@@ -634,6 +682,9 @@ fn execute_content(
                 lines,
                 highlights,
                 show_line_numbers: preview.show_line_numbers,
+                identity,
+                fold_source,
+                fold_regions,
             })
         }
     }
@@ -689,6 +740,22 @@ mod tests {
         assert!(generations.accept(current));
         assert!(!generations.is_loading());
         assert!(!generations.accept(current));
+    }
+
+    #[test]
+    fn content_identity_normalizes_nested_repository_paths_and_rejects_escape_components() {
+        let root = Path::new("/workspace");
+        let nested = Path::new("/workspace/vendor/repo/src/lib.rs");
+        assert_eq!(
+            ContentIdentity::from_absolute(root, nested)
+                .expect("nested repository path should remain workspace relative")
+                .path(),
+            Path::new("vendor/repo/src/lib.rs")
+        );
+        assert!(ContentIdentity::from_absolute(root, Path::new("/outside/lib.rs")).is_none());
+        assert!(
+            ContentIdentity::from_absolute(root, Path::new("/workspace/../escape.rs")).is_none()
+        );
     }
 
     #[test]

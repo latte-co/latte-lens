@@ -12,7 +12,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, GitRowKind, GitTreeRow,
+        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker, GitRowKind,
+        GitTreeRow,
         SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
@@ -73,6 +74,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let content_header = inset_left(content_header, 1);
     let content_rows = inset_left(content_rows, 1);
+    app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
         header,
@@ -1155,18 +1157,34 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     }
     let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
-    let lines: Vec<Line> = visual_rows
+    let render_area = if app.content_mode == ContentMode::Info {
+        inset_top(rows, 1)
+    } else {
+        rows
+    };
+    let start = app.effective_content_scroll(visual_rows.len());
+    let end = start
+        .saturating_add(usize::from(render_area.height))
+        .min(visual_rows.len());
+    let lines: Vec<Line> = visual_rows[start..end]
         .iter()
         .filter_map(|visual_row| {
             let line = app.content_lines.get(visual_row.line_index)?;
             let segment = line.get(visual_row.byte_range.clone())?;
-            let mut highlights = app
-                .content_highlights
-                .get(visual_row.line_index)
-                .cloned()
-                .unwrap_or_default();
-            highlights.extend(app.preview_find_highlights(visual_row.line_index));
-            let selection = visual_row_selection(app, visual_row);
+            let mut highlights = if visual_row.synthetic {
+                Vec::new()
+            } else {
+                app.content_highlights
+                    .get(visual_row.line_index)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            if !visual_row.synthetic {
+                highlights.extend(app.preview_find_highlights(visual_row.line_index));
+            }
+            let selection = (!visual_row.synthetic)
+                .then(|| visual_row_selection(app, visual_row))
+                .flatten();
             Some(match app.content_mode {
                 ContentMode::Diff => diff_line(
                     segment,
@@ -1181,9 +1199,9 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
                     line_number_width,
                     segment,
                     line.starts_with("… preview truncated"),
-                    visual_row.byte_range.start,
                     &highlights,
                     selection,
+                    visual_row,
                 ),
                 ContentMode::Preview => {
                     preview_text_line(segment, visual_row.byte_range.start, &highlights, selection)
@@ -1197,24 +1215,9 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             })
         })
         .collect();
-    let paragraph = Paragraph::new(Text::from(lines)).scroll((
-        app.content_scroll
-            .min(visual_rows.len().saturating_sub(1))
-            .min(u16::MAX as usize) as u16,
-        if app.content_wraps_lines() {
-            0
-        } else {
-            app.content_horizontal_scroll.min(u16::MAX as usize) as u16
-        },
-    ));
-    frame.render_widget(
-        paragraph,
-        if app.content_mode == ContentMode::Info {
-            inset_top(rows, 1)
-        } else {
-            rows
-        },
-    );
+    let paragraph = Paragraph::new(Text::from(lines))
+        .scroll((0, app.effective_content_horizontal_scroll() as u16));
+    frame.render_widget(paragraph, render_area);
 }
 
 fn draw_preview_find(frame: &mut Frame, app: &App) {
@@ -1327,7 +1330,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help = if area.width < 96 {
         "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  1/2 scope  r refresh  q×2 quit"
     } else if app.content_mode == ContentMode::Preview {
-        "  ↑↓ scroll  ←→ focus  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  1/2 scope  p preview  d diff  r refresh  q×2 quit"
+        "  ↑↓ scroll  [/] folds  Enter toggle  {/} all  Ctrl+F find  drag copies  Ctrl+C quit/copy  1/2 scope  p/d view  r refresh  q×2 quit"
     } else if app.content_mode == ContentMode::Diff {
         "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  p preview  d diff  r refresh  q×2 quit"
     } else {
@@ -1507,9 +1510,9 @@ fn preview_line(
     width: usize,
     line: &str,
     truncated: bool,
-    segment_start: usize,
     highlights: &[HighlightSpan],
     selection: Option<Range<usize>>,
+    visual_row: &ContentVisualRow,
 ) -> Line<'static> {
     let text_style = if truncated {
         Style::default().fg(PEACH)
@@ -1517,21 +1520,32 @@ fn preview_line(
         Style::default().fg(Color::Reset)
     };
     let number = number.map(|number| number.to_string()).unwrap_or_default();
+    let marker = match visual_row.fold_marker {
+        FoldVisualMarker::None => '│',
+        FoldVisualMarker::Expanded => '▾',
+        FoldVisualMarker::Collapsed => '▸',
+    };
     let mut spans = vec![Span::styled(
-        format!("{number:>width$} │ "),
+        format!("{number:>width$} {marker} "),
         Style::default().fg(MUTED),
     )];
     spans.extend(preview_content_spans(
         line,
-        segment_start,
+        visual_row.byte_range.start,
         if truncated { &[] } else { highlights },
         selection,
         text_style,
     ));
+    if let Some(summary) = visual_row.summary.as_deref() {
+        spans.push(Span::styled(summary.to_owned(), Style::default().fg(MUTED)));
+    }
     Line::from(spans)
 }
 
 fn visual_row_selection(app: &App, visual_row: &ContentVisualRow) -> Option<Range<usize>> {
+    if visual_row.synthetic {
+        return None;
+    }
     let selection = app.content_selection_range(visual_row.line_index)?;
     let start = selection.start.max(visual_row.byte_range.start);
     let end = selection.end.min(visual_row.byte_range.end);

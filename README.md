@@ -99,6 +99,9 @@ Inside the TUI:
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
+| `[` / `]` | In focused Preview content, jump to the previous or next visible fold marker |
+| `enter` / `space` | In focused Preview content, toggle the fold at the current marker |
+| `{` / `}` | In focused Preview content, collapse or expand all folds |
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
@@ -116,6 +119,7 @@ Mouse controls:
 - In the popup, type directly, use `↑`/`↓` to preview results, and press `Enter` to open one. `Esc`, the close button, and opening a result hide the popup without clearing its query, results, selection, or scroll position. Reopening File or Text search restores that mode's previous session.
 - Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
+- Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
@@ -204,6 +208,7 @@ validated.
 src/main.rs   CLI entry point and terminal lifecycle
 src/app.rs    application state, focus, and keyboard interaction
 src/runtime.rs bounded background I/O worker and generation state
+src/folding.rs bounded Markdown and Tree-sitter fold extraction
 src/tree.rs   ignore-aware working-tree scan
 src/git.rs    Git status and diff boundary
 src/repo_graph.rs bounded repository discovery, relationships, and owning-repo routing
@@ -225,6 +230,13 @@ line keeps one line-number entry; wrapped continuation rows leave the number
 gutter blank. Tabs render at four-column stops. Scrolling and mouse selection
 follow the visual rows, while copied text preserves the original tabs and
 logical lines without inserting display-only spaces or newlines.
+
+The built-in text provider extracts folds in the background before the
+truncation footer is added. Markdown headings and fenced code blocks, plus
+semantic declarations in Rust, TypeScript/JavaScript, Python, and Go, are
+supported without an LSP. Folding is a display projection: source lines,
+syntax ranges, line numbers, selection, and copied bytes stay unchanged.
+Unsupported languages and custom preview providers remain unfolded.
 
 Recognized source files highlight comments, strings, keywords, functions,
 types, numbers, constants, and attributes. The bundled grammar set includes

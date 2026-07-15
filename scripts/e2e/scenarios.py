@@ -560,6 +560,13 @@ def search_preview(context: ScenarioContext) -> None:
     session.wait_screen(
         ("Preview", "searchable()"), "file search opens selected preview", absent=("Open File",)
     )
+    session.key(b"l")
+    session.key(b"{")
+    session.wait_screen(
+        ("Preview", "▸", "3 lines"),
+        "Preview semantic fold collapses from the content pane",
+        absent=("folded_value",),
+    )
 
     session.key(b"\x06")
     session.wait_screen(("Find", "0/0"), "Preview find opens")
@@ -569,6 +576,20 @@ def search_preview(context: ScenarioContext) -> None:
     session.wait_screen(("1/1",), "Preview find next wraps predictably")
     session.key(b"\x1b")
     session.wait_screen(("Preview", "searchable()"), "Preview find closes", absent=(" Find ",))
+
+    session.key(b"\x06")
+    session.wait_screen(("Find", "0/0"), "Preview body find opens")
+    session.key(b"folded_value")
+    session.wait_screen(
+        ("Find", "folded_value", "let folded_value = 1"),
+        "Preview find expands every folded ancestor of a body match",
+    )
+    session.key(b"\x1b")
+    session.wait_screen(
+        ("Preview", "folded_value"),
+        "Preview body find closes after revealing the match",
+        absent=(" Find ",),
+    )
 
     session.key(b"\x14")
     session.wait_screen(("Search Workspace", "Aa", "Word", ".*", "Ign"), "text search opens")

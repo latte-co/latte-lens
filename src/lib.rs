@@ -4,6 +4,7 @@ pub mod app;
 mod clipboard;
 mod content_safety;
 mod diff;
+mod folding;
 pub mod git;
 pub mod preview;
 pub mod repo_graph;

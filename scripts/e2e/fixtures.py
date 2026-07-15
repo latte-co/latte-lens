@@ -117,7 +117,8 @@ def create_search_fixture(root: Path, environment: dict[str, str]) -> None:
         "alpha needle\nsecond needle\n", encoding="utf-8"
     )
     (root / "src" / "search-target.rs").write_text(
-        "pub fn searchable() {}\n// unique_workspace_phrase\n", encoding="utf-8"
+        "pub fn searchable() {\n// unique_workspace_phrase\nlet folded_value = 1;\n}\n",
+        encoding="utf-8",
     )
     (root / "src" / "search-target-other.rs").write_text(
         "pub fn other_search_target() {}\n", encoding="utf-8"
