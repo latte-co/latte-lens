@@ -374,10 +374,15 @@ class PtySession:
         os.write(self.master_fd, b"\x1b[<0;" + position + b"m")
 
     def double_click(self, column: int, row: int) -> None:
-        position = f"{column + 1};{row + 1}".encode()
-        down = b"\x1b[<0;" + position + b"M"
-        up = b"\x1b[<0;" + position + b"m"
-        os.write(self.master_fd, down + up + down + up)
+        self.click(column, row)
+        # A real terminal consumes redraw output concurrently between clicks.
+        # Keep doing the same here so a slower PTY producer cannot fill its
+        # output buffer and delay the second click beyond the app's window.
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            self.drain()
+            time.sleep(0.005)
+        self.click(column, row)
 
     def click_marker(self, marker: str, *, offset: int = 0) -> None:
         position = self.screen.find(marker)
