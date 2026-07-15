@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     clipboard,
     diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
-    git::{FileStatus, GitRepo},
+    git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
     preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
@@ -68,6 +68,20 @@ pub enum GitRowKind {
     Change(RepoChange),
     Pointer(RepoChange),
     Issue(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffReviewState {
+    Unreviewed,
+    Reviewed,
+    ChangedAfterReview,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReviewProgress {
+    pub total: usize,
+    pub reviewed: usize,
+    pub changed_after_review: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -415,6 +429,9 @@ pub struct App {
     loading_directories: HashSet<PathBuf>,
     tree_epoch: u64,
     git_changes_expansion: HashMap<GitRowIdentity, bool>,
+    reviewed_change_versions: HashMap<RepoPath, ChangeVersion>,
+    current_diff_path: Option<RepoPath>,
+    pending_diff_path: Option<(u64, RepoPath)>,
     // This is the single selectable/renderable tree dataset. The raw vectors
     // above remain canonical scan results for their respective scopes.
     visible_rows: Vec<FileEntry>,
@@ -520,6 +537,9 @@ impl App {
             loading_directories: HashSet::new(),
             tree_epoch: 0,
             git_changes_expansion: HashMap::new(),
+            reviewed_change_versions: HashMap::new(),
+            current_diff_path: None,
+            pending_diff_path: None,
             visible_rows: Vec::new(),
             visible_changed_entries: Vec::new(),
             git_rows: Vec::new(),
@@ -684,6 +704,57 @@ impl App {
                 .get(&row.identity)
                 .copied()
                 .unwrap_or(true)
+    }
+
+    pub(crate) fn git_row_review_state(&self, row: &GitTreeRow) -> Option<DiffReviewState> {
+        let GitRowKind::Change(change) = &row.kind else {
+            return None;
+        };
+        let version = &self
+            .repo_graph
+            .as_ref()?
+            .change_details(&change.path)?
+            .version;
+        Some(match self.reviewed_change_versions.get(&change.path) {
+            None => DiffReviewState::Unreviewed,
+            Some(reviewed) if reviewed == version => DiffReviewState::Reviewed,
+            Some(_) => DiffReviewState::ChangedAfterReview,
+        })
+    }
+
+    pub(crate) fn git_row_diff_stat(&self, row: &GitTreeRow) -> Option<DiffStat> {
+        let change = match &row.kind {
+            GitRowKind::Change(change) | GitRowKind::Pointer(change) => change,
+            GitRowKind::Repository { .. } | GitRowKind::Directory | GitRowKind::Issue(_) => {
+                return None;
+            }
+        };
+        self.repo_graph
+            .as_ref()?
+            .change_details(&change.path)?
+            .diff_stat
+    }
+
+    pub(crate) fn review_progress(&self) -> ReviewProgress {
+        self.git_rows
+            .iter()
+            .fold(ReviewProgress::default(), |mut progress, row| {
+                let Some(state) = self.git_row_review_state(row) else {
+                    return progress;
+                };
+                progress.total = progress.total.saturating_add(1);
+                match state {
+                    DiffReviewState::Reviewed => {
+                        progress.reviewed = progress.reviewed.saturating_add(1);
+                    }
+                    DiffReviewState::ChangedAfterReview => {
+                        progress.changed_after_review =
+                            progress.changed_after_review.saturating_add(1);
+                    }
+                    DiffReviewState::Unreviewed => {}
+                }
+                progress
+            })
     }
 
     pub fn selected_content_label(&self) -> String {
@@ -920,6 +991,9 @@ impl App {
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
             (KeyCode::Char('d'), KeyModifiers::NONE) => self.load_selected_diff(),
+            (KeyCode::Char(' '), KeyModifiers::NONE) if self.content_mode == ContentMode::Diff => {
+                self.toggle_current_diff_review();
+            }
             (KeyCode::Char('n'), KeyModifiers::NONE) if self.content_mode == ContentMode::Diff => {
                 self.select_changed(1);
             }
@@ -2754,6 +2828,13 @@ impl App {
             self.repository_graph_truncated =
                 repository_graph_is_truncated(&graph, full_repository_discovery);
             self.git_changes_truncated |= self.repository_graph_truncated;
+            if full_repository_discovery
+                && !self.repository_graph_truncated
+                && self.repository_error_count == 0
+            {
+                self.reviewed_change_versions
+                    .retain(|path, _| graph.change_details(path).is_some());
+            }
             self.git_rows = build_git_rows(&self.root, &graph, &snapshot.existing_changes);
             self.changed_count = self
                 .git_rows
@@ -3293,7 +3374,16 @@ impl App {
                 return;
             };
             match row.kind {
-                GitRowKind::Change(change) | GitRowKind::Pointer(change) => {
+                GitRowKind::Change(change) => {
+                    let label = row.label;
+                    let review_path = change.path.clone();
+                    self.request_reviewable_diff(
+                        label,
+                        ContentTarget::Repository(change),
+                        review_path,
+                    );
+                }
+                GitRowKind::Pointer(change) => {
                     let label = row.label;
                     self.request_content(
                         ContentKind::Diff,
@@ -3324,10 +3414,11 @@ impl App {
             return;
         };
 
-        self.request_content(
-            ContentKind::Diff,
+        let review_path = change.path.clone();
+        self.request_reviewable_diff(
             relative.display().to_string(),
             ContentTarget::Repository(change),
+            review_path,
         );
     }
 
@@ -3389,11 +3480,31 @@ impl App {
     }
 
     fn request_content(&mut self, kind: ContentKind, label: String, target: ContentTarget) -> u64 {
+        self.request_content_with_review_path(kind, label, target, None)
+    }
+
+    fn request_reviewable_diff(
+        &mut self,
+        label: String,
+        target: ContentTarget,
+        review_path: RepoPath,
+    ) -> u64 {
+        self.request_content_with_review_path(ContentKind::Diff, label, target, Some(review_path))
+    }
+
+    fn request_content_with_review_path(
+        &mut self,
+        kind: ContentKind,
+        label: String,
+        target: ContentTarget,
+        review_path: Option<RepoPath>,
+    ) -> u64 {
         let generation = self.content_requests.begin();
         self.reset_content(match kind {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         });
+        self.pending_diff_path = review_path.map(|path| (generation, path));
         self.content_lines = vec![format!("Loading {label}…")];
         self.runtime.request_content(ContentRequest {
             generation,
@@ -3430,6 +3541,11 @@ impl App {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         };
+        let completed_diff_path = self
+            .pending_diff_path
+            .take()
+            .filter(|(pending_generation, _)| *pending_generation == generation)
+            .map(|(_, path)| path);
         let pending_preview_find = self.preview_find.take();
         self.reset_content(mode);
         match completion.result {
@@ -3444,6 +3560,9 @@ impl App {
                 } else {
                     Vec::new()
                 };
+                if mode == ContentMode::Diff {
+                    self.current_diff_path = completed_diff_path;
+                }
                 if let Some(target) = self
                     .search_preview_target
                     .take()
@@ -3497,13 +3616,34 @@ impl App {
         self.content_highlights.clear();
         self.content_show_line_numbers = false;
         self.content_diff_lines.clear();
+        self.current_diff_path = None;
     }
 
     fn set_info(&mut self, lines: Vec<String>) {
         self.content_requests.invalidate();
         self.runtime.cancel_pending_content();
+        self.pending_diff_path = None;
         self.reset_content(ContentMode::Info);
         self.content_lines = lines;
+    }
+
+    fn toggle_current_diff_review(&mut self) {
+        let Some(path) = self.current_diff_path.clone() else {
+            return;
+        };
+        let Some(version) = self
+            .repo_graph
+            .as_ref()
+            .and_then(|graph| graph.change_details(&path))
+            .map(|details| details.version.clone())
+        else {
+            return;
+        };
+        if self.reviewed_change_versions.get(&path) == Some(&version) {
+            self.reviewed_change_versions.remove(&path);
+        } else {
+            self.reviewed_change_versions.insert(path, version);
+        }
     }
 }
 

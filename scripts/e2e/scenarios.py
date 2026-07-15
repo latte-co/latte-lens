@@ -503,6 +503,50 @@ def git_status_matrix(context: ScenarioContext) -> None:
     session.wait_screen(("Diff", "diff --git"), "changed file switches back to Diff")
 
 
+def git_review_state(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    session.key(b"2")
+    session.wait_until(
+        lambda screen: all(
+            marker in _line_with(screen, "worktree.txt")
+            for marker in ("○", "+1", "-1")
+        ),
+        "worktree diff row exposes unreviewed state and line counts",
+    )
+
+    _click_tree_row(session, "worktree.txt")
+    session.wait_screen(
+        ("worktree.txt", "+worktree after", "Space review"),
+        "reviewable worktree diff is fully loaded",
+    )
+    session.key(b" ")
+    session.wait_until(
+        lambda screen: "✓" in _line_with(screen, "worktree.txt")
+        and "1/6 reviewed" in screen.text(),
+        "Space marks the current diff version reviewed",
+    )
+
+    context.write_text("worktree.txt", "worktree after changed\nsecond line\n")
+    session.key(b"r")
+    session.wait_until(
+        lambda screen: all(
+            marker in _line_with(screen, "worktree.txt")
+            for marker in ("↻", "+2", "-1")
+        )
+        and "1 changed" in screen.text()
+        and "+worktree after changed" in screen.text(),
+        "refresh marks a reviewed file stale and loads its updated diff and line counts",
+    )
+    session.key(b" ")
+    session.wait_until(
+        lambda screen: "✓" in _line_with(screen, "worktree.txt")
+        and "1/6 reviewed" in screen.text()
+        and "1 changed" not in screen.text(),
+        "Space reviews the refreshed diff version",
+    )
+
+
 def search_preview(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
@@ -701,6 +745,7 @@ CASES = (
     ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
+    ScenarioCase("git-review-state", "git-changes", create_git_matrix_fixture, git_review_state),
     ScenarioCase("search-preview", "search-preview", create_search_fixture, search_preview),
     ScenarioCase("search-controls", "search-preview", create_search_fixture, search_controls),
 )

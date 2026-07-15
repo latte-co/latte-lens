@@ -12,8 +12,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, ContentMode, ContentVisualRow, FocusPane, GitRowKind, GitTreeRow, SearchMode,
-        SearchResult, TreeScope, UiRegions, display_workspace_path,
+        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, GitRowKind, GitTreeRow,
+        SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -265,6 +265,22 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ));
     } else if app.total_repository_count > 0 {
         let change_count = format_change_count(app.changed_count);
+        let review_progress = app.review_progress();
+        let review_summary = if app.tree_scope == TreeScope::GitChanges && review_progress.total > 0
+        {
+            format!(
+                " · {}/{} reviewed{}",
+                review_progress.reviewed,
+                review_progress.total,
+                if review_progress.changed_after_review > 0 {
+                    format!(" · {} changed", review_progress.changed_after_review)
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            String::new()
+        };
         title.push(Span::raw("  "));
         if let Some(branch) = app.branch.as_deref() {
             title.push(Span::styled(branch, Style::default().fg(MINT)));
@@ -272,7 +288,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         }
         title.push(Span::styled(
             format!(
-                "{}/{} repos · {change_count}{}{}{}",
+                "{}/{} repos · {change_count}{review_summary}{}{}{}",
                 app.dirty_repository_count,
                 app.total_repository_count,
                 if app.repo.is_none() {
@@ -737,10 +753,23 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         format!("{entry_count} loaded")
     } else if app.tree_scope == TreeScope::GitChanges {
         let change_count = format_change_count(entry_count);
-        format!(
-            "{change_count} · {}/{} repos",
-            app.dirty_repository_count, app.total_repository_count
-        )
+        let progress = app.review_progress();
+        if progress.total == 0 {
+            format!(
+                "{change_count} · {}/{} repos",
+                app.dirty_repository_count, app.total_repository_count
+            )
+        } else if progress.changed_after_review == 0 {
+            format!(
+                "{change_count} · {}/{} reviewed",
+                progress.reviewed, progress.total
+            )
+        } else {
+            format!(
+                "{change_count} · {}/{} reviewed · {} changed",
+                progress.reviewed, progress.total, progress.changed_after_review
+            )
+        }
     } else {
         format!("{entry_count} entries")
     };
@@ -796,6 +825,7 @@ fn git_tree_line(
     };
     let repository_has_changes = repository_change_count.is_some_and(|count| count > 0);
     let indent = "  ".repeat(row.depth);
+    let review_state = app.git_row_review_state(row);
     let icon = if row.is_container() {
         if app.git_row_is_expanded(row) {
             "▾ "
@@ -803,12 +833,20 @@ fn git_tree_line(
             "▸ "
         }
     } else {
-        match row.kind {
-            GitRowKind::Pointer(_) => "~ ",
-            GitRowKind::Issue(_) => "! ",
-            GitRowKind::Change(_) => "- ",
-            GitRowKind::Repository { .. } | GitRowKind::Directory => unreachable!(),
+        match (review_state, &row.kind) {
+            (Some(DiffReviewState::Unreviewed), _) => "○ ",
+            (Some(DiffReviewState::Reviewed), _) => "✓ ",
+            (Some(DiffReviewState::ChangedAfterReview), _) => "↻ ",
+            (None, GitRowKind::Pointer(_)) => "~ ",
+            (None, GitRowKind::Issue(_)) => "! ",
+            (None, GitRowKind::Change(_)) => "- ",
+            (None, GitRowKind::Repository { .. } | GitRowKind::Directory) => unreachable!(),
         }
+    };
+    let review_color = match review_state {
+        Some(DiffReviewState::Reviewed) => Some(MINT),
+        Some(DiffReviewState::ChangedAfterReview) => Some(PEACH),
+        Some(DiffReviewState::Unreviewed) | None => None,
     };
     let selection_style = if selected && focused {
         Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
@@ -824,7 +862,7 @@ fn git_tree_line(
     } else if matches!(row.kind, GitRowKind::Issue(_)) {
         ROSE
     } else {
-        MUTED
+        review_color.unwrap_or(MUTED)
     };
     let spans = vec![
         Span::styled(
@@ -846,12 +884,31 @@ fn git_tree_line(
         selection_style
     };
     if let Some(status) = row.status {
-        tree_row_with_hint(
-            spans,
-            row.label.clone(),
-            label_style,
+        let mut hint = Vec::new();
+        if let Some(stat) = app.git_row_diff_stat(row) {
+            if stat.binary {
+                hint.push(Span::styled("binary", Style::default().fg(MUTED)));
+            } else {
+                hint.push(Span::styled(
+                    format!("+{}", stat.added),
+                    Style::default().fg(MINT),
+                ));
+                hint.push(Span::raw(" "));
+                hint.push(Span::styled(
+                    format!("-{}", stat.deleted),
+                    Style::default().fg(ROSE),
+                ));
+            }
+            hint.push(Span::raw(" "));
+        }
+        hint.push(Span::styled(
             compact_tree_status_label(status),
             Style::default().fg(status_color(status)),
+        ));
+        tree_row_with_styled_spans_hint(
+            spans,
+            vec![Span::styled(row.label.clone(), label_style)],
+            hint,
             width,
         )
     } else if !row.detail.is_empty() {
@@ -985,22 +1042,36 @@ fn tree_row_with_hint(
 }
 
 fn tree_row_with_styled_hint(
-    mut leading: Vec<Span<'static>>,
+    leading: Vec<Span<'static>>,
     content: Vec<Span<'static>>,
     hint: String,
     hint_style: Style,
     width: u16,
 ) -> Line<'static> {
+    tree_row_with_styled_spans_hint(
+        leading,
+        content,
+        vec![Span::styled(hint, hint_style)],
+        width,
+    )
+}
+
+fn tree_row_with_styled_spans_hint(
+    mut leading: Vec<Span<'static>>,
+    content: Vec<Span<'static>>,
+    hint: Vec<Span<'static>>,
+    width: u16,
+) -> Line<'static> {
     let width = usize::from(width);
     let leading_width = spans_width(&leading);
-    let hint_width = UnicodeWidthStr::width(hint.as_str());
+    let hint_width = spans_width(&hint);
     let content_width = width.saturating_sub(leading_width + hint_width + 2);
 
     leading.extend(truncate_spans_to_width(content, content_width));
     let used_width = spans_width(&leading);
     let padding = width.saturating_sub(used_width + hint_width + 1).max(1);
     leading.push(Span::raw(" ".repeat(padding)));
-    leading.push(Span::styled(hint, hint_style));
+    leading.extend(hint);
     leading.push(Span::raw(" "));
     Line::from(leading)
 }
@@ -1258,7 +1329,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.content_mode == ContentMode::Preview {
         "  ↑↓ scroll  ←→ focus  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  1/2 scope  p preview  d diff  r refresh  q×2 quit"
     } else if app.content_mode == ContentMode::Diff {
-        "  ↑↓ scroll  ←→ focus  drag copies  Ctrl+C quit/copy selection  1/2 scope  p preview  d diff  r refresh  q×2 quit"
+        "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  p preview  d diff  r refresh  q×2 quit"
     } else {
         "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  1/2 scope  p preview  d diff  r refresh  q×2 quit"
     };
