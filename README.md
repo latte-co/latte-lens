@@ -99,6 +99,9 @@ Inside the TUI:
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
+| `f12` / `shift-f12` / `ctrl-f12` | In focused Preview content, find the definition, references, or implementations through an explicitly configured language server |
+| `@` | Open bounded local document symbols for the current Preview |
+| `alt-←` / `alt-→` | Move backward or forward through successful navigation locations |
 | `[` / `]` | In focused Preview content, jump to the previous or next visible fold marker |
 | `enter` / `space` | In focused Preview content, toggle the fold at the current marker |
 | `{` / `}` | In focused Preview content, collapse or expand all folds |
@@ -120,6 +123,7 @@ Mouse controls:
 - Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
+- In a supported built-in source Preview, `Ctrl`-click (or `Command`-click on macOS) requests the clicked token's definition. Semantic navigation never falls back to a same-name AST/workspace guess: without an explicitly configured language server it reports the unavailable state and leaves the current view unchanged.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
@@ -188,19 +192,77 @@ interactive, and the completed snapshot replaces it without restarting the UI.
 File watching is not implemented; entering Git Changes or pressing `r`
 requests a fresh graph-aware snapshot.
 
+## Code navigation
+
+Definition, references, and implementations are available on Linux, macOS,
+and Windows through a language server that the user explicitly enables. Latte
+Lens never discovers or starts a server merely because it is present on
+`PATH`, and it never installs one. Without a configured and usable server,
+semantic navigation reports the unavailable state and leaves the current file,
+tree, viewport, and history unchanged. Tree-sitter and Markdown parsing still
+provide bounded folding and local document symbols; they are not semantic
+fallbacks.
+
+Set `LATTELENS_LSP_CONFIG` to an absolute JSON path, or use the platform default:
+
+- macOS: `~/Library/Application Support/latte-lens/lsp.json`
+- Windows: `%APPDATA%\\latte-lens\\lsp.json`
+- Linux and other Unix: `$XDG_CONFIG_HOME/latte-lens/lsp.json`, falling back to
+  `~/.config/latte-lens/lsp.json`
+
+Every enabled entry is explicit. `program` may be an absolute native executable
+or a basename resolved only after that entry is enabled:
+
+```json
+{
+  "enabled": true,
+  "servers": {
+    "rust": {
+      "enabled": true,
+      "program": "/absolute/path/to/rust-analyzer",
+      "args": []
+    },
+    "typescript": {
+      "enabled": true,
+      "program": "typescript-language-server",
+      "args": ["--stdio"]
+    },
+    "python": { "enabled": false },
+    "go": {
+      "enabled": true,
+      "program": "gopls",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Configuration is user-level only. Workspace commands, Windows shell wrappers,
+symlink/reparse-point executables, and executables inside the opened workspace
+are rejected. Executable identity and workspace exclusion are checked again
+immediately before every spawn. The external language server remains trusted
+host tooling and may have capabilities outside Latte Lens's read-only protocol
+behavior.
+
+Navigation uses logical payload admission limits of 32 MiB per session and
+192 MiB globally, including framed bodies, parse scratch reservations,
+normalized results, document indexes, and revalidation buffers. These are
+application accounting limits, not RSS or allocator hard caps.
+
 ## Platform support
 
 | Validation surface | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| Locked compile and unit/integration tests | CI | Not currently covered | CI |
+| Locked compile and unit/integration tests | CI | CI | CI |
+| Real framed LSP and descendant process-tree cleanup | Process group in CI | Process group in CI | Job Object in CI |
 | Native release build, package, and SHA-256 checksum | CI (`.tar.gz`) | CI (`.tar.gz`) | CI (`.zip` containing `latte-lens.exe`) |
 | Interactive PTY E2E | CI (POSIX PTY) | CI (POSIX PTY) | Not currently covered |
 
-Windows CI covers the supported build, unit/integration test, and packaging
-surface. The current interactive E2E harness uses POSIX PTY APIs, so it is not
-used as Windows evidence. ConPTY-based interactive E2E remains out of scope and
-should be considered experimental until it is implemented and continuously
-validated.
+Windows CI runs the framed definition journey through the production direct
+`CreateProcessW` spawner and a separate descendant-held-pipe Job Object cleanup
+journey before the full locked suite and package checks. The interactive
+harness uses POSIX PTY APIs, so Windows process integration—not a fake PTY—is
+its native lifecycle evidence.
 
 ## Architecture
 
@@ -295,6 +357,7 @@ make coverage       # enforce both independent coverage floors
 make coverage-unit  # enforce 93% on the direct unit-test responsibility surface
 make coverage-e2e   # enforce 85% on the production PTY interaction surface
 make coverage-html  # generate an inspectable all-target HTML report
+make test-navigation-real # real framed LSP plus process-tree lifecycle
 make bench          # run performance benchmarks
 make package        # create a release archive and SHA-256 checksum
 make package-smoke  # build and verify the archive payload and checksum

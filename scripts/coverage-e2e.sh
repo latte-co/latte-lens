@@ -10,11 +10,24 @@ binary=${BINARY:-latte-lens}
 minimum=${E2E_COVERAGE_MIN:-85}
 ignore_regex=${E2E_COVERAGE_IGNORE_REGEX:-'(/agent/|/(clipboard|content_safety|diff|git|preview|repo_graph|runtime|search|text_layout|tree)\.rs$)'}
 target_dir=${E2E_COVERAGE_TARGET_DIR:-target/llvm-cov-e2e}
+helper_target_dir=$repo_root/target
 
 case "$target_dir" in
   /*) ;;
   *) target_dir="$repo_root/$target_dir" ;;
 esac
+target_dir=$("$python_command" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$target_dir")
+helper_target_dir=$("$python_command" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$helper_target_dir")
+if [[ "$target_dir" == "$helper_target_dir" ]]; then
+  echo "E2E_COVERAGE_TARGET_DIR must not resolve to the non-instrumented helper target: $helper_target_dir" >&2
+  exit 2
+fi
+
+# Keep the deterministic LSP peer outside the instrumented production target.
+# A clean coverage checkout still needs the helper journeys to be self-contained.
+CARGO_TARGET_DIR=$helper_target_dir \
+  "$cargo_command" build --locked --features navigation-test-support \
+  --bin latte-lens-lsp-test-helper
 export CARGO_TARGET_DIR=$target_dir
 
 env_file=$(mktemp "${TMPDIR:-/tmp}/latte-lens-coverage-env.XXXXXX")

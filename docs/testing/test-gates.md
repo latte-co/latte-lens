@@ -242,7 +242,7 @@ Q3 开始前和退出后计算：
 
 ## 10. CI 与命令规划
 
-当前 `make e2e` 是 Files、Git Changes 和 Search/Preview 的 blocking production E2E：
+当前 `make e2e` 是 Files、Git Changes、Search/Preview 和 Code Navigation 的 blocking production E2E：
 
 | Target | 内容 |
 |---|---|
@@ -250,17 +250,18 @@ Q3 开始前和退出后计算：
 | `make e2e-files` | F-E2E cards |
 | `make e2e-git` | G-E2E cards |
 | `make e2e-search` | F/S search-preview cards |
+| `make e2e-navigation` | folding、structure navigation、LSP navigation/lifecycle cards |
 | `make e2e` | 聚合所有当前 required scenarios |
 
 CI 映射：
 
 - Linux quality：Q0–Q2；
-- Linux/macOS PTY：Q3 Files + Git Changes + Search；
+- Linux/macOS PTY：Q3 Files + Git Changes + Search + Code Navigation；
 - Windows：Q0–Q2、package；ConPTY 未持续验证前不声称 Q3；
 - Agent jobs：按专项文档增加 Q4，不替代主 PTY job；
-- coverage-unit：只统计由 Q1 直接单测负责的 `clipboard.rs`、`diff.rs`、`preview.rs`、`search.rs`、`text_layout.rs` 支持模块，保持 93% line floor；
-- coverage-e2e：用 production binary + PTY 执行全部 required scenarios，只统计 `app.rs`、`main.rs`、`ui.rs` 交互层，保持 85% line floor；
-- 其余边界模块由 Q2 integration/contract tests 独立阻断，不与上述两个分母合并；`make coverage` 顺序执行两个 coverage gate；
+- coverage-unit：分母以 Makefile 的 `UT_COVERAGE_IGNORE_REGEX` 为准。当前过滤后由 Q1 直接单测负责的 surface 包含 `clipboard.rs`、`diff.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`navigation.rs`、`preview.rs`、`search.rs` 和 `text_layout.rs`，保持 93% line floor；
+- coverage-e2e：用 production binary + PTY 执行全部 required scenarios，分母以 Makefile 的 `E2E_COVERAGE_IGNORE_REGEX` 为准。当前 production PTY surface 包含 `app.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`main.rs`、`navigation.rs` 和 `ui.rs`，保持 85% line floor；
+- 被上述过滤器排除的边界模块仍由 Q2 integration/contract tests 独立阻断；`lsp_process_unix.rs` 与 `lsp_process_windows.rs` 只在各自适用的 target 编译和计量，覆盖率报告不替代上述 Windows native PR CI 证据。`make coverage` 顺序执行两个 coverage gate；
 - package：Q5，并验证只有 production binary/资产。
 
 ## 11. 改动与卡点映射

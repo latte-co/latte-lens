@@ -12,9 +12,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker, GitRowKind,
-        GitTreeRow,
-        SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
+        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
+        GitRowKind, GitTreeRow, SearchMode, SearchResult, TreeScope, UiRegions,
+        display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -93,7 +93,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
-    if app.search_is_active() {
+    if app.navigation_picker.is_some() {
+        dim_underlay(frame);
+        draw_navigation_picker(frame, app);
+    } else if app.search_is_active() {
         dim_underlay(frame);
         draw_search_popup(frame, app);
     }
@@ -180,6 +183,8 @@ fn regions(areas: DrawAreas) -> UiRegions {
         search_text_mode: Rect::default(),
         search_options: [Rect::default(); 4],
         search_results: Rect::default(),
+        navigation_popup: Rect::default(),
+        navigation_results: Rect::default(),
         preview_find_input,
         preview_find_case,
         preview_find_position,
@@ -560,6 +565,63 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             "↑↓ select · Enter open · Ctrl+U clear · Esc close",
+            Style::default().fg(MUTED),
+        )),
+        help,
+    );
+}
+
+fn draw_navigation_picker(frame: &mut Frame, app: &mut App) {
+    let popup = search_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+    let title = app
+        .navigation_picker
+        .as_ref()
+        .map_or("Navigation", |picker| picker.title.as_str());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(LAVENDER))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = inset_horizontal(block.inner(popup), 1);
+    frame.render_widget(block, popup);
+    let [results, help] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    app.ui_regions.navigation_popup = popup;
+    app.ui_regions.navigation_results = results;
+    let Some(picker) = app.navigation_picker.as_mut() else {
+        return;
+    };
+    let selected = picker.list_state.selected();
+    let items: Vec<ListItem> = picker
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let style = if selected == Some(index) {
+                Style::default()
+                    .fg(Color::Reset)
+                    .bg(Color::Rgb(54, 51, 58))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            let mut spans = vec![Span::styled(item.label.clone(), style)];
+            if let Some(detail) = item.detail.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {detail}"),
+                    Style::default().fg(SUBTLE),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    frame.render_stateful_widget(List::new(items), results, &mut picker.list_state);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "↑↓ select · Enter open · Esc close",
             Style::default().fg(MUTED),
         )),
         help,
@@ -1181,6 +1243,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             };
             if !visual_row.synthetic {
                 highlights.extend(app.preview_find_highlights(visual_row.line_index));
+                highlights.extend(app.navigation_highlights(visual_row.line_index));
             }
             let selection = (!visual_row.synthetic)
                 .then(|| visual_row_selection(app, visual_row))
@@ -1284,6 +1347,22 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.navigation_picker.is_some() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Navigate ",
+                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  ↑↓ select  Enter open  Esc close",
+                    Style::default().fg(MUTED),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
     if app.preview_find_is_active() {
         let help = if area.width < 96 {
             "  type query  Enter/↓ next  Shift+Enter/↑ previous  F2 case  Esc close"
@@ -1382,6 +1461,33 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled("  ", Style::default()),
             Span::styled(status, Style::default().fg(MINT)),
+        ])
+    } else if let Some(status) = &app.navigation_status {
+        Line::from(vec![
+            Span::styled(
+                format!(" {focus} "),
+                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                status.message.clone(),
+                Style::default().fg(match status.level {
+                    super::app::NavigationStatusLevel::Info => MINT,
+                    super::app::NavigationStatusLevel::Error => ROSE,
+                }),
+            ),
+        ])
+    } else if let Some(warning) = &app.navigation_config_warning {
+        Line::from(vec![
+            Span::styled(
+                format!(" {focus} "),
+                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("Navigation config: {warning}"),
+                Style::default().fg(ROSE),
+            ),
         ])
     } else if let Some(status) = &app.clipboard_status {
         Line::from(vec![
@@ -1643,6 +1749,11 @@ fn highlight_style(kind: HighlightKind) -> Style {
         HighlightKind::Search => Style::default()
             .fg(LAVENDER)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        HighlightKind::NavigationTarget => Style::default()
+            .fg(Color::Black)
+            .bg(MINT)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::NavigationCaret => Style::default().add_modifier(Modifier::UNDERLINED),
     }
 }
 

@@ -13,8 +13,9 @@ use crate::{
     content_safety::{
         ContentPathKind, ensure_beneath, inspect_content_path, path_exists_without_following,
     },
-    folding::{FoldRegion, FoldSource, fold_regions},
+    folding::{FoldRegion, FoldSource, StructureSnapshot, structure_snapshot},
     git::StatusMap,
+    navigation::{LineIndex, NavigationSource, language_for_path},
     preview::{HighlightSpan, PreviewRegistry, PreviewRequest, PreviewResolution},
     repo_graph::{DiscoveryOptions, RepoChange, RepoGraph},
     tree::{self, ScanResult},
@@ -48,7 +49,14 @@ pub(crate) struct DirectoryRequest {
 pub(crate) struct ContentRequest {
     pub generation: u64,
     pub kind: ContentKind,
+    pub purpose: ContentPurpose,
     pub target: ContentTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContentPurpose {
+    Display,
+    NavigationStage { navigation_generation: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -76,13 +84,15 @@ pub(crate) struct ContentSnapshot {
     pub identity: Option<ContentIdentity>,
     pub fold_source: FoldSource,
     pub fold_regions: Vec<FoldRegion>,
+    pub structure: StructureSnapshot,
+    pub navigation_source: Option<NavigationSource>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ContentIdentity(PathBuf);
 
 impl ContentIdentity {
-    fn from_absolute(root: &Path, absolute: &Path) -> Option<Self> {
+    pub(crate) fn from_absolute(root: &Path, absolute: &Path) -> Option<Self> {
         let relative = absolute.strip_prefix(root).ok()?;
         let mut normalized = PathBuf::new();
         for component in relative.components() {
@@ -119,6 +129,7 @@ pub(crate) struct DirectoryCompletion {
 pub(crate) struct ContentCompletion {
     pub generation: u64,
     pub kind: ContentKind,
+    pub purpose: ContentPurpose,
     pub result: Result<ContentSnapshot, String>,
 }
 
@@ -448,6 +459,7 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
             Work::Content(request) => {
                 let generation = request.generation;
                 let kind = request.kind;
+                let purpose = request.purpose;
                 let result = catch_worker_error(|| {
                     execute_content(&root, graph.as_ref(), &preview_registry, request)
                 });
@@ -459,6 +471,7 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
                 state.completed_content = Some(ContentCompletion {
                     generation,
                     kind,
+                    purpose,
                     result,
                 });
                 shared.changed.notify_all();
@@ -589,6 +602,8 @@ fn execute_content(
                 identity: None,
                 fold_source: FoldSource::None,
                 fold_regions: Vec::new(),
+                structure: StructureSnapshot::unavailable(),
+                navigation_source: None,
             })
         }
         ContentKind::Preview => {
@@ -629,6 +644,8 @@ fn execute_content(
                         identity: None,
                         fold_source: FoldSource::None,
                         fold_regions: Vec::new(),
+                        structure: StructureSnapshot::unavailable(),
+                        navigation_source: None,
                     });
                 }
                 PreviewResolution::Unsafe {
@@ -658,18 +675,44 @@ fn execute_content(
                         identity: None,
                         fold_source: FoldSource::None,
                         fold_regions: Vec::new(),
+                        structure: StructureSnapshot::unavailable(),
+                        navigation_source: None,
                     });
                 }
             };
             let identity = ContentIdentity::from_absolute(root, &absolute);
             let mut lines = preview.lines;
             let mut highlights = preview.highlights;
-            let fold_regions = if fold_source.allows_folding() {
+            let structure = if fold_source.allows_folding() {
                 identity
                     .as_ref()
-                    .map_or_else(Vec::new, |identity| fold_regions(identity.path(), &lines))
+                    .map_or_else(StructureSnapshot::unavailable, |identity| {
+                        structure_snapshot(identity.path(), &lines)
+                    })
             } else {
-                Vec::new()
+                StructureSnapshot::unavailable()
+            };
+            let fold_regions = structure.folds.clone();
+            let navigation_source = if fold_source == FoldSource::BuiltinText
+                && !preview.truncated
+                && let (Some(identity), Some(language)) =
+                    (identity.clone(), language_for_path(&display_path))
+            {
+                let text: Arc<str> = Arc::from(lines.join("\n"));
+                let line_index = Arc::new(LineIndex::new(Arc::clone(&text))?);
+                let disk_raw_len = preview_request.open_regular()?.map_or(0, |file| file.len());
+                Some(NavigationSource {
+                    identity,
+                    absolute_path: absolute.clone(),
+                    disk_raw_len,
+                    server_root: server_root_for_document(root, graph, &absolute),
+                    language,
+                    text,
+                    line_index,
+                    structure: Arc::new(structure.clone()),
+                })
+            } else {
+                None
             };
             if preview.truncated {
                 lines.push(format!(
@@ -685,6 +728,8 @@ fn execute_content(
                 identity,
                 fold_source,
                 fold_regions,
+                structure,
+                navigation_source,
             })
         }
     }
@@ -702,6 +747,46 @@ fn workspace_statuses(root: &std::path::Path, graph: &RepoGraph) -> StatusMap {
             Some((relative, change.status))
         })
         .collect()
+}
+
+pub(crate) fn server_root_for_document(
+    app_root: &Path,
+    graph: Option<&RepoGraph>,
+    absolute: &Path,
+) -> PathBuf {
+    graph
+        .into_iter()
+        .flat_map(RepoGraph::repositories)
+        .filter(|repository| {
+            repository.node.repo.is_some()
+                && repository.node.worktree.starts_with(app_root)
+                && absolute.starts_with(&repository.node.worktree)
+        })
+        .max_by_key(|repository| repository.node.worktree.components().count())
+        .map_or_else(
+            || app_root.to_path_buf(),
+            |repository| repository.node.worktree.clone(),
+        )
+}
+
+/// Rebind an immutable preview source to the repository graph installed by a
+/// refresh without reopening the file or rebuilding its text indexes.
+///
+/// A source whose absolute path no longer agrees with its workspace identity
+/// is not safe to carry forward. Returning `None` makes navigation degrade
+/// closed instead of retaining a server root from the previous graph.
+pub(crate) fn rebind_navigation_source(
+    app_root: &Path,
+    graph: Option<&RepoGraph>,
+    source: &NavigationSource,
+) -> Option<NavigationSource> {
+    let identity = ContentIdentity::from_absolute(app_root, &source.absolute_path)?;
+    if identity != source.identity {
+        return None;
+    }
+    let mut rebound = source.clone();
+    rebound.server_root = server_root_for_document(app_root, graph, &source.absolute_path);
+    Some(rebound)
 }
 
 fn catch_worker_error<T>(work: impl FnOnce() -> Result<T>) -> Result<T, String> {
@@ -780,6 +865,7 @@ mod tests {
         slot.submit(ContentRequest {
             generation: 1,
             kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
         });
         assert_eq!(slot.start_next().unwrap().generation, 1);
@@ -788,6 +874,7 @@ mod tests {
             slot.submit(ContentRequest {
                 generation,
                 kind: ContentKind::Preview,
+                purpose: ContentPurpose::Display,
                 target: ContentTarget::Workspace(PathBuf::from(format!("{generation}.txt"))),
             });
         }

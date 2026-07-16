@@ -3,6 +3,7 @@ use std::{
     io,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,23 +24,73 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     clipboard,
     diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
-    folding::{FoldAnchor, FoldRegion, FoldSource},
+    folding::{FoldAnchor, FoldRegion, FoldSource, StructureSnapshot, SymbolId},
     git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
+    lsp::{
+        NavigationDocumentSymbolCompletion, NavigationProtocolResult, NavigationRuntime,
+        NavigationRuntimeCompletion, NavigationRuntimeRequest, ProtocolDocumentSymbol,
+        ProtocolLocation,
+    },
+    navigation::{
+        AppOptions, DocumentVersion, NavigationOperation, NavigationSettings, NavigationSource,
+        NavigationTargetRange, SourcePosition, SourceRange, lsp_uri_to_safe_path,
+    },
     preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
         RepoRelationState, RepoSnapshot,
     },
     runtime::{
-        ContentCompletion, ContentIdentity, ContentKind, ContentRequest, ContentTarget,
-        DirectoryCompletion, DirectoryRequest, RefreshCompletion, RefreshRequest, RefreshSnapshot,
-        RequestGeneration, WorkerRuntime,
+        ContentCompletion, ContentIdentity, ContentKind, ContentPurpose, ContentRequest,
+        ContentSnapshot, ContentTarget, DirectoryCompletion, DirectoryRequest, RefreshCompletion,
+        RefreshRequest, RefreshSnapshot, RequestGeneration, WorkerRuntime,
+        rebind_navigation_source,
     },
     search::{SearchEvent, SearchMatch, SearchOptions, SearchRequest, SearchRuntime},
     text_layout::{expand_tabs, grapheme_width_at},
     tree::{self, FileEntry},
     ui,
 };
+
+#[cfg(feature = "navigation-test-support")]
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct NavigationTestProbe {
+    stats: Arc<std::sync::Mutex<crate::lsp::NavigationCleanupStats>>,
+}
+
+#[cfg(feature = "navigation-test-support")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct NavigationCleanupReport {
+    pub sessions_cleaned: usize,
+    pub clean_exits: usize,
+    pub forced_tree_cleanups: usize,
+    pub direct_children_reaped: usize,
+    pub io_threads_joined: usize,
+    pub process_owners_dropped: usize,
+    pub quarantined_process_owners: usize,
+}
+
+#[cfg(feature = "navigation-test-support")]
+impl NavigationTestProbe {
+    pub fn snapshot(&self) -> NavigationCleanupReport {
+        let snapshot = self
+            .stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot;
+        NavigationCleanupReport {
+            sessions_cleaned: snapshot.sessions_cleaned,
+            clean_exits: snapshot.clean_exits,
+            forced_tree_cleanups: snapshot.forced_tree_cleanups,
+            direct_children_reaped: snapshot.direct_children_reaped,
+            io_threads_joined: snapshot.io_threads_joined,
+            process_owners_dropped: snapshot.process_owners_dropped,
+            quarantined_process_owners: snapshot.quarantined_process_owners,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TreeScope {
@@ -171,6 +222,14 @@ pub struct SearchResult {
 #[derive(Clone)]
 struct SearchRestore {
     focused_pane: FocusPane,
+    tree_scope: TreeScope,
+    tree_state: ListState,
+    all_files_selection: Option<PathBuf>,
+    git_changes_selection: Option<GitRowIdentity>,
+    pending_all_scope_path: Option<PathBuf>,
+    pending_all_scope_navigation: bool,
+    pending_git_scope_path: Option<PathBuf>,
+    pending_git_scope_fallback: Option<GitRowIdentity>,
     content_lines: Vec<String>,
     content_highlights: Vec<Vec<HighlightSpan>>,
     content_viewport: ContentViewportRestore,
@@ -184,11 +243,19 @@ struct SearchRestore {
     content_identity: Option<ContentIdentity>,
     content_fold_source: FoldSource,
     content_fold_regions: Vec<FoldRegion>,
+    content_structure: StructureSnapshot,
     content_collapsed_folds: HashSet<FoldAnchor>,
     content_cursor_line: usize,
     content_successful: bool,
     content_was_loading: bool,
     last_error: Option<String>,
+    navigation_source: Option<Arc<NavigationSource>>,
+    navigation_document_version: DocumentVersion,
+    navigation_caret: NavigationCaret,
+    navigation_target_highlight: Option<SourceRange>,
+    navigation_status: Option<NavigationStatus>,
+    navigation_back: VecDeque<NavigationHistoryEntry>,
+    navigation_forward: VecDeque<NavigationHistoryEntry>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -281,6 +348,82 @@ struct QuitConfirmation {
 }
 
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1_500);
+const NAVIGATION_HISTORY_LIMIT: usize = 128;
+const NAVIGATION_STATUS_INFO: Duration = Duration::from_secs(4);
+const NAVIGATION_STATUS_ERROR: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NavigationStatusLevel {
+    Info,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NavigationStatus {
+    pub(crate) level: NavigationStatusLevel,
+    pub(crate) message: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NavigationTarget {
+    document: ContentIdentity,
+    range: NavigationTargetRange,
+}
+
+#[derive(Clone, Debug)]
+struct NavigationHistoryEntry {
+    target: NavigationTarget,
+    viewport: ContentViewportRestore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigationHistoryIntent {
+    Jump,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Debug)]
+struct NavigationInvocation {
+    generation: u64,
+    operation: NavigationOperation,
+    source_identity: ContentIdentity,
+    source_version: DocumentVersion,
+    origin: NavigationHistoryEntry,
+    history_intent: NavigationHistoryIntent,
+    destination_viewport: Option<ContentViewportRestore>,
+    return_focus: FocusPane,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NavigationPickerItem {
+    target: NavigationTarget,
+    pub(crate) label: String,
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NavigationPickerState {
+    pub(crate) title: String,
+    invocation: NavigationInvocation,
+    pub(crate) results: Vec<NavigationPickerItem>,
+    pub(crate) list_state: ListState,
+    return_focus: FocusPane,
+}
+
+#[derive(Clone, Debug)]
+struct PendingNavigationStage {
+    invocation: NavigationInvocation,
+    content_generation: u64,
+    target: NavigationTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NavigationCaret {
+    point: SourcePosition,
+    preferred_display_column: usize,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PreviewFindState {
@@ -375,6 +518,8 @@ pub struct UiRegions {
     pub search_text_mode: Rect,
     pub search_options: [Rect; 4],
     pub search_results: Rect,
+    pub navigation_popup: Rect,
+    pub navigation_results: Rect,
     pub preview_find_input: Rect,
     pub preview_find_case: Rect,
     pub preview_find_position: Rect,
@@ -436,6 +581,7 @@ pub struct App {
     content_identity: Option<ContentIdentity>,
     content_fold_source: FoldSource,
     content_fold_regions: Vec<FoldRegion>,
+    pub(crate) content_structure: StructureSnapshot,
     content_collapsed_folds: HashSet<FoldAnchor>,
     content_cursor_line: usize,
     content_successful: bool,
@@ -456,6 +602,7 @@ pub struct App {
     all_files_selection: Option<PathBuf>,
     git_changes_selection: Option<GitRowIdentity>,
     pending_all_scope_path: Option<PathBuf>,
+    pending_all_scope_navigation: bool,
     pending_git_scope_path: Option<PathBuf>,
     pending_git_scope_fallback: Option<GitRowIdentity>,
     all_files_expansion: HashMap<PathBuf, bool>,
@@ -489,6 +636,22 @@ pub struct App {
     has_refresh_snapshot: bool,
     quit_confirmation: Option<QuitConfirmation>,
     should_quit: bool,
+    #[allow(dead_code)] // Consumed by the following App/navigation integration node.
+    pub(crate) navigation_settings: NavigationSettings,
+    pub(crate) navigation_config_warning: Option<String>,
+    navigation_runtime: NavigationRuntime,
+    navigation_source: Option<Arc<NavigationSource>>,
+    navigation_document_version: DocumentVersion,
+    navigation_generation: u64,
+    navigation_invocation: Option<NavigationInvocation>,
+    pending_navigation_stage: Option<PendingNavigationStage>,
+    pub(crate) navigation_picker: Option<NavigationPickerState>,
+    pub(crate) navigation_status: Option<NavigationStatus>,
+    navigation_caret: NavigationCaret,
+    navigation_target_highlight: Option<SourceRange>,
+    navigation_back: VecDeque<NavigationHistoryEntry>,
+    navigation_forward: VecDeque<NavigationHistoryEntry>,
+    last_navigation_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -497,17 +660,41 @@ impl App {
     }
 
     pub fn with_preview_registry(path: PathBuf, preview_registry: PreviewRegistry) -> Result<Self> {
-        Self::with_preview_registry_and_scan_limit(
+        Self::with_options(path, preview_registry, AppOptions::default())
+    }
+
+    pub fn with_options(
+        path: PathBuf,
+        preview_registry: PreviewRegistry,
+        options: AppOptions,
+    ) -> Result<Self> {
+        Self::with_preview_registry_scan_limit_and_options(
             path,
             preview_registry,
             tree::DEFAULT_MAX_ENTRIES,
+            options,
         )
     }
 
+    #[cfg(test)]
     fn with_preview_registry_and_scan_limit(
         path: PathBuf,
         preview_registry: PreviewRegistry,
         scan_entry_limit: usize,
+    ) -> Result<Self> {
+        Self::with_preview_registry_scan_limit_and_options(
+            path,
+            preview_registry,
+            scan_entry_limit,
+            AppOptions::default(),
+        )
+    }
+
+    fn with_preview_registry_scan_limit_and_options(
+        path: PathBuf,
+        preview_registry: PreviewRegistry,
+        scan_entry_limit: usize,
+        mut options: AppOptions,
     ) -> Result<Self> {
         let requested_root = path
             .canonicalize()
@@ -521,8 +708,15 @@ impl App {
         // repository's status and diff paths into this workspace.
         let root = requested_root;
 
+        if let Err(error) = options.navigation.revalidate(&root) {
+            options.navigation = NavigationSettings::disabled();
+            options.navigation_config_warning = Some(format!("{error:#}"));
+        }
+
         let runtime = WorkerRuntime::start(root.clone(), preview_registry.clone())?;
         let search_runtime = SearchRuntime::start(root.clone())?;
+        let navigation_runtime =
+            NavigationRuntime::start(root.clone(), options.navigation.clone())?;
         let mut app = Self {
             root,
             repo: None,
@@ -552,6 +746,7 @@ impl App {
             content_identity: None,
             content_fold_source: FoldSource::None,
             content_fold_regions: Vec::new(),
+            content_structure: StructureSnapshot::unavailable(),
             content_collapsed_folds: HashSet::new(),
             content_cursor_line: 0,
             content_successful: false,
@@ -572,6 +767,7 @@ impl App {
             all_files_selection: None,
             git_changes_selection: None,
             pending_all_scope_path: None,
+            pending_all_scope_navigation: false,
             pending_git_scope_path: None,
             pending_git_scope_fallback: None,
             all_files_expansion: HashMap::new(),
@@ -603,6 +799,24 @@ impl App {
             has_refresh_snapshot: false,
             quit_confirmation: None,
             should_quit: false,
+            navigation_settings: options.navigation,
+            navigation_config_warning: options.navigation_config_warning,
+            navigation_runtime,
+            navigation_source: None,
+            navigation_document_version: DocumentVersion(0),
+            navigation_generation: 0,
+            navigation_invocation: None,
+            pending_navigation_stage: None,
+            navigation_picker: None,
+            navigation_status: None,
+            navigation_caret: NavigationCaret {
+                point: SourcePosition { line: 0, byte: 0 },
+                preferred_display_column: 0,
+            },
+            navigation_target_highlight: None,
+            navigation_back: VecDeque::new(),
+            navigation_forward: VecDeque::new(),
+            last_navigation_click: None,
         };
         app.request_refresh(false);
         Ok(app)
@@ -1066,6 +1280,11 @@ impl App {
 
     /// Apply one terminal key event to the same path used by the interactive loop.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.navigation_picker.is_some() {
+            self.quit_confirmation = None;
+            self.handle_navigation_picker_key(key);
+            return;
+        }
         let copy_key = matches!(key.code, KeyCode::Char('c' | 'C'));
         if copy_key && key.modifiers.contains(KeyModifiers::SUPER) {
             self.quit_confirmation = None;
@@ -1097,12 +1316,34 @@ impl App {
             return;
         }
         if key.code == KeyCode::Esc {
+            if self.navigation_invocation.is_some() || self.pending_navigation_stage.is_some() {
+                self.cancel_pending_navigation();
+                return;
+            }
             self.request_quit(QuitKey::Escape);
             return;
         }
         self.quit_confirmation = None;
 
         match (key.code, key.modifiers) {
+            (KeyCode::F(12), KeyModifiers::NONE) => {
+                self.request_semantic_navigation(NavigationOperation::Definition);
+            }
+            (KeyCode::F(12), KeyModifiers::SHIFT) => {
+                self.request_semantic_navigation(NavigationOperation::References);
+            }
+            (KeyCode::F(12), KeyModifiers::CONTROL) => {
+                self.request_semantic_navigation(NavigationOperation::Implementations);
+            }
+            (KeyCode::Left, KeyModifiers::ALT) => {
+                self.navigate_history(NavigationHistoryIntent::Back);
+            }
+            (KeyCode::Right, KeyModifiers::ALT) => {
+                self.navigate_history(NavigationHistoryIntent::Forward);
+            }
+            (KeyCode::Char('@'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.open_document_symbols();
+            }
             (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(SearchMode::Files),
             (KeyCode::Char('p' | 'P'), KeyModifiers::CONTROL) => {
                 self.open_search(SearchMode::Files);
@@ -1182,6 +1423,10 @@ impl App {
             return;
         }
         let restore = self.capture_search_restore();
+        // Search previews temporarily replace ContentSnapshot state. Retire
+        // any semantic request before that identity can change, while keeping
+        // its visible pre-search state in the restore value above.
+        self.cancel_pending_navigation();
         self.activate_search(mode, restore);
     }
 
@@ -1192,6 +1437,14 @@ impl App {
         let top = rows.get(effective_scroll);
         SearchRestore {
             focused_pane: self.focused_pane,
+            tree_scope: self.tree_scope,
+            tree_state: self.tree_state,
+            all_files_selection: self.all_files_selection.clone(),
+            git_changes_selection: self.git_changes_selection.clone(),
+            pending_all_scope_path: self.pending_all_scope_path.clone(),
+            pending_all_scope_navigation: self.pending_all_scope_navigation,
+            pending_git_scope_path: self.pending_git_scope_path.clone(),
+            pending_git_scope_fallback: self.pending_git_scope_fallback.clone(),
             content_lines: self.content_lines.clone(),
             content_highlights: self.content_highlights.clone(),
             content_viewport: ContentViewportRestore {
@@ -1210,11 +1463,19 @@ impl App {
             content_identity: self.content_identity.clone(),
             content_fold_source: self.content_fold_source,
             content_fold_regions: self.content_fold_regions.clone(),
+            content_structure: self.content_structure.clone(),
             content_collapsed_folds: self.content_collapsed_folds.clone(),
             content_cursor_line: self.content_cursor_line,
             content_successful: self.content_successful,
             content_was_loading: self.is_content_loading(),
             last_error: self.last_error.clone(),
+            navigation_source: self.navigation_source.clone(),
+            navigation_document_version: self.navigation_document_version,
+            navigation_caret: self.navigation_caret,
+            navigation_target_highlight: self.navigation_target_highlight,
+            navigation_status: self.navigation_status.clone(),
+            navigation_back: self.navigation_back.clone(),
+            navigation_forward: self.navigation_forward.clone(),
         }
     }
 
@@ -1371,6 +1632,48 @@ impl App {
                 },
             })
             .collect()
+    }
+
+    pub(crate) fn navigation_highlights(&self, line: usize) -> Vec<HighlightSpan> {
+        let mut highlights = Vec::with_capacity(2);
+        if let Some(range) = self.navigation_target_highlight
+            && range.start.line <= line
+            && line <= range.end.line
+            && let Some(text) = self.content_lines.get(line)
+        {
+            let start = if line == range.start.line {
+                range.start.byte
+            } else {
+                0
+            };
+            let end = if line == range.end.line {
+                range.end.byte
+            } else {
+                text.len()
+            };
+            if start < end && end <= text.len() {
+                highlights.push(HighlightSpan {
+                    range: start..end,
+                    kind: HighlightKind::NavigationTarget,
+                });
+            }
+        }
+        if self.focused_pane == FocusPane::Content
+            && self.content_mode == ContentMode::Preview
+            && self.content_selection.is_none()
+            && self.navigation_caret.point.line == line
+            && let Some(text) = self.content_lines.get(line)
+            && let Some(scalar) = text
+                .get(self.navigation_caret.point.byte..)
+                .and_then(|suffix| suffix.chars().next())
+        {
+            highlights.push(HighlightSpan {
+                range: self.navigation_caret.point.byte
+                    ..self.navigation_caret.point.byte + scalar.len_utf8(),
+                kind: HighlightKind::NavigationCaret,
+            });
+        }
+        highlights
     }
 
     fn handle_preview_find_key(&mut self, key: KeyEvent) {
@@ -2044,7 +2347,18 @@ impl App {
         if restore_content {
             self.content_requests.invalidate();
             self.runtime.cancel_pending_content();
+            let restored_tree_state = restore.tree_state;
             self.focused_pane = restore.focused_pane;
+            self.tree_scope = restore.tree_scope;
+            self.all_files_selection = restore.all_files_selection;
+            self.git_changes_selection = restore.git_changes_selection;
+            self.pending_all_scope_path = restore.pending_all_scope_path;
+            self.pending_all_scope_navigation = restore.pending_all_scope_navigation;
+            self.pending_git_scope_path = restore.pending_git_scope_path;
+            self.pending_git_scope_fallback = restore.pending_git_scope_fallback;
+            self.rebuild_visible_rows();
+            self.tree_state = restored_tree_state;
+            self.normalize_tree_state();
             self.content_lines = restore.content_lines;
             self.content_highlights = restore.content_highlights;
             self.content_horizontal_scroll = restore.content_horizontal_scroll;
@@ -2057,10 +2371,18 @@ impl App {
             self.content_identity = restore.content_identity;
             self.content_fold_source = restore.content_fold_source;
             self.content_fold_regions = restore.content_fold_regions;
+            self.content_structure = restore.content_structure;
             self.content_collapsed_folds = restore.content_collapsed_folds;
             self.content_cursor_line = restore.content_cursor_line;
             self.content_successful = restore.content_successful;
             self.last_error = restore.last_error;
+            self.navigation_source = restore.navigation_source;
+            self.navigation_document_version = restore.navigation_document_version;
+            self.navigation_caret = restore.navigation_caret;
+            self.navigation_target_highlight = restore.navigation_target_highlight;
+            self.navigation_status = restore.navigation_status;
+            self.navigation_back = restore.navigation_back;
+            self.navigation_forward = restore.navigation_forward;
             self.restore_content_viewport(restore.content_viewport);
             if restore.content_was_loading {
                 self.load_scope_default_content();
@@ -2136,6 +2458,17 @@ impl App {
     /// Apply a mouse event using hit boxes captured during the latest draw.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.quit_confirmation = None;
+        if self.navigation_picker.is_some() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.handle_navigation_picker_mouse_down(mouse);
+                }
+                MouseEventKind::ScrollUp => self.move_navigation_picker(-3),
+                MouseEventKind::ScrollDown => self.move_navigation_picker(3),
+                _ => {}
+            }
+            return;
+        }
         if self.search.is_some() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2201,6 +2534,19 @@ impl App {
                 } else if contains(self.ui_regions.content_inner, mouse.column, mouse.row) {
                     self.focused_pane = FocusPane::Content;
                     if self.handle_fold_mouse_down(mouse) {
+                        return;
+                    }
+                    if self.content_mode == ContentMode::Preview
+                        && matches!(mouse.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                        && let Some(point) = self.navigation_point_at_mouse(mouse)
+                    {
+                        self.clear_content_selection();
+                        self.navigation_caret = NavigationCaret {
+                            point,
+                            preferred_display_column: 0,
+                        };
+                        self.navigation_target_highlight = None;
+                        self.request_semantic_navigation(NavigationOperation::Definition);
                         return;
                     }
                     self.begin_content_selection(mouse);
@@ -2385,6 +2731,14 @@ impl App {
             return;
         };
         self.pending_clipboard_text = None;
+        self.navigation_caret = NavigationCaret {
+            point: SourcePosition {
+                line: before.line,
+                byte: before.byte,
+            },
+            preferred_display_column: 0,
+        };
+        self.navigation_target_highlight = None;
         self.content_selection = Some(ContentSelection {
             anchor_before: before,
             anchor_after: after,
@@ -2510,6 +2864,27 @@ impl App {
         ))
     }
 
+    fn navigation_point_at_mouse(&self, mouse: MouseEvent) -> Option<SourcePosition> {
+        let rows = self.content_text_rows();
+        if !contains(rows, mouse.column, mouse.row) {
+            return None;
+        }
+        let visible_row = usize::from(mouse.row.saturating_sub(rows.y));
+        let visual_rows = self.content_visual_rows(rows.width);
+        let effective_scroll = self.effective_content_scroll(visual_rows.len());
+        if visual_rows
+            .get(effective_scroll.saturating_add(visible_row))?
+            .synthetic
+        {
+            return None;
+        }
+        let (point, _) = self.content_point_bounds(mouse)?;
+        Some(SourcePosition {
+            line: point.line,
+            byte: point.byte,
+        })
+    }
+
     fn content_text_rows(&self) -> Rect {
         let rows = self.ui_regions.content_inner;
         if self.content_mode == ContentMode::Info {
@@ -2575,6 +2950,7 @@ impl App {
             scope == TreeScope::GitChanges && self.tree_scope != TreeScope::GitChanges;
         if entering_git_changes {
             self.pending_all_scope_path = None;
+            self.pending_all_scope_navigation = false;
             self.pending_git_scope_path = self.selected_file_path_for_scope_sync();
             self.pending_git_scope_fallback = self
                 .pending_git_scope_path
@@ -2785,6 +3161,7 @@ impl App {
 
     fn select(&mut self, index: usize) {
         self.pending_all_scope_path = None;
+        self.pending_all_scope_navigation = false;
         self.pending_git_scope_path = None;
         self.pending_git_scope_fallback = None;
         if self.tree_row_count() == 0 {
@@ -2822,6 +3199,7 @@ impl App {
 
     fn toggle_selected_directory(&mut self) {
         self.pending_all_scope_path = None;
+        self.pending_all_scope_navigation = false;
         self.pending_git_scope_path = None;
         self.pending_git_scope_fallback = None;
         if self.tree_scope == TreeScope::GitChanges {
@@ -2917,6 +3295,10 @@ impl App {
         self.content_scroll = self.effective_content_scroll(rows.len());
         if let Some(row) = rows.get(self.content_scroll) {
             self.content_cursor_line = row.line_index;
+            self.navigation_caret = NavigationCaret {
+                point: first_navigation_point_on_line(&self.content_lines, row.line_index),
+                preferred_display_column: 0,
+            };
         }
     }
 
@@ -3095,7 +3477,11 @@ impl App {
         self.sync_content_cursor_to_scroll();
     }
 
-    fn request_refresh(&mut self, full_repository_discovery: bool) {
+    fn request_refresh(&mut self, full_repository_discovery: bool) -> u64 {
+        // A refresh changes repository ownership and therefore LSP session
+        // identity. Retire every request/picker tied to the old graph before
+        // the worker can publish its replacement.
+        self.cancel_pending_navigation();
         self.remember_current_selection();
         let generation = self.refresh_requests.begin();
         self.last_refresh_error = None;
@@ -3105,6 +3491,7 @@ impl App {
             scan_depth: tree::DEFAULT_INITIAL_SCAN_DEPTH,
             full_repository_discovery,
         });
+        generation
     }
 
     pub fn poll_background(&mut self) {
@@ -3113,6 +3500,13 @@ impl App {
             .is_some_and(|confirmation| Instant::now() > confirmation.deadline)
         {
             self.quit_confirmation = None;
+        }
+        if self
+            .navigation_status
+            .as_ref()
+            .is_some_and(|status| Instant::now() > status.expires_at)
+        {
+            self.navigation_status = None;
         }
         self.dispatch_search_if_due();
         let (refresh, directories, content) = self.runtime.take_completions();
@@ -3125,7 +3519,23 @@ impl App {
         if let Some(completion) = content {
             self.apply_content_completion(completion);
         }
+        for completion in self.navigation_runtime.take_completions() {
+            self.apply_navigation_completion(completion);
+        }
+        for completion in self.navigation_runtime.take_symbol_completions() {
+            self.apply_document_symbol_completion(completion);
+        }
         self.apply_search_events();
+    }
+
+    /// Return a handle to bounded process/thread cleanup evidence used by the
+    /// cross-platform production-spawner integration tests.
+    #[cfg(feature = "navigation-test-support")]
+    #[doc(hidden)]
+    pub fn navigation_test_probe(&self) -> NavigationTestProbe {
+        NavigationTestProbe {
+            stats: self.navigation_runtime.cleanup_probe(),
+        }
     }
 
     /// Wait until all currently requested work is reduced into application
@@ -3251,6 +3661,7 @@ impl App {
             self.git_rows.clear();
             self.repo_graph = None;
         }
+        self.rebind_navigation_sources_after_refresh();
         self.reconcile_expansion_state();
         let expanded_boundaries: Vec<PathBuf> = self
             .unloaded_directories
@@ -3268,11 +3679,21 @@ impl App {
         }
         self.tree_state = ListState::default();
         self.rebuild_visible_rows();
+        let visible_navigation_path = self
+            .navigation_source
+            .as_ref()
+            .map(|source| source.identity.path().to_path_buf());
 
         match self.tree_scope {
             TreeScope::AllFiles => {
-                if let Some(path) = self.pending_all_scope_path.clone() {
-                    self.reveal_all_files_selection(path);
+                if let Some(path) = visible_navigation_path {
+                    self.reveal_navigation_tree_selection(path);
+                } else if let Some(path) = self.pending_all_scope_path.clone() {
+                    if self.pending_all_scope_navigation {
+                        self.reveal_navigation_tree_selection(path);
+                    } else {
+                        self.reveal_all_files_selection(path);
+                    }
                 } else {
                     self.restore_visible_selection(self.all_files_selection.clone());
                 }
@@ -3290,7 +3711,10 @@ impl App {
                 } else {
                     self.git_changes_selection.clone()
                 };
-                self.restore_git_selection(synchronized.or(fallback));
+                self.restore_git_selection_inner(
+                    synchronized.or(fallback),
+                    self.navigation_source.is_none(),
+                );
             }
         }
 
@@ -3347,14 +3771,27 @@ impl App {
         self.rebuild_visible_rows();
         match self.tree_scope {
             TreeScope::AllFiles => {
-                if let Some(path) = self.pending_all_scope_path.clone() {
-                    self.reveal_all_files_selection(path);
+                if let Some(path) = self
+                    .navigation_source
+                    .as_ref()
+                    .map(|source| source.identity.path().to_path_buf())
+                {
+                    self.reveal_navigation_tree_selection(path);
+                } else if let Some(path) = self.pending_all_scope_path.clone() {
+                    if self.pending_all_scope_navigation {
+                        self.reveal_navigation_tree_selection(path);
+                    } else {
+                        self.reveal_all_files_selection(path);
+                    }
                 } else {
                     self.restore_visible_selection(Some(completion.relative));
                 }
             }
             TreeScope::GitChanges => {
-                self.restore_git_selection(self.git_changes_selection.clone());
+                self.restore_git_selection_inner(
+                    self.git_changes_selection.clone(),
+                    self.navigation_source.is_none(),
+                );
             }
         }
         self.last_error = None;
@@ -3434,6 +3871,16 @@ impl App {
     }
 
     fn reveal_all_files_selection(&mut self, path: PathBuf) {
+        self.pending_all_scope_navigation = false;
+        self.reveal_all_files_selection_inner(path, true);
+    }
+
+    fn reveal_navigation_tree_selection(&mut self, path: PathBuf) {
+        self.pending_all_scope_navigation = true;
+        self.reveal_all_files_selection_inner(path, false);
+    }
+
+    fn reveal_all_files_selection_inner(&mut self, path: PathBuf, load_content: bool) {
         self.pending_all_scope_path = Some(path.clone());
         let mut parent = path.parent();
         while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
@@ -3452,13 +3899,24 @@ impl App {
         }
         self.rebuild_visible_rows();
         let resolved = self.visible_index_for_path(&path).is_some();
-        self.restore_visible_selection(Some(path.clone()));
+        let index = self
+            .visible_index_for_path(&path)
+            .or_else(|| self.nearest_visible_ancestor_index(&path))
+            .or_else(|| self.default_selection_index());
+        if load_content {
+            self.select_optional(index);
+        } else {
+            self.tree_state.select(index);
+            self.normalize_tree_state();
+            self.remember_current_selection();
+        }
         let waiting = self
             .loading_directories
             .iter()
             .any(|directory| path.starts_with(directory));
         if resolved || !waiting {
             self.pending_all_scope_path = None;
+            self.pending_all_scope_navigation = false;
         }
     }
 
@@ -3584,6 +4042,14 @@ impl App {
     }
 
     fn restore_git_selection(&mut self, preferred: Option<GitRowIdentity>) {
+        self.restore_git_selection_inner(preferred, true);
+    }
+
+    fn restore_git_selection_inner(
+        &mut self,
+        preferred: Option<GitRowIdentity>,
+        load_content: bool,
+    ) {
         let index = preferred
             .as_ref()
             .and_then(|identity| {
@@ -3606,7 +4072,13 @@ impl App {
                 })
             })
             .or_else(|| self.default_selection_index());
-        self.select_optional(index);
+        if load_content {
+            self.select_optional(index);
+        } else {
+            self.tree_state.select(index);
+            self.normalize_tree_state();
+            self.remember_current_selection();
+        }
     }
 
     fn visible_index_for_path(&self, path: &Path) -> Option<usize> {
@@ -3897,6 +4369,9 @@ impl App {
         target: ContentTarget,
         review_path: Option<RepoPath>,
     ) -> u64 {
+        self.cancel_pending_navigation();
+        self.navigation_picker = None;
+        self.navigation_target_highlight = None;
         let generation = self.content_requests.begin();
         self.cache_current_folds();
         self.reset_content(match kind {
@@ -3908,6 +4383,7 @@ impl App {
         self.runtime.request_content(ContentRequest {
             generation,
             kind,
+            purpose: ContentPurpose::Display,
             target,
         });
         generation
@@ -3931,9 +4407,711 @@ impl App {
             .cloned()
     }
 
+    fn set_navigation_status(&mut self, level: NavigationStatusLevel, message: impl AsRef<str>) {
+        let duration = match level {
+            NavigationStatusLevel::Info => NAVIGATION_STATUS_INFO,
+            NavigationStatusLevel::Error => NAVIGATION_STATUS_ERROR,
+        };
+        self.navigation_status = Some(NavigationStatus {
+            level,
+            message: clean_navigation_message(message.as_ref()),
+            expires_at: Instant::now() + duration,
+        });
+    }
+
+    fn next_navigation_generation(&mut self) -> u64 {
+        if let Some(invocation) = self.navigation_invocation.take() {
+            self.navigation_runtime.cancel(invocation.generation);
+        }
+        if let Some(stage) = self.pending_navigation_stage.take() {
+            self.navigation_runtime.cancel(stage.invocation.generation);
+        }
+        self.navigation_picker = None;
+        self.navigation_generation = self
+            .navigation_generation
+            .checked_add(1)
+            .expect("navigation generation exhausted");
+        self.navigation_status = None;
+        self.navigation_generation
+    }
+
+    fn cancel_pending_navigation(&mut self) {
+        if let Some(invocation) = self.navigation_invocation.take() {
+            self.navigation_runtime.cancel(invocation.generation);
+        }
+        if let Some(stage) = self.pending_navigation_stage.take() {
+            self.navigation_runtime.cancel(stage.invocation.generation);
+            self.content_requests.invalidate();
+            self.runtime.cancel_pending_content();
+        }
+        self.navigation_picker = None;
+        self.last_navigation_click = None;
+        self.navigation_generation = self
+            .navigation_generation
+            .checked_add(1)
+            .expect("navigation generation exhausted");
+        self.navigation_status = None;
+    }
+
+    fn rebind_navigation_sources_after_refresh(&mut self) {
+        let root = &self.root;
+        let graph = self.repo_graph.as_ref();
+        self.navigation_source = self
+            .navigation_source
+            .as_deref()
+            .and_then(|source| rebind_navigation_source(root, graph, source).map(Arc::new));
+        if let Some(search) = &mut self.search {
+            search.restore.navigation_source = search
+                .restore
+                .navigation_source
+                .as_deref()
+                .and_then(|source| rebind_navigation_source(root, graph, source).map(Arc::new));
+        }
+    }
+
+    fn rebind_content_snapshot_navigation(&self, snapshot: &mut ContentSnapshot) {
+        snapshot.navigation_source = snapshot.navigation_source.as_ref().and_then(|source| {
+            rebind_navigation_source(&self.root, self.repo_graph.as_ref(), source)
+        });
+    }
+
+    fn current_navigation_entry(&self) -> Option<NavigationHistoryEntry> {
+        let source = self.navigation_source.as_ref()?;
+        let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
+        let effective_scroll = self.effective_content_scroll(rows.len());
+        let row = rows.get(effective_scroll);
+        let viewport = ContentViewportRestore {
+            line: row.map(|row| row.line_index),
+            byte_start: row.map_or(0, |row| row.byte_range.start),
+            synthetic: row.is_some_and(|row| row.synthetic),
+            effective_scroll,
+        };
+        let point = self.navigation_caret.point;
+        Some(NavigationHistoryEntry {
+            target: NavigationTarget {
+                document: source.identity.clone(),
+                range: NavigationTargetRange::Source(SourceRange {
+                    start: point,
+                    end: point,
+                }),
+            },
+            viewport,
+        })
+    }
+
+    fn request_semantic_navigation(&mut self, operation: NavigationOperation) {
+        if self.focused_pane != FocusPane::Content || self.content_mode != ContentMode::Preview {
+            self.set_navigation_status(NavigationStatusLevel::Info, "Focus Preview to navigate.");
+            return;
+        }
+        let Some(source) = self.navigation_source.clone() else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Navigation unavailable: preview is truncated or unsupported.",
+            );
+            return;
+        };
+        let generation = self.next_navigation_generation();
+        if !source.structure.recognizable_tokens.complete {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Navigation token index is incomplete; refresh Preview.",
+            );
+            return;
+        }
+        let Some(token) = source
+            .structure
+            .recognizable_tokens
+            .containing(self.navigation_caret.point)
+        else {
+            self.set_navigation_status(NavigationStatusLevel::Info, "No navigable token at caret.");
+            return;
+        };
+        let Some(mut origin) = self.current_navigation_entry() else {
+            return;
+        };
+        origin.target.range = NavigationTargetRange::Source(token);
+        let invocation = NavigationInvocation {
+            generation,
+            operation,
+            source_identity: source.identity.clone(),
+            source_version: self.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: self.focused_pane,
+        };
+        let request = NavigationRuntimeRequest {
+            generation,
+            operation,
+            origin: self.navigation_caret.point,
+            source,
+            version: self.navigation_document_version,
+        };
+        self.navigation_invocation = Some(invocation);
+        if let Err(error) = self.navigation_runtime.request(request) {
+            self.navigation_invocation = None;
+            self.set_navigation_status(NavigationStatusLevel::Error, format!("{error:#}"));
+            return;
+        }
+        self.set_navigation_status(
+            NavigationStatusLevel::Info,
+            match operation {
+                NavigationOperation::Definition => "Finding definition…",
+                NavigationOperation::References => "Finding references…",
+                NavigationOperation::Implementations => "Finding implementations…",
+                NavigationOperation::DocumentSymbols => "Finding document symbols…",
+            },
+        );
+    }
+
+    fn open_document_symbols(&mut self) {
+        if self.focused_pane != FocusPane::Content || self.content_mode != ContentMode::Preview {
+            self.set_navigation_status(NavigationStatusLevel::Info, "Focus Preview to navigate.");
+            return;
+        }
+        let Some(source) = self.navigation_source.clone() else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Document symbols unavailable for this Preview.",
+            );
+            return;
+        };
+        let generation = self.next_navigation_generation();
+        if source.structure.symbols_complete && source.structure.symbols.is_empty() {
+            self.set_navigation_status(NavigationStatusLevel::Info, "No document symbols found.");
+            return;
+        }
+        let Some(origin) = self.current_navigation_entry() else {
+            return;
+        };
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::DocumentSymbols,
+            source_identity: source.identity.clone(),
+            source_version: self.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: self.focused_pane,
+        };
+        if !source.structure.symbols_complete {
+            let request = NavigationRuntimeRequest {
+                generation,
+                operation: NavigationOperation::DocumentSymbols,
+                origin: self.navigation_caret.point,
+                source,
+                version: self.navigation_document_version,
+            };
+            self.navigation_invocation = Some(invocation);
+            if let Err(error) = self.navigation_runtime.request(request) {
+                self.navigation_invocation = None;
+                self.set_navigation_status(NavigationStatusLevel::Error, format!("{error:#}"));
+                return;
+            }
+            self.set_navigation_status(NavigationStatusLevel::Info, "Finding document symbols…");
+            return;
+        }
+        let mut depths = HashMap::<SymbolId, usize>::new();
+        let results = source
+            .structure
+            .symbols
+            .iter()
+            .map(|symbol| {
+                let depth = symbol
+                    .parent
+                    .and_then(|parent| depths.get(&parent).copied())
+                    .map_or(0, |depth| depth.saturating_add(1));
+                depths.insert(symbol.id, depth);
+                let position = source
+                    .line_index
+                    .to_utf16(symbol.selection_range.start)
+                    .unwrap_or_default();
+                NavigationPickerItem {
+                    target: NavigationTarget {
+                        document: source.identity.clone(),
+                        range: NavigationTargetRange::Source(symbol.selection_range),
+                    },
+                    label: format!(
+                        "{}{}:{}:{} · {}",
+                        "  ".repeat(depth),
+                        source.identity.path().display(),
+                        position.line.saturating_add(1),
+                        position.character.saturating_add(1),
+                        symbol.name
+                    ),
+                    detail: symbol.detail.clone().or_else(|| symbol.container.clone()),
+                }
+            })
+            .collect();
+        self.open_navigation_picker("Document Symbols", invocation, results);
+    }
+
+    fn apply_document_symbol_completion(&mut self, completion: NavigationDocumentSymbolCompletion) {
+        let Some(invocation) = self.navigation_invocation.take() else {
+            return;
+        };
+        if invocation.operation != NavigationOperation::DocumentSymbols
+            || completion.generation != invocation.generation
+            || completion.source_identity != invocation.source_identity
+            || completion.source_version != invocation.source_version
+        {
+            self.navigation_invocation = Some(invocation);
+            return;
+        }
+        let Some(source) = self.navigation_source.as_ref() else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Document symbol source is no longer available.",
+            );
+            return;
+        };
+        if source.identity != completion.source_identity
+            || self.navigation_document_version != completion.source_version
+        {
+            // The runtime triple matched the invocation, but the visible
+            // document moved on before this reducer turn.
+            self.navigation_status = None;
+            return;
+        }
+        if completion.symbols.is_empty() {
+            self.set_navigation_status(NavigationStatusLevel::Info, "No document symbols found.");
+            return;
+        }
+        let results = match protocol_symbol_picker_items(source, completion.symbols) {
+            Ok(results) => results,
+            Err(error) => {
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("Invalid document symbol range: {error:#}"),
+                );
+                return;
+            }
+        };
+        self.open_navigation_picker("Document Symbols", invocation, results);
+    }
+
+    fn open_navigation_picker(
+        &mut self,
+        title: impl Into<String>,
+        invocation: NavigationInvocation,
+        results: Vec<NavigationPickerItem>,
+    ) {
+        let mut list_state = ListState::default();
+        list_state.select((!results.is_empty()).then_some(0));
+        self.navigation_picker = Some(NavigationPickerState {
+            title: title.into(),
+            return_focus: invocation.return_focus,
+            invocation,
+            results,
+            list_state,
+        });
+        self.navigation_invocation = None;
+        self.navigation_status = None;
+    }
+
+    fn apply_navigation_completion(&mut self, completion: NavigationRuntimeCompletion) {
+        let Some(invocation) = self.navigation_invocation.take() else {
+            return;
+        };
+        if completion.generation != invocation.generation
+            || completion.source_identity != invocation.source_identity
+            || completion.source_version != invocation.source_version
+            || completion.operation != invocation.operation
+        {
+            self.navigation_invocation = Some(invocation);
+            return;
+        }
+        match completion.result {
+            NavigationProtocolResult::Locations(locations) => {
+                self.reduce_protocol_locations(invocation, locations);
+            }
+            NavigationProtocolResult::Unavailable(message) => {
+                self.set_navigation_status(NavigationStatusLevel::Error, message);
+            }
+            NavigationProtocolResult::Failed(message) => {
+                self.set_navigation_status(NavigationStatusLevel::Error, message);
+            }
+            NavigationProtocolResult::Cancelled => {
+                self.navigation_status = None;
+            }
+        }
+    }
+
+    fn reduce_protocol_locations(
+        &mut self,
+        invocation: NavigationInvocation,
+        locations: Vec<ProtocolLocation>,
+    ) {
+        let had_locations = !locations.is_empty();
+        let mut targets: Vec<_> = locations
+            .into_iter()
+            .filter_map(|location| {
+                let absolute = lsp_uri_to_safe_path(&location.uri, &self.root).ok()?;
+                let document = ContentIdentity::from_absolute(&self.root, &absolute)?;
+                Some(NavigationTarget {
+                    document,
+                    range: NavigationTargetRange::Utf16(location.range),
+                })
+            })
+            .collect();
+        targets.sort_by(|left, right| {
+            navigation_target_sort_key(left).cmp(&navigation_target_sort_key(right))
+        });
+        targets.dedup();
+        if targets.is_empty() {
+            self.set_navigation_status(
+                if had_locations {
+                    NavigationStatusLevel::Error
+                } else {
+                    NavigationStatusLevel::Info
+                },
+                if had_locations {
+                    "Navigation target is outside the opened workspace or unsafe."
+                } else {
+                    match invocation.operation {
+                        NavigationOperation::Definition => "No definition found.",
+                        NavigationOperation::References => "No references found.",
+                        NavigationOperation::Implementations => "No implementations found.",
+                        NavigationOperation::DocumentSymbols => "No document symbols found.",
+                    }
+                },
+            );
+            return;
+        }
+        let items = targets
+            .into_iter()
+            .map(|target| NavigationPickerItem {
+                label: navigation_target_label(&target),
+                target,
+                detail: None,
+            })
+            .collect::<Vec<_>>();
+        let direct = invocation.operation != NavigationOperation::References && items.len() == 1;
+        if direct {
+            self.accept_navigation_target(invocation, items[0].target.clone());
+        } else {
+            let title = match invocation.operation {
+                NavigationOperation::Definition => "Definitions",
+                NavigationOperation::References => "References",
+                NavigationOperation::Implementations => "Implementations",
+                NavigationOperation::DocumentSymbols => "Document Symbols",
+            };
+            self.open_navigation_picker(title, invocation, items);
+        }
+    }
+
+    fn accept_navigation_target(
+        &mut self,
+        invocation: NavigationInvocation,
+        target: NavigationTarget,
+    ) {
+        if self
+            .navigation_source
+            .as_ref()
+            .is_some_and(|source| source.identity == target.document)
+        {
+            let Some(range) = self.resolve_target_in_current_document(&target) else {
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    "Navigation target range is invalid.",
+                );
+                return;
+            };
+            self.commit_navigation_reveal(&invocation, target.document.clone(), range);
+            return;
+        }
+        let content_generation = self.content_requests.begin();
+        self.runtime.request_content(ContentRequest {
+            generation: content_generation,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::NavigationStage {
+                navigation_generation: invocation.generation,
+            },
+            target: ContentTarget::Workspace(target.document.path().to_path_buf()),
+        });
+        self.pending_navigation_stage = Some(PendingNavigationStage {
+            invocation,
+            content_generation,
+            target,
+        });
+        self.navigation_picker = None;
+        self.set_navigation_status(NavigationStatusLevel::Info, "Loading navigation target…");
+    }
+
+    fn resolve_target_in_current_document(&self, target: &NavigationTarget) -> Option<SourceRange> {
+        let source = self.navigation_source.as_ref()?;
+        if source.identity != target.document {
+            return None;
+        }
+        match target.range.clone() {
+            NavigationTargetRange::Source(range) => source
+                .line_index
+                .to_utf16(range.start)
+                .and_then(|_| source.line_index.to_utf16(range.end))
+                .ok()
+                .map(|_| range),
+            NavigationTargetRange::Utf16(range) => source.line_index.range_from_utf16(range).ok(),
+        }
+    }
+
+    fn apply_navigation_stage_completion(
+        &mut self,
+        navigation_generation: u64,
+        content_generation: u64,
+        result: Result<ContentSnapshot, String>,
+    ) {
+        let Some(stage) = self.pending_navigation_stage.take() else {
+            return;
+        };
+        if stage.invocation.generation != navigation_generation
+            || stage.content_generation != content_generation
+            || self.navigation_generation != navigation_generation
+        {
+            return;
+        }
+        let mut snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("Unable to load navigation target: {error}"),
+                );
+                return;
+            }
+        };
+        self.rebind_content_snapshot_navigation(&mut snapshot);
+        let Some(source) = snapshot.navigation_source.as_ref() else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Navigation target preview is truncated or unsupported.",
+            );
+            return;
+        };
+        if source.identity != stage.target.document {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Navigation target identity changed while loading.",
+            );
+            return;
+        }
+        let range = match stage.target.range.clone() {
+            NavigationTargetRange::Source(range) => source
+                .line_index
+                .to_utf16(range.start)
+                .and_then(|_| source.line_index.to_utf16(range.end))
+                .map(|_| range),
+            NavigationTargetRange::Utf16(range) => source.line_index.range_from_utf16(range),
+        };
+        let Ok(range) = range else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Navigation target range is invalid.",
+            );
+            return;
+        };
+        self.install_navigation_snapshot(snapshot);
+        self.commit_navigation_reveal(&stage.invocation, stage.target.document, range);
+    }
+
+    fn install_navigation_snapshot(&mut self, snapshot: ContentSnapshot) {
+        self.cache_current_folds();
+        self.reset_content(ContentMode::Preview);
+        let cached = snapshot
+            .identity
+            .as_ref()
+            .map_or_else(HashSet::new, |identity| self.cached_folds(identity));
+        self.content_provider = snapshot.provider;
+        self.content_lines = snapshot.lines;
+        self.content_highlights = snapshot.highlights;
+        self.content_show_line_numbers = snapshot.show_line_numbers;
+        self.content_identity = snapshot.identity;
+        self.content_fold_source = snapshot.fold_source;
+        self.content_fold_regions = snapshot.fold_regions;
+        self.content_structure = snapshot.structure;
+        self.navigation_source = snapshot.navigation_source.map(Arc::new);
+        let valid_anchors: HashSet<_> = self
+            .content_fold_regions
+            .iter()
+            .map(|region| region.anchor)
+            .collect();
+        self.content_collapsed_folds = cached.intersection(&valid_anchors).copied().collect();
+        self.content_successful = true;
+        self.navigation_document_version = DocumentVersion(
+            self.navigation_document_version
+                .0
+                .checked_add(1)
+                .expect("navigation document version exhausted"),
+        );
+    }
+
+    fn commit_navigation_reveal(
+        &mut self,
+        invocation: &NavigationInvocation,
+        document: ContentIdentity,
+        range: SourceRange,
+    ) {
+        self.reveal_folded_line(range.start.line);
+        self.scroll_to_logical_line(range.start.line, range.start.byte);
+        if let Some(viewport) = invocation.destination_viewport {
+            self.restore_content_viewport(viewport);
+        }
+        self.navigation_caret = NavigationCaret {
+            point: range.start,
+            preferred_display_column: 0,
+        };
+        self.navigation_target_highlight = Some(range);
+        self.focused_pane = FocusPane::Content;
+        if self.tree_scope != TreeScope::AllFiles {
+            self.apply_tree_scope(TreeScope::AllFiles);
+        }
+        self.reveal_navigation_tree_selection(document.path().to_path_buf());
+        match invocation.history_intent {
+            NavigationHistoryIntent::Jump => {
+                push_bounded_history(&mut self.navigation_back, invocation.origin.clone());
+                self.navigation_forward.clear();
+            }
+            NavigationHistoryIntent::Back => {
+                self.navigation_back.pop_back();
+                push_bounded_history(&mut self.navigation_forward, invocation.origin.clone());
+            }
+            NavigationHistoryIntent::Forward => {
+                self.navigation_forward.pop_back();
+                push_bounded_history(&mut self.navigation_back, invocation.origin.clone());
+            }
+        }
+        self.navigation_invocation = None;
+        self.pending_navigation_stage = None;
+        self.navigation_picker = None;
+        self.set_navigation_status(NavigationStatusLevel::Info, "Navigation target opened.");
+    }
+
+    fn navigate_history(&mut self, intent: NavigationHistoryIntent) {
+        let target = match intent {
+            NavigationHistoryIntent::Back => self.navigation_back.back(),
+            NavigationHistoryIntent::Forward => self.navigation_forward.back(),
+            NavigationHistoryIntent::Jump => None,
+        }
+        .cloned();
+        let Some(target) = target else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Info,
+                if intent == NavigationHistoryIntent::Back {
+                    "No previous navigation location."
+                } else {
+                    "No forward navigation location."
+                },
+            );
+            return;
+        };
+        let Some(source_identity) = self
+            .navigation_source
+            .as_ref()
+            .map(|source| source.identity.clone())
+        else {
+            return;
+        };
+        let Some(origin) = self.current_navigation_entry() else {
+            return;
+        };
+        let generation = self.next_navigation_generation();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::Definition,
+            source_identity,
+            source_version: self.navigation_document_version,
+            origin,
+            history_intent: intent,
+            destination_viewport: Some(target.viewport),
+            return_focus: self.focused_pane,
+        };
+        self.accept_navigation_target(invocation, target.target);
+    }
+
+    fn handle_navigation_picker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                if let Some(picker) = self.navigation_picker.take() {
+                    self.focused_pane = picker.return_focus;
+                }
+            }
+            (KeyCode::Down, _) => self.move_navigation_picker(1),
+            (KeyCode::Up, _) => self.move_navigation_picker(-1),
+            (KeyCode::PageDown, _) => self.move_navigation_picker(10),
+            (KeyCode::PageUp, _) => self.move_navigation_picker(-10),
+            (KeyCode::Enter, _) => self.accept_navigation_picker_selection(),
+            _ => {}
+        }
+    }
+
+    fn handle_navigation_picker_mouse_down(&mut self, mouse: MouseEvent) {
+        if !contains(self.ui_regions.navigation_results, mouse.column, mouse.row) {
+            return;
+        }
+        let visible_row = usize::from(mouse.row - self.ui_regions.navigation_results.y);
+        let (offset, count) = self.navigation_picker.as_ref().map_or((0, 0), |picker| {
+            (picker.list_state.offset(), picker.results.len())
+        });
+        let index = offset.saturating_add(visible_row);
+        if index >= count {
+            return;
+        }
+        let double_click = self
+            .last_navigation_click
+            .is_some_and(|(previous, instant)| {
+                previous == index && instant.elapsed() <= Duration::from_millis(400)
+            });
+        if let Some(picker) = self.navigation_picker.as_mut() {
+            picker.list_state.select(Some(index));
+        }
+        self.last_navigation_click = Some((index, Instant::now()));
+        if double_click {
+            self.accept_navigation_picker_selection();
+        }
+    }
+
+    fn move_navigation_picker(&mut self, delta: isize) {
+        let Some(picker) = self.navigation_picker.as_mut() else {
+            return;
+        };
+        if picker.results.is_empty() {
+            return;
+        }
+        let current = picker.list_state.selected().unwrap_or(0);
+        picker.list_state.select(Some(
+            current
+                .saturating_add_signed(delta)
+                .min(picker.results.len().saturating_sub(1)),
+        ));
+    }
+
+    fn accept_navigation_picker_selection(&mut self) {
+        let Some(picker) = self.navigation_picker.take() else {
+            return;
+        };
+        let Some(index) = picker.list_state.selected() else {
+            return;
+        };
+        let Some(item) = picker.results.get(index) else {
+            return;
+        };
+        self.accept_navigation_target(picker.invocation, item.target.clone());
+    }
+
     fn apply_content_completion(&mut self, completion: ContentCompletion) {
         let generation = completion.generation;
         if !self.content_requests.accept(completion.generation) {
+            return;
+        }
+        if let ContentPurpose::NavigationStage {
+            navigation_generation,
+        } = completion.purpose
+        {
+            self.apply_navigation_stage_completion(
+                navigation_generation,
+                generation,
+                completion.result,
+            );
             return;
         }
         let mode = match completion.kind {
@@ -3948,7 +5126,8 @@ impl App {
         let pending_preview_find = self.preview_find.take();
         self.reset_content(mode);
         match completion.result {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                self.rebind_content_snapshot_navigation(&mut snapshot);
                 let cached = snapshot
                     .identity
                     .as_ref()
@@ -3959,6 +5138,14 @@ impl App {
                 self.content_identity = snapshot.identity;
                 self.content_fold_source = snapshot.fold_source;
                 self.content_fold_regions = snapshot.fold_regions;
+                self.content_structure = snapshot.structure;
+                self.navigation_source = snapshot.navigation_source.map(Arc::new);
+                self.navigation_document_version = DocumentVersion(
+                    self.navigation_document_version
+                        .0
+                        .checked_add(1)
+                        .expect("navigation document version exhausted"),
+                );
                 let valid_anchors: HashSet<_> = self
                     .content_fold_regions
                     .iter()
@@ -4006,6 +5193,10 @@ impl App {
                     self.last_error = None;
                 }
                 if mode == ContentMode::Preview {
+                    self.navigation_caret = NavigationCaret {
+                        point: first_navigation_point(&self.content_lines),
+                        preferred_display_column: 0,
+                    };
                     self.preview_find = pending_preview_find;
                     if search_target.is_none() {
                         if self.preview_find.is_some() {
@@ -4041,12 +5232,16 @@ impl App {
         self.content_identity = None;
         self.content_fold_source = FoldSource::None;
         self.content_fold_regions.clear();
+        self.content_structure = StructureSnapshot::unavailable();
+        self.navigation_source = None;
+        self.navigation_target_highlight = None;
         self.content_collapsed_folds.clear();
         self.content_cursor_line = 0;
         self.content_successful = false;
     }
 
     fn set_info(&mut self, lines: Vec<String>) {
+        self.cancel_pending_navigation();
         self.content_requests.invalidate();
         self.runtime.cancel_pending_content();
         self.pending_diff_path = None;
@@ -4073,6 +5268,115 @@ impl App {
             self.reviewed_change_versions.insert(path, version);
         }
     }
+}
+
+fn first_navigation_point(lines: &[String]) -> SourcePosition {
+    first_navigation_point_on_line(lines, 0)
+}
+
+fn protocol_symbol_picker_items(
+    source: &NavigationSource,
+    symbols: Vec<ProtocolDocumentSymbol>,
+) -> Result<Vec<NavigationPickerItem>> {
+    let mut depths = Vec::<usize>::with_capacity(symbols.len());
+    symbols
+        .into_iter()
+        .enumerate()
+        .map(|(index, symbol)| {
+            let depth = symbol
+                .parent
+                .and_then(|parent| (parent < index).then_some(parent))
+                .and_then(|parent| depths.get(parent).copied())
+                .map_or(0, |depth| depth.saturating_add(1));
+            depths.push(depth);
+            let position = source.line_index.to_utf16(symbol.selection_range.start)?;
+            Ok(NavigationPickerItem {
+                target: NavigationTarget {
+                    document: source.identity.clone(),
+                    range: NavigationTargetRange::Source(symbol.selection_range),
+                },
+                label: format!(
+                    "{}{}:{}:{} · {}",
+                    "  ".repeat(depth),
+                    source.identity.path().display(),
+                    position.line.saturating_add(1),
+                    position.character.saturating_add(1),
+                    symbol.name
+                ),
+                detail: symbol.detail.or(symbol.container),
+            })
+        })
+        .collect()
+}
+
+fn first_navigation_point_on_line(lines: &[String], line: usize) -> SourcePosition {
+    let byte = lines
+        .get(line)
+        .and_then(|text| {
+            text.char_indices()
+                .find(|(_, character)| !character.is_whitespace())
+                .map(|(byte, _)| byte)
+        })
+        .unwrap_or(0);
+    SourcePosition { line, byte }
+}
+
+fn navigation_target_sort_key(target: &NavigationTarget) -> (PathBuf, u32, u32, u32, u32) {
+    let (start_line, start_character, end_line, end_character) = match target.range {
+        NavigationTargetRange::Utf16(range) => (
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+        ),
+        NavigationTargetRange::Source(range) => (
+            u32::try_from(range.start.line).unwrap_or(u32::MAX),
+            u32::try_from(range.start.byte).unwrap_or(u32::MAX),
+            u32::try_from(range.end.line).unwrap_or(u32::MAX),
+            u32::try_from(range.end.byte).unwrap_or(u32::MAX),
+        ),
+    };
+    (
+        target.document.path().to_path_buf(),
+        start_line,
+        start_character,
+        end_line,
+        end_character,
+    )
+}
+
+fn navigation_target_label(target: &NavigationTarget) -> String {
+    let (line, column) = match target.range {
+        NavigationTargetRange::Utf16(range) => (range.start.line, range.start.character),
+        NavigationTargetRange::Source(range) => (
+            u32::try_from(range.start.line).unwrap_or(u32::MAX),
+            u32::try_from(range.start.byte).unwrap_or(u32::MAX),
+        ),
+    };
+    format!(
+        "{}:{}:{}",
+        target.document.path().display(),
+        line.saturating_add(1),
+        column.saturating_add(1)
+    )
+}
+
+fn push_bounded_history(
+    history: &mut VecDeque<NavigationHistoryEntry>,
+    entry: NavigationHistoryEntry,
+) {
+    if history.len() == NAVIGATION_HISTORY_LIMIT {
+        history.pop_front();
+    }
+    history.push_back(entry);
+}
+
+fn clean_navigation_message(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control() && *character != '\u{1b}')
+        .take(240)
+        .collect()
 }
 
 fn search_result(found: SearchMatch) -> SearchResult {
@@ -4663,7 +5967,7 @@ fn contains(rect: Rect, column: u16, row: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, process::Command};
 
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -5254,6 +6558,7 @@ mod tests {
         app.apply_content_completion(ContentCompletion {
             generation: stale_preview,
             kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
             result: Ok(content_snapshot("obsolete preview")),
         });
 
@@ -5264,6 +6569,7 @@ mod tests {
         app.apply_content_completion(ContentCompletion {
             generation: current_diff,
             kind: ContentKind::Diff,
+            purpose: ContentPurpose::Display,
             result: Ok(content_snapshot("current diff")),
         });
         assert!(!app.is_content_loading());
@@ -5294,6 +6600,7 @@ mod tests {
         app.apply_content_completion(ContentCompletion {
             generation: content,
             kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
             result: Ok(content_snapshot("recovered content")),
         });
         assert_eq!(
@@ -5305,6 +6612,7 @@ mod tests {
         app.apply_content_completion(ContentCompletion {
             generation: content,
             kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
             result: Err("fixture content error".to_owned()),
         });
         assert!(!app.is_content_loading());
@@ -5456,7 +6764,1008 @@ mod tests {
             identity: None,
             fold_source: FoldSource::None,
             fold_regions: Vec::new(),
+            structure: crate::folding::StructureSnapshot::unavailable(),
+            navigation_source: None,
         }
+    }
+
+    fn navigation_app(source: &str) -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.keep();
+        fs::write(root.join("caller.rs"), source).unwrap();
+        fs::write(root.join("target.rs"), "fn target() {}\n").unwrap();
+        let mut app = App::new(root).unwrap();
+        app.wait_for_background();
+        app.request_content(
+            ContentKind::Preview,
+            "caller.rs".to_owned(),
+            ContentTarget::Workspace(PathBuf::from("caller.rs")),
+        );
+        app.wait_for_background();
+        app.focused_pane = FocusPane::Content;
+        app.ui_regions.content_inner = Rect::new(0, 0, 80, 20);
+        app.ui_regions.content_body = app.ui_regions.content_inner;
+        app.navigation_caret = NavigationCaret {
+            point: SourcePosition { line: 0, byte: 3 },
+            preferred_display_column: 3,
+        };
+        app
+    }
+
+    fn init_git_repository(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        let output = Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init", "--quiet"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn mark_local_symbols_incomplete(app: &mut App) {
+        let mut structure = app.content_structure.clone();
+        structure.symbols.clear();
+        structure.symbols_complete = false;
+        app.content_structure = structure.clone();
+        let mut source = app
+            .navigation_source
+            .as_ref()
+            .map(|source| source.as_ref().clone())
+            .unwrap();
+        source.structure = Arc::new(structure);
+        app.navigation_source = Some(Arc::new(source));
+    }
+
+    fn protocol_symbol(
+        name: &str,
+        selection_range: SourceRange,
+        parent: Option<usize>,
+    ) -> ProtocolDocumentSymbol {
+        ProtocolDocumentSymbol::for_app_test(
+            name,
+            selection_range,
+            selection_range,
+            parent,
+            None,
+            None,
+        )
+    }
+
+    fn set_search_result(app: &mut App, path: &str) {
+        let search = app.search.as_mut().unwrap();
+        search.results = vec![SearchResult {
+            path: PathBuf::from(path),
+            is_dir: false,
+            line_number: None,
+            line: None,
+            match_range: None,
+            source_match_range: None,
+        }];
+        app.search_list_state.select(Some(0));
+    }
+
+    #[test]
+    fn search_cancel_restores_navigation_identity_and_rejects_late_preview_state() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let caller_source = app.navigation_source.clone().unwrap();
+        let caller_version = app.navigation_document_version;
+        let caller_caret = NavigationCaret {
+            point: SourcePosition { line: 0, byte: 4 },
+            preferred_display_column: 4,
+        };
+        let caller_highlight = SourceRange {
+            start: SourcePosition { line: 0, byte: 3 },
+            end: SourcePosition { line: 0, byte: 9 },
+        };
+        app.navigation_caret = caller_caret;
+        app.navigation_target_highlight = Some(caller_highlight);
+        app.set_navigation_status(NavigationStatusLevel::Info, "caller navigation state");
+        let history_entry = app.current_navigation_entry().unwrap();
+        app.navigation_back.push_back(history_entry);
+        let original_tree_scope = app.tree_scope;
+        let original_tree_selection = app.tree_state.selected();
+
+        app.open_search(SearchMode::Files);
+        set_search_result(&mut app, "target.rs");
+        app.preview_search_selection();
+        app.wait_for_background();
+        let target_source = app.navigation_source.clone().unwrap();
+        let target_version = app.navigation_document_version;
+        assert_ne!(target_source.identity, caller_source.identity);
+
+        app.close_search(true);
+        assert_eq!(
+            app.navigation_source
+                .as_ref()
+                .map(|source| &source.identity),
+            Some(&caller_source.identity)
+        );
+        assert_eq!(app.navigation_document_version, caller_version);
+        assert_eq!(app.navigation_caret, caller_caret);
+        assert_eq!(app.navigation_target_highlight, Some(caller_highlight));
+        let restored_source = app.navigation_source.as_ref().unwrap();
+        assert_eq!(restored_source.absolute_path, caller_source.absolute_path);
+        assert_eq!(restored_source.server_root, caller_source.server_root);
+        assert_eq!(restored_source.text, caller_source.text);
+        assert_eq!(app.navigation_back.len(), 1);
+        assert_eq!(app.tree_scope, original_tree_scope);
+        assert_eq!(app.tree_state.selected(), original_tree_selection);
+
+        app.request_semantic_navigation(NavigationOperation::Definition);
+        let current = app.navigation_invocation.clone().unwrap();
+        assert_eq!(current.source_identity, caller_source.identity);
+        assert_eq!(current.source_version, caller_version);
+        assert!(matches!(
+            current.origin.target.range,
+            NavigationTargetRange::Source(range) if range.contains(caller_caret.point)
+        ));
+        app.apply_navigation_completion(NavigationRuntimeCompletion {
+            generation: current.generation,
+            operation: NavigationOperation::Definition,
+            source_identity: target_source.identity.clone(),
+            source_version: target_version,
+            result: NavigationProtocolResult::Locations(Vec::new()),
+        });
+        assert_eq!(
+            app.navigation_invocation
+                .as_ref()
+                .map(|invocation| (&invocation.source_identity, invocation.source_version)),
+            Some((&caller_source.identity, caller_version))
+        );
+        app.cancel_pending_navigation();
+    }
+
+    #[test]
+    fn search_accept_adopts_target_navigation_identity_while_empty_and_error_cancel_restore() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let caller = app.navigation_source.clone().unwrap();
+
+        app.open_search(SearchMode::Files);
+        set_search_result(&mut app, "target.rs");
+        app.preview_search_selection();
+        app.wait_for_background();
+        app.accept_search_selection();
+        app.wait_for_background();
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.navigation_source
+                .as_ref()
+                .map(|source| source.identity.path()),
+            Some(Path::new("target.rs"))
+        );
+
+        app.request_content(
+            ContentKind::Preview,
+            "caller.rs".to_owned(),
+            ContentTarget::Workspace(PathBuf::from("caller.rs")),
+        );
+        app.wait_for_background();
+        let restored_caller = app.navigation_source.clone().unwrap();
+        assert_eq!(restored_caller.identity, caller.identity);
+
+        for (lines, error) in [
+            (vec!["No matches".to_owned()], None),
+            (
+                vec!["Search failed".to_owned()],
+                Some("search fixture error".to_owned()),
+            ),
+        ] {
+            app.open_search(SearchMode::Text);
+            app.set_info(lines);
+            app.last_error = error;
+            app.close_search(true);
+            assert_eq!(
+                app.navigation_source
+                    .as_ref()
+                    .map(|source| &source.identity),
+                Some(&restored_caller.identity)
+            );
+            assert_eq!(
+                app.content_identity.as_ref(),
+                Some(&restored_caller.identity)
+            );
+        }
+    }
+
+    #[test]
+    fn complete_local_document_symbols_open_immediately_without_runtime_pending() {
+        let mut app = navigation_app("mod outer {\n    fn inner() {}\n}\n");
+        assert!(app.content_structure.symbols_complete);
+
+        app.open_document_symbols();
+
+        assert!(app.navigation_invocation.is_none());
+        let picker = app.navigation_picker.as_ref().unwrap();
+        assert_eq!(picker.title, "Document Symbols");
+        assert!(
+            picker
+                .results
+                .iter()
+                .any(|item| item.label.contains("outer"))
+        );
+        assert!(
+            picker
+                .results
+                .iter()
+                .any(|item| item.label.contains("inner"))
+        );
+    }
+
+    #[test]
+    fn incomplete_document_symbols_without_lsp_report_unavailable_and_stay_put() {
+        let mut app = navigation_app("fn caller() {}\n");
+        mark_local_symbols_incomplete(&mut app);
+        let before = app.content_identity.clone();
+
+        app.open_document_symbols();
+        assert!(app.navigation_invocation.is_some());
+        for _ in 0..100 {
+            app.poll_background();
+            if app.navigation_invocation.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(app.content_identity, before);
+        assert!(app.navigation_picker.is_none());
+        assert!(
+            app.navigation_status
+                .as_ref()
+                .is_some_and(|status| status.message.contains("No configured Rust"))
+        );
+    }
+
+    #[test]
+    fn lsp_document_symbols_preserve_nested_and_flat_labels_utf16_and_atomic_selection() {
+        let mut app = navigation_app("// 😀 target\nfn caller() {}\n");
+        mark_local_symbols_incomplete(&mut app);
+        app.open_document_symbols();
+        let invocation = app.navigation_invocation.clone().unwrap();
+        let emoji_name = SourceRange {
+            start: SourcePosition { line: 0, byte: 8 },
+            end: SourcePosition { line: 0, byte: 14 },
+        };
+        let caller_name = SourceRange {
+            start: SourcePosition { line: 1, byte: 3 },
+            end: SourcePosition { line: 1, byte: 9 },
+        };
+        app.apply_document_symbol_completion(NavigationDocumentSymbolCompletion {
+            generation: invocation.generation,
+            source_identity: invocation.source_identity.clone(),
+            source_version: invocation.source_version,
+            symbols: vec![
+                protocol_symbol("target", emoji_name, None),
+                protocol_symbol("caller", caller_name, Some(0)),
+            ],
+        });
+
+        let picker = app.navigation_picker.as_ref().unwrap();
+        assert_eq!(picker.results.len(), 2);
+        assert!(picker.results[0].label.contains("caller.rs:1:7 · target"));
+        assert!(
+            picker.results[1]
+                .label
+                .starts_with("  caller.rs:2:4 · caller")
+        );
+        app.move_navigation_picker(1);
+        app.accept_navigation_picker_selection();
+        assert!(app.navigation_picker.is_none());
+        assert_eq!(app.navigation_caret.point, caller_name.start);
+        assert_eq!(app.navigation_target_highlight, Some(caller_name));
+        assert_eq!(app.navigation_back.len(), 1);
+
+        mark_local_symbols_incomplete(&mut app);
+        app.open_document_symbols();
+        let invocation = app.navigation_invocation.clone().unwrap();
+        app.apply_document_symbol_completion(NavigationDocumentSymbolCompletion {
+            generation: invocation.generation,
+            source_identity: invocation.source_identity,
+            source_version: invocation.source_version,
+            symbols: vec![
+                protocol_symbol("flat-a", emoji_name, None),
+                protocol_symbol("flat-b", caller_name, None),
+            ],
+        });
+        let picker = app.navigation_picker.as_ref().unwrap();
+        assert!(!picker.results[0].label.starts_with(' '));
+        assert!(!picker.results[1].label.starts_with(' '));
+    }
+
+    #[test]
+    fn late_document_symbol_completion_is_rejected_without_clearing_current_pending() {
+        let mut app = navigation_app("fn caller() {}\n");
+        mark_local_symbols_incomplete(&mut app);
+        app.open_document_symbols();
+        let invocation = app.navigation_invocation.clone().unwrap();
+        let name = SourceRange {
+            start: SourcePosition { line: 0, byte: 3 },
+            end: SourcePosition { line: 0, byte: 9 },
+        };
+
+        app.apply_document_symbol_completion(NavigationDocumentSymbolCompletion {
+            generation: invocation.generation.saturating_sub(1),
+            source_identity: invocation.source_identity.clone(),
+            source_version: invocation.source_version,
+            symbols: vec![protocol_symbol("late", name, None)],
+        });
+
+        assert!(app.navigation_picker.is_none());
+        assert_eq!(
+            app.navigation_invocation
+                .as_ref()
+                .map(|current| current.generation),
+            Some(invocation.generation)
+        );
+        app.cancel_pending_navigation();
+    }
+
+    #[test]
+    fn lsp_document_symbol_zero_sets_status_and_single_still_uses_picker() {
+        let mut app = navigation_app("fn caller() {}\n");
+        mark_local_symbols_incomplete(&mut app);
+        app.open_document_symbols();
+        let first = app.navigation_invocation.clone().unwrap();
+        app.apply_document_symbol_completion(NavigationDocumentSymbolCompletion {
+            generation: first.generation,
+            source_identity: first.source_identity,
+            source_version: first.source_version,
+            symbols: Vec::new(),
+        });
+        assert!(app.navigation_picker.is_none());
+        assert!(
+            app.navigation_status
+                .as_ref()
+                .is_some_and(|status| status.message == "No document symbols found.")
+        );
+
+        app.open_document_symbols();
+        let second = app.navigation_invocation.clone().unwrap();
+        let name = SourceRange {
+            start: SourcePosition { line: 0, byte: 3 },
+            end: SourcePosition { line: 0, byte: 9 },
+        };
+        app.apply_document_symbol_completion(NavigationDocumentSymbolCompletion {
+            generation: second.generation,
+            source_identity: second.source_identity,
+            source_version: second.source_version,
+            symbols: vec![protocol_symbol("caller", name, None)],
+        });
+        assert_eq!(
+            app.navigation_picker
+                .as_ref()
+                .map(|picker| picker.results.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn terminal_navigation_failures_clear_pending_and_surface_status() {
+        for message in [
+            "language server initialize failed",
+            "File revalidation worker became wedged.",
+            "language server selected unsupported position encoding utf-8",
+        ] {
+            let mut app = navigation_app("fn caller() {}\n");
+            app.request_semantic_navigation(NavigationOperation::Definition);
+            let invocation = app.navigation_invocation.clone().unwrap();
+            let before = app.content_identity.clone();
+            app.apply_navigation_completion(NavigationRuntimeCompletion {
+                generation: invocation.generation,
+                operation: invocation.operation,
+                source_identity: invocation.source_identity,
+                source_version: invocation.source_version,
+                result: NavigationProtocolResult::Failed(message.to_owned()),
+            });
+            assert!(app.navigation_invocation.is_none());
+            assert_eq!(app.content_identity, before);
+            assert!(
+                app.navigation_status
+                    .as_ref()
+                    .is_some_and(|status| status.message.contains(message))
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_cancels_pending_definition_and_document_symbols_and_rejects_late_results() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let identity = app.content_identity.clone();
+
+        app.request_semantic_navigation(NavigationOperation::Definition);
+        let definition = app.navigation_invocation.clone().unwrap();
+        app.request_refresh(false);
+        assert!(app.is_refreshing());
+        assert!(app.navigation_invocation.is_none());
+        assert!(app.pending_navigation_stage.is_none());
+        assert!(app.navigation_picker.is_none());
+        assert!(!app.is_content_loading());
+        assert!(app.navigation_status.is_none());
+
+        app.apply_navigation_completion(NavigationRuntimeCompletion {
+            generation: definition.generation,
+            operation: definition.operation,
+            source_identity: definition.source_identity,
+            source_version: definition.source_version,
+            result: NavigationProtocolResult::Locations(Vec::new()),
+        });
+        assert!(app.navigation_invocation.is_none());
+        assert!(app.navigation_status.is_none());
+        assert_eq!(app.content_identity, identity);
+
+        app.wait_for_background();
+        assert!(!app.is_refreshing());
+
+        mark_local_symbols_incomplete(&mut app);
+        app.open_document_symbols();
+        let symbols = app.navigation_invocation.clone().unwrap();
+        app.request_refresh(false);
+        assert!(app.navigation_invocation.is_none());
+        app.apply_document_symbol_completion(NavigationDocumentSymbolCompletion {
+            generation: symbols.generation,
+            source_identity: symbols.source_identity,
+            source_version: symbols.source_version,
+            symbols: vec![protocol_symbol(
+                "late",
+                SourceRange {
+                    start: SourcePosition { line: 0, byte: 3 },
+                    end: SourcePosition { line: 0, byte: 9 },
+                },
+                None,
+            )],
+        });
+        assert!(app.navigation_picker.is_none());
+        assert!(app.navigation_status.is_none());
+        app.wait_for_background();
+        assert!(!app.is_refreshing());
+        assert!(!app.is_content_loading());
+    }
+
+    #[test]
+    fn refresh_failure_keeps_the_installed_graph_root_but_cancels_navigation_loading() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let source = app.navigation_source.clone().unwrap();
+        let graph = app.repo_graph.clone();
+        app.request_semantic_navigation(NavigationOperation::Definition);
+        let pending = app.navigation_invocation.clone().unwrap();
+
+        let refresh = app.request_refresh(false);
+        app.apply_refresh_completion(RefreshCompletion {
+            generation: refresh,
+            result: Err("fixture refresh failure".to_owned()),
+        });
+
+        assert!(!app.is_refreshing());
+        assert!(!app.is_content_loading());
+        assert!(app.navigation_invocation.is_none());
+        assert!(app.pending_navigation_stage.is_none());
+        assert_eq!(
+            app.navigation_source
+                .as_ref()
+                .map(|source| &source.server_root),
+            Some(&source.server_root)
+        );
+        assert_eq!(
+            app.repo_graph.as_ref().map(RepoGraph::workspace_root),
+            graph.as_ref().map(RepoGraph::workspace_root)
+        );
+        assert_eq!(
+            app.last_refresh_error.as_deref(),
+            Some("refresh failed: fixture refresh failure")
+        );
+
+        app.apply_navigation_completion(NavigationRuntimeCompletion {
+            generation: pending.generation,
+            operation: pending.operation,
+            source_identity: pending.source_identity,
+            source_version: pending.source_version,
+            result: NavigationProtocolResult::Locations(Vec::new()),
+        });
+        assert!(app.navigation_status.is_none());
+    }
+
+    #[test]
+    fn refresh_closes_picker_and_cancels_navigation_stage_content_loading() {
+        let mut picker_app = navigation_picker_app(4);
+        assert!(picker_app.navigation_picker.is_some());
+        let refresh = picker_app.request_refresh(false);
+        assert!(picker_app.navigation_picker.is_none());
+        picker_app.apply_refresh_completion(RefreshCompletion {
+            generation: refresh,
+            result: Ok(empty_snapshot()),
+        });
+
+        let mut stage_app = navigation_app("fn caller() {}\n");
+        let origin = stage_app.current_navigation_entry().unwrap();
+        let generation = stage_app.next_navigation_generation();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::Definition,
+            source_identity: origin.target.document.clone(),
+            source_version: stage_app.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: FocusPane::Content,
+        };
+        let target =
+            ContentIdentity::from_absolute(&stage_app.root, &stage_app.root.join("target.rs"))
+                .unwrap();
+        stage_app.accept_navigation_target(
+            invocation,
+            NavigationTarget {
+                document: target,
+                range: NavigationTargetRange::Utf16(lsp_types::Range::new(
+                    lsp_types::Position::new(0, 3),
+                    lsp_types::Position::new(0, 9),
+                )),
+            },
+        );
+        assert!(stage_app.pending_navigation_stage.is_some());
+        assert!(stage_app.is_content_loading());
+
+        let refresh = stage_app.request_refresh(false);
+        assert!(stage_app.pending_navigation_stage.is_none());
+        assert!(!stage_app.is_content_loading());
+        stage_app.apply_refresh_completion(RefreshCompletion {
+            generation: refresh,
+            result: Ok(empty_snapshot()),
+        });
+        assert!(!stage_app.is_refreshing());
+        assert!(!stage_app.is_content_loading());
+    }
+
+    #[test]
+    fn successful_refresh_rebinds_nested_server_root_without_reloading_visible_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let old_root = root.join("a");
+        let new_root = old_root.join("b");
+        init_git_repository(&old_root);
+        let relative = PathBuf::from("a/b/caller.rs");
+        let source_text = "fn caller() {\n    caller();\n}\nfn helper() {}\n";
+        fs::create_dir_all(&new_root).unwrap();
+        fs::write(root.join(&relative), source_text).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.wait_for_background();
+        app.request_content(
+            ContentKind::Preview,
+            relative.display().to_string(),
+            ContentTarget::Workspace(relative.clone()),
+        );
+        app.wait_for_background();
+        app.focused_pane = FocusPane::Content;
+        app.ui_regions.content_inner = Rect::new(0, 0, 30, 3);
+        app.ui_regions.content_body = app.ui_regions.content_inner;
+        app.collapse_all_folds();
+        app.content_scroll = 1;
+        app.navigation_caret = NavigationCaret {
+            point: SourcePosition { line: 1, byte: 4 },
+            preferred_display_column: 4,
+        };
+        let highlight = SourceRange {
+            start: SourcePosition { line: 1, byte: 4 },
+            end: SourcePosition { line: 1, byte: 10 },
+        };
+        app.navigation_target_highlight = Some(highlight);
+        app.navigation_back
+            .push_back(app.current_navigation_entry().unwrap());
+
+        let old_source = app.navigation_source.clone().unwrap();
+        assert_eq!(old_source.server_root, old_root.canonicalize().unwrap());
+        let lines = app.content_lines.clone();
+        let folds = app.content_collapsed_folds.clone();
+        let viewport = app.content_scroll;
+        let version = app.navigation_document_version;
+        let caret = app.navigation_caret;
+        let history = app.navigation_back.clone();
+        app.open_search(SearchMode::Files);
+
+        fs::remove_dir_all(old_root.join(".git")).unwrap();
+        init_git_repository(&new_root);
+        let canonical_new_root = new_root.canonicalize().unwrap();
+        app.request_refresh(true);
+        app.wait_for_background();
+
+        let rebound = app.navigation_source.as_ref().unwrap();
+        assert_eq!(rebound.server_root, canonical_new_root);
+        assert_eq!(rebound.identity, old_source.identity);
+        assert_eq!(rebound.absolute_path, old_source.absolute_path);
+        assert_eq!(rebound.disk_raw_len, old_source.disk_raw_len);
+        assert_eq!(rebound.language, old_source.language);
+        assert_eq!(rebound.text, old_source.text);
+        assert!(Arc::ptr_eq(&rebound.text, &old_source.text));
+        assert!(Arc::ptr_eq(&rebound.line_index, &old_source.line_index));
+        assert!(Arc::ptr_eq(&rebound.structure, &old_source.structure));
+        assert_eq!(app.content_lines, lines);
+        assert_eq!(app.content_collapsed_folds, folds);
+        assert_eq!(app.content_scroll, viewport);
+        assert_eq!(app.navigation_document_version, version);
+        assert_eq!(app.navigation_caret, caret);
+        assert_eq!(app.navigation_target_highlight, Some(highlight));
+        assert_eq!(app.navigation_back.len(), history.len());
+        let actual_history = app.navigation_back.back().unwrap();
+        let expected_history = history.back().unwrap();
+        assert_eq!(actual_history.target, expected_history.target);
+        assert_eq!(actual_history.viewport.line, expected_history.viewport.line);
+        assert_eq!(
+            actual_history.viewport.byte_start,
+            expected_history.viewport.byte_start
+        );
+        assert_eq!(
+            actual_history.viewport.effective_scroll,
+            expected_history.viewport.effective_scroll
+        );
+        assert!(!app.is_refreshing());
+        assert!(!app.is_content_loading());
+
+        app.close_search(true);
+        assert_eq!(
+            app.navigation_source
+                .as_ref()
+                .map(|source| source.server_root.as_path()),
+            Some(canonical_new_root.as_path())
+        );
+        assert_eq!(app.content_lines, lines);
+        assert_eq!(app.content_collapsed_folds, folds);
+        assert_eq!(app.content_scroll, viewport);
+        assert_eq!(app.navigation_back.len(), history.len());
+        assert_eq!(
+            app.navigation_back.back().unwrap().target,
+            history.back().unwrap().target
+        );
+
+        app.request_semantic_navigation(NavigationOperation::Definition);
+        assert!(app.navigation_invocation.is_some());
+        assert_eq!(
+            app.navigation_source
+                .as_ref()
+                .map(|source| source.server_root.as_path()),
+            Some(canonical_new_root.as_path())
+        );
+        app.cancel_pending_navigation();
+
+        let generation = app.content_requests.begin();
+        app.apply_content_completion(ContentCompletion {
+            generation,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            result: Ok(ContentSnapshot {
+                provider: Some("builtin:text".to_owned()),
+                lines: lines.clone(),
+                highlights: Vec::new(),
+                show_line_numbers: true,
+                identity: Some(old_source.identity.clone()),
+                fold_source: FoldSource::BuiltinText,
+                fold_regions: old_source.structure.folds.clone(),
+                structure: old_source.structure.as_ref().clone(),
+                navigation_source: Some(old_source.as_ref().clone()),
+            }),
+        });
+        assert_eq!(
+            app.navigation_source
+                .as_ref()
+                .map(|source| source.server_root.as_path()),
+            Some(canonical_new_root.as_path())
+        );
+    }
+
+    #[test]
+    fn refresh_degrades_a_source_whose_workspace_identity_is_no_longer_valid() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let lines = app.content_lines.clone();
+        let mut invalid = app.navigation_source.as_ref().unwrap().as_ref().clone();
+        invalid.absolute_path = app.root.join("../outside.rs");
+        app.navigation_source = Some(Arc::new(invalid));
+
+        app.rebind_navigation_sources_after_refresh();
+
+        assert!(app.navigation_source.is_none());
+        assert_eq!(app.content_lines, lines);
+        assert!(app.content_identity.is_some());
+    }
+
+    fn navigation_picker_app(count: usize) -> App {
+        let source = (0..count)
+            .map(|index| format!("fn item_{index}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = navigation_app(&source);
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let identity = app.navigation_source.as_ref().unwrap().identity.clone();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::DocumentSymbols,
+            source_identity: identity.clone(),
+            source_version: app.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: FocusPane::Content,
+        };
+        let results = (0..count)
+            .map(|index| {
+                let range = SourceRange {
+                    start: SourcePosition {
+                        line: index,
+                        byte: 3,
+                    },
+                    end: SourcePosition {
+                        line: index,
+                        byte: 9,
+                    },
+                };
+                NavigationPickerItem {
+                    target: NavigationTarget {
+                        document: identity.clone(),
+                        range: NavigationTargetRange::Source(range),
+                    },
+                    label: format!("caller.rs:{}:4 · item_{index}", index + 1),
+                    detail: None,
+                }
+            })
+            .collect();
+        app.open_navigation_picker("Document Symbols", invocation, results);
+        app
+    }
+
+    #[test]
+    fn scrolled_navigation_picker_mouse_uses_visible_offset_for_click_and_double_click() {
+        let mut app = navigation_picker_app(40);
+        app.navigation_picker
+            .as_mut()
+            .unwrap()
+            .list_state
+            .select(Some(30));
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let offset = app.navigation_picker.as_ref().unwrap().list_state.offset();
+        assert!(offset > 0);
+        let visible_row =
+            1usize.min(usize::from(app.ui_regions.navigation_results.height).saturating_sub(1));
+        let expected = offset + visible_row;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.ui_regions.navigation_results.x,
+            row: app
+                .ui_regions
+                .navigation_results
+                .y
+                .saturating_add(u16::try_from(visible_row).unwrap()),
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse);
+        assert_eq!(
+            app.navigation_picker
+                .as_ref()
+                .unwrap()
+                .list_state
+                .selected(),
+            Some(expected)
+        );
+        app.handle_mouse(mouse);
+        assert!(app.navigation_picker.is_none());
+        assert_eq!(app.navigation_caret.point.line, expected);
+    }
+
+    #[test]
+    fn resized_narrow_navigation_picker_clamps_mouse_hit_to_visible_items() {
+        let mut app = navigation_picker_app(40);
+        app.navigation_picker
+            .as_mut()
+            .unwrap()
+            .list_state
+            .select(Some(35));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        terminal.resize(Rect::new(0, 0, 32, 10)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let picker = app.navigation_picker.as_ref().unwrap();
+        let offset = picker.list_state.offset();
+        let visible = usize::from(app.ui_regions.navigation_results.height);
+        assert!(visible > 0);
+        let last_visible = visible - 1;
+        let expected = offset + last_visible;
+        assert!(expected < picker.results.len());
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.ui_regions.navigation_results.x,
+            row: app
+                .ui_regions
+                .navigation_results
+                .y
+                .saturating_add(u16::try_from(last_visible).unwrap()),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.navigation_picker
+                .as_ref()
+                .unwrap()
+                .list_state
+                .selected(),
+            Some(expected)
+        );
+
+        // The row immediately outside the results viewport must not select.
+        let selected = expected;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.ui_regions.navigation_results.x,
+            row: app.ui_regions.navigation_results.bottom(),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.navigation_picker
+                .as_ref()
+                .unwrap()
+                .list_state
+                .selected(),
+            Some(selected)
+        );
+    }
+
+    #[test]
+    fn semantic_navigation_without_configured_lsp_keeps_the_preview_in_place() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let before = app.content_lines.clone();
+        let identity = app.content_identity.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        for _ in 0..100 {
+            app.poll_background();
+            if app.navigation_invocation.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(app.content_lines, before);
+        assert_eq!(app.content_identity, identity);
+        assert!(
+            app.navigation_status
+                .as_ref()
+                .is_some_and(|status| status.message.contains("No configured Rust"))
+        );
+        assert!(app.navigation_back.is_empty());
+    }
+
+    #[test]
+    fn stale_navigation_completion_cannot_replace_the_current_invocation() {
+        let mut app = navigation_app("fn caller() {}\n");
+        app.request_semantic_navigation(NavigationOperation::Definition);
+        let invocation = app.navigation_invocation.clone().unwrap();
+        let before = app.content_lines.clone();
+
+        app.apply_navigation_completion(NavigationRuntimeCompletion {
+            generation: invocation.generation.saturating_sub(1),
+            operation: invocation.operation,
+            source_identity: invocation.source_identity.clone(),
+            source_version: invocation.source_version,
+            result: NavigationProtocolResult::Locations(Vec::new()),
+        });
+
+        assert_eq!(app.content_lines, before);
+        assert_eq!(
+            app.navigation_invocation
+                .as_ref()
+                .map(|current| current.generation),
+            Some(invocation.generation)
+        );
+        app.cancel_pending_navigation();
+    }
+
+    #[test]
+    fn failed_cross_file_navigation_stage_is_atomic() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let before_lines = app.content_lines.clone();
+        let before_identity = app.content_identity.clone();
+        let before_scope = app.tree_scope;
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::Definition,
+            source_identity: origin.target.document.clone(),
+            source_version: app.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: app.focused_pane,
+        };
+        let target_path = app.root.join("target.rs");
+        let target_identity = ContentIdentity::from_absolute(&app.root, &target_path).unwrap();
+        app.accept_navigation_target(
+            invocation,
+            NavigationTarget {
+                document: target_identity,
+                range: NavigationTargetRange::Utf16(lsp_types::Range::new(
+                    lsp_types::Position::new(0, 3),
+                    lsp_types::Position::new(0, 9),
+                )),
+            },
+        );
+        let stage = app.pending_navigation_stage.clone().unwrap();
+
+        app.apply_content_completion(ContentCompletion {
+            generation: stage.content_generation,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::NavigationStage {
+                navigation_generation: stage.invocation.generation,
+            },
+            result: Err("fixture stage failure".to_owned()),
+        });
+
+        assert_eq!(app.content_lines, before_lines);
+        assert_eq!(app.content_identity, before_identity);
+        assert_eq!(app.tree_scope, before_scope);
+        assert!(app.navigation_back.is_empty());
+        assert!(app.pending_navigation_stage.is_none());
+        assert!(
+            app.navigation_status
+                .as_ref()
+                .is_some_and(|status| status.message.contains("fixture stage failure"))
+        );
+    }
+
+    #[test]
+    fn successful_cross_file_stage_commits_history_then_back_and_forward() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let caller = app.content_identity.clone().unwrap();
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::Definition,
+            source_identity: caller.clone(),
+            source_version: app.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: app.focused_pane,
+        };
+        let target_path = app.root.join("target.rs");
+        let target = ContentIdentity::from_absolute(&app.root, &target_path).unwrap();
+        app.accept_navigation_target(
+            invocation,
+            NavigationTarget {
+                document: target.clone(),
+                range: NavigationTargetRange::Utf16(lsp_types::Range::new(
+                    lsp_types::Position::new(0, 3),
+                    lsp_types::Position::new(0, 9),
+                )),
+            },
+        );
+        app.wait_for_background();
+
+        assert_eq!(app.content_identity.as_ref(), Some(&target));
+        assert_eq!(app.navigation_back.len(), 1);
+        assert!(app.navigation_forward.is_empty());
+
+        app.navigate_history(NavigationHistoryIntent::Back);
+        app.wait_for_background();
+        assert_eq!(app.content_identity.as_ref(), Some(&caller));
+        assert!(app.navigation_back.is_empty());
+        assert_eq!(app.navigation_forward.len(), 1);
+
+        app.navigate_history(NavigationHistoryIntent::Forward);
+        app.wait_for_background();
+        assert_eq!(app.content_identity.as_ref(), Some(&target));
+        assert_eq!(app.navigation_back.len(), 1);
+        assert!(app.navigation_forward.is_empty());
     }
 
     fn drag_content(

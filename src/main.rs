@@ -1,8 +1,12 @@
 use std::{io, path::PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use latte_lens::app::App;
+use latte_lens::{
+    app::App,
+    navigation::{AppOptions, NavigationSettings},
+    preview::PreviewRegistry,
+};
 #[cfg(not(windows))]
 use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -23,7 +27,22 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut app = App::new(cli.path)?;
+    let workspace = cli
+        .path
+        .canonicalize()
+        .with_context(|| format!("cannot open {}", cli.path.display()))?;
+    if !workspace.is_dir() {
+        bail!("{} is not a directory", workspace.display());
+    }
+    let loaded = NavigationSettings::load_user_config(&workspace);
+    let mut app = App::with_options(
+        workspace,
+        PreviewRegistry::with_builtins(),
+        AppOptions {
+            navigation: loaded.settings,
+            navigation_config_warning: loaded.warning,
+        },
+    )?;
 
     ratatui::run(|terminal| -> io::Result<()> {
         let _terminal_input = TerminalInputGuard::enable()?;

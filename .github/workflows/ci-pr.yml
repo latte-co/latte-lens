@@ -72,6 +72,7 @@ jobs:
         with:
           shared-key: stable-${{ runner.os }}
           save-if: false
+      - run: make test-navigation-real
       - run: make e2e
       - uses: actions/upload-artifact@v7
         if: always()
@@ -131,6 +132,41 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Check all targets with Cargo.lock
         run: cargo check --all-targets --locked
+      - name: Run the real framed LSP journey
+        shell: pwsh
+        run: >-
+          cargo test --locked --features navigation-test-support
+          --test app_tui_integration
+          windows_production_spawner_runs_framed_definition_journey
+          -- --exact --nocapture
+      - name: Run the Job Object descendant cleanup journey
+        shell: pwsh
+        run: >-
+          cargo test --locked --features navigation-test-support
+          --test lsp_process_integration
+          windows_job_cleanup_terminates_pipe_holding_descendant
+          -- --exact --nocapture
+      - name: Run the Ready-session exit-first descendant cleanup journey
+        shell: pwsh
+        run: >-
+          cargo test --locked --features navigation-test-support
+          --test lsp_process_integration
+          windows_ready_session_cleanup_terminates_exit_first_descendant
+          -- --exact --nocapture
+      - name: Reject an incompatible position encoding and clean the process tree
+        shell: pwsh
+        run: >-
+          cargo test --locked --features navigation-test-support
+          --test lsp_process_integration
+          windows_incompatible_position_encoding_forces_terminal_cleanup
+          -- --exact --nocapture
+      - name: Verify repeated crash backoff becomes terminal
+        shell: pwsh
+        run: >-
+          cargo test --locked --features navigation-test-support
+          --test lsp_process_integration
+          repeated_real_crashes_back_off_and_fifth_failure_stops_spawning
+          -- --exact --nocapture
       - name: Run unit and integration tests
         run: cargo test --all-targets --locked
       - name: Build the release binary
@@ -149,6 +185,19 @@ jobs:
             dist/*.zip
             dist/*.sha256
           if-no-files-found: error
+
+  windows-msrv:
+    name: Windows MSRV (1.88.0)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-${{ runner.os }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo check --all-targets --all-features --locked
 
   package:
     name: Package smoke (${{ matrix.os }})
@@ -177,7 +226,7 @@ jobs:
   gate:
     name: CI gate
     if: always()
-    needs: [static, test, msrv, e2e, coverage-unit, coverage-e2e, windows, package]
+    needs: [static, test, msrv, e2e, coverage-unit, coverage-e2e, windows, windows-msrv, package]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -191,6 +240,7 @@ jobs:
           COVERAGE_UNIT_RESULT: ${{ needs['coverage-unit'].result }}
           COVERAGE_E2E_RESULT: ${{ needs['coverage-e2e'].result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
+          WINDOWS_MSRV_RESULT: ${{ needs.windows-msrv.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
           set -euo pipefail
@@ -202,6 +252,7 @@ jobs:
             "$COVERAGE_UNIT_RESULT" \
             "$COVERAGE_E2E_RESULT" \
             "$WINDOWS_RESULT" \
+            "$WINDOWS_MSRV_RESULT" \
             "$PACKAGE_RESULT"; do
             test "$result" = success
           done

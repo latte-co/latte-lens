@@ -226,5 +226,46 @@ class ProcessEvidenceTests(unittest.TestCase):
             sandbox.cleanup()
 
 
+class CoverageScriptTests(unittest.TestCase):
+    def test_instrumented_target_cannot_canonicalize_to_helper_target(self) -> None:
+        sandbox = Sandbox("coverage-target-collision-self-test")
+        try:
+            cargo_marker = sandbox.root / "cargo-invoked"
+            fake_cargo = sandbox.root / "fake-cargo"
+            fake_cargo.write_text(
+                "#!/bin/sh\n"
+                'printf invoked > "$CARGO_MARKER"\n'
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CARGO": str(fake_cargo),
+                    "CARGO_MARKER": str(cargo_marker),
+                    "PYTHON": sys.executable,
+                    "E2E_COVERAGE_TARGET_DIR": "target/../target",
+                }
+            )
+            result = subprocess.run(
+                [str(SCRIPTS / "coverage-e2e.sh")],
+                cwd=SCRIPTS.parent,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(
+                "must not resolve to the non-instrumented helper target",
+                result.stderr,
+            )
+            self.assertFalse(cargo_marker.exists(), "collision must fail before Cargo runs")
+        finally:
+            sandbox.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
