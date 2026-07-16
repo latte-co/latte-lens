@@ -839,7 +839,7 @@ fn executable_identity(_path: &Path, metadata: &Metadata) -> Result<ExecutableId
 }
 
 #[cfg(windows)]
-fn executable_identity(path: &Path, metadata: &Metadata) -> Result<ExecutableIdentity> {
+fn executable_identity(path: &Path, _metadata: &Metadata) -> Result<ExecutableIdentity> {
     use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
@@ -902,11 +902,77 @@ pub(crate) fn lsp_uri_to_safe_path(uri: &lsp_types::Uri, workspace_root: &Path) 
     let path = url
         .to_file_path()
         .map_err(|_| anyhow!("file URI cannot be represented on this platform"))?;
+    let path = normalize_lsp_target_path(workspace_root, &path)?;
     let inspected = inspect_content_path(Some(workspace_root), &path)?;
     if inspected.kind != ContentPathKind::Regular || inspected.path != path {
         bail!("navigation target is not a safe regular workspace file");
     }
     Ok(path)
+}
+
+#[cfg(not(windows))]
+fn normalize_lsp_target_path(_workspace_root: &Path, path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn normalize_lsp_target_path(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
+    use std::{ffi::OsString, path::Prefix};
+
+    #[derive(Eq, PartialEq)]
+    enum Volume {
+        Disk(u8),
+        Unc(OsString, OsString),
+    }
+
+    fn absolute_parts(path: &Path) -> Result<(Volume, Vec<OsString>)> {
+        let mut components = path.components();
+        let volume = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
+                    Volume::Disk(disk.to_ascii_lowercase())
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    Volume::Unc(server.to_ascii_lowercase(), share.to_ascii_lowercase())
+                }
+                _ => bail!("navigation target uses an unsupported Windows path prefix"),
+            },
+            _ => bail!("navigation target is not an absolute Windows path"),
+        };
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            bail!("navigation target is not an absolute Windows path");
+        }
+        let mut names = Vec::new();
+        for component in components {
+            match component {
+                Component::Normal(name) => names.push(name.to_ascii_lowercase()),
+                _ => bail!("navigation target contains a non-normal Windows path component"),
+            }
+        }
+        Ok((volume, names))
+    }
+
+    if path.strip_prefix(workspace_root).is_ok() {
+        return Ok(path.to_path_buf());
+    }
+
+    let (root_volume, root_names) = absolute_parts(workspace_root)?;
+    let (target_volume, target_names) = absolute_parts(path)?;
+    if root_volume != target_volume
+        || target_names.len() < root_names.len()
+        || target_names[..root_names.len()] != root_names
+    {
+        bail!("navigation target is outside the opened workspace");
+    }
+
+    let mut normalized = workspace_root.to_path_buf();
+    for component in path.components().skip(2 + root_names.len()) {
+        let Component::Normal(name) = component else {
+            bail!("navigation target contains a non-normal Windows path component");
+        };
+        normalized.push(name);
+    }
+    Ok(normalized)
 }
 
 fn clean_warning(message: &str) -> String {
@@ -1226,6 +1292,7 @@ mod tests {
         {
             let _variables = EnvironmentGuard::apply(&[
                 ("LATTELENS_LSP_CONFIG", None),
+                ("XDG_CONFIG_HOME", None),
                 ("HOME", Some(home.clone().into_os_string())),
             ]);
             let loaded = NavigationSettings::load_user_config(&workspace);
@@ -1233,8 +1300,11 @@ mod tests {
             assert!(loaded.warning.is_none());
         }
         for home_value in [None, Some(OsString::from("relative-home"))] {
-            let _variables =
-                EnvironmentGuard::apply(&[("LATTELENS_LSP_CONFIG", None), ("HOME", home_value)]);
+            let _variables = EnvironmentGuard::apply(&[
+                ("LATTELENS_LSP_CONFIG", None),
+                ("XDG_CONFIG_HOME", None),
+                ("HOME", home_value),
+            ]);
             let loaded = NavigationSettings::load_user_config(&workspace);
             assert!(!loaded.settings.is_enabled());
             assert!(loaded.warning.is_some());
@@ -1437,9 +1507,10 @@ mod tests {
             identity: validated.identity,
         };
         server.revalidate_before_spawn(&workspace).unwrap();
-        fs::remove_file(&outside).unwrap();
-        fs::write(&outside, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        let replacement = tools.join("replacement");
+        fs::write(&replacement, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&replacement, &outside).unwrap();
         assert!(server.revalidate_before_spawn(&workspace).is_err());
     }
 
@@ -1454,6 +1525,26 @@ mod tests {
         assert_eq!(lsp_uri_to_safe_path(&uri, &root).unwrap(), path);
         let query: lsp_types::Uri = format!("{}?x=1", uri.as_str()).parse().unwrap();
         assert!(lsp_uri_to_safe_path(&query, &root).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lsp_targets_match_verbatim_workspace_prefixes() {
+        let disk_root = Path::new(r"\\?\C:\Work\Repo");
+        let disk_target = Path::new(r"c:\work\repo\src\main.rs");
+        assert_eq!(
+            normalize_lsp_target_path(disk_root, disk_target).unwrap(),
+            disk_root.join(r"src\main.rs")
+        );
+
+        let unc_root = Path::new(r"\\?\UNC\Server\Share\Repo");
+        let unc_target = Path::new(r"\\server\share\repo\src\main.rs");
+        assert_eq!(
+            normalize_lsp_target_path(unc_root, unc_target).unwrap(),
+            unc_root.join(r"src\main.rs")
+        );
+
+        assert!(normalize_lsp_target_path(disk_root, Path::new(r"C:\Work\Other\main.rs")).is_err());
     }
 
     #[test]
