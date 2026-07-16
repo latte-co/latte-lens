@@ -36,14 +36,15 @@ pub(crate) struct SpawnedLanguageServer {
 /// A Windows process was created inside its Job, but a later failure could not
 /// prove that the Job is empty and the direct child is reaped. The manager must
 /// retain this owner instead of letting handle unwinding masquerade as cleanup.
+#[cfg(windows)]
 pub(crate) struct RetainedSpawnFailure {
     original_error: String,
     cleanup_error: String,
     tree: Option<OwnedProcessTree>,
 }
 
+#[cfg(windows)]
 impl RetainedSpawnFailure {
-    #[cfg(windows)]
     pub(crate) fn new(
         original_error: impl Into<String>,
         cleanup_error: impl Into<String>,
@@ -61,6 +62,7 @@ impl RetainedSpawnFailure {
     }
 }
 
+#[cfg(windows)]
 impl std::fmt::Debug for RetainedSpawnFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -72,6 +74,7 @@ impl std::fmt::Debug for RetainedSpawnFailure {
     }
 }
 
+#[cfg(windows)]
 impl std::fmt::Display for RetainedSpawnFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -82,6 +85,7 @@ impl std::fmt::Display for RetainedSpawnFailure {
     }
 }
 
+#[cfg(windows)]
 impl std::error::Error for RetainedSpawnFailure {}
 
 /// Spawn performs the final executable identity/workspace exclusion check in

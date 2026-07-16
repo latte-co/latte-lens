@@ -789,7 +789,7 @@ mod tests {
         let decoded = String::from_utf16(&quoted[..quoted.len() - 1]).unwrap();
         assert_eq!(
             decoded,
-            r#""C:\Program Files\server.exe" "a\"b" "tail\\" """#
+            r#""C:\Program Files\server.exe" "a\\\"b" "tail\\" """#
         );
     }
 

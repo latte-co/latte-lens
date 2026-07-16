@@ -26,10 +26,7 @@ use serde::{
 
 use crate::{
     content_safety::{OpenRegular, open_regular},
-    lsp_process::{
-        IoThreadDone, IoThreadKind, OwnedProcessTree, ProcessIo, RetainedSpawnFailure,
-        spawn_language_server,
-    },
+    lsp_process::{IoThreadDone, IoThreadKind, OwnedProcessTree, ProcessIo, spawn_language_server},
     navigation::{
         DocumentVersion, LanguageFamily, MAX_NAVIGATION_LINES, MAX_NAVIGATION_TEXT_BYTES,
         NavigationDocument, NavigationOperation, NavigationSettings, NavigationSource,
@@ -1348,11 +1345,17 @@ impl NavigationManager {
                 Ok(session) => {
                     self.sessions.insert(key.clone(), session);
                 }
-                Err(mut error) => {
+                Err(error) => {
                     let message = format!("{error:#}");
-                    let retained_tree = error
-                        .downcast_mut::<RetainedSpawnFailure>()
-                        .and_then(RetainedSpawnFailure::take_tree);
+                    #[cfg(windows)]
+                    let retained_tree = {
+                        let mut error = error;
+                        error
+                            .downcast_mut::<crate::lsp_process::RetainedSpawnFailure>()
+                            .and_then(crate::lsp_process::RetainedSpawnFailure::take_tree)
+                    };
+                    #[cfg(not(windows))]
+                    let retained_tree = None;
                     if let Some(tree) = retained_tree {
                         self.permanent_failures.insert(key.clone(), message.clone());
                         self.retain_quarantined_spawn(key.clone(), tree);

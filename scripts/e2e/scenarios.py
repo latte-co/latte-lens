@@ -370,7 +370,11 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"2")
     session.wait_screen(("Git changes", "Diff", "diff --git"), "Git Changes is ready for change cycling")
     session.wait_until(
-        lambda screen: "Refreshing workspace" not in screen.text() and "a-dir" in screen.text(),
+        lambda screen: all(
+            marker not in screen.text()
+            for marker in ("Refreshing workspace", "Loading content", "Loading directory")
+        )
+        and "a-dir" in screen.text(),
         "Git Changes refresh settles before directory interaction",
     )
     _click_tree_row(session, "a-dir")
@@ -1011,8 +1015,26 @@ def code_navigation(context: ScenarioContext) -> None:
         ("References", "a-caller.rs", "b-target.rs"),
         "Shift-F12 opens the multi-result picker",
     )
+    picker_column = session.screen.columns // 2
+    picker_row = session.screen.rows // 2
+    session.click(picker_column, picker_row)
+    session.scroll_down(picker_column, picker_row)
+    session.scroll_up(picker_column, picker_row)
+    session.key(b"\x1b[B")
+    session.key(b"\x1b[6~")
+    session.key(b"\x1b[5~")
+    session.key(b"\x1b[A")
+    _drain_for(
+        session,
+        0.2,
+        "picker bounds empty clicks and processes wheel, Down, PageDown, PageUp, and Up",
+    )
     session.key(b"\r")
-    session.wait_screen(("a-caller.rs", "caller!"), "picker commits the first reference")
+    session.wait_screen(
+        ("a-caller.rs", "caller!"),
+        "picker commits the first reference",
+        absent=("References",),
+    )
     session.key(b"\x1b[1;3D")
     session.wait_screen(("b-target.rs", "pub fn"), "Alt-Left returns through navigation history")
     session.key(b"\x1b[1;3C")
