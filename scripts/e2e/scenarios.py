@@ -377,10 +377,12 @@ def keyboard_controls(context: ScenarioContext) -> None:
         and "a-dir" in screen.text(),
         "Git Changes refresh settles before directory interaction",
     )
-    _click_tree_row(session, "a-dir")
+    session.key(b"\x1b[D")
+    session.key(b"\x1b[H")
+    session.key(b"\x1b[B")
     session.wait_screen(
         ("changed file", "directory"),
-        "Git directory selection renders its aggregate information",
+        "keyboard selects the Git directory and renders its aggregate information",
     )
     session.key(b"\r")
     session.wait_screen(("b-changed.rs",), "Git directory reopens after its information view")
@@ -396,6 +398,10 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.wait_screen(("Diff", "diff --git"), "d restores the owning diff")
     session.click_marker("r  Refresh")
     session.wait_screen(("Git changes", "Diff"), "mouse refresh preserves Git Changes")
+    session.key(b"1")
+    session.wait_screen(("Files", "a-dir"), "1 switches back to the complete file tree")
+    session.key(b"\x1b")
+    session.wait_screen(("Press Esc again to quit",), "Esc requests quit confirmation")
 
 
 def git_navigation(context: ScenarioContext) -> None:
