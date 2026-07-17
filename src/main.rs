@@ -1,7 +1,19 @@
 use std::{io, path::PathBuf};
 
+#[cfg(feature = "agent-observability")]
+use std::{
+    env,
+    ffi::OsStr,
+    io::Read,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
 use anyhow::Result;
 use clap::Parser;
+#[cfg(feature = "agent-observability")]
+use clap::{Args, Subcommand};
+#[cfg(feature = "agent-observability")]
+use latte_lens::agent::*;
 use latte_lens::app::App;
 #[cfg(not(windows))]
 use ratatui::crossterm::event::{
@@ -16,19 +28,129 @@ use ratatui::crossterm::{
 #[derive(Debug, Parser)]
 #[command(name = "latte-lens", version, about)]
 struct Cli {
+    #[cfg(feature = "agent-observability")]
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Repository or directory to inspect.
     #[arg(default_value = ".")]
     path: PathBuf,
 }
 
+#[cfg(feature = "agent-observability")]
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Receive one bounded Code Agent hook event without starting the TUI.
+    Hook(HookArgs),
+}
+
+#[cfg(feature = "agent-observability")]
+#[derive(Debug, Args)]
+struct HookArgs {
+    #[arg(long)]
+    observer: String,
+    #[arg(long)]
+    event: String,
+    #[arg(long)]
+    observer_version: Option<String>,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+}
+
+#[cfg(feature = "agent-observability")]
+const HOOK_LIVE_DEADLINE: Duration = Duration::from_millis(5);
+#[cfg(feature = "agent-observability")]
+const HOOK_METADATA_FALLBACK_BUDGET: Duration = Duration::from_millis(2);
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let mut app = App::new(cli.path)?;
+    #[cfg(feature = "agent-observability")]
+    let hook_requested = env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == OsStr::new("hook"));
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            #[cfg(feature = "agent-observability")]
+            if hook_requested {
+                return Ok(());
+            }
+            error.exit()
+        }
+    };
+
+    #[cfg(feature = "agent-observability")]
+    if let Some(Command::Hook(hook)) = cli.command {
+        let _ = run_hook(hook);
+        return Ok(());
+    }
+
+    run_tui(cli.path)
+}
+
+fn run_tui(path: PathBuf) -> Result<()> {
+    let mut app = App::new(path.clone())?;
+    #[cfg(feature = "agent-observability")]
+    if let Ok(agent) = start_production_agent_runtime(&path) {
+        let _ = app.attach_agent_runtime(agent.runtime, agent.selector);
+    }
 
     ratatui::run(|terminal| -> io::Result<()> {
         let _terminal_input = TerminalInputGuard::enable()?;
         app.run(terminal)
     })?;
+    Ok(())
+}
+
+#[cfg(feature = "agent-observability")]
+fn run_hook(hook: HookArgs) -> Result<(), ()> {
+    let observer = ObserverId::parse(hook.observer).map_err(|_| ())?;
+    let adapters = production_adapter_registry();
+    if adapters.resolve(&observer).is_none() {
+        return Ok(());
+    }
+
+    let mut payload = Vec::with_capacity(1024);
+    Read::by_ref(&mut io::stdin())
+        .take(MAX_ADAPTER_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut payload)
+        .map_err(|_| ())?;
+    if payload.len() > MAX_ADAPTER_INPUT_BYTES {
+        return Ok(());
+    }
+
+    let state_root = resolve_state_root_from_environment().map_err(|_| ())?;
+    let identity = load_or_create_install_identity(state_root.clone()).map_err(|_| ())?;
+    let workspace = resolve_workspace(&hook.workspace, &identity).map_err(|_| ())?;
+    let install = identity.install_id().clone();
+    let metadata = FilesystemMetadataStore::new(state_root, install.clone()).map_err(|_| ())?;
+    let registry = FilesystemLiveReceiverRegistry::new(
+        resolve_runtime_root_from_environment().map_err(|_| ())?,
+        install,
+    )
+    .map_err(|_| ())?;
+    let publisher = RegistryLivePublisher::new(registry, workspace.primary().clone());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let live_deadline = Instant::now() + HOOK_LIVE_DEADLINE;
+    let _ = emit_hook_invocation(
+        HookInvocation {
+            observer: &observer,
+            event_name: &hook.event,
+            observer_version: hook.observer_version.as_deref(),
+            observed_at: Timestamp::from_unix_millis(now),
+            workspace: workspace.primary().clone(),
+            payload: &payload,
+        },
+        &adapters,
+        &identity,
+        &publisher,
+        &metadata,
+        live_deadline,
+        HOOK_METADATA_FALLBACK_BUDGET,
+    );
     Ok(())
 }
 

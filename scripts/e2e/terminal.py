@@ -6,6 +6,7 @@ import fcntl
 import os
 import pty
 import select
+import signal
 import struct
 import subprocess
 import termios
@@ -285,6 +286,17 @@ class PtySession:
                 return
             self.output.extend(chunk)
             self.screen.feed(chunk)
+
+    def resize(self, columns: int, rows: int) -> None:
+        if columns <= 0 or rows <= 0:
+            raise ValueError("terminal dimensions must be positive")
+        fcntl.ioctl(
+            self.master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, columns, 0, 0),
+        )
+        self.screen = TerminalScreen(columns, rows)
+        os.killpg(self.process.pid, signal.SIGWINCH)
 
     def wait_raw(
         self,

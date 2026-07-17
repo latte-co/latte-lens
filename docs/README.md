@@ -12,6 +12,12 @@ Latte Lens 当前只维护中文版文档。文档按职责分层，不为尚未
 - [项目测试卡点](testing/test-gates.md)：Files、Git Changes、Search/Preview、终端交互与未来 Agent 功能的项目级 UT、集成测试和 E2E 门禁。
 - [Code Agent 可观测性测试卡点](testing/code-agent-observability-test-gates.md)：Code Agent synthetic contract、headless E2E 与 PTY E2E 专项补充。
 
+## 集成
+
+- [Claude Code Hooks 集成](integrations/claude-code-hooks.md)：Claude Code command Hooks 的手工配置、exact-workspace 语义、验证方法与当前能力边界。
+- [OpenCode 插件集成](integrations/opencode-plugins.md)：OpenCode 本地插件的安装、native event 映射、exact-workspace 语义与数据边界。
+- [TraeX Hooks 集成](integrations/traex-hooks.md)：TraeX command Hooks 的项目配置、事件映射、数据边界与真实 CLI canary。
+
 ## 工程
 
 - [内容搜索性能检查](engineering/search-performance.md)：搜索索引生命周期、Refresh 语义与本地性能检查方法。

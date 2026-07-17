@@ -8,7 +8,7 @@ cargo_command=${CARGO:-cargo}
 python_command=${PYTHON:-python3}
 binary=${BINARY:-latte-lens}
 minimum=${E2E_COVERAGE_MIN:-85}
-ignore_regex=${E2E_COVERAGE_IGNORE_REGEX:-'(/agent/|/(clipboard|content_safety|diff|git|preview|repo_graph|runtime|search|text_layout|tree)\.rs$)'}
+ignore_regex=${E2E_COVERAGE_IGNORE_REGEX:-'(/agent/|/bin/agent_observability_harness\.rs$|/(clipboard|content_safety|diff|git|preview|repo_graph|runtime|search|text_layout|tree)\.rs$)'}
 target_dir=${E2E_COVERAGE_TARGET_DIR:-target/llvm-cov-e2e}
 
 case "$target_dir" in
@@ -31,6 +31,15 @@ source "$env_file"
   "$CARGO_TARGET_DIR/debug/$binary" \
   --scenario all \
   --artifact-dir "$CARGO_TARGET_DIR/e2e-artifacts"
+# Exercise every final-binary CLI branch as part of the process-level profile.
+# The live Hook case accepts an idempotent metadata fallback when coverage
+# instrumentation consumes the fixed 5 ms ACK budget.
+"$cargo_command" test --all-features --locked --test cli_e2e
+"$cargo_command" build --locked --features agent-observability-harness \
+  --bin latte-lens-agent-harness
+"$python_command" scripts/agent_e2e_tui.py \
+  "$CARGO_TARGET_DIR/debug/latte-lens-agent-harness" \
+  --artifact-dir "$CARGO_TARGET_DIR/e2e-artifacts/agent"
 "$cargo_command" llvm-cov report \
   --ignore-filename-regex "$ignore_regex" \
   --fail-under-lines "$minimum"

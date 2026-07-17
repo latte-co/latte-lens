@@ -1,0 +1,114 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event SessionStart --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event UserPromptSubmit --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event PreToolUse --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event PermissionRequest --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event PostToolUse --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event PostToolUseFailure --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event SubagentStart --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event SubagentStop --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event Stop --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "latte-lens hook --observer bytedance/traex-hook --event SessionEnd --workspace .",
+            "timeout": "1s"
+          }
+        ]
+      }
+    ]
+  }
+}

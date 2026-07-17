@@ -2,7 +2,7 @@ use std::{error::Error, fmt, time::Instant};
 
 use super::{
     BoundedBytes, BoundedText, BoundedVec, InstanceContract, ObserverId, ObserverInstanceId,
-    StreamSequence, Timestamp, WorkspaceSelector,
+    SnapshotScope, StreamSequence, Timestamp, WorkspaceSelector,
 };
 
 pub const MAX_PROVIDER_INSTANCES: usize = 32;
@@ -70,6 +70,8 @@ pub struct RawSnapshot {
     cursor: Option<ProviderCursor>,
     watermark: Option<StreamSequence>,
     complete: bool,
+    captured_at: Timestamp,
+    scope: Option<SnapshotScope>,
     items: BoundedVec<RawProviderItem, MAX_RAW_SNAPSHOT_ITEMS>,
 }
 
@@ -90,8 +92,24 @@ impl RawSnapshot {
             cursor,
             watermark,
             complete,
+            captured_at: items
+                .iter()
+                .map(|item| item.observed_at)
+                .max()
+                .unwrap_or_else(|| Timestamp::from_unix_millis(0)),
+            scope: None,
             items,
         })
+    }
+
+    pub fn with_scope(mut self, scope: SnapshotScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    pub fn with_captured_at(mut self, captured_at: Timestamp) -> Self {
+        self.captured_at = captured_at;
+        self
     }
 
     pub const fn cursor(&self) -> Option<&ProviderCursor> {
@@ -104,6 +122,14 @@ impl RawSnapshot {
 
     pub const fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    pub const fn captured_at(&self) -> Timestamp {
+        self.captured_at
+    }
+
+    pub const fn scope(&self) -> Option<&SnapshotScope> {
+        self.scope.as_ref()
     }
 
     pub fn items(&self) -> &[RawProviderItem] {
@@ -160,6 +186,7 @@ pub trait ObservationProvider: Send {
         &mut self,
         selector: &WorkspaceSelector,
         limits: ProviderDiscoveryLimits,
+        deadline: Instant,
     ) -> Result<BoundedVec<ProviderInstance, MAX_PROVIDER_INSTANCES>, ProviderError>;
 
     fn probe(
@@ -181,4 +208,9 @@ pub trait ObservationProvider: Send {
         instance: &ProviderInstance,
         deadline: Instant,
     ) -> ProviderEventOutcome;
+
+    /// Cancel subscriptions and release local read-only provider resources.
+    /// Implementations must return within the same bounded operation contract
+    /// as the other methods and must not mutate the observed Agent runtime.
+    fn begin_draining(&mut self);
 }

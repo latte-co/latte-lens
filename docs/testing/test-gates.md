@@ -255,12 +255,13 @@ Q3 开始前和退出后计算：
 CI 映射：
 
 - Linux quality：Q0–Q2；
-- Linux/macOS PTY：Q3 Files + Git Changes + Search；
+- Linux/macOS PTY：Q3 Files + Git Changes + Search，以及 required 的 Agent journey；
 - Windows：Q0–Q2、package；ConPTY 未持续验证前不声称 Q3；
 - Agent jobs：按专项文档增加 Q4，不替代主 PTY job；
 - coverage-unit：只统计由 Q1 直接单测负责的 `clipboard.rs`、`diff.rs`、`preview.rs`、`search.rs`、`text_layout.rs` 支持模块，保持 93% line floor；
 - coverage-e2e：用 production binary + PTY 执行全部 required scenarios，只统计 `app.rs`、`main.rs`、`ui.rs` 交互层，保持 85% line floor；
-- 其余边界模块由 Q2 integration/contract tests 独立阻断，不与上述两个分母合并；`make coverage` 顺序执行两个 coverage gate；
+- coverage-agent：统计完整 synthetic Agent Core 的 G1–G3 Rust 执行路径，保持 80% line floor；不得通过排除新增 Agent 模块维持数字；
+- 其余边界模块由 Q2 integration/contract tests 独立阻断，不与上述三个分母合并；`make coverage` 顺序执行三个 coverage gate；
 - package：Q5，并验证只有 production binary/资产。
 
 ## 11. 改动与卡点映射

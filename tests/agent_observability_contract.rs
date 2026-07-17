@@ -2,7 +2,11 @@
 
 mod support;
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use latte_lens::agent::*;
 use support::agent::*;
@@ -123,8 +127,29 @@ fn adapter(fixture: &Fixture) -> Arc<dyn CodeAgentAdapter> {
 }
 
 #[test]
-fn production_registry_is_empty_and_registry_has_no_fallback() {
-    assert!(production_adapter_registry().is_empty());
+fn production_registry_contains_only_approved_hook_adapters_and_has_no_fallback() {
+    let production = production_adapter_registry();
+    assert_eq!(production.len(), 4);
+    assert!(
+        production
+            .resolve(&ObserverId::parse(CODEX_HOOK_OBSERVER_ID).expect("Codex observer"))
+            .is_some()
+    );
+    assert!(
+        production
+            .resolve(&ObserverId::parse(CLAUDE_HOOK_OBSERVER_ID).expect("Claude observer"))
+            .is_some()
+    );
+    assert!(
+        production
+            .resolve(&ObserverId::parse(OPENCODE_PLUGIN_OBSERVER_ID).expect("OpenCode observer"),)
+            .is_some()
+    );
+    assert!(
+        production
+            .resolve(&ObserverId::parse(TRAEX_HOOK_OBSERVER_ID).expect("TraeX observer"))
+            .is_some()
+    );
 
     let fixture = fixture(EvidenceAuthority::Authoritative);
     let registry = AdapterRegistry::new();
@@ -178,6 +203,129 @@ fn adapter_template_prevents_probe_from_expanding_authority() {
         ),
         Err(ObservationError::UnsupportedCapability)
     );
+}
+
+#[test]
+fn adapter_template_narrowing_is_fail_closed_across_every_contract_axis() {
+    let fixture = fixture(EvidenceAuthority::Authoritative);
+
+    let mut expanded = fixture.contract.clone();
+    expanded
+        .subjects
+        .try_insert(SubjectNamespace::parse("test/other-agent").expect("subject"))
+        .expect("subject capacity");
+    assert!(!fixture.template.permits(&expanded));
+
+    let mut expanded = fixture.contract.clone();
+    expanded
+        .acquisition
+        .try_insert(AcquisitionMode::ProcessPresence)
+        .expect("acquisition capacity");
+    assert!(!fixture.template.permits(&expanded));
+
+    let mut expanded = fixture.contract.clone();
+    expanded.snapshot_semantics = SnapshotSemantics {
+        supported: true,
+        atomic_boundary: true,
+        chunked: false,
+        provides_watermark: false,
+    };
+    assert!(!fixture.template.permits(&expanded));
+
+    let mut restricted_template = fixture.template.clone();
+    restricted_template.stream_semantics.reports_gap = false;
+    assert!(!restricted_template.permits(&fixture.contract));
+
+    let mut expanded = fixture.contract.clone();
+    expanded.requires_instrumentation = false;
+    assert!(!fixture.template.permits(&expanded));
+
+    let mut restricted_template = fixture.template.clone();
+    restricted_template.stability = InterfaceStability::PrivateExperimental;
+    assert!(!restricted_template.permits(&fixture.contract));
+}
+
+#[test]
+fn contract_rejects_identity_control_and_destructive_claim_violations() {
+    let fixture = fixture(EvidenceAuthority::Authoritative);
+
+    let mut wrong_observer = event(&fixture);
+    wrong_observer.stream.observer = ObserverId::parse("test/other").expect("observer");
+    assert_eq!(
+        fixture
+            .contract
+            .validate_envelope(&ObservationEnvelope::Event(wrong_observer)),
+        Err(ObservationError::ObserverMismatch)
+    );
+
+    let mut wrong_instance = event(&fixture);
+    wrong_instance.stream.instance = ObserverInstanceId::from_digest(digest(90));
+    assert_eq!(
+        fixture
+            .contract
+            .validate_envelope(&ObservationEnvelope::Event(wrong_instance)),
+        Err(ObservationError::InstanceMismatch)
+    );
+
+    let mut wrong_provenance = event(&fixture);
+    let StreamOp::Upsert(observations) = &wrong_provenance.op else {
+        unreachable!("fixture event is an upsert");
+    };
+    let mut observations = observations.clone().into_vec();
+    observations[0].evidence.provenance = EvidenceProvenance::NativeControlPlane;
+    wrong_provenance.op =
+        StreamOp::Upsert(BoundedVec::try_from_vec(observations).expect("observations"));
+    assert_eq!(
+        fixture
+            .contract
+            .validate_envelope(&ObservationEnvelope::Event(wrong_provenance)),
+        Err(ObservationError::ProvenanceMismatch)
+    );
+
+    let mut destructive = event(&fixture);
+    let StreamOp::Upsert(observations) = &destructive.op else {
+        unreachable!("fixture event is an upsert");
+    };
+    let mut observations = observations.clone().into_vec();
+    observations[0].kind = ObservationKind::Activity(ActivityOp::Clear);
+    observations[0].evidence.authority = EvidenceAuthority::Observational;
+    destructive.op =
+        StreamOp::Upsert(BoundedVec::try_from_vec(observations).expect("observations"));
+    assert_eq!(
+        fixture
+            .contract
+            .validate_envelope(&ObservationEnvelope::Event(destructive)),
+        Err(ObservationError::DestructiveOperationDenied)
+    );
+
+    for (op, disable) in [
+        (StreamOp::Reset, "reset"),
+        (
+            StreamOp::Gap {
+                expected: Some(StreamSequence::new(2)),
+                received: Some(StreamSequence::new(4)),
+            },
+            "gap",
+        ),
+    ] {
+        let mut contract = fixture.contract.clone();
+        if disable == "reset" {
+            contract.stream_semantics.reports_reset = false;
+        } else {
+            contract.stream_semantics.reports_gap = false;
+        }
+        let envelope = ObservationEnvelope::Event(EventEnvelope {
+            stream: event(&fixture).stream,
+            event_id: EventId::from_digest(digest(91)),
+            sequence: None,
+            op,
+        });
+        assert_eq!(
+            contract.validate_envelope(&envelope),
+            Err(ObservationError::UnsupportedCapability),
+            "{disable} must be declared before it can be emitted"
+        );
+    }
 }
 
 #[test]
@@ -254,6 +402,49 @@ fn instance_registry_rejects_wrong_epoch_and_stale_revision() {
 }
 
 #[test]
+fn instance_registry_distinguishes_idempotence_epoch_rotation_and_revision_update() {
+    let fixture = fixture(EvidenceAuthority::Authoritative);
+    let mut instances = InstanceRegistry::new();
+    assert_eq!(
+        instances
+            .upsert(fixture.contract.clone(), fixture.epoch.clone())
+            .expect("insert"),
+        ContractUpdate::Inserted
+    );
+    assert_eq!(
+        instances
+            .upsert(fixture.contract.clone(), fixture.epoch.clone())
+            .expect("idempotent update"),
+        ContractUpdate::Unchanged
+    );
+
+    let next_epoch = StreamEpoch::from_digest(digest(92));
+    assert_eq!(
+        instances
+            .upsert(fixture.contract.clone(), next_epoch.clone())
+            .expect("epoch rotation"),
+        ContractUpdate::Updated
+    );
+    assert!(matches!(
+        instances.contract_for(&StreamRef {
+            observer: fixture.observer.clone(),
+            instance: fixture.instance.clone(),
+            epoch: fixture.epoch,
+        }),
+        Err(ObservationError::WrongEpoch)
+    ));
+
+    let mut next_contract = fixture.contract;
+    next_contract.revision = ContractRevision::new(2);
+    assert_eq!(
+        instances
+            .upsert(next_contract, next_epoch)
+            .expect("revision update"),
+        ContractUpdate::Updated
+    );
+}
+
+#[test]
 fn identity_merge_requires_same_subject_and_authority() {
     let keyer = FakeIdentityKeyer::new();
     let subject = SubjectNamespace::parse("test/agent").expect("subject");
@@ -324,6 +515,147 @@ fn dispatcher_prefers_live_delivery_and_falls_back_to_metadata() {
     );
     assert_eq!(fallback_store.writes().len(), 1);
     assert_eq!(fallback_store.writes()[0].session, fixture.session);
+
+    let partial_store = InMemoryMetadataStore::default();
+    let partial = FakePublisher::new(PublishOutcome::Partial {
+        accepted: 1,
+        attempted: 2,
+    });
+    assert_eq!(
+        ObservationDispatcher::new(&registry, &partial, &partial_store).dispatch(
+            event(&fixture),
+            &fixture.contract,
+            Instant::now(),
+        ),
+        DispatchOutcome::Metadata(MetadataWriteOutcome::Updated)
+    );
+    assert_eq!(partial_store.writes().len(), 1);
+}
+
+#[test]
+fn dispatcher_fallback_policy_is_stable_for_every_non_accepted_live_outcome() {
+    let fixture = fixture(EvidenceAuthority::Authoritative);
+    let mut registry = AdapterRegistry::new();
+    registry.register(adapter(&fixture)).expect("adapter");
+
+    for outcome in [
+        PublishOutcome::Partial {
+            accepted: 1,
+            attempted: 2,
+        },
+        PublishOutcome::Unavailable,
+        PublishOutcome::NotMember,
+        PublishOutcome::Busy,
+        PublishOutcome::Incompatible,
+        PublishOutcome::Rejected,
+    ] {
+        let metadata = InMemoryMetadataStore::default();
+        let publisher = FakePublisher::new(outcome);
+        assert_eq!(
+            ObservationDispatcher::new(&registry, &publisher, &metadata).dispatch(
+                event(&fixture),
+                &fixture.contract,
+                Instant::now() + Duration::from_millis(10),
+            ),
+            DispatchOutcome::Metadata(MetadataWriteOutcome::Updated),
+            "{outcome:?} must preserve the metadata fallback"
+        );
+        assert_eq!(metadata.writes().len(), 1);
+    }
+}
+
+#[test]
+fn dispatcher_rejects_invalid_or_multi_session_fallback_and_ignores_control_events() {
+    let fixture = fixture(EvidenceAuthority::Authoritative);
+    let mut registry = AdapterRegistry::new();
+    registry.register(adapter(&fixture)).expect("adapter");
+    let unavailable = FakePublisher::new(PublishOutcome::Unavailable);
+    let metadata = InMemoryMetadataStore::default();
+    let dispatcher = ObservationDispatcher::new(&registry, &unavailable, &metadata);
+
+    let mut invalid = event(&fixture);
+    let StreamOp::Upsert(observations) = &invalid.op else {
+        unreachable!("fixture event is an upsert");
+    };
+    let mut observations = observations.clone().into_vec();
+    observations[0].evidence.provenance = EvidenceProvenance::NativeControlPlane;
+    invalid.op = StreamOp::Upsert(BoundedVec::try_from_vec(observations).expect("observations"));
+    assert_eq!(
+        dispatcher.dispatch(invalid, &fixture.contract, Instant::now()),
+        DispatchOutcome::RejectedInvalid
+    );
+
+    let reset = EventEnvelope {
+        stream: event(&fixture).stream,
+        event_id: EventId::from_digest(digest(93)),
+        sequence: None,
+        op: StreamOp::Reset,
+    };
+    assert_eq!(
+        dispatcher.dispatch(reset, &fixture.contract, Instant::now()),
+        DispatchOutcome::IgnoredNoSession
+    );
+
+    let mut second = fixture.observation.clone();
+    second.session = Some(SessionRef::new(
+        SessionKey::new(
+            fixture.session.key().subject().clone(),
+            fixture.session.key().install_id().clone(),
+            fixture.session.key().authority_id().clone(),
+            digest(94),
+        ),
+        fixture.session.workspace().clone(),
+    ));
+    let multi_session = EventEnvelope {
+        stream: event(&fixture).stream,
+        event_id: EventId::from_digest(digest(95)),
+        sequence: Some(StreamSequence::new(2)),
+        op: StreamOp::Upsert(
+            BoundedVec::try_from_vec(vec![fixture.observation.clone(), second])
+                .expect("observations"),
+        ),
+    };
+    assert_eq!(
+        dispatcher.dispatch(multi_session, &fixture.contract, Instant::now()),
+        DispatchOutcome::RejectedInvalid
+    );
+    assert!(metadata.writes().is_empty());
+}
+
+#[test]
+fn dispatcher_starts_metadata_budget_after_live_deadline_is_exhausted() {
+    struct DeadlinePublisher;
+
+    impl LiveObservationPublisher for DeadlinePublisher {
+        fn publish(&self, _event: &EventEnvelope, deadline: Instant) -> PublishOutcome {
+            while Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            PublishOutcome::Unavailable
+        }
+    }
+
+    let fixture = fixture(EvidenceAuthority::Authoritative);
+    let mut registry = AdapterRegistry::new();
+    registry.register(adapter(&fixture)).expect("adapter");
+    let metadata = InMemoryMetadataStore::default();
+    let result = ObservationDispatcher::new(&registry, &DeadlinePublisher, &metadata)
+        .dispatch_with_budget(
+            event(&fixture),
+            &fixture.contract,
+            Instant::now() + Duration::from_millis(2),
+            Duration::from_millis(20),
+        );
+    let returned_at = Instant::now();
+    assert_eq!(
+        result,
+        DispatchOutcome::Metadata(MetadataWriteOutcome::Updated)
+    );
+    let metadata_deadline = metadata.merge_deadlines()[0];
+    assert!(
+        metadata_deadline.saturating_duration_since(returned_at) >= Duration::from_millis(15),
+        "fallback should retain its own lock budget"
+    );
 }
 
 #[test]
@@ -359,6 +691,7 @@ fn fake_provider_exposes_only_bounded_read_results() {
         .discover(
             &WorkspaceSelector::default(),
             ProviderDiscoveryLimits { max_instances: 1 },
+            Instant::now() + Duration::from_secs(1),
         )
         .expect("discover");
     assert_eq!(discovered.len(), 1);

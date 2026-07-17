@@ -8,12 +8,18 @@ license = "Apache-2.0"
 repository = "https://github.com/latte-co/latte-lens"
 
 [features]
-default = []
+default = ["agent-observability"]
 agent-observability = []
+agent-observability-harness = ["agent-observability"]
 
 [[bin]]
 name = "latte-lens"
 path = "src/main.rs"
+
+[[bin]]
+name = "latte-lens-agent-harness"
+path = "src/bin/agent_observability_harness.rs"
+required-features = ["agent-observability-harness"]
 
 [dependencies]
 anyhow = "1.0"

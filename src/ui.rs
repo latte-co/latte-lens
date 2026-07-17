@@ -10,6 +10,9 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[cfg(feature = "agent-observability")]
+use crate::agent::{ActivityState, AgentViewSession, ObservationMode};
+
 use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, GitRowKind, GitTreeRow,
@@ -35,6 +38,8 @@ const DEFAULT_MAX_TREE_WIDTH: u16 = 44;
 
 const ALL_FILES_TAB_LABEL: &str = "  1 Files ";
 const GIT_CHANGES_TAB_LABEL: &str = "  2 Git changes ";
+#[cfg(feature = "agent-observability")]
+const AGENTS_TAB_LABEL: &str = "  3 Agents ";
 const REFRESH_LABEL: &str = " r  Refresh ";
 const FILE_SEARCH_LABEL: &str = "/ Open ";
 const TEXT_SEARCH_LABEL: &str = " ^T Text ";
@@ -140,6 +145,13 @@ fn regions(areas: DrawAreas) -> UiRegions {
         .min(scope_end);
     let git_changes_width =
         (GIT_CHANGES_TAB_LABEL.len() as u16).min(scope_end.saturating_sub(git_changes_x));
+    #[cfg(feature = "agent-observability")]
+    let agents_x = git_changes_x
+        .saturating_add(GIT_CHANGES_TAB_LABEL.len() as u16)
+        .saturating_add(1)
+        .min(scope_end);
+    #[cfg(feature = "agent-observability")]
+    let agents_width = (AGENTS_TAB_LABEL.len() as u16).min(scope_end.saturating_sub(agents_x));
     let refresh_width = (REFRESH_LABEL.len() as u16).min(header.width);
     let refresh_x = header
         .x
@@ -167,6 +179,8 @@ fn regions(areas: DrawAreas) -> UiRegions {
             git_changes_width,
             scope_tabs.height,
         ),
+        #[cfg(feature = "agent-observability")]
+        agents_tab: Rect::new(agents_x, scope_tabs.y, agents_width, scope_tabs.height),
         refresh_button: Rect::new(refresh_x, header.y, refresh_width, header.height.min(1)),
         file_search_button,
         text_search_button,
@@ -344,9 +358,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_scope_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    #[cfg(not(feature = "agent-observability"))]
     let labels = [
         (TreeScope::AllFiles, ALL_FILES_TAB_LABEL),
         (TreeScope::GitChanges, GIT_CHANGES_TAB_LABEL),
+    ];
+    #[cfg(feature = "agent-observability")]
+    let labels = [
+        (TreeScope::AllFiles, ALL_FILES_TAB_LABEL),
+        (TreeScope::GitChanges, GIT_CHANGES_TAB_LABEL),
+        (TreeScope::Agents, AGENTS_TAB_LABEL),
     ];
     let mut spans = Vec::with_capacity(labels.len() * 2 - 1);
     for (index, (scope, label)) in labels.into_iter().enumerate() {
@@ -696,7 +717,7 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     let selected = app.tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
-    let items: Vec<ListItem> = if app.is_initial_loading() {
+    let items: Vec<ListItem> = if app.is_initial_loading() && !is_agents_scope(app) {
         vec![ListItem::new(Line::from(Span::styled(
             "  Scanning files…",
             Style::default().fg(MINT),
@@ -731,10 +752,40 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                     ))
                 })
                 .collect(),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => app
+                .agent_view()
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    ListItem::new(agent_session_line(
+                        session,
+                        selected == Some(index),
+                        focused,
+                        rows.width,
+                    ))
+                })
+                .collect(),
         }
     };
     let entry_count = app.scope_entry_count();
-    let detail = if app.is_initial_loading() {
+    let detail = if is_agents_scope(app) {
+        #[cfg(feature = "agent-observability")]
+        {
+            let view = app.agent_view();
+            format!(
+                "{}/{} live{}",
+                view.live_count,
+                view.known_count,
+                if view.truncated { " · PARTIAL" } else { "" }
+            )
+        }
+        #[cfg(not(feature = "agent-observability"))]
+        {
+            String::new()
+        }
+    } else if app.is_initial_loading() {
         "loading…".to_owned()
     } else if app.scope_is_truncated() {
         let noun = if app.tree_scope == TreeScope::GitChanges {
@@ -775,10 +826,15 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     };
     let (file_button, text_button) = inactive_search_buttons(header);
     let heading_width = file_button.x.saturating_sub(header.x);
+    let heading = if is_agents_scope(app) {
+        "Agents"
+    } else {
+        "Files"
+    };
     draw_panel_heading(
         frame,
         Rect::new(header.x, header.y, heading_width, header.height),
-        "Files",
+        heading,
         &detail,
         focused,
     );
@@ -806,6 +862,60 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         text_button,
     );
     frame.render_stateful_widget(List::new(items), rows, &mut app.tree_state);
+}
+
+#[cfg(feature = "agent-observability")]
+fn is_agents_scope(app: &App) -> bool {
+    app.tree_scope == TreeScope::Agents
+}
+
+#[cfg(not(feature = "agent-observability"))]
+const fn is_agents_scope(_app: &App) -> bool {
+    false
+}
+
+#[cfg(feature = "agent-observability")]
+fn agent_session_line(
+    session: &AgentViewSession,
+    selected: bool,
+    focused: bool,
+    width: u16,
+) -> Line<'static> {
+    let state = match session.activity {
+        ActivityState::Working => "Working",
+        ActivityState::WaitingPermission => "Permission",
+        ActivityState::Idle => "Idle",
+        ActivityState::Unknown => "Unknown",
+    };
+    let mode = match session.mode {
+        ObservationMode::MetadataOnly => "metadata",
+        ObservationMode::LiveObserved => "live",
+    };
+    let marker = if session.reconciling {
+        "~"
+    } else if session.dropped_live_events > 0 {
+        "!"
+    } else {
+        "•"
+    };
+    let label = format!(
+        "{marker} {} {} {mode} {state}",
+        session.subject.as_str(),
+        session.short_key()
+    );
+    let label = truncate_to_width(&label, usize::from(width));
+    let style = if selected && focused {
+        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Reset)
+            .add_modifier(Modifier::BOLD)
+    } else if session.activity == ActivityState::Working {
+        Style::default().fg(MINT)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    Line::from(Span::styled(label, style))
 }
 
 fn format_change_count(count: usize) -> String {
@@ -1324,14 +1434,25 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         FocusPane::Tree => "Tree",
         FocusPane::Content => "Content",
     };
-    let help = if area.width < 96 {
-        "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  1/2 scope  r refresh  q×2 quit"
-    } else if app.content_mode == ContentMode::Preview {
-        "  ↑↓ scroll  ←→ focus  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  1/2 scope  p preview  d diff  r refresh  q×2 quit"
-    } else if app.content_mode == ContentMode::Diff {
-        "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  p preview  d diff  r refresh  q×2 quit"
+    let scope_keys = if cfg!(feature = "agent-observability") {
+        "1/2/3 scope"
     } else {
-        "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  1/2 scope  p preview  d diff  r refresh  q×2 quit"
+        "1/2 scope"
+    };
+    let help = if area.width < 96 {
+        format!("  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  q×2 quit")
+    } else if app.content_mode == ContentMode::Preview {
+        format!(
+            "  ↑↓ scroll  ←→ focus  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+        )
+    } else if app.content_mode == ContentMode::Diff {
+        format!(
+            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+        )
+    } else {
+        format!(
+            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+        )
     };
     let content = if let Some(message) = app.quit_confirmation_message() {
         Line::from(vec![

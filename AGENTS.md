@@ -33,6 +33,7 @@ text query. Preserve these bounded, non-blocking semantics for every workspace.
 | `src/repo_graph.rs` | Nested-repository discovery, ownership, and repository relationships. |
 | `src/content_safety.rs` | Non-following path inspection and safe regular-file opening. |
 | `src/preview.rs` | Bounded preview-provider contract, registry, text preview, and syntax highlighting. |
+| `src/agent/` | Vendor-neutral Code Agent core plus approved Codex, Claude Code, OpenCode, and TraeX adapters. |
 | `src/ui.rs` | Pure Ratatui layout/rendering and mouse hit-region calculation. |
 | `src/clipboard.rs` | Native clipboard adapters and OSC 52 fallback. |
 | `tests/` | CLI, Git, tree, repository-graph, and full TUI integration tests. |
@@ -54,9 +55,10 @@ Run commands from the repository root.
 | `cargo run -- /path/to/workspace` | Start Latte Lens against a directory; omit the path to use `.`. |
 | `make build` | Build the debug binary with the lockfile. |
 | `make ci` | Run the complete local handoff gate: formatting, check, lint, Rust tests, script tests, and PTY E2E. |
-| `make coverage` | Enforce both independent coverage floors. |
+| `make coverage` | Enforce the UT, production PTY E2E, and Agent Core coverage floors. |
 | `make coverage-unit` | Enforce 93% line coverage on the Q1 direct unit-test responsibility surface. |
 | `make coverage-e2e` | Enforce 85% line coverage on the production PTY interaction surface. |
+| `make coverage-agent` | Enforce 80% line coverage across the complete synthetic Agent Core. |
 | `make bench` | Run Criterion benchmarks. |
 | `make release` | Build the optimized binary. |
 | `make package-smoke` | Build and verify the current platform's release archive and checksum. |
@@ -109,9 +111,9 @@ Test behavior at the boundary being changed:
   remain blocking production-binary E2E coverage; feature-specific test suites
   supplement this project-wide gate instead of replacing it.
 - Code Agent observability changes additionally follow
-  `docs/testing/code-agent-observability-test-gates.md`: keep C0-C2 tests synthetic,
-  keep the production adapter registry empty, and test reducer/contract behavior
-  below PTY level before adding a terminal journey.
+  `docs/testing/code-agent-observability-test-gates.md`: keep C0-C2 core tests
+  synthetic, keep fake/default decoders out of the production registry, and test
+  reducer/contract behavior below PTY level before adding a terminal journey.
 
 Do not weaken or delete timing/safety tests to make a change pass. Timing tests
 must assert the intended invariant with enough headroom for CI variance.
