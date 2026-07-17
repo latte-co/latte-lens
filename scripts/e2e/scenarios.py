@@ -1226,7 +1226,11 @@ def structure_navigation(context: ScenarioContext) -> None:
             f"{filename} local document symbols are visible",
         )
         session.key(b"\x1b")
-        session.wait_screen(("Preview", body_marker), f"{filename} symbol picker closes")
+        session.wait_screen(
+            ("Preview", body_marker),
+            f"{filename} symbol picker closes",
+            absent=("Document Symbols",),
+        )
         session.key(b"{")
         session.wait_screen(
             ("Preview", "▸"),
