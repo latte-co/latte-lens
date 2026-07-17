@@ -351,9 +351,6 @@ const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1_500);
 const NAVIGATION_HISTORY_LIMIT: usize = 128;
 const NAVIGATION_STATUS_INFO: Duration = Duration::from_secs(4);
 const NAVIGATION_STATUS_ERROR: Duration = Duration::from_secs(8);
-const NAVIGATION_SHORTCUT_CHORD_WINDOW: Duration = Duration::from_secs(4);
-const NAVIGATION_SHORTCUT_CHORD_PROMPT: &str =
-    "Navigation: D definition · R references · I implementations · Esc cancel";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NavigationStatusLevel {
@@ -406,12 +403,38 @@ pub(crate) struct NavigationPickerItem {
     pub(crate) detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NavigationPickerGroup {
+    pub(crate) path: PathBuf,
+    pub(crate) results: Range<usize>,
+    pub(crate) expanded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NavigationPickerRow {
+    Group(usize),
+    Result(usize),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NavigationPickerPreview {
+    pub(crate) path: PathBuf,
+    pub(crate) lines: Vec<String>,
+    pub(crate) highlights: Vec<Vec<HighlightSpan>>,
+    pub(crate) target: SourceRange,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NavigationPickerState {
     pub(crate) title: String,
     invocation: NavigationInvocation,
     pub(crate) results: Vec<NavigationPickerItem>,
+    pub(crate) groups: Vec<NavigationPickerGroup>,
+    pub(crate) visible_rows: Vec<NavigationPickerRow>,
     pub(crate) list_state: ListState,
+    pub(crate) preview: Option<NavigationPickerPreview>,
+    pub(crate) preview_loading: bool,
+    pub(crate) preview_error: Option<String>,
     return_focus: FocusPane,
 }
 
@@ -522,6 +545,7 @@ pub struct UiRegions {
     pub search_options: [Rect; 4],
     pub search_results: Rect,
     pub navigation_popup: Rect,
+    pub navigation_preview: Rect,
     pub navigation_results: Rect,
     pub preview_find_input: Rect,
     pub preview_find_case: Rect,
@@ -626,6 +650,7 @@ pub struct App {
     runtime: WorkerRuntime,
     refresh_requests: RequestGeneration,
     content_requests: RequestGeneration,
+    navigation_preview_requests: RequestGeneration,
     search_runtime: SearchRuntime,
     pub(crate) search: Option<SearchState>,
     pub(crate) search_list_state: ListState,
@@ -650,8 +675,8 @@ pub struct App {
     pending_navigation_stage: Option<PendingNavigationStage>,
     pub(crate) navigation_picker: Option<NavigationPickerState>,
     pub(crate) navigation_status: Option<NavigationStatus>,
-    navigation_shortcut_chord_deadline: Option<Instant>,
     navigation_caret: NavigationCaret,
+    navigation_hover_highlight: Option<SourceRange>,
     navigation_target_highlight: Option<SourceRange>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
@@ -790,6 +815,7 @@ impl App {
             runtime,
             refresh_requests: RequestGeneration::default(),
             content_requests: RequestGeneration::default(),
+            navigation_preview_requests: RequestGeneration::default(),
             search_runtime,
             search: None,
             search_list_state: ListState::default(),
@@ -813,11 +839,11 @@ impl App {
             pending_navigation_stage: None,
             navigation_picker: None,
             navigation_status: None,
-            navigation_shortcut_chord_deadline: None,
             navigation_caret: NavigationCaret {
                 point: SourcePosition { line: 0, byte: 0 },
                 preferred_display_column: 0,
             },
+            navigation_hover_highlight: None,
             navigation_target_highlight: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
@@ -1285,6 +1311,7 @@ impl App {
 
     /// Apply one terminal key event to the same path used by the interactive loop.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.navigation_hover_highlight = None;
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
@@ -1316,9 +1343,6 @@ impl App {
             self.handle_search_key(key);
             return;
         }
-        if self.handle_navigation_shortcut_chord(key) {
-            return;
-        }
         if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
             self.request_quit(QuitKey::Q);
             return;
@@ -1334,38 +1358,21 @@ impl App {
         self.quit_confirmation = None;
 
         match (key.code, key.modifiers) {
-            (KeyCode::Char('b' | 'B'), KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+            (KeyCode::Char('d' | 'D'), KeyModifiers::CONTROL) => {
                 self.request_semantic_navigation(NavigationOperation::Definition);
             }
-            (KeyCode::Char('b' | 'B'), modifiers)
-                if modifiers == KeyModifiers::CONTROL | KeyModifiers::ALT
-                    || modifiers == KeyModifiers::SUPER | KeyModifiers::ALT =>
-            {
-                self.request_semantic_navigation(NavigationOperation::Implementations);
-            }
-            (KeyCode::Char('k' | 'K'), KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                self.begin_navigation_shortcut_chord();
-            }
-            (KeyCode::F(7), KeyModifiers::ALT) => {
+            (KeyCode::Char('r' | 'R'), KeyModifiers::CONTROL) => {
                 self.request_semantic_navigation(NavigationOperation::References);
             }
-            (KeyCode::F(12), KeyModifiers::NONE) => {
-                self.request_semantic_navigation(NavigationOperation::Definition);
-            }
-            (KeyCode::F(12), KeyModifiers::SHIFT) => {
-                self.request_semantic_navigation(NavigationOperation::References);
-            }
-            (KeyCode::F(12), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('o' | 'O'), KeyModifiers::CONTROL) => {
                 self.request_semantic_navigation(NavigationOperation::Implementations);
             }
+            (KeyCode::Char('s' | 'S'), KeyModifiers::CONTROL) => self.open_document_symbols(),
             (KeyCode::Left, KeyModifiers::ALT) => {
                 self.navigate_history(NavigationHistoryIntent::Back);
             }
             (KeyCode::Right, KeyModifiers::ALT) => {
                 self.navigate_history(NavigationHistoryIntent::Forward);
-            }
-            (KeyCode::Char('@'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                self.open_document_symbols();
             }
             (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(SearchMode::Files),
             (KeyCode::Char('p' | 'P'), KeyModifiers::CONTROL) => {
@@ -1428,63 +1435,6 @@ impl App {
             key,
             deadline: now + QUIT_CONFIRM_WINDOW,
         });
-    }
-
-    fn begin_navigation_shortcut_chord(&mut self) {
-        if self.focused_pane != FocusPane::Content || self.content_mode != ContentMode::Preview {
-            self.set_navigation_status(NavigationStatusLevel::Error, "Focus Preview to navigate.");
-            return;
-        }
-        self.navigation_shortcut_chord_deadline =
-            Some(Instant::now() + NAVIGATION_SHORTCUT_CHORD_WINDOW);
-        self.set_navigation_status(
-            NavigationStatusLevel::Info,
-            NAVIGATION_SHORTCUT_CHORD_PROMPT,
-        );
-    }
-
-    fn handle_navigation_shortcut_chord(&mut self, key: KeyEvent) -> bool {
-        let Some(deadline) = self.navigation_shortcut_chord_deadline else {
-            return false;
-        };
-        if Instant::now() > deadline {
-            self.clear_navigation_shortcut_chord();
-            return false;
-        }
-        let operation = match (key.code, key.modifiers) {
-            (KeyCode::Char('d' | 'D'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Some(NavigationOperation::Definition)
-            }
-            (KeyCode::Char('r' | 'R'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Some(NavigationOperation::References)
-            }
-            (KeyCode::Char('i' | 'I'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Some(NavigationOperation::Implementations)
-            }
-            (KeyCode::Esc, _) => {
-                self.clear_navigation_shortcut_chord();
-                return true;
-            }
-            _ => None,
-        };
-        let Some(operation) = operation else {
-            self.clear_navigation_shortcut_chord();
-            return false;
-        };
-        self.clear_navigation_shortcut_chord();
-        self.request_semantic_navigation(operation);
-        true
-    }
-
-    fn clear_navigation_shortcut_chord(&mut self) {
-        self.navigation_shortcut_chord_deadline = None;
-        if self
-            .navigation_status
-            .as_ref()
-            .is_some_and(|status| status.message == NAVIGATION_SHORTCUT_CHORD_PROMPT)
-        {
-            self.navigation_status = None;
-        }
     }
 
     pub(crate) fn quit_confirmation_message(&self) -> Option<&'static str> {
@@ -1738,20 +1688,27 @@ impl App {
                 });
             }
         }
-        if self.focused_pane == FocusPane::Content
-            && self.content_mode == ContentMode::Preview
-            && self.content_selection.is_none()
-            && self.navigation_caret.point.line == line
+        if let Some(range) = self.navigation_hover_highlight
+            && range.start.line <= line
+            && line <= range.end.line
             && let Some(text) = self.content_lines.get(line)
-            && let Some(scalar) = text
-                .get(self.navigation_caret.point.byte..)
-                .and_then(|suffix| suffix.chars().next())
         {
-            highlights.push(HighlightSpan {
-                range: self.navigation_caret.point.byte
-                    ..self.navigation_caret.point.byte + scalar.len_utf8(),
-                kind: HighlightKind::NavigationCaret,
-            });
+            let start = if line == range.start.line {
+                range.start.byte
+            } else {
+                0
+            };
+            let end = if line == range.end.line {
+                range.end.byte
+            } else {
+                text.len()
+            };
+            if start < end && end <= text.len() {
+                highlights.push(HighlightSpan {
+                    range: start..end,
+                    kind: HighlightKind::NavigationHover,
+                });
+            }
         }
         highlights
     }
@@ -2538,6 +2495,19 @@ impl App {
     /// Apply a mouse event using hit boxes captured during the latest draw.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.quit_confirmation = None;
+        self.navigation_hover_highlight = None;
+        if mouse.kind == MouseEventKind::Moved {
+            if mouse.modifiers == KeyModifiers::ALT
+                && self.navigation_picker.is_none()
+                && self.search.is_none()
+                && self.preview_find.is_none()
+                && self.content_mode == ContentMode::Preview
+                && let Some((_, token)) = self.navigation_token_at_mouse(mouse)
+            {
+                self.navigation_hover_highlight = Some(token);
+            }
+            return;
+        }
         if self.navigation_picker.is_some() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2617,14 +2587,15 @@ impl App {
                         return;
                     }
                     if self.content_mode == ContentMode::Preview
-                        && matches!(mouse.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER)
-                        && let Some(point) = self.navigation_point_at_mouse(mouse)
+                        && mouse.modifiers == KeyModifiers::ALT
+                        && let Some((point, token)) = self.navigation_token_at_mouse(mouse)
                     {
                         self.clear_content_selection();
                         self.navigation_caret = NavigationCaret {
                             point,
                             preferred_display_column: 0,
                         };
+                        self.navigation_hover_highlight = Some(token);
                         self.navigation_target_highlight = None;
                         self.request_semantic_navigation(NavigationOperation::Definition);
                         return;
@@ -2965,6 +2936,16 @@ impl App {
         })
     }
 
+    fn navigation_token_at_mouse(
+        &self,
+        mouse: MouseEvent,
+    ) -> Option<(SourcePosition, SourceRange)> {
+        let point = self.navigation_point_at_mouse(mouse)?;
+        let source = self.navigation_source.as_ref()?;
+        let token = source.structure.recognizable_tokens.containing(point)?;
+        Some((point, token))
+    }
+
     fn content_text_rows(&self) -> Rect {
         let rows = self.ui_regions.content_inner;
         if self.content_mode == ContentMode::Info {
@@ -3110,6 +3091,10 @@ impl App {
         self.content_requests.is_loading()
     }
 
+    const fn is_navigation_preview_loading(&self) -> bool {
+        self.navigation_preview_requests.is_loading()
+    }
+
     pub fn is_directory_loading(&self) -> bool {
         !self.loading_directories.is_empty()
     }
@@ -3176,12 +3161,8 @@ impl App {
             }
             (KeyCode::Down | KeyCode::Char('j'), _) => self.scroll_content(1, 0),
             (KeyCode::Up | KeyCode::Char('k'), _) => self.scroll_content(-1, 0),
-            (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                self.scroll_content(12, 0);
-            }
-            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.scroll_content(-12, 0);
-            }
+            (KeyCode::PageDown, _) => self.scroll_content(12, 0),
+            (KeyCode::PageUp, _) => self.scroll_content(-12, 0),
             (KeyCode::Left, KeyModifiers::SHIFT) => self.scroll_content(0, -4),
             (KeyCode::Right, KeyModifiers::SHIFT) => self.scroll_content(0, 4),
             (KeyCode::Left, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
@@ -3588,12 +3569,6 @@ impl App {
         {
             self.navigation_status = None;
         }
-        if self
-            .navigation_shortcut_chord_deadline
-            .is_some_and(|deadline| Instant::now() > deadline)
-        {
-            self.clear_navigation_shortcut_chord();
-        }
         self.dispatch_search_if_due();
         let (refresh, directories, content) = self.runtime.take_completions();
         if let Some(completion) = refresh {
@@ -3632,9 +3607,14 @@ impl App {
         while self.is_refreshing()
             || self.is_directory_loading()
             || self.is_content_loading()
+            || self.is_navigation_preview_loading()
             || self.is_searching()
         {
-            if self.is_refreshing() || self.is_directory_loading() || self.is_content_loading() {
+            if self.is_refreshing()
+                || self.is_directory_loading()
+                || self.is_content_loading()
+                || self.is_navigation_preview_loading()
+            {
                 if !self.runtime.wait_for_completion() {
                     self.last_error =
                         Some("background worker stopped before completing work".to_owned());
@@ -4506,6 +4486,8 @@ impl App {
     }
 
     fn next_navigation_generation(&mut self) -> u64 {
+        self.navigation_preview_requests.invalidate();
+        self.runtime.cancel_pending_content();
         if let Some(invocation) = self.navigation_invocation.take() {
             self.navigation_runtime.cancel(invocation.generation);
         }
@@ -4513,7 +4495,7 @@ impl App {
             self.navigation_runtime.cancel(stage.invocation.generation);
         }
         self.navigation_picker = None;
-        self.navigation_shortcut_chord_deadline = None;
+        self.navigation_hover_highlight = None;
         self.navigation_generation = self
             .navigation_generation
             .checked_add(1)
@@ -4523,6 +4505,8 @@ impl App {
     }
 
     fn cancel_pending_navigation(&mut self) {
+        self.navigation_preview_requests.invalidate();
+        self.runtime.cancel_pending_content();
         if let Some(invocation) = self.navigation_invocation.take() {
             self.navigation_runtime.cancel(invocation.generation);
         }
@@ -4532,7 +4516,7 @@ impl App {
             self.runtime.cancel_pending_content();
         }
         self.navigation_picker = None;
-        self.navigation_shortcut_chord_deadline = None;
+        self.navigation_hover_highlight = None;
         self.last_navigation_click = None;
         self.navigation_generation = self
             .navigation_generation
@@ -4785,17 +4769,29 @@ impl App {
         invocation: NavigationInvocation,
         results: Vec<NavigationPickerItem>,
     ) {
+        let groups = navigation_picker_groups(&results);
+        let visible_rows = navigation_picker_rows(&groups);
         let mut list_state = ListState::default();
-        list_state.select((!results.is_empty()).then_some(0));
+        list_state.select(
+            visible_rows
+                .iter()
+                .position(|row| matches!(row, NavigationPickerRow::Result(_))),
+        );
         self.navigation_picker = Some(NavigationPickerState {
             title: title.into(),
             return_focus: invocation.return_focus,
             invocation,
             results,
+            groups,
+            visible_rows,
             list_state,
+            preview: None,
+            preview_loading: false,
+            preview_error: None,
         });
         self.navigation_invocation = None;
         self.navigation_status = None;
+        self.request_navigation_picker_preview();
     }
 
     fn apply_navigation_completion(&mut self, completion: NavigationRuntimeCompletion) {
@@ -4875,7 +4871,7 @@ impl App {
                 detail: None,
             })
             .collect::<Vec<_>>();
-        let direct = invocation.operation != NavigationOperation::References && items.len() == 1;
+        let direct = invocation.operation == NavigationOperation::Definition && items.len() == 1;
         if direct {
             self.accept_navigation_target(invocation, items[0].target.clone());
         } else {
@@ -5118,11 +5114,7 @@ impl App {
 
     fn handle_navigation_picker_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                if let Some(picker) = self.navigation_picker.take() {
-                    self.focused_pane = picker.return_focus;
-                }
-            }
+            (KeyCode::Esc, _) => self.close_navigation_picker(),
             (KeyCode::Down, _) => self.move_navigation_picker(1),
             (KeyCode::Up, _) => self.move_navigation_picker(-1),
             (KeyCode::PageDown, _) => self.move_navigation_picker(10),
@@ -5138,7 +5130,7 @@ impl App {
         }
         let visible_row = usize::from(mouse.row - self.ui_regions.navigation_results.y);
         let (offset, count) = self.navigation_picker.as_ref().map_or((0, 0), |picker| {
-            (picker.list_state.offset(), picker.results.len())
+            (picker.list_state.offset(), picker.visible_rows.len())
         });
         let index = offset.saturating_add(visible_row);
         if index >= count {
@@ -5153,8 +5145,15 @@ impl App {
             picker.list_state.select(Some(index));
         }
         self.last_navigation_click = Some((index, Instant::now()));
-        if double_click {
+        let group_selected = self
+            .navigation_picker
+            .as_ref()
+            .and_then(|picker| picker.visible_rows.get(index))
+            .is_some_and(|row| matches!(row, NavigationPickerRow::Group(_)));
+        if group_selected || double_click {
             self.accept_navigation_picker_selection();
+        } else {
+            self.request_navigation_picker_preview();
         }
     }
 
@@ -5162,47 +5161,262 @@ impl App {
         let Some(picker) = self.navigation_picker.as_mut() else {
             return;
         };
-        if picker.results.is_empty() {
+        if picker.visible_rows.is_empty() {
             return;
         }
         let current = picker.list_state.selected().unwrap_or(0);
         picker.list_state.select(Some(
             current
                 .saturating_add_signed(delta)
-                .min(picker.results.len().saturating_sub(1)),
+                .min(picker.visible_rows.len().saturating_sub(1)),
         ));
+        self.request_navigation_picker_preview();
     }
 
     fn accept_navigation_picker_selection(&mut self) {
+        let selected = self.navigation_picker.as_ref().and_then(|picker| {
+            picker
+                .list_state
+                .selected()
+                .and_then(|index| picker.visible_rows.get(index).copied())
+        });
+        let Some(selected) = selected else {
+            return;
+        };
+        if let NavigationPickerRow::Group(group_index) = selected {
+            if let Some(picker) = self.navigation_picker.as_mut()
+                && let Some(group) = picker.groups.get_mut(group_index)
+            {
+                group.expanded = !group.expanded;
+                picker.visible_rows = navigation_picker_rows(&picker.groups);
+                picker.list_state.select(
+                    picker
+                        .visible_rows
+                        .iter()
+                        .position(|row| *row == NavigationPickerRow::Group(group_index)),
+                );
+            }
+            self.request_navigation_picker_preview();
+            return;
+        }
+        let NavigationPickerRow::Result(result_index) = selected else {
+            return;
+        };
+        self.navigation_preview_requests.invalidate();
+        self.runtime.cancel_pending_content();
         let Some(picker) = self.navigation_picker.take() else {
             return;
         };
-        let Some(index) = picker.list_state.selected() else {
-            return;
-        };
-        let Some(item) = picker.results.get(index) else {
+        let Some(item) = picker.results.get(result_index) else {
             return;
         };
         self.accept_navigation_target(picker.invocation, item.target.clone());
     }
 
+    fn close_navigation_picker(&mut self) {
+        self.navigation_preview_requests.invalidate();
+        self.runtime.cancel_pending_content();
+        if let Some(picker) = self.navigation_picker.take() {
+            self.focused_pane = picker.return_focus;
+        }
+        self.last_navigation_click = None;
+    }
+
+    fn request_navigation_picker_preview(&mut self) {
+        let selected_target = self.navigation_picker.as_ref().and_then(|picker| {
+            let row = picker
+                .list_state
+                .selected()
+                .and_then(|index| picker.visible_rows.get(index))?;
+            let NavigationPickerRow::Result(result_index) = *row else {
+                return None;
+            };
+            picker
+                .results
+                .get(result_index)
+                .map(|item| item.target.clone())
+        });
+        let Some(target) = selected_target else {
+            self.navigation_preview_requests.invalidate();
+            self.runtime.cancel_pending_content();
+            if let Some(picker) = self.navigation_picker.as_mut() {
+                picker.preview = None;
+                picker.preview_loading = false;
+                picker.preview_error = None;
+            }
+            return;
+        };
+
+        if self
+            .navigation_source
+            .as_ref()
+            .is_some_and(|source| source.identity == target.document)
+        {
+            self.navigation_preview_requests.invalidate();
+            self.runtime.cancel_pending_content();
+            let preview = self
+                .resolve_target_in_current_document(&target)
+                .map(|range| NavigationPickerPreview {
+                    path: target.document.path().to_path_buf(),
+                    lines: self.content_lines.clone(),
+                    highlights: self.content_highlights.clone(),
+                    target: range,
+                });
+            if let Some(preview) = preview {
+                self.install_navigation_picker_preview(preview);
+            } else if let Some(picker) = self.navigation_picker.as_mut() {
+                picker.preview_loading = false;
+                picker.preview_error = Some("Navigation target range is invalid.".to_owned());
+                picker.preview = None;
+            }
+            return;
+        }
+
+        let navigation_generation = self
+            .navigation_picker
+            .as_ref()
+            .map(|picker| picker.invocation.generation)
+            .unwrap_or_default();
+        let generation = self.navigation_preview_requests.begin();
+        if let Some(picker) = self.navigation_picker.as_mut() {
+            picker.preview = None;
+            picker.preview_loading = true;
+            picker.preview_error = None;
+        }
+        self.runtime.request_content(ContentRequest {
+            generation,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::NavigationPreview {
+                navigation_generation,
+            },
+            target: ContentTarget::Workspace(target.document.path().to_path_buf()),
+        });
+    }
+
+    fn apply_navigation_preview_completion(
+        &mut self,
+        navigation_generation: u64,
+        result: Result<ContentSnapshot, String>,
+    ) {
+        let selected_target = self.navigation_picker.as_ref().and_then(|picker| {
+            (picker.invocation.generation == navigation_generation)
+                .then_some(picker)
+                .and_then(|picker| {
+                    let row = picker
+                        .list_state
+                        .selected()
+                        .and_then(|index| picker.visible_rows.get(index))?;
+                    let NavigationPickerRow::Result(result_index) = *row else {
+                        return None;
+                    };
+                    picker
+                        .results
+                        .get(result_index)
+                        .map(|item| item.target.clone())
+                })
+        });
+        let Some(target) = selected_target else {
+            return;
+        };
+        let preview = match result {
+            Ok(mut snapshot) => {
+                self.rebind_content_snapshot_navigation(&mut snapshot);
+                let Some(source) = snapshot
+                    .navigation_source
+                    .as_ref()
+                    .filter(|source| source.identity == target.document)
+                else {
+                    if let Some(picker) = self.navigation_picker.as_mut() {
+                        picker.preview_loading = false;
+                        picker.preview_error =
+                            Some("Preview has no safe navigation source.".to_owned());
+                    }
+                    return;
+                };
+                let range = match target.range.clone() {
+                    NavigationTargetRange::Source(range) => source
+                        .line_index
+                        .to_utf16(range.start)
+                        .and_then(|_| source.line_index.to_utf16(range.end))
+                        .map(|_| range),
+                    NavigationTargetRange::Utf16(range) => {
+                        source.line_index.range_from_utf16(range)
+                    }
+                };
+                let Ok(range) = range else {
+                    if let Some(picker) = self.navigation_picker.as_mut() {
+                        picker.preview_loading = false;
+                        picker.preview_error =
+                            Some("Navigation target range is invalid.".to_owned());
+                    }
+                    return;
+                };
+                NavigationPickerPreview {
+                    path: target.document.path().to_path_buf(),
+                    lines: snapshot.lines,
+                    highlights: snapshot.highlights,
+                    target: range,
+                }
+            }
+            Err(error) => {
+                if let Some(picker) = self.navigation_picker.as_mut() {
+                    picker.preview_loading = false;
+                    picker.preview_error = Some(clean_navigation_message(&error));
+                }
+                return;
+            }
+        };
+        self.install_navigation_picker_preview(preview);
+    }
+
+    fn install_navigation_picker_preview(&mut self, preview: NavigationPickerPreview) {
+        if let Some(picker) = self.navigation_picker.as_mut() {
+            let selected_result = picker
+                .list_state
+                .selected()
+                .and_then(|index| picker.visible_rows.get(index))
+                .and_then(|row| match row {
+                    NavigationPickerRow::Result(index) => Some(*index),
+                    NavigationPickerRow::Group(_) => None,
+                });
+            if let Some(item) = selected_result.and_then(|index| picker.results.get_mut(index))
+                && item.detail.is_none()
+            {
+                item.detail = navigation_preview_summary(&preview);
+            }
+            picker.preview = Some(preview);
+            picker.preview_loading = false;
+            picker.preview_error = None;
+        }
+    }
+
     fn apply_content_completion(&mut self, completion: ContentCompletion) {
-        let generation = completion.generation;
-        if !self.content_requests.accept(completion.generation) {
+        let ContentCompletion {
+            generation,
+            kind,
+            purpose,
+            result,
+        } = completion;
+        if let ContentPurpose::NavigationPreview {
+            navigation_generation,
+        } = purpose
+        {
+            if self.navigation_preview_requests.accept(generation) {
+                self.apply_navigation_preview_completion(navigation_generation, result);
+            }
+            return;
+        }
+        if !self.content_requests.accept(generation) {
             return;
         }
         if let ContentPurpose::NavigationStage {
             navigation_generation,
-        } = completion.purpose
+        } = purpose
         {
-            self.apply_navigation_stage_completion(
-                navigation_generation,
-                generation,
-                completion.result,
-            );
+            self.apply_navigation_stage_completion(navigation_generation, generation, result);
             return;
         }
-        let mode = match completion.kind {
+        let mode = match kind {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         };
@@ -5213,7 +5427,7 @@ impl App {
             .map(|(_, path)| path);
         let pending_preview_find = self.preview_find.take();
         self.reset_content(mode);
-        match completion.result {
+        match result {
             Ok(mut snapshot) => {
                 self.rebind_content_snapshot_navigation(&mut snapshot);
                 let cached = snapshot
@@ -5296,7 +5510,7 @@ impl App {
                 }
             }
             Err(error) => {
-                self.content_lines = vec![match completion.kind {
+                self.content_lines = vec![match kind {
                     ContentKind::Diff => format!("Unable to load diff: {error}"),
                     ContentKind::Preview => format!("Unable to preview file: {error}"),
                 }];
@@ -5322,6 +5536,7 @@ impl App {
         self.content_fold_regions.clear();
         self.content_structure = StructureSnapshot::unavailable();
         self.navigation_source = None;
+        self.navigation_hover_highlight = None;
         self.navigation_target_highlight = None;
         self.content_collapsed_folds.clear();
         self.content_cursor_line = 0;
@@ -5431,6 +5646,48 @@ fn navigation_target_sort_key(target: &NavigationTarget) -> (PathBuf, u32, u32, 
         end_line,
         end_character,
     )
+}
+
+fn navigation_picker_groups(results: &[NavigationPickerItem]) -> Vec<NavigationPickerGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    while start < results.len() {
+        let path = results[start].target.document.path().to_path_buf();
+        let mut end = start.saturating_add(1);
+        while end < results.len() && results[end].target.document.path() == path {
+            end = end.saturating_add(1);
+        }
+        groups.push(NavigationPickerGroup {
+            path,
+            results: start..end,
+            expanded: true,
+        });
+        start = end;
+    }
+    groups
+}
+
+fn navigation_picker_rows(groups: &[NavigationPickerGroup]) -> Vec<NavigationPickerRow> {
+    let mut rows = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        rows.push(NavigationPickerRow::Group(group_index));
+        if group.expanded {
+            rows.extend(group.results.clone().map(NavigationPickerRow::Result));
+        }
+    }
+    rows
+}
+
+fn navigation_preview_summary(preview: &NavigationPickerPreview) -> Option<String> {
+    let summary = preview.lines.get(preview.target.start.line)?.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    let mut bounded = summary.chars().take(120).collect::<String>();
+    if summary.chars().count() > 120 {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn navigation_target_label(target: &NavigationTarget) -> String {
@@ -7604,6 +7861,31 @@ mod tests {
     }
 
     #[test]
+    fn navigation_picker_uses_preview_and_grouped_results_only_when_wide_enough() {
+        let mut app = navigation_picker_app(3);
+        let backend = TestBackend::new(140, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        assert!(app.ui_regions.navigation_preview.width >= 48);
+        assert!(app.ui_regions.navigation_results.width >= 32);
+        let wide = terminal.backend().buffer().content();
+        let wide = wide.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(wide.contains("fn item_0"));
+        assert!(wide.contains("caller.rs"));
+
+        let backend = TestBackend::new(70, 18);
+        let mut narrow_terminal = Terminal::new(backend).unwrap();
+        narrow_terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.ui_regions.navigation_preview, Rect::default());
+        assert!(app.ui_regions.navigation_results.width > 0);
+    }
+
+    #[test]
     fn scrolled_navigation_picker_mouse_uses_visible_offset_for_click_and_double_click() {
         let mut app = navigation_picker_app(40);
         app.navigation_picker
@@ -7621,6 +7903,14 @@ mod tests {
         let visible_row =
             1usize.min(usize::from(app.ui_regions.navigation_results.height).saturating_sub(1));
         let expected = offset + visible_row;
+        let expected_result = match app
+            .navigation_picker
+            .as_ref()
+            .and_then(|picker| picker.visible_rows.get(expected))
+        {
+            Some(NavigationPickerRow::Result(index)) => *index,
+            row => panic!("expected a result row, got {row:?}"),
+        };
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: app.ui_regions.navigation_results.x,
@@ -7642,7 +7932,7 @@ mod tests {
         );
         app.handle_mouse(mouse);
         assert!(app.navigation_picker.is_none());
-        assert_eq!(app.navigation_caret.point.line, expected);
+        assert_eq!(app.navigation_caret.point.line, expected_result);
     }
 
     #[test]
@@ -7712,7 +8002,7 @@ mod tests {
         let before = app.content_lines.clone();
         let identity = app.content_identity.clone();
 
-        app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         for _ in 0..100 {
             app.poll_background();
             if app.navigation_invocation.is_none() {
@@ -7732,105 +8022,207 @@ mod tests {
     }
 
     #[test]
-    fn idea_aliases_and_terminal_chord_dispatch_semantic_navigation() {
+    fn unified_control_shortcuts_dispatch_semantic_navigation() {
         let cases = [
             (
-                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
-                None,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
                 NavigationOperation::Definition,
             ),
             (
-                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::SUPER),
-                None,
-                NavigationOperation::Definition,
-            ),
-            (
-                KeyEvent::new(
-                    KeyCode::Char('b'),
-                    KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ),
-                None,
-                NavigationOperation::Implementations,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::SUPER | KeyModifiers::ALT),
-                None,
-                NavigationOperation::Implementations,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-                Some(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-                NavigationOperation::Definition,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER),
-                Some(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
                 NavigationOperation::References,
             ),
             (
-                KeyEvent::new(KeyCode::F(7), KeyModifiers::ALT),
-                None,
-                NavigationOperation::References,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-                Some(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT)),
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
                 NavigationOperation::Implementations,
             ),
         ];
 
-        for (prefix, action, expected) in cases {
+        for (key, expected) in cases {
             let mut app = navigation_app("fn caller() {}\n");
-            app.handle_key(prefix);
-            if let Some(action) = action {
-                assert!(app.navigation_shortcut_chord_deadline.is_some());
-                app.handle_key(action);
-            }
+            app.handle_key(key);
             assert_eq!(
                 app.navigation_invocation
                     .as_ref()
                     .map(|invocation| invocation.operation),
                 Some(expected)
             );
-            assert!(app.navigation_shortcut_chord_deadline.is_none());
             app.cancel_pending_navigation();
         }
     }
 
     #[test]
-    fn navigation_chord_escape_cancels_without_quitting() {
+    fn ctrl_s_opens_local_document_symbols_in_the_results_popup() {
         let mut app = navigation_app("fn caller() {}\n");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        assert!(app.navigation_shortcut_chord_deadline.is_some());
-        assert!(app.navigation_status.as_ref().is_some_and(|status| {
-            status.message.contains("D definition") && status.message.contains("R references")
-        }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        assert!(app.navigation_shortcut_chord_deadline.is_none());
-        assert!(app.navigation_status.is_none());
-        assert!(!app.should_quit);
+        let picker = app.navigation_picker.as_ref().unwrap();
+        assert_eq!(picker.title, "Document Symbols");
+        assert_eq!(picker.results.len(), 1);
+        assert!(picker.preview.is_some());
     }
 
     #[test]
-    fn navigation_chord_timeout_and_unknown_key_restore_normal_input() {
+    fn references_and_implementations_always_open_results_even_for_one_location() {
+        for operation in [
+            NavigationOperation::References,
+            NavigationOperation::Implementations,
+        ] {
+            let mut app = navigation_app("fn caller() {}\n");
+            app.request_semantic_navigation(operation);
+            let invocation = app.navigation_invocation.clone().unwrap();
+            let uri = crate::navigation::path_to_lsp_uri(&app.root.join("caller.rs")).unwrap();
+            app.apply_navigation_completion(NavigationRuntimeCompletion {
+                generation: invocation.generation,
+                operation,
+                source_identity: invocation.source_identity,
+                source_version: invocation.source_version,
+                result: NavigationProtocolResult::Locations(vec![ProtocolLocation::for_app_test(
+                    uri,
+                    lsp_types::Range::new(
+                        lsp_types::Position::new(0, 3),
+                        lsp_types::Position::new(0, 9),
+                    ),
+                )]),
+            });
+
+            let picker = app.navigation_picker.as_ref().unwrap();
+            assert_eq!(picker.results.len(), 1);
+            assert_eq!(picker.groups.len(), 1);
+            assert_eq!(
+                picker.visible_rows,
+                [
+                    NavigationPickerRow::Group(0),
+                    NavigationPickerRow::Result(0)
+                ]
+            );
+            assert!(picker.preview.is_some());
+        }
+    }
+
+    #[test]
+    fn results_preview_loads_cross_file_without_replacing_content_until_accept() {
         let mut app = navigation_app("fn caller() {}\n");
+        let caller = app.content_identity.clone().unwrap();
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let target =
+            ContentIdentity::from_absolute(&app.root, &app.root.join("target.rs")).unwrap();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::References,
+            source_identity: caller.clone(),
+            source_version: app.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: FocusPane::Content,
+        };
+        app.open_navigation_picker(
+            "References",
+            invocation,
+            vec![NavigationPickerItem {
+                target: NavigationTarget {
+                    document: target.clone(),
+                    range: NavigationTargetRange::Utf16(lsp_types::Range::new(
+                        lsp_types::Position::new(0, 3),
+                        lsp_types::Position::new(0, 9),
+                    )),
+                },
+                label: "target.rs:1:4".to_owned(),
+                detail: None,
+            }],
+        );
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        app.navigation_shortcut_chord_deadline = Some(Instant::now() - Duration::from_millis(1));
-        app.poll_background();
-        assert!(app.navigation_shortcut_chord_deadline.is_none());
-        assert!(app.navigation_status.is_none());
+        assert!(app.is_navigation_preview_loading());
+        assert!(!app.is_content_loading());
+        assert_eq!(app.content_identity.as_ref(), Some(&caller));
+        app.wait_for_background();
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        app.content_scroll = 5;
-        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        let picker = app.navigation_picker.as_ref().unwrap();
+        let preview = picker.preview.as_ref().unwrap();
+        assert_eq!(preview.path, Path::new("target.rs"));
+        assert_eq!(preview.lines, ["fn target() {}"]);
+        assert_eq!(app.content_identity.as_ref(), Some(&caller));
 
-        assert!(app.navigation_shortcut_chord_deadline.is_none());
-        assert!(app.navigation_status.is_none());
-        assert_eq!(app.content_scroll, 0);
+        app.accept_navigation_picker_selection();
+        app.wait_for_background();
+        assert!(app.navigation_picker.is_none());
+        assert_eq!(app.content_identity.as_ref(), Some(&target));
+        assert_eq!(app.navigation_back.len(), 1);
+    }
+
+    #[test]
+    fn result_file_groups_collapse_without_committing_navigation() {
+        let mut app = navigation_picker_app(3);
+        assert_eq!(
+            app.navigation_picker.as_ref().unwrap().visible_rows.len(),
+            4
+        );
+
+        app.move_navigation_picker(-1);
+        app.accept_navigation_picker_selection();
+
+        let picker = app.navigation_picker.as_ref().unwrap();
+        assert_eq!(picker.visible_rows, [NavigationPickerRow::Group(0)]);
+        assert!(picker.preview.is_none());
+        assert_eq!(
+            app.content_identity.as_ref().map(ContentIdentity::path),
+            Some(Path::new("caller.rs"))
+        );
+    }
+
+    #[test]
+    fn alt_hover_underlines_the_complete_token_and_alt_click_requests_definition() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let column = u16::try_from(app.content_gutter_width().saturating_add(3)).unwrap();
+        let hover = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::ALT,
+        };
+
+        app.handle_mouse(hover);
+        let token = SourceRange {
+            start: SourcePosition { line: 0, byte: 3 },
+            end: SourcePosition { line: 0, byte: 9 },
+        };
+        assert_eq!(app.navigation_hover_highlight, Some(token));
+        assert!(app.navigation_highlights(0).iter().any(|highlight| {
+            highlight.kind == HighlightKind::NavigationHover && highlight.range == (3..9)
+        }));
+
+        app.handle_mouse(MouseEvent {
+            modifiers: KeyModifiers::NONE,
+            ..hover
+        });
+        assert!(app.navigation_hover_highlight.is_none());
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..hover
+        });
+        assert_eq!(
+            app.navigation_invocation
+                .as_ref()
+                .map(|invocation| invocation.operation),
+            Some(NavigationOperation::Definition)
+        );
+    }
+
+    #[test]
+    fn retired_navigation_aliases_do_not_dispatch_semantic_navigation() {
+        let mut app = navigation_app("fn caller() {}\n");
+        for key in [
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::F(7), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key);
+        }
         assert!(app.navigation_invocation.is_none());
     }
 

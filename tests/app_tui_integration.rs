@@ -1700,7 +1700,7 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
     assert_eq!(app.content_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
 
-    app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::PageDown));
     assert_eq!(app.content_scroll, 12);
     app.handle_key(key(KeyCode::PageUp));
     assert_eq!(app.content_scroll, 0);
@@ -3611,7 +3611,7 @@ fn run_production_spawner_framed_journey() {
     assert_eq!(app.content_lines, [caller_text.trim_end()]);
 
     app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::F(12)));
+    app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
 
     wait_until(Duration::from_secs(5), || {
         app.poll_background();

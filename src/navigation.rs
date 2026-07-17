@@ -887,11 +887,14 @@ pub(crate) fn validate_executable(
     if !path.is_absolute() {
         bail!("language server executable must be absolute");
     }
-    ensure_absolute_no_links(path)?;
-    let inspected = inspect_content_path(None, path)?;
-    if inspected.kind != ContentPathKind::Regular || inspected.path != path {
-        bail!("language server executable is not a regular file");
+    if path.starts_with(workspace_root) {
+        bail!("language server executable entry must be outside the opened workspace");
     }
+    // User-level package managers commonly expose language servers through a
+    // bin symlink. Resolve that indirection once and retain only the canonical
+    // target: later link replacement cannot redirect the trusted command.
+    // The canonical target itself must still traverse no links/reparse points,
+    // live outside the workspace, and retain the same file identity at spawn.
     let canonical = path
         .canonicalize()
         .with_context(|| format!("cannot resolve language server {}", path.display()))?;
@@ -1674,7 +1677,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn executable_and_target_path_checks_reject_links_modes_and_escapes() {
+    fn executable_and_target_path_checks_resolve_links_and_reject_modes_and_escapes() {
         use std::{os::unix::fs::PermissionsExt, str::FromStr};
 
         let container = tempfile::tempdir().unwrap();
@@ -1695,7 +1698,21 @@ mod tests {
         validate_executable(&server, &workspace).unwrap();
         let link = directory.join("server-link");
         std::os::unix::fs::symlink(&server, &link).unwrap();
-        assert!(validate_executable(&link, &workspace).is_err());
+        let linked = validate_executable(&link, &workspace).unwrap();
+        assert_eq!(linked.path, server.canonicalize().unwrap());
+        let workspace_link = workspace.join("server-link");
+        std::os::unix::fs::symlink(&server, &workspace_link).unwrap();
+        assert!(validate_executable(&workspace_link, &workspace).is_err());
+
+        let broken = directory.join("broken-link");
+        std::os::unix::fs::symlink(directory.join("missing-server"), &broken).unwrap();
+        assert!(validate_executable(&broken, &workspace).is_err());
+
+        let cycle_a = directory.join("cycle-a");
+        let cycle_b = directory.join("cycle-b");
+        std::os::unix::fs::symlink(&cycle_b, &cycle_a).unwrap();
+        std::os::unix::fs::symlink(&cycle_a, &cycle_b).unwrap();
+        assert!(validate_executable(&cycle_a, &workspace).is_err());
         assert!(ensure_absolute_no_links(Path::new("relative/../server")).is_err());
 
         let inside = workspace.join("inside.rs");
@@ -1743,6 +1760,41 @@ mod tests {
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
         fs::rename(&replacement, &outside).unwrap();
         assert!(server.revalidate_before_spawn(&workspace).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_symlink_is_pinned_to_its_authorized_canonical_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let container = tempfile::tempdir().unwrap();
+        let workspace = container.path().join("workspace");
+        let tools = container.path().join("tools");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        let first = tools.join("first-server");
+        let second = tools.join("second-server");
+        for path in [&first, &second] {
+            fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let link = tools.join("language-server");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let validated = validate_executable(&link, &workspace).unwrap();
+        let first = first.canonicalize().unwrap();
+        assert_eq!(validated.path, first);
+        let server = TrustedServer {
+            program: validated.path,
+            args: Arc::from([]),
+            identity: validated.identity,
+        };
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+
+        assert_eq!(server.program(), first);
+        server.revalidate_before_spawn(&workspace).unwrap();
     }
 
     #[test]

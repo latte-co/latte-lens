@@ -99,13 +99,12 @@ Inside the TUI:
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
-| `ctrl-b` / `cmd-b` | In focused Preview content, go to the definition; the `cmd` form works when the terminal forwards Command/Super keys |
-| `ctrl-alt-b` / `cmd-alt-b` | Find implementations, following the IntelliJ keymap; the `cmd` form depends on terminal support |
-| `alt-f7` | Find references using the IntelliJ keymap; on macOS this may still require `fn` |
-| `ctrl-k` / `cmd-k`, then `d` / `r` / `i` | Open the terminal-safe navigation chord for definition, references, or implementations; press `esc` to cancel |
-| `f12` / `shift-f12` / `ctrl-f12` | VS Code-compatible aliases for definition, references, or implementations; on macOS these may require `fn` |
-| `@` | Open bounded local document symbols for the current Preview |
+| `ctrl-d` | In focused Preview content, go to the definition; one result jumps directly and multiple results open the navigation popup |
+| `ctrl-r` | Find references in the navigation popup, including when there is only one result |
+| `ctrl-o` | Find implementations in the navigation popup, including when there is only one result |
+| `ctrl-s` | Open bounded document symbols for the current Preview |
 | `alt-←` / `alt-→` | Move backward or forward through successful navigation locations |
+| `alt` + mouse move / left click | Underline the complete navigable token under the pointer, or request its definition |
 | `[` / `]` | In focused Preview content, jump to the previous or next visible fold marker |
 | `enter` / `space` | In focused Preview content, toggle the fold at the current marker |
 | `{` / `}` | In focused Preview content, collapse or expand all folds |
@@ -127,7 +126,7 @@ Mouse controls:
 - Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
-- In a supported built-in source Preview, `Ctrl`-click (or `Command`-click on macOS) requests the clicked token's definition. For keyboard navigation without macOS function keys, use terminal-safe `Ctrl+B` for definition or `Ctrl+K`, then `D`/`R`/`I`; IDEA-style Command variants are also accepted when the terminal forwards them. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
+- In a supported built-in source Preview, hold `Alt` while moving the mouse to underline a complete navigable token, then `Alt`-click to request its definition. Keyboard navigation uses the same `Ctrl` + mnemonic style as search: `Ctrl+D` definition, `Ctrl+R` references, `Ctrl+O` implementations, and `Ctrl+S` document symbols. References and implementations always open a file-grouped results popup; on wide terminals it previews the selected location without replacing the main Content pane, and `Enter` or double-click commits the jump. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
@@ -239,11 +238,14 @@ absolute native executable or a basename:
 ```
 
 The file accepts JSONC line/block comments and trailing commas. Configuration is
-user-level only. Workspace commands, Windows shell wrappers, symlink/reparse-
-point executables, and executables inside the opened workspace are rejected.
-Executable identity and workspace exclusion are checked again immediately
-before every spawn. The external language server remains trusted host tooling
-and may have capabilities outside Latte Lens's read-only protocol behavior.
+user-level only. Workspace commands, Windows shell wrappers, broken or cyclic
+links, and executables whose canonical target is inside the opened workspace
+are rejected. A user-level package-manager symlink may be used as the command:
+Latte Lens resolves it once, stores only the canonical executable and its file
+identity, and never follows a later retargeting of that entry link. Canonical
+target identity and workspace exclusion are checked again immediately before
+every spawn. The external language server remains trusted host tooling and may
+have capabilities outside Latte Lens's read-only protocol behavior.
 
 Navigation uses logical payload admission limits of 32 MiB per session and
 192 MiB globally, including framed bodies, parse scratch reservations,

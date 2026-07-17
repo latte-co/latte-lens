@@ -88,7 +88,7 @@ fn repeated_real_crashes_back_off_and_fifth_failure_stops_spawning() {
     let probe = app.navigation_test_probe();
 
     for (index, delay) in [1, 2, 4, 8, 30].into_iter().enumerate() {
-        app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         let expected = index + 1;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -109,7 +109,7 @@ fn repeated_real_crashes_back_off_and_fifth_failure_stops_spawning() {
         }
     }
 
-    app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         app.poll_background();
@@ -328,7 +328,7 @@ fn escaped_pipe_owner_is_quarantined_without_fake_cleanup_or_unbounded_drop() {
     .unwrap();
     app.wait_for_background();
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     let escaped_pid = wait_for_trace_pid(&trace, "escaped=", Duration::from_secs(5));
     let probe = app.navigation_test_probe();
     wait_until(Duration::from_secs(3), || {
@@ -338,7 +338,7 @@ fn escaped_pipe_owner_is_quarantined_without_fake_cleanup_or_unbounded_drop() {
     assert_eq!(probe.snapshot().quarantined_process_owners, 1);
     assert_eq!(trace_count(&trace, "escaped-started"), 1);
     for _ in 0..2 {
-        app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         app.poll_background();
     }
     let no_respawn_deadline = Instant::now() + Duration::from_millis(500);
@@ -403,7 +403,7 @@ fn run_pipe_holding_descendant_cleanup(role: &str, ready_marker: Option<&str>) {
     .unwrap();
     app.wait_for_background();
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
 
     let descendant_pid = wait_for_descendant_pid(&trace, Duration::from_secs(5));
     if let Some(marker) = ready_marker {
@@ -462,7 +462,7 @@ fn run_incompatible_position_encoding_cleanup() {
     .unwrap();
     app.wait_for_background();
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     wait_until(Duration::from_secs(5), || {
         app.poll_background();
         trace_contains(&trace, "utf8-initialize-sent")
@@ -543,7 +543,7 @@ fn select_file_and_request_definition(
     app.wait_for_background();
     assert_eq!(app.selected_relative_path().as_deref(), Some(relative));
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     let root_uri = url::Url::from_file_path(server_root).unwrap().to_string();
     let marker = format!("definition={root_uri}");
     wait_until(Duration::from_secs(5), || {

@@ -169,6 +169,12 @@ def _write_navigation_config(
     environment["HOME"] = str(home)
     config = home / ".latte" / "latte-lens.jsonc"
     config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        bin_dir = config.parent / "bin"
+        bin_dir.mkdir(mode=0o700)
+        helper_link = bin_dir / helper.name
+        helper_link.symlink_to(helper)
+        helper = helper_link
     helper_json = json.dumps(str(helper))
     role_json = json.dumps(role)
     config.write_text(

@@ -968,10 +968,10 @@ def code_navigation(context: ScenarioContext) -> None:
     )
 
     session.key(b"l")
-    session.key(b"\x02")
+    session.key(b"\x04")
     session.wait_screen(
         ("b-target.rs", "pub fn"),
-        "Ctrl-B definition commits the cross-file target",
+        "Ctrl-D definition commits the cross-file target",
         absent=("Navigation target is invalid",),
     )
     server_receipts = tuple(
@@ -1000,45 +1000,41 @@ def code_navigation(context: ScenarioContext) -> None:
 
     session.key(b"\x1b[1;3D")
     session.wait_screen(("a-caller.rs", "caller!"), "definition history returns to caller")
-    session.key(b"\x1b[24;5~")
+    session.key(b"\x0f")
     session.wait_screen(
         ("implementation fixture error", "caller!"),
-        "Ctrl-F12 surfaces a bounded language-server error without moving",
+        "Ctrl-O surfaces a bounded language-server error without moving",
     )
-    session.key(b"\x1b[24;5~")
+    session.key(b"\x0f")
     session.wait_screen(
         ("No implementations found.", "caller!"),
-        "Ctrl-F12 handles a valid null implementation result",
+        "Ctrl-O handles a valid null implementation result",
     )
-    session.key(b"\x1b[24;5~")
+    session.key(b"\x0f")
+    session.wait_screen(
+        ("Implementations", "b-target.rs"),
+        "Ctrl-O opens a picker even for one implementation",
+    )
+    session.key(b"\r")
     session.wait_screen(
         ("b-target.rs", "pub fn"),
-        "Ctrl-F12 commits a successful implementation target on the reused session",
+        "Enter commits the implementation target on the reused session",
+        absent=("Implementations",),
     )
 
-    session.key(b"\x0b")
-    session.wait_screen(
-        ("Navigation: D definition", "R references", "I implementations"),
-        "Ctrl-K opens the terminal-safe navigation chord",
-    )
-    session.key(b"r")
+    session.key(b"\x12")
     session.wait_screen(
         ("References", "a-caller.rs", "b-target.rs"),
-        "Ctrl-K then R opens the multi-result picker",
+        "Ctrl-R opens the multi-result picker",
     )
-    picker_column = session.screen.columns // 2
-    picker_row = session.screen.rows // 2
-    session.click(picker_column, picker_row)
-    session.scroll_down(picker_column, picker_row)
-    session.scroll_up(picker_column, picker_row)
-    session.key(b"\x1b[B")
-    session.key(b"\x1b[6~")
-    session.key(b"\x1b[5~")
     session.key(b"\x1b[A")
+    session.key(b"\r")
+    session.key(b"\r")
+    session.key(b"\x1b[B")
     _drain_for(
         session,
         0.2,
-        "picker bounds empty clicks and processes wheel, Down, PageDown, PageUp, and Up",
+        "reference file group collapses, expands, and returns selection to its first result",
     )
     session.key(b"\r")
     session.wait_screen(
@@ -1051,7 +1047,7 @@ def code_navigation(context: ScenarioContext) -> None:
     session.key(b"\x1b[1;3C")
     session.wait_screen(("a-caller.rs", "caller!"), "Alt-Right moves forward through history")
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     _wait_trace(context, ("definition-held",), "second definition is held for cancellation")
     session.wait_screen(("Finding definition…", "caller!"), "held definition stays responsive")
     session.key(b"\x1b")
@@ -1072,33 +1068,33 @@ def code_navigation(context: ScenarioContext) -> None:
         "late cancelled definition response cannot move the current Preview",
         absent=("Finding definition…",),
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("b-target.rs", "pub fn"),
         "a request after cancellation succeeds on the same session",
     )
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("No definition found.", "b-target.rs"),
         "a null definition result keeps the current Preview",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Navigation target opened.", "b-target.rs"),
         "a LocationLink definition resolves inside the current Preview",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Navigation target is outside the opened workspace or unsafe.", "b-target.rs"),
         "an outside-workspace definition is rejected at the App safety boundary",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Navigation target range is invalid.", "b-target.rs"),
         "an out-of-range same-document definition cannot move the Preview",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Definitions", "a-caller.rs", "b-target.rs"),
         "multiple definitions are sorted and deduplicated in a picker",
@@ -1110,12 +1106,12 @@ def code_navigation(context: ScenarioContext) -> None:
         absent=("Definitions",),
     )
 
-    session.key(b"\x1b[24;2~")
+    session.key(b"\x12")
     session.wait_screen(
         ("No references found.", "caller!"),
         "an empty reference array produces a bounded empty-result status",
     )
-    session.key(b"\x1b[24;2~")
+    session.key(b"\x12")
     session.wait_screen(
         ("References", "b-target.rs"),
         "a single reference still uses the explicit reference picker",
@@ -1127,7 +1123,7 @@ def code_navigation(context: ScenarioContext) -> None:
         absent=("References",),
     )
 
-    session.key(b"\x1b[24;5~")
+    session.key(b"\x0f")
     session.wait_screen(
         ("Implementations", "a-caller.rs", "b-target.rs"),
         "multiple implementations use the implementation picker",
@@ -1138,7 +1134,7 @@ def code_navigation(context: ScenarioContext) -> None:
         "implementation picker commits a safe current-document target",
         absent=("Implementations",),
     )
-    session.key(b"\x1b[24;2~")
+    session.key(b"\x12")
     session.wait_screen(
         ("invalid or mixed LSP Location/LocationLink item", "caller!"),
         "mixed reference variants fail and retire the configured session",
@@ -1159,7 +1155,7 @@ def structure_navigation(context: ScenarioContext) -> None:
         "Rust structure Preview loads semantic declarations",
     )
     session.key(b"l")
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("Document Symbols", "Alpha", "first", "second", "omega"),
         "Rust local document-symbol picker exposes nested declarations",
@@ -1224,7 +1220,7 @@ def structure_navigation(context: ScenarioContext) -> None:
             absent=("Open File",),
         )
         session.key(b"l")
-        session.key(b"@")
+        session.key(b"\x13")
         session.wait_screen(
             ("Document Symbols", *symbols),
             f"{filename} local document symbols are visible",
@@ -1284,8 +1280,9 @@ def fold_keyboard_and_mouse_definition(context: ScenarioContext) -> None:
     )
     trace_path = Path(context.environment["LATTELENS_TEST_TRACE"])
     summary_position = _content_token_position(session, "lines")
-    session.ctrl_click(*summary_position)
-    _drain_for(session, 0.35, "Ctrl-click on a synthetic fold row remains locally inert")
+    session.alt_move(*summary_position)
+    session.alt_click(*summary_position)
+    _drain_for(session, 0.35, "Alt-click on a synthetic fold row remains locally inert")
     trace = trace_path.read_text(encoding="utf-8") if trace_path.exists() else ""
     if "definition-" in trace or "helper-started=" in trace:
         raise E2EAssertionError(
@@ -1295,7 +1292,7 @@ def fold_keyboard_and_mouse_definition(context: ScenarioContext) -> None:
     session.assertions.append("synthetic collapsed row emits no definition request")
     session.wait_screen(
         ("a-fold-caller.rs", "middle_region_with_a_deliberately_long_anchor"),
-        "synthetic-row Ctrl-click cannot navigate away",
+        "synthetic-row Alt-click cannot navigate away",
     )
 
     session.key(b" ")
@@ -1305,10 +1302,11 @@ def fold_keyboard_and_mouse_definition(context: ScenarioContext) -> None:
         absent=("…",),
     )
     token_position = _content_token_position(session, "target_call")
-    session.ctrl_click(*token_position)
+    session.alt_move(*token_position)
+    session.alt_click(*token_position)
     session.wait_screen(
         ("b-fold-target.rs", "target_destination", "Navigation target opened."),
-        "Ctrl-click on a real token performs definition navigation",
+        "Alt-hover and Alt-click on a real token perform definition navigation",
     )
     trace = _wait_trace(
         context,
@@ -1319,7 +1317,7 @@ def fold_keyboard_and_mouse_definition(context: ScenarioContext) -> None:
         raise E2EAssertionError(
             "helper_receipt", f"expected exactly one definition request, got trace {trace!r}"
         )
-    session.assertions.append("exactly one definition request follows the real-token Ctrl-click")
+    session.assertions.append("exactly one definition request follows the real-token Alt-click")
 
 
 def lsp_document_symbols(context: ScenarioContext) -> None:
@@ -1331,7 +1329,7 @@ def lsp_document_symbols(context: ScenarioContext) -> None:
     )
     session.key(b"l")
 
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("Document Symbols", "LargeRoot", "NestedSymbol"),
         "nested DocumentSymbol results populate the production picker",
@@ -1348,7 +1346,7 @@ def lsp_document_symbols(context: ScenarioContext) -> None:
         absent=("Document Symbols",),
     )
 
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("Document Symbols", "FlatSymbol", "fixture"),
         "flat SymbolInformation results populate the production picker",
@@ -1361,7 +1359,7 @@ def lsp_document_symbols(context: ScenarioContext) -> None:
         absent=("Document Symbols",),
     )
 
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("No document symbols found.", "pub fn large_root"),
         "null LSP document symbols produce the bounded empty-result status",
@@ -1369,7 +1367,7 @@ def lsp_document_symbols(context: ScenarioContext) -> None:
     )
     trace = _wait_trace(context, ("document-symbol-3",), "null LSP symbols are requested")
 
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("Document Symbols", "ChildrenNull"),
         "nested symbols accept an explicit null children field",
@@ -1380,13 +1378,13 @@ def lsp_document_symbols(context: ScenarioContext) -> None:
         "null-children symbol picker closes before the empty-result request",
         absent=("Document Symbols",),
     )
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("No document symbols found.", "pub fn large_root"),
         "an empty symbol array follows the same bounded empty-result path",
         absent=("Document Symbols",),
     )
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("mixes nested and flat variants", "pub fn large_root"),
         "mixed document-symbol variants fail and retire the configured session",
@@ -1412,7 +1410,7 @@ def crashing_lsp(context: ScenarioContext) -> None:
         absent=("LOADING", "Loading content"),
     )
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     _wait_trace(
         context,
         ("crash-started", "crash-after-initialize"),
@@ -1424,7 +1422,7 @@ def crashing_lsp(context: ScenarioContext) -> None:
         absent=("Finding definition…",),
     )
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is restarting after failure:", "caller!"),
         "immediate retry observes the bounded restart backoff",
@@ -1442,14 +1440,14 @@ def incompatible_lsp(context: ScenarioContext) -> None:
     session = context.session
     session.wait_screen(("role-caller.rs", "caller!"), "UTF-8 LSP fixture Preview loads")
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     _wait_trace(context, ("utf8-initialize-sent",), "server selects an incompatible encoding")
     session.wait_screen(
         ("unsupported positionEncoding", "requires UTF-16", "caller!"),
         "incompatible position encoding fails the deferred navigation request",
         absent=("Finding definition…",),
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is restarting after failure:", "caller!"),
         "incompatible server cleanup records restart backoff",
@@ -1460,7 +1458,7 @@ def descendant_lsp(context: ScenarioContext) -> None:
     session = context.session
     session.wait_screen(("role-caller.rs", "caller!"), "descendant LSP fixture Preview loads")
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     trace = _wait_trace(
         context,
         ("ready-before-direct-exit", "descendant=", "direct="),
@@ -1480,7 +1478,7 @@ def timeout_lsp(context: ScenarioContext) -> None:
     session = context.session
     session.wait_screen(("role-caller.rs", "caller!"), "timeout LSP fixture Preview loads")
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     _wait_trace(context, ("timeout-definition-held",), "definition request is held by the server")
     session.wait_screen(
         ("Language server request timed out.", "caller!"),
@@ -1524,7 +1522,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
             f"{repository_name} caller Preview opens",
             absent=("Open File", "LOADING", "Loading content"),
         )
-        session.key(b"\x1b[24~")
+        session.key(b"\x04")
         session.wait_screen(
             ("No definition found.", f"{repository_name}/caller.rs"),
             f"{repository_name} keeps one ready stalled-session tree",
@@ -1564,10 +1562,10 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
     session.key(b"l")
     trace_path = Path(context.environment["LATTELENS_TEST_TRACE"])
 
-    session.key(b"\x1b[24;2~")
+    session.key(b"\x12")
     session.wait_screen(
         ("Configured language server does not provide References.", "caller!"),
-        "launch one exposes unsupported Shift-F12 without sending References",
+        "launch one exposes unsupported Ctrl-R without sending References",
     )
     trace = _wait_trace(
         context,
@@ -1578,20 +1576,20 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
         raise E2EAssertionError("helper_receipt", f"unsupported References changed trace: {trace!r}")
     session.assertions.append("unsupported References sends no semantic request")
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("bounded JSON string token is too large", "caller!"),
         "launch one invalid error shape retires the ready session",
     )
     _wait_trace(context, ("resilience-response=1",), "launch one arms its invalid error shape")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is restarting after failure:", "caller!"),
         "first immediate retry observes one-second backoff",
     )
     _drain_for(session, 1.1, "PTY remains drained through one-second backoff")
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("fixture initialize denied", "caller!"),
         "launch two surfaces the bounded initialize error",
@@ -1601,14 +1599,14 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
         ("resilience-launch=2", "resilience-initialize-denied"),
         "launch two records initialize denial",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is restarting after failure:", "caller!"),
         "second immediate retry observes two-second backoff",
     )
     _drain_for(session, 2.1, "PTY remains drained through two-second backoff")
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("malformed language server JSON", "caller!"),
         "launch three rejects framed malformed JSON",
@@ -1618,14 +1616,14 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
         ("resilience-launch=3", "resilience-response=3"),
         "launch three arms framed malformed JSON before sending",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is restarting after failure:", "caller!"),
         "third immediate retry observes four-second backoff",
     )
     _drain_for(session, 4.1, "PTY remains drained through four-second backoff")
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("JSON-RPC response is missing its id", "caller!"),
         "launch four rejects a response without id",
@@ -1640,14 +1638,14 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
     )
     helper_pid = int(pid_line.split("=", 1)[1])
     _assert_process_gone(session, helper_pid, "SIGTERM-resistant launch four is killed and reaped")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is restarting after failure:", "caller!"),
         "fourth immediate retry observes eight-second backoff",
     )
     _drain_for(session, 8.1, "PTY remains drained through eight-second backoff")
 
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("JSON-RPC response must contain exactly one of result or error", "caller!"),
         "launch five rejects a response with result and error",
@@ -1657,7 +1655,7 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
         ("resilience-launch=5", "resilience-response=5"),
         "launch five reaches the permanent-failure boundary",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Language server is disabled after repeated failures:", "caller!"),
         "immediate request after fifth failure is permanently disabled",
@@ -1677,7 +1675,7 @@ def default_lsp(context: ScenarioContext) -> None:
         ("basename-caller.rs", "caller!"), "default language-server fixture Preview loads"
     )
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("basename-target.rs", "pub fn target", "Navigation target opened."),
         "PATH-resolved trusted server completes production definition navigation",
@@ -1696,7 +1694,7 @@ def invalid_product_config(context: ScenarioContext) -> None:
         "malformed explicit config is sanitized and surfaced in the footer",
     )
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Code navigation is unavailable for Rust: no language server was found.", "caller!"),
         "invalid config disables navigation without affecting the Preview",
@@ -1711,7 +1709,7 @@ def code_navigation_without_lsp(context: ScenarioContext) -> None:
         "no-LSP fixture Preview loads",
         absent=("LOADING", "Loading caller.rs"),
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Focus Preview to navigate.", "caller!"),
         "semantic navigation is ignored while the file tree owns focus",
@@ -1721,15 +1719,15 @@ def code_navigation_without_lsp(context: ScenarioContext) -> None:
     session.wait_screen(("No previous navigation location.",), "empty back history is bounded")
     session.key(b"\x1b[1;3C")
     session.wait_screen(("No forward navigation location.",), "empty forward history is bounded")
-    session.key(b"@")
+    session.key(b"\x13")
     session.wait_screen(
         ("No document symbols found.", "caller!"),
         "complete empty local symbols avoid unnecessary LSP startup",
     )
-    session.key(b"\x1b[24~")
+    session.key(b"\x04")
     session.wait_screen(
         ("Code navigation is unavailable for Rust: no language server was found.", "caller!"),
-        "F12 without LSP reports unavailable and stays in place",
+        "Ctrl-D without LSP reports unavailable and stays in place",
     )
 
 

@@ -42,7 +42,7 @@ pub enum HighlightKind {
     SearchMatch,
     Search,
     NavigationTarget,
-    NavigationCaret,
+    NavigationHover,
 }
 
 /// A syntax-highlighted byte range within one logical preview line.

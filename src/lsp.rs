@@ -873,6 +873,17 @@ impl PartialEq for ProtocolLocation {
 
 impl Eq for ProtocolLocation {}
 
+#[cfg(test)]
+impl ProtocolLocation {
+    pub(crate) fn for_app_test(uri: lsp_types::Uri, range: lsp_types::Range) -> Self {
+        Self {
+            uri,
+            range,
+            _permit: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtocolSymbolKind {
     Function,

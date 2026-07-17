@@ -57,6 +57,7 @@ pub(crate) struct ContentRequest {
 pub(crate) enum ContentPurpose {
     Display,
     NavigationStage { navigation_generation: u64 },
+    NavigationPreview { navigation_generation: u64 },
 }
 
 #[derive(Clone, Debug)]
