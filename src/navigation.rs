@@ -518,7 +518,6 @@ pub(crate) enum ExecutableIdentity {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    version: u32,
     code_navigation: Option<RawCodeNavigation>,
 }
 
@@ -594,11 +593,7 @@ fn load_user_config(workspace_root: &Path) -> Result<NavigationSettings> {
         if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
             bail!("Latte Lens config must not contain a UTF-8 BOM");
         }
-        let raw = parse_raw_config(&bytes)?;
-        if raw.version != 1 {
-            bail!("unsupported Latte Lens config version {}", raw.version);
-        }
-        Some(raw)
+        Some(parse_raw_config(&bytes)?)
     };
 
     let raw_navigation = raw
@@ -1344,18 +1339,18 @@ mod tests {
     #[test]
     fn jsonc_schema_rejects_duplicate_and_unknown_fields_but_allows_partial_overrides() {
         for input in [
-            r#"{"version":1,"version":1}"#,
-            r#"{"version":1,"unknown":1}"#,
-            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"extra":1}}}}"#,
-            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"java":{"enabled":true}}}}"#,
-            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"engine":{"type":"other","command":[]}}}}}"#,
+            r#"{"code_navigation":{},"code_navigation":{}}"#,
+            r#"{"version":1}"#,
+            r#"{"unknown":1}"#,
+            r#"{"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"extra":1}}}}"#,
+            r#"{"code_navigation":{"enabled":true,"languages":{"java":{"enabled":true}}}}"#,
+            r#"{"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"engine":{"type":"other","command":[]}}}}}"#,
         ] {
             assert!(parse_raw_config(input.as_bytes()).is_err(), "{input}");
         }
-        let inherited = parse_raw_config(
-            br#"{"version":1,"code_navigation":{"languages":{"rust":{"enabled":true}}}}"#,
-        )
-        .unwrap();
+        let inherited =
+            parse_raw_config(br#"{"code_navigation":{"languages":{"rust":{"enabled":true}}}}"#)
+                .unwrap();
         let navigation = inherited.code_navigation.unwrap();
         assert_eq!(navigation.enabled, None);
         let rust = navigation.languages.unwrap().rust.unwrap();
@@ -1368,7 +1363,6 @@ mod tests {
         let parsed = parse_raw_config(
             br#"{
                 // Product configuration, not an LSP-specific file.
-                "version": 1,
                 "code_navigation": {
                     "enabled": true,
                     "languages": {
@@ -1396,12 +1390,12 @@ mod tests {
             rust.engine.unwrap().command[0],
             "https://example.invalid//server"
         );
-        assert!(parse_raw_config(br#"{"version":1} /* unterminated"#).is_err());
+        assert!(parse_raw_config(br#"{} /* unterminated"#).is_err());
     }
 
     #[test]
     fn config_bytes_enforce_exact_size_utf8_and_bom_boundaries() {
-        let mut exact = br#"{"version":1}"#.to_vec();
+        let mut exact = br#"{}"#.to_vec();
         exact.resize(MAX_CONFIG_BYTES as usize, b' ');
         assert!(parse_raw_config(&exact).is_ok());
         exact.push(b' ');
@@ -1571,14 +1565,11 @@ mod tests {
             );
         }
         for (raw, enabled) in [
-            (r#"{"version":1}"#, true),
+            (r#"{}"#, true),
+            (r#"{"code_navigation":{"enabled":false}}"#, false),
+            (r#"{"code_navigation":{"enabled":true}}"#, true),
             (
-                r#"{"version":1,"code_navigation":{"enabled":false}}"#,
-                false,
-            ),
-            (r#"{"version":1,"code_navigation":{"enabled":true}}"#, true),
-            (
-                r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":false}}}}"#,
+                r#"{"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":false}}}}"#,
                 false,
             ),
         ] {
@@ -1594,7 +1585,7 @@ mod tests {
         {
             fs::write(
                 &config,
-                r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true}}}}"#,
+                r#"{"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true}}}}"#,
             )
             .unwrap();
             let _variables = EnvironmentGuard::apply(&[
@@ -1620,7 +1611,6 @@ mod tests {
         fs::write(
             &config,
             serde_json::to_vec(&serde_json::json!({
-                "version": 1,
                 "code_navigation": {
                     "enabled": true,
                     "languages": {
@@ -1651,7 +1641,7 @@ mod tests {
 
         fs::write(
             &config,
-            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"engine":{"type":"language_server","command":["language-server"]}}}}}"#,
+            r#"{"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"engine":{"type":"language_server","command":["language-server"]}}}}}"#,
         )
         .unwrap();
         let path = std::env::join_paths([PathBuf::from("relative-bin"), tools.clone()]).unwrap();

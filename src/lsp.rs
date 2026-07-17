@@ -6550,7 +6550,6 @@ done
         fs::write(
             &config,
             serde_json::to_vec(&serde_json::json!({
-                "version": 1,
                 "code_navigation": {
                     "enabled": true,
                     "languages": {

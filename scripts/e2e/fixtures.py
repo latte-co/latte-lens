@@ -174,7 +174,6 @@ def _write_navigation_config(
     config.write_text(
         f"""{{
   // Code navigation is the feature; the language server is its engine.
-  "version": 1,
   "code_navigation": {{
     "enabled": true,
     "languages": {{
@@ -396,7 +395,7 @@ def create_invalid_product_config_fixture(root: Path, environment: dict[str, str
     run("git", "add", caller.name, cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "invalid config fixture", cwd=root, environment=environment)
     config = (root.parent / "invalid-latte-lens.jsonc").resolve()
-    config.write_text('{"version":1,"code_navigation":', encoding="utf-8")
+    config.write_text('{"code_navigation":', encoding="utf-8")
     environment["LATTELENS_CONFIG"] = str(config)
 
 

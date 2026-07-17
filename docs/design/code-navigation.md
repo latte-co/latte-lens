@@ -388,7 +388,6 @@ Latte 产品统一把用户配置放在 `~/.latte`。代码跳转默认开启，
 
 ```jsonc
 {
-  "version": 1,
   "code_navigation": {
     "languages": {
       "rust": {
@@ -407,7 +406,7 @@ Latte 产品统一把用户配置放在 `~/.latte`。代码跳转默认开启，
   65,537 bytes，只有在 EOF 且长度不超过 64 KiB 时才解析。内容必须是严格 UTF-8，不接受 BOM。
 - parser 接受 JSONC 行注释、块注释与尾逗号，在所有 object 层拒绝 duplicate key，并对
   top-level、feature、family map、language entry 和 engine 全部执行 `deny_unknown_fields`。
-  `version` 必须为 `1`，engine `type` 必须为 `language_server`。最多 4 个 language entry。
+  engine `type` 必须为 `language_server`。最多 4 个 language entry。
 - `command[0]` 长度必须为 1..=4,096 bytes 且不含 NUL；其余 argv 最多 16 项，每项最多 4,096 bytes、
   累计最多 16 KiB，且均不含 NUL。任何文件大小、UTF-8、schema、duplicate、字符串或数组上限
   失败都使整个配置 disabled，产生最多 240 个清理后字符的 warning，并且绝不进入 PATH 解析。

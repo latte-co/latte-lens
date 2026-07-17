@@ -491,7 +491,6 @@ fn write_navigation_config(path: &Path, helper: &Path, args: &[&str]) {
     fs::write(
         path,
         serde_json::to_vec(&serde_json::json!({
-            "version": 1,
             "code_navigation": {
                 "enabled": true,
                 "languages": {

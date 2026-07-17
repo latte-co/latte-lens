@@ -220,7 +220,6 @@ absolute native executable or a basename:
 
 ```jsonc
 {
-  "version": 1,
   "code_navigation": {
     "languages": {
       "rust": {
