@@ -351,6 +351,9 @@ const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1_500);
 const NAVIGATION_HISTORY_LIMIT: usize = 128;
 const NAVIGATION_STATUS_INFO: Duration = Duration::from_secs(4);
 const NAVIGATION_STATUS_ERROR: Duration = Duration::from_secs(8);
+const NAVIGATION_SHORTCUT_CHORD_WINDOW: Duration = Duration::from_secs(4);
+const NAVIGATION_SHORTCUT_CHORD_PROMPT: &str =
+    "Navigation: D definition · R references · I implementations · Esc cancel";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NavigationStatusLevel {
@@ -647,6 +650,7 @@ pub struct App {
     pending_navigation_stage: Option<PendingNavigationStage>,
     pub(crate) navigation_picker: Option<NavigationPickerState>,
     pub(crate) navigation_status: Option<NavigationStatus>,
+    navigation_shortcut_chord_deadline: Option<Instant>,
     navigation_caret: NavigationCaret,
     navigation_target_highlight: Option<SourceRange>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
@@ -809,6 +813,7 @@ impl App {
             pending_navigation_stage: None,
             navigation_picker: None,
             navigation_status: None,
+            navigation_shortcut_chord_deadline: None,
             navigation_caret: NavigationCaret {
                 point: SourcePosition { line: 0, byte: 0 },
                 preferred_display_column: 0,
@@ -1311,6 +1316,9 @@ impl App {
             self.handle_search_key(key);
             return;
         }
+        if self.handle_navigation_shortcut_chord(key) {
+            return;
+        }
         if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
             self.request_quit(QuitKey::Q);
             return;
@@ -1326,6 +1334,21 @@ impl App {
         self.quit_confirmation = None;
 
         match (key.code, key.modifiers) {
+            (KeyCode::Char('b' | 'B'), KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                self.request_semantic_navigation(NavigationOperation::Definition);
+            }
+            (KeyCode::Char('b' | 'B'), modifiers)
+                if modifiers == KeyModifiers::CONTROL | KeyModifiers::ALT
+                    || modifiers == KeyModifiers::SUPER | KeyModifiers::ALT =>
+            {
+                self.request_semantic_navigation(NavigationOperation::Implementations);
+            }
+            (KeyCode::Char('k' | 'K'), KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                self.begin_navigation_shortcut_chord();
+            }
+            (KeyCode::F(7), KeyModifiers::ALT) => {
+                self.request_semantic_navigation(NavigationOperation::References);
+            }
             (KeyCode::F(12), KeyModifiers::NONE) => {
                 self.request_semantic_navigation(NavigationOperation::Definition);
             }
@@ -1405,6 +1428,63 @@ impl App {
             key,
             deadline: now + QUIT_CONFIRM_WINDOW,
         });
+    }
+
+    fn begin_navigation_shortcut_chord(&mut self) {
+        if self.focused_pane != FocusPane::Content || self.content_mode != ContentMode::Preview {
+            self.set_navigation_status(NavigationStatusLevel::Error, "Focus Preview to navigate.");
+            return;
+        }
+        self.navigation_shortcut_chord_deadline =
+            Some(Instant::now() + NAVIGATION_SHORTCUT_CHORD_WINDOW);
+        self.set_navigation_status(
+            NavigationStatusLevel::Info,
+            NAVIGATION_SHORTCUT_CHORD_PROMPT,
+        );
+    }
+
+    fn handle_navigation_shortcut_chord(&mut self, key: KeyEvent) -> bool {
+        let Some(deadline) = self.navigation_shortcut_chord_deadline else {
+            return false;
+        };
+        if Instant::now() > deadline {
+            self.clear_navigation_shortcut_chord();
+            return false;
+        }
+        let operation = match (key.code, key.modifiers) {
+            (KeyCode::Char('d' | 'D'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Some(NavigationOperation::Definition)
+            }
+            (KeyCode::Char('r' | 'R'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Some(NavigationOperation::References)
+            }
+            (KeyCode::Char('i' | 'I'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Some(NavigationOperation::Implementations)
+            }
+            (KeyCode::Esc, _) => {
+                self.clear_navigation_shortcut_chord();
+                return true;
+            }
+            _ => None,
+        };
+        let Some(operation) = operation else {
+            self.clear_navigation_shortcut_chord();
+            return false;
+        };
+        self.clear_navigation_shortcut_chord();
+        self.request_semantic_navigation(operation);
+        true
+    }
+
+    fn clear_navigation_shortcut_chord(&mut self) {
+        self.navigation_shortcut_chord_deadline = None;
+        if self
+            .navigation_status
+            .as_ref()
+            .is_some_and(|status| status.message == NAVIGATION_SHORTCUT_CHORD_PROMPT)
+        {
+            self.navigation_status = None;
+        }
     }
 
     pub(crate) fn quit_confirmation_message(&self) -> Option<&'static str> {
@@ -3508,6 +3588,12 @@ impl App {
         {
             self.navigation_status = None;
         }
+        if self
+            .navigation_shortcut_chord_deadline
+            .is_some_and(|deadline| Instant::now() > deadline)
+        {
+            self.clear_navigation_shortcut_chord();
+        }
         self.dispatch_search_if_due();
         let (refresh, directories, content) = self.runtime.take_completions();
         if let Some(completion) = refresh {
@@ -4427,6 +4513,7 @@ impl App {
             self.navigation_runtime.cancel(stage.invocation.generation);
         }
         self.navigation_picker = None;
+        self.navigation_shortcut_chord_deadline = None;
         self.navigation_generation = self
             .navigation_generation
             .checked_add(1)
@@ -4445,6 +4532,7 @@ impl App {
             self.runtime.cancel_pending_content();
         }
         self.navigation_picker = None;
+        self.navigation_shortcut_chord_deadline = None;
         self.last_navigation_click = None;
         self.navigation_generation = self
             .navigation_generation
@@ -7641,6 +7729,109 @@ mod tests {
                 .is_some_and(|status| status.message.contains("unavailable for Rust"))
         );
         assert!(app.navigation_back.is_empty());
+    }
+
+    #[test]
+    fn idea_aliases_and_terminal_chord_dispatch_semantic_navigation() {
+        let cases = [
+            (
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                None,
+                NavigationOperation::Definition,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::SUPER),
+                None,
+                NavigationOperation::Definition,
+            ),
+            (
+                KeyEvent::new(
+                    KeyCode::Char('b'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ),
+                None,
+                NavigationOperation::Implementations,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::SUPER | KeyModifiers::ALT),
+                None,
+                NavigationOperation::Implementations,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Some(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+                NavigationOperation::Definition,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER),
+                Some(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+                NavigationOperation::References,
+            ),
+            (
+                KeyEvent::new(KeyCode::F(7), KeyModifiers::ALT),
+                None,
+                NavigationOperation::References,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Some(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT)),
+                NavigationOperation::Implementations,
+            ),
+        ];
+
+        for (prefix, action, expected) in cases {
+            let mut app = navigation_app("fn caller() {}\n");
+            app.handle_key(prefix);
+            if let Some(action) = action {
+                assert!(app.navigation_shortcut_chord_deadline.is_some());
+                app.handle_key(action);
+            }
+            assert_eq!(
+                app.navigation_invocation
+                    .as_ref()
+                    .map(|invocation| invocation.operation),
+                Some(expected)
+            );
+            assert!(app.navigation_shortcut_chord_deadline.is_none());
+            app.cancel_pending_navigation();
+        }
+    }
+
+    #[test]
+    fn navigation_chord_escape_cancels_without_quitting() {
+        let mut app = navigation_app("fn caller() {}\n");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(app.navigation_shortcut_chord_deadline.is_some());
+        assert!(app.navigation_status.as_ref().is_some_and(|status| {
+            status.message.contains("D definition") && status.message.contains("R references")
+        }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.navigation_shortcut_chord_deadline.is_none());
+        assert!(app.navigation_status.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn navigation_chord_timeout_and_unknown_key_restore_normal_input() {
+        let mut app = navigation_app("fn caller() {}\n");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        app.navigation_shortcut_chord_deadline = Some(Instant::now() - Duration::from_millis(1));
+        app.poll_background();
+        assert!(app.navigation_shortcut_chord_deadline.is_none());
+        assert!(app.navigation_status.is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        app.content_scroll = 5;
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+
+        assert!(app.navigation_shortcut_chord_deadline.is_none());
+        assert!(app.navigation_status.is_none());
+        assert_eq!(app.content_scroll, 0);
+        assert!(app.navigation_invocation.is_none());
     }
 
     #[test]

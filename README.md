@@ -99,7 +99,11 @@ Inside the TUI:
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
-| `f12` / `shift-f12` / `ctrl-f12` | In focused Preview content, find the definition, references, or implementations through the available code-navigation engine |
+| `ctrl-b` / `cmd-b` | In focused Preview content, go to the definition; the `cmd` form works when the terminal forwards Command/Super keys |
+| `ctrl-alt-b` / `cmd-alt-b` | Find implementations, following the IntelliJ keymap; the `cmd` form depends on terminal support |
+| `alt-f7` | Find references using the IntelliJ keymap; on macOS this may still require `fn` |
+| `ctrl-k` / `cmd-k`, then `d` / `r` / `i` | Open the terminal-safe navigation chord for definition, references, or implementations; press `esc` to cancel |
+| `f12` / `shift-f12` / `ctrl-f12` | VS Code-compatible aliases for definition, references, or implementations; on macOS these may require `fn` |
 | `@` | Open bounded local document symbols for the current Preview |
 | `alt-←` / `alt-→` | Move backward or forward through successful navigation locations |
 | `[` / `]` | In focused Preview content, jump to the previous or next visible fold marker |
@@ -123,7 +127,7 @@ Mouse controls:
 - Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
-- In a supported built-in source Preview, `Ctrl`-click (or `Command`-click on macOS) requests the clicked token's definition. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
+- In a supported built-in source Preview, `Ctrl`-click (or `Command`-click on macOS) requests the clicked token's definition. For keyboard navigation without macOS function keys, use terminal-safe `Ctrl+B` for definition or `Ctrl+K`, then `D`/`R`/`I`; IDEA-style Command variants are also accepted when the terminal forwards them. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.

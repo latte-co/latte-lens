@@ -1406,10 +1406,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         FocusPane::Tree => "Tree",
         FocusPane::Content => "Content",
     };
-    let help = if area.width < 96 {
+    let help = if area.width < 96 && app.content_mode == ContentMode::Preview {
+        "  ↑↓ scroll  [/] folds  Ctrl+B definition  Ctrl+K nav  Ctrl+C copy/quit  Ctrl+F find  q×2 quit"
+    } else if area.width < 96 {
         "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  1/2 scope  r refresh  q×2 quit"
     } else if app.content_mode == ContentMode::Preview {
-        "  ↑↓ scroll  [/] folds  Enter toggle  {/} all  Ctrl+F find  drag copies  Ctrl+C quit/copy  1/2 scope  p/d view  r refresh  q×2 quit"
+        "  ↑↓ scroll  [/] folds  Enter toggle  {/} all  Ctrl+B definition  Ctrl+K nav  Ctrl+C copy/quit  Ctrl+F find  drag copies  1/2 scope  p/d view  r refresh  q×2 quit"
     } else if app.content_mode == ContentMode::Diff {
         "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  p preview  d diff  r refresh  q×2 quit"
     } else {

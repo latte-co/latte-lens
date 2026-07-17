@@ -968,10 +968,10 @@ def code_navigation(context: ScenarioContext) -> None:
     )
 
     session.key(b"l")
-    session.key(b"\x1b[24~")
+    session.key(b"\x02")
     session.wait_screen(
         ("b-target.rs", "pub fn"),
-        "F12 definition commits the cross-file target",
+        "Ctrl-B definition commits the cross-file target",
         absent=("Navigation target is invalid",),
     )
     server_receipts = tuple(
@@ -1016,10 +1016,15 @@ def code_navigation(context: ScenarioContext) -> None:
         "Ctrl-F12 commits a successful implementation target on the reused session",
     )
 
-    session.key(b"\x1b[24;2~")
+    session.key(b"\x0b")
+    session.wait_screen(
+        ("Navigation: D definition", "R references", "I implementations"),
+        "Ctrl-K opens the terminal-safe navigation chord",
+    )
+    session.key(b"r")
     session.wait_screen(
         ("References", "a-caller.rs", "b-target.rs"),
-        "Shift-F12 opens the multi-result picker",
+        "Ctrl-K then R opens the multi-result picker",
     )
     picker_column = session.screen.columns // 2
     picker_row = session.screen.rows // 2
