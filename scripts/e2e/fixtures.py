@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -152,21 +153,42 @@ def _navigation_helper() -> Path:
     return helper
 
 
-def _write_lsp_config(root: Path, helper: Path, role: str) -> Path:
-    config = (root.parent / "lsp.json").resolve()
+def _isolated_path_with_git(environment: dict[str, str], *directories: Path) -> str:
+    git = shutil.which("git", path=environment.get("PATH"))
+    if git is None:
+        raise RuntimeError("git is required by the E2E read-only oracle")
+    entries = [str(directory.resolve()) for directory in directories]
+    entries.append(str(Path(git).resolve().parent))
+    return os.pathsep.join(entries)
+
+
+def _write_navigation_config(
+    root: Path, environment: dict[str, str], helper: Path, role: str
+) -> Path:
+    home = Path(environment["HOME"]).resolve()
+    environment["HOME"] = str(home)
+    config = home / ".latte" / "latte-lens.jsonc"
+    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    helper_json = json.dumps(str(helper))
+    role_json = json.dumps(role)
     config.write_text(
-        json.dumps(
-            {
-                "enabled": True,
-                "servers": {
-                    "rust": {
-                        "enabled": True,
-                        "program": str(helper),
-                        "args": [role],
-                    }
-                },
-            }
-        ),
+        f"""{{
+  // Code navigation is the feature; the language server is its engine.
+  "version": 1,
+  "code_navigation": {{
+    "enabled": true,
+    "languages": {{
+      "rust": {{
+        "enabled": true,
+        "engine": {{
+          "type": "language_server",
+          "command": [{helper_json}, {role_json},],
+        }},
+      }},
+    }},
+  }},
+}}
+""",
         encoding="utf-8",
     )
     return config
@@ -181,8 +203,7 @@ def create_code_navigation_fixture(root: Path, environment: dict[str, str]) -> N
     run("git", "add", "a-caller.rs", "b-target.rs", cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "navigation fixture", cwd=root, environment=environment)
 
-    config = _write_lsp_config(root, _navigation_helper(), "pty-lsp")
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
     environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
     environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / "lsp-trace.txt").resolve())
@@ -219,8 +240,7 @@ def create_fold_mouse_navigation_fixture(
     run("git", "add", caller.name, target.name, cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "fold mouse fixture", cwd=root, environment=environment)
 
-    config = _write_lsp_config(root, _navigation_helper(), "pty-lsp")
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
     environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
     environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / "fold-mouse-trace.txt").resolve())
@@ -243,8 +263,7 @@ def create_lsp_document_symbol_fixture(
     run("git", "add", caller.name, cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "large symbol fixture", cwd=root, environment=environment)
 
-    config = _write_lsp_config(root, _navigation_helper(), "pty-lsp")
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
     environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
     environment["LATTELENS_TEST_TARGET_URI"] = caller.resolve().as_uri()
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / "symbol-trace.txt").resolve())
@@ -260,8 +279,7 @@ def create_crashing_lsp_fixture(root: Path, environment: dict[str, str]) -> None
     run("git", "add", caller.name, cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "crash fixture", cwd=root, environment=environment)
 
-    config = _write_lsp_config(root, _navigation_helper(), "crash-initialize")
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    _write_navigation_config(root, environment, _navigation_helper(), "crash-initialize")
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / "crash-trace.txt").resolve())
 
 
@@ -277,8 +295,7 @@ def _create_role_lsp_fixture(
     caller.write_text("caller!(); // 😀中\n", encoding="utf-8")
     run("git", "add", caller.name, cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", f"{role} fixture", cwd=root, environment=environment)
-    config = _write_lsp_config(root, _navigation_helper(), role)
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    _write_navigation_config(root, environment, _navigation_helper(), role)
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / trace_name).resolve())
 
 
@@ -331,8 +348,7 @@ def create_batch_shutdown_lsp_fixture(
             environment=environment,
         )
 
-    config = _write_lsp_config(root, _navigation_helper(), "stalled-session-tree")
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    _write_navigation_config(root, environment, _navigation_helper(), "stalled-session-tree")
     environment["LATTELENS_TEST_TRACE"] = str(
         (root.parent / "batch-shutdown-trace.txt").resolve()
     )
@@ -350,7 +366,7 @@ def create_resilience_lsp_fixture(root: Path, environment: dict[str, str]) -> No
     )
 
 
-def create_basename_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+def create_default_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
     init_repository(root, environment)
     caller = root / "basename-caller.rs"
     target = root / "basename-target.rs"
@@ -360,24 +376,28 @@ def create_basename_lsp_fixture(root: Path, environment: dict[str, str]) -> None
     run("git", "commit", "-q", "-m", "basename fixture", cwd=root, environment=environment)
 
     helper = _navigation_helper()
-    config = _write_lsp_config(root, Path(helper.name), "pty-lsp")
-    environment["PATH"] = os.pathsep.join((str(helper.parent), environment.get("PATH", "")))
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    server_bin = root.parent / "default-server-bin"
+    server_bin.mkdir(mode=0o700)
+    server = server_bin / ("rust-analyzer.exe" if os.name == "nt" else "rust-analyzer")
+    shutil.copy2(helper, server)
+    if os.name != "nt":
+        server.chmod(0o700)
+    environment["PATH"] = _isolated_path_with_git(environment, server_bin)
     environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
     environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / "basename-trace.txt").resolve())
     environment["LATTELENS_TEST_RELEASE"] = str((root.parent / "basename-release").resolve())
 
 
-def create_invalid_lsp_config_fixture(root: Path, environment: dict[str, str]) -> None:
+def create_invalid_product_config_fixture(root: Path, environment: dict[str, str]) -> None:
     init_repository(root, environment)
     caller = root / "invalid-config.rs"
     caller.write_text("caller!();\n", encoding="utf-8")
     run("git", "add", caller.name, cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "invalid config fixture", cwd=root, environment=environment)
-    config = (root.parent / "invalid-lsp.json").resolve()
-    config.write_text('{"enabled":true,"servers":', encoding="utf-8")
-    environment["LATTELENS_LSP_CONFIG"] = str(config)
+    config = (root.parent / "invalid-latte-lens.jsonc").resolve()
+    config.write_text('{"version":1,"code_navigation":', encoding="utf-8")
+    environment["LATTELENS_CONFIG"] = str(config)
 
 
 def create_code_navigation_without_lsp_fixture(
@@ -387,6 +407,9 @@ def create_code_navigation_without_lsp_fixture(
     (root / "caller.rs").write_text("caller!();\n", encoding="utf-8")
     run("git", "add", "caller.rs", cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "no LSP fixture", cwd=root, environment=environment)
+    empty_path = root.parent / "empty-path"
+    empty_path.mkdir(mode=0o700)
+    environment["PATH"] = _isolated_path_with_git(environment, empty_path)
 
 
 def create_structure_fixture(root: Path, environment: dict[str, str]) -> None:

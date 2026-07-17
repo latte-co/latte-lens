@@ -3558,17 +3558,22 @@ fn run_production_spawner_framed_journey() {
     let target_path = target_path.canonicalize().unwrap();
     let trace = container.path().join("framed.trace");
     let release = container.path().join("release-definition");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
     let config_value = serde_json::json!({
-        "enabled": true,
-        "servers": {
-            "rust": {
-                "enabled": true,
-                "program": helper,
-                "args": ["framed-lsp"]
+        "version": 1,
+        "code_navigation": {
+            "enabled": true,
+            "languages": {
+                "rust": {
+                    "enabled": true,
+                    "engine": {
+                        "type": "language_server",
+                        "command": [helper, "framed-lsp"]
+                    }
+                }
             }
         }
     });
@@ -3578,7 +3583,7 @@ fn run_production_spawner_framed_journey() {
     let root_uri = url::Url::from_file_path(&workspace).unwrap().to_string();
     let caller_uri = url::Url::from_file_path(&caller_path).unwrap().to_string();
     let target_uri = url::Url::from_file_path(&target_path).unwrap().to_string();
-    set_test_env("LATTELENS_LSP_CONFIG", config.as_os_str());
+    set_test_env("LATTELENS_CONFIG", config.as_os_str());
     set_test_env("LATTELENS_TEST_HELPER_MODE", "framed-lsp");
     set_test_env("LATTELENS_TEST_ROOT_URI", &root_uri);
     set_test_env("LATTELENS_TEST_CALLER_URI", &caller_uri);
@@ -3663,7 +3668,7 @@ fn run_production_spawner_framed_journey() {
     assert_eq!(report.process_owners_dropped, 1);
 
     for key in [
-        "LATTELENS_LSP_CONFIG",
+        "LATTELENS_CONFIG",
         "LATTELENS_TEST_HELPER_MODE",
         "LATTELENS_TEST_ROOT_URI",
         "LATTELENS_TEST_CALLER_URI",

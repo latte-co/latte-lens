@@ -1485,7 +1485,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled("  ", Style::default()),
             Span::styled(
-                format!("Navigation config: {warning}"),
+                format!("Configuration: {warning}"),
                 Style::default().fg(ROSE),
             ),
         ])

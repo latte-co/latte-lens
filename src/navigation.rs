@@ -1,8 +1,9 @@
 //! Bounded, read-only code-navigation domain and configuration policy.
 //!
-//! Semantic navigation is authorized only by an explicit user configuration.
-//! Structural data in [`crate::folding`] is deliberately not a semantic
-//! definition/reference fallback.
+//! Semantic navigation uses built-in language-server defaults that user-level
+//! product configuration can disable or override. Structural data in
+//! [`crate::folding`] is deliberately not a semantic definition/reference
+//! fallback.
 #![allow(dead_code)]
 
 use std::{
@@ -419,11 +420,11 @@ impl NavigationSettings {
         self.servers.get(&family)
     }
 
-    /// Load the one explicit user-level LSP configuration boundary.
+    /// Load code-navigation settings from the user-level Latte Lens configuration.
     ///
-    /// Missing default configuration is a disabled success. An explicit path
-    /// that is missing or invalid disables navigation and returns a warning;
-    /// it never prevents the viewer from starting.
+    /// Missing default configuration uses built-in language-server commands.
+    /// An explicit path that is missing or invalid disables navigation and
+    /// returns a warning; it never prevents the viewer from starting.
     pub fn load_user_config(workspace_root: &Path) -> LoadedNavigationSettings {
         match load_user_config(workspace_root) {
             Ok(settings) => LoadedNavigationSettings {
@@ -517,25 +518,45 @@ pub(crate) enum ExecutableIdentity {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    enabled: Option<bool>,
-    servers: Option<RawServers>,
+    version: u32,
+    code_navigation: Option<RawCodeNavigation>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawServers {
-    rust: Option<RawServer>,
-    typescript: Option<RawServer>,
-    python: Option<RawServer>,
-    go: Option<RawServer>,
+struct RawCodeNavigation {
+    enabled: Option<bool>,
+    languages: Option<RawLanguages>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawServer {
+struct RawLanguages {
+    rust: Option<RawLanguage>,
+    typescript: Option<RawLanguage>,
+    python: Option<RawLanguage>,
+    go: Option<RawLanguage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLanguage {
     enabled: Option<bool>,
-    program: Option<String>,
-    args: Option<Vec<String>>,
+    engine: Option<RawNavigationEngine>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNavigationEngine {
+    #[serde(rename = "type")]
+    kind: RawNavigationEngineKind,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawNavigationEngineKind {
+    LanguageServer,
 }
 
 fn load_user_config(workspace_root: &Path) -> Result<NavigationSettings> {
@@ -543,121 +564,242 @@ fn load_user_config(workspace_root: &Path) -> Result<NavigationSettings> {
         .canonicalize()
         .with_context(|| format!("cannot resolve workspace {}", workspace_root.display()))?;
     let (path, explicit) = user_config_path()?;
-    if !path.exists() {
+    let raw = if !path.exists() {
         if explicit {
-            bail!("explicit LSP config does not exist: {}", path.display());
-        }
-        return Ok(NavigationSettings::disabled());
-    }
-    ensure_absolute_no_links(&path)?;
-    let mut file = match open_regular(None, &path)? {
-        OpenRegular::Opened(file) => file,
-        OpenRegular::Declined(inspected) => {
             bail!(
-                "LSP config is a {}, not a regular file",
-                inspected.kind.label()
-            )
+                "explicit Latte Lens config does not exist: {}",
+                path.display()
+            );
         }
+        None
+    } else {
+        ensure_absolute_no_links(&path)?;
+        let mut file = match open_regular(None, &path)? {
+            OpenRegular::Opened(file) => file,
+            OpenRegular::Declined(inspected) => {
+                bail!(
+                    "Latte Lens config is a {}, not a regular file",
+                    inspected.kind.label()
+                )
+            }
+        };
+        let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES as usize + 1);
+        file.by_ref()
+            .take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("cannot read Latte Lens config")?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            bail!("Latte Lens config exceeds 64 KiB");
+        }
+        if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+            bail!("Latte Lens config must not contain a UTF-8 BOM");
+        }
+        let raw = parse_raw_config(&bytes)?;
+        if raw.version != 1 {
+            bail!("unsupported Latte Lens config version {}", raw.version);
+        }
+        Some(raw)
     };
-    let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES as usize + 1);
-    file.by_ref()
-        .take(MAX_CONFIG_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .context("cannot read LSP config")?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        bail!("LSP config exceeds 64 KiB");
-    }
-    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        bail!("LSP config must not contain a UTF-8 BOM");
-    }
-    let raw = parse_raw_config(&bytes)?;
-    if raw.enabled != Some(true) {
+
+    let raw_navigation = raw
+        .as_ref()
+        .and_then(|config| config.code_navigation.as_ref());
+    if raw_navigation.and_then(|navigation| navigation.enabled) == Some(false) {
         return Ok(NavigationSettings::disabled());
     }
-    let Some(raw_servers) = raw.servers else {
-        return Ok(NavigationSettings::disabled());
-    };
+    let raw_languages = raw_navigation.and_then(|navigation| navigation.languages.as_ref());
     let mut servers = BTreeMap::new();
     for (family, raw) in [
-        (LanguageFamily::Rust, raw_servers.rust),
-        (LanguageFamily::TypeScript, raw_servers.typescript),
-        (LanguageFamily::Python, raw_servers.python),
-        (LanguageFamily::Go, raw_servers.go),
+        (
+            LanguageFamily::Rust,
+            raw_languages.and_then(|value| value.rust.as_ref()),
+        ),
+        (
+            LanguageFamily::TypeScript,
+            raw_languages.and_then(|value| value.typescript.as_ref()),
+        ),
+        (
+            LanguageFamily::Python,
+            raw_languages.and_then(|value| value.python.as_ref()),
+        ),
+        (
+            LanguageFamily::Go,
+            raw_languages.and_then(|value| value.go.as_ref()),
+        ),
     ] {
-        let Some(raw) = raw else { continue };
-        if raw.enabled != Some(true) {
+        if raw.and_then(|language| language.enabled) == Some(false) {
             continue;
         }
-        let program = raw
-            .program
-            .filter(|program| !program.is_empty())
-            .ok_or_else(|| anyhow!("enabled {} server has no program", family.config_key()))?;
-        validate_string("program", &program, MAX_PROGRAM_BYTES)?;
-        let args = raw.args.unwrap_or_default();
-        validate_args(&args)?;
-        let resolved = resolve_program(&program)?;
-        let validated = validate_executable(&resolved, &workspace_root)?;
-        servers.insert(
-            family,
-            TrustedServer {
-                program: validated.path,
-                args: args.into(),
-                identity: validated.identity,
-            },
-        );
+        if let Some(engine) = raw.and_then(|language| language.engine.as_ref()) {
+            match engine.kind {
+                RawNavigationEngineKind::LanguageServer => {}
+            }
+            let server = trusted_server_from_command(&engine.command, family, &workspace_root)?;
+            servers.insert(family, server);
+        } else {
+            let command = default_language_server_command(family);
+            // Built-in discovery is best effort: an unavailable language server
+            // disables only that language, matching editor-style activation.
+            if let Ok(server) = trusted_server_from_command(&command, family, &workspace_root) {
+                servers.insert(family, server);
+            }
+        }
     }
     Ok(NavigationSettings { servers })
 }
 
+fn default_language_server_command(family: LanguageFamily) -> Vec<String> {
+    let command: &[&str] = match family {
+        LanguageFamily::Rust => &["rust-analyzer"],
+        LanguageFamily::TypeScript => &["typescript-language-server", "--stdio"],
+        LanguageFamily::Python => &["pyright-langserver", "--stdio"],
+        LanguageFamily::Go => &["gopls", "serve"],
+    };
+    command.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn trusted_server_from_command(
+    command: &[String],
+    family: LanguageFamily,
+    workspace_root: &Path,
+) -> Result<TrustedServer> {
+    let (program, args) = command.split_first().ok_or_else(|| {
+        anyhow!(
+            "enabled {} code navigation has an empty command",
+            family.config_key()
+        )
+    })?;
+    validate_string("code navigation command", program, MAX_PROGRAM_BYTES)?;
+    validate_args(args)?;
+    let resolved = resolve_program(program)?;
+    let validated = validate_executable(&resolved, workspace_root)?;
+    Ok(TrustedServer {
+        program: validated.path,
+        args: Arc::from(args),
+        identity: validated.identity,
+    })
+}
+
 fn parse_raw_config(bytes: &[u8]) -> Result<RawConfig> {
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        bail!("LSP config exceeds 64 KiB");
+        bail!("Latte Lens config exceeds 64 KiB");
     }
     if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        bail!("LSP config must not contain a UTF-8 BOM");
+        bail!("Latte Lens config must not contain a UTF-8 BOM");
     }
-    std::str::from_utf8(bytes).context("LSP config is not strict UTF-8")?;
-    serde_json::from_slice(bytes).context("invalid LSP config")
+    std::str::from_utf8(bytes).context("Latte Lens config is not strict UTF-8")?;
+    let normalized = normalize_jsonc(bytes)?;
+    serde_json::from_slice(&normalized).context("invalid Latte Lens config")
 }
 
 fn user_config_path() -> Result<(PathBuf, bool)> {
-    if let Some(path) = env::var_os("LATTELENS_LSP_CONFIG") {
+    if let Some(path) = env::var_os("LATTELENS_CONFIG") {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
-            bail!("LATTELENS_LSP_CONFIG must be an absolute path");
+            bail!("LATTELENS_CONFIG must be an absolute path");
         }
         return Ok((path, true));
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = absolute_env_path("HOME")?;
-        Ok((
-            home.join("Library/Application Support/latte-lens/lsp.json"),
-            false,
-        ))
-    }
+    #[cfg(not(windows))]
+    let home = absolute_env_path("HOME")?;
     #[cfg(windows)]
-    {
-        let appdata = absolute_env_path("APPDATA")?;
-        Ok((appdata.join("latte-lens/lsp.json"), false))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(config) = env::var_os("XDG_CONFIG_HOME") {
-            let config = PathBuf::from(config);
-            if !config.is_absolute() {
-                bail!("XDG_CONFIG_HOME must be absolute");
+    let home = absolute_env_path("USERPROFILE")?;
+    Ok((home.join(".latte/latte-lens.jsonc"), false))
+}
+
+fn normalize_jsonc(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut normalized = bytes.to_vec();
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < normalized.len() {
+        let byte = normalized[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
             }
-            return Ok((config.join("latte-lens/lsp.json"), false));
+            index += 1;
+            continue;
         }
-        let home = absolute_env_path("HOME")?;
-        Ok((home.join(".config/latte-lens/lsp.json"), false))
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte != b'/' || index + 1 >= normalized.len() {
+            index += 1;
+            continue;
+        }
+        match normalized[index + 1] {
+            b'/' => {
+                normalized[index] = b' ';
+                normalized[index + 1] = b' ';
+                index += 2;
+                while index < normalized.len() && !matches!(normalized[index], b'\n' | b'\r') {
+                    normalized[index] = b' ';
+                    index += 1;
+                }
+            }
+            b'*' => {
+                normalized[index] = b' ';
+                normalized[index + 1] = b' ';
+                index += 2;
+                let mut terminated = false;
+                while index < normalized.len() {
+                    if index + 1 < normalized.len()
+                        && normalized[index] == b'*'
+                        && normalized[index + 1] == b'/'
+                    {
+                        normalized[index] = b' ';
+                        normalized[index + 1] = b' ';
+                        index += 2;
+                        terminated = true;
+                        break;
+                    }
+                    if !matches!(normalized[index], b'\n' | b'\r') {
+                        normalized[index] = b' ';
+                    }
+                    index += 1;
+                }
+                if !terminated {
+                    bail!("invalid Latte Lens config: unterminated block comment");
+                }
+            }
+            _ => index += 1,
+        }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        bail!("user LSP config location is unsupported on this platform")
+
+    index = 0;
+    in_string = false;
+    escaped = false;
+    while index < normalized.len() {
+        let byte = normalized[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b',' {
+            let mut next = index + 1;
+            while next < normalized.len() && normalized[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if next < normalized.len() && matches!(normalized[next], b'}' | b']') {
+                normalized[index] = b' ';
+            }
+        }
+        index += 1;
     }
+    Ok(normalized)
 }
 
 fn absolute_env_path(name: &str) -> Result<PathBuf> {
@@ -1200,29 +1342,109 @@ mod tests {
     }
 
     #[test]
-    fn serde_schema_rejects_duplicate_unknown_and_implicit_enablement() {
+    fn jsonc_schema_rejects_duplicate_and_unknown_fields_but_allows_partial_overrides() {
         for input in [
-            r#"{"enabled":true,"enabled":true,"servers":{}}"#,
-            r#"{"enabled":true,"unknown":1,"servers":{}}"#,
-            r#"{"enabled":true,"servers":{"rust":{"enabled":true,"extra":1}}}"#,
-            r#"{"enabled":true,"servers":{"java":{"enabled":true}}}"#,
+            r#"{"version":1,"version":1}"#,
+            r#"{"version":1,"unknown":1}"#,
+            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"extra":1}}}}"#,
+            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"java":{"enabled":true}}}}"#,
+            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"engine":{"type":"other","command":[]}}}}}"#,
         ] {
-            assert!(serde_json::from_str::<RawConfig>(input).is_err(), "{input}");
+            assert!(parse_raw_config(input.as_bytes()).is_err(), "{input}");
         }
-        let disabled: RawConfig =
-            serde_json::from_str(r#"{"servers":{"rust":{"program":"rust-analyzer"}}}"#).unwrap();
-        assert_ne!(disabled.enabled, Some(true));
+        let inherited = parse_raw_config(
+            br#"{"version":1,"code_navigation":{"languages":{"rust":{"enabled":true}}}}"#,
+        )
+        .unwrap();
+        let navigation = inherited.code_navigation.unwrap();
+        assert_eq!(navigation.enabled, None);
+        let rust = navigation.languages.unwrap().rust.unwrap();
+        assert_eq!(rust.enabled, Some(true));
+        assert!(rust.engine.is_none());
+    }
+
+    #[test]
+    fn jsonc_accepts_comments_trailing_commas_and_comment_markers_in_strings() {
+        let parsed = parse_raw_config(
+            br#"{
+                // Product configuration, not an LSP-specific file.
+                "version": 1,
+                "code_navigation": {
+                    "enabled": true,
+                    "languages": {
+                        "rust": {
+                            "enabled": true,
+                            "engine": {
+                                "type": "language_server",
+                                "command": ["https://example.invalid//server",],
+                            },
+                        },
+                    },
+                },
+                /* Future product domains live beside code_navigation. */
+            }"#,
+        )
+        .unwrap();
+        let rust = parsed
+            .code_navigation
+            .unwrap()
+            .languages
+            .unwrap()
+            .rust
+            .unwrap();
+        assert_eq!(
+            rust.engine.unwrap().command[0],
+            "https://example.invalid//server"
+        );
+        assert!(parse_raw_config(br#"{"version":1} /* unterminated"#).is_err());
     }
 
     #[test]
     fn config_bytes_enforce_exact_size_utf8_and_bom_boundaries() {
-        let mut exact = br#"{"enabled":false}"#.to_vec();
+        let mut exact = br#"{"version":1}"#.to_vec();
         exact.resize(MAX_CONFIG_BYTES as usize, b' ');
         assert!(parse_raw_config(&exact).is_ok());
         exact.push(b' ');
         assert!(parse_raw_config(&exact).is_err());
         assert!(parse_raw_config(b"\xef\xbb\xbf{}").is_err());
         assert!(parse_raw_config(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn default_config_path_uses_the_cross_platform_latte_home() {
+        let _environment = lock_navigation_environment();
+        let home = tempfile::tempdir().unwrap();
+        #[cfg(not(windows))]
+        let home_variable = "HOME";
+        #[cfg(windows)]
+        let home_variable = "USERPROFILE";
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", None),
+            (home_variable, Some(home.path().as_os_str().to_os_string())),
+        ]);
+        let (path, explicit) = user_config_path().unwrap();
+        assert!(!explicit);
+        assert_eq!(path, home.path().join(".latte/latte-lens.jsonc"));
+    }
+
+    #[test]
+    fn built_in_navigation_commands_cover_every_supported_language() {
+        assert_eq!(
+            default_language_server_command(LanguageFamily::Rust),
+            ["rust-analyzer"]
+        );
+        assert_eq!(
+            default_language_server_command(LanguageFamily::TypeScript),
+            ["typescript-language-server", "--stdio"]
+        );
+        assert_eq!(
+            default_language_server_command(LanguageFamily::Python),
+            ["pyright-langserver", "--stdio"]
+        );
+        assert_eq!(
+            default_language_server_command(LanguageFamily::Go),
+            ["gopls", "serve"]
+        );
     }
 
     #[test]
@@ -1260,14 +1482,17 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&tools).unwrap();
         let workspace = workspace.canonicalize().unwrap();
-        let config = container_root.join("lsp.json");
+        let config = container_root.join("latte-lens.jsonc");
+        let default_server = tools.join("rust-analyzer");
+        fs::write(&default_server, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&default_server, fs::Permissions::from_mode(0o755)).unwrap();
+        let default_server = default_server.canonicalize().unwrap();
+        let controlled_path = std::env::join_paths([tools.clone()]).unwrap();
 
         {
             let missing = container_root.join("missing.json");
-            let _variables = EnvironmentGuard::apply(&[(
-                "LATTELENS_LSP_CONFIG",
-                Some(missing.into_os_string()),
-            )]);
+            let _variables =
+                EnvironmentGuard::apply(&[("LATTELENS_CONFIG", Some(missing.into_os_string()))]);
             let loaded = NavigationSettings::load_user_config(&workspace);
             assert!(!loaded.settings.is_enabled());
             assert!(
@@ -1278,8 +1503,8 @@ mod tests {
         }
         {
             let _variables = EnvironmentGuard::apply(&[(
-                "LATTELENS_LSP_CONFIG",
-                Some(OsString::from("relative/lsp.json")),
+                "LATTELENS_CONFIG",
+                Some(OsString::from("relative/latte-lens.jsonc")),
             )]);
             let loaded = NavigationSettings::load_user_config(&workspace);
             assert!(!loaded.settings.is_enabled());
@@ -1291,20 +1516,20 @@ mod tests {
         }
         {
             let _variables = EnvironmentGuard::apply(&[
-                ("LATTELENS_LSP_CONFIG", None),
-                ("XDG_CONFIG_HOME", None),
+                ("LATTELENS_CONFIG", None),
                 ("HOME", Some(home.clone().into_os_string())),
+                ("PATH", Some(controlled_path.clone())),
             ]);
             let loaded = NavigationSettings::load_user_config(&workspace);
-            assert!(!loaded.settings.is_enabled());
+            assert!(loaded.settings.is_enabled());
             assert!(loaded.warning.is_none());
+            let rust = loaded.settings.server(LanguageFamily::Rust).unwrap();
+            assert_eq!(rust.program(), default_server);
+            assert!(rust.args().is_empty());
         }
         for home_value in [None, Some(OsString::from("relative-home"))] {
-            let _variables = EnvironmentGuard::apply(&[
-                ("LATTELENS_LSP_CONFIG", None),
-                ("XDG_CONFIG_HOME", None),
-                ("HOME", home_value),
-            ]);
+            let _variables =
+                EnvironmentGuard::apply(&[("LATTELENS_CONFIG", None), ("HOME", home_value)]);
             let loaded = NavigationSettings::load_user_config(&workspace);
             assert!(!loaded.settings.is_enabled());
             assert!(loaded.warning.is_some());
@@ -1312,7 +1537,7 @@ mod tests {
 
         {
             let _variables = EnvironmentGuard::apply(&[(
-                "LATTELENS_LSP_CONFIG",
+                "LATTELENS_CONFIG",
                 Some(container_root.as_os_str().to_os_string()),
             )]);
             let loaded = NavigationSettings::load_user_config(&workspace);
@@ -1324,10 +1549,7 @@ mod tests {
             );
         }
 
-        let explicit = [(
-            "LATTELENS_LSP_CONFIG",
-            Some(config.clone().into_os_string()),
-        )];
+        let explicit = [("LATTELENS_CONFIG", Some(config.clone().into_os_string()))];
         {
             fs::write(&config, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
             let _variables = EnvironmentGuard::apply(&explicit);
@@ -1348,30 +1570,46 @@ mod tests {
                     .is_some_and(|warning| warning.contains("UTF-8 BOM"))
             );
         }
-        for raw in [
-            r#"{"enabled":false}"#,
-            r#"{"enabled":true}"#,
-            r#"{"enabled":true,"servers":{"rust":{"enabled":false}}}"#,
+        for (raw, enabled) in [
+            (r#"{"version":1}"#, true),
+            (
+                r#"{"version":1,"code_navigation":{"enabled":false}}"#,
+                false,
+            ),
+            (r#"{"version":1,"code_navigation":{"enabled":true}}"#, true),
+            (
+                r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":false}}}}"#,
+                false,
+            ),
         ] {
             fs::write(&config, raw).unwrap();
-            let _variables = EnvironmentGuard::apply(&explicit);
+            let _variables = EnvironmentGuard::apply(&[
+                explicit[0].clone(),
+                ("PATH", Some(controlled_path.clone())),
+            ]);
             let loaded = NavigationSettings::load_user_config(&workspace);
             assert!(loaded.warning.is_none(), "raw={raw:?}");
-            assert!(!loaded.settings.is_enabled(), "raw={raw:?}");
+            assert_eq!(loaded.settings.is_enabled(), enabled, "raw={raw:?}");
         }
         {
             fs::write(
                 &config,
-                r#"{"enabled":true,"servers":{"rust":{"enabled":true}}}"#,
+                r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true}}}}"#,
             )
             .unwrap();
-            let _variables = EnvironmentGuard::apply(&explicit);
+            let _variables = EnvironmentGuard::apply(&[
+                explicit[0].clone(),
+                ("PATH", Some(controlled_path.clone())),
+            ]);
             let loaded = NavigationSettings::load_user_config(&workspace);
-            assert!(!loaded.settings.is_enabled());
-            assert!(
+            assert!(loaded.warning.is_none());
+            assert_eq!(
                 loaded
-                    .warning
-                    .is_some_and(|warning| warning.contains("has no program"))
+                    .settings
+                    .server(LanguageFamily::Rust)
+                    .unwrap()
+                    .program(),
+                default_server
             );
         }
 
@@ -1382,10 +1620,19 @@ mod tests {
         fs::write(
             &config,
             serde_json::to_vec(&serde_json::json!({
-                "enabled": true,
-                "servers": {
-                    "rust": {"enabled": true, "program": server, "args": ["--stdio"]},
-                    "go": {"enabled": false, "program": "ignored"}
+                "version": 1,
+                "code_navigation": {
+                    "enabled": true,
+                    "languages": {
+                        "rust": {
+                            "enabled": true,
+                            "engine": {
+                                "type": "language_server",
+                                "command": [server, "--stdio"]
+                            }
+                        },
+                        "go": {"enabled": false}
+                    }
                 }
             }))
             .unwrap(),
@@ -1404,16 +1651,13 @@ mod tests {
 
         fs::write(
             &config,
-            r#"{"enabled":true,"servers":{"rust":{"enabled":true,"program":"language-server"}}}"#,
+            r#"{"version":1,"code_navigation":{"enabled":true,"languages":{"rust":{"enabled":true,"engine":{"type":"language_server","command":["language-server"]}}}}}"#,
         )
         .unwrap();
         let path = std::env::join_paths([PathBuf::from("relative-bin"), tools.clone()]).unwrap();
         {
             let _variables = EnvironmentGuard::apply(&[
-                (
-                    "LATTELENS_LSP_CONFIG",
-                    Some(config.clone().into_os_string()),
-                ),
+                ("LATTELENS_CONFIG", Some(config.clone().into_os_string())),
                 ("PATH", Some(path)),
             ]);
             let loaded = NavigationSettings::load_user_config(&workspace);
@@ -1429,10 +1673,7 @@ mod tests {
         }
         for path in [None, Some(OsString::from("relative-bin"))] {
             let _variables = EnvironmentGuard::apply(&[
-                (
-                    "LATTELENS_LSP_CONFIG",
-                    Some(config.clone().into_os_string()),
-                ),
+                ("LATTELENS_CONFIG", Some(config.clone().into_os_string())),
                 ("PATH", path),
             ]);
             let loaded = NavigationSettings::load_user_config(&workspace);

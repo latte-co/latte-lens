@@ -9,6 +9,7 @@ use std::{
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
+        None => pty_lsp(),
         Some("framed-lsp") => framed_lsp(),
         Some("pty-lsp") => pty_lsp(),
         Some("descendant") => descendant(),

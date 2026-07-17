@@ -13,7 +13,7 @@ from typing import Callable
 from .fixtures import (
     ReadOnlyOracle,
     Sandbox,
-    create_basename_lsp_fixture,
+    create_default_lsp_fixture,
     create_batch_shutdown_lsp_fixture,
     create_code_navigation_fixture,
     create_code_navigation_without_lsp_fixture,
@@ -22,7 +22,7 @@ from .fixtures import (
     create_fold_mouse_navigation_fixture,
     create_git_matrix_fixture,
     create_incompatible_lsp_fixture,
-    create_invalid_lsp_config_fixture,
+    create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
     create_navigation_fixture,
     create_repository_relation_fixture,
@@ -1666,9 +1666,11 @@ def lsp_resilience_backoff_cleanup(context: ScenarioContext) -> None:
     session.assertions.append("exactly five persisted helper launches reach permanent disablement")
 
 
-def basename_lsp(context: ScenarioContext) -> None:
+def default_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("basename-caller.rs", "caller!"), "basename LSP fixture Preview loads")
+    session.wait_screen(
+        ("basename-caller.rs", "caller!"), "default language-server fixture Preview loads"
+    )
     session.key(b"l")
     session.key(b"\x1b[24~")
     session.wait_screen(
@@ -1678,20 +1680,20 @@ def basename_lsp(context: ScenarioContext) -> None:
     _wait_trace(
         context,
         ("helper-started=", "definition-1"),
-        "basename server resolution launches the configured helper",
+        "built-in server discovery launches rust-analyzer without configuration",
     )
 
 
-def invalid_lsp_config(context: ScenarioContext) -> None:
+def invalid_product_config(context: ScenarioContext) -> None:
     session = context.session
     session.wait_screen(
-        ("invalid-config.rs", "Navigation config:", "invalid LSP config"),
+        ("invalid-config.rs", "Configuration:", "invalid Latte Lens config"),
         "malformed explicit config is sanitized and surfaced in the footer",
     )
     session.key(b"l")
     session.key(b"\x1b[24~")
     session.wait_screen(
-        ("No configured Rust language server.", "caller!"),
+        ("Code navigation is unavailable for Rust: no language server was found.", "caller!"),
         "invalid config disables navigation without affecting the Preview",
     )
 
@@ -1721,7 +1723,7 @@ def code_navigation_without_lsp(context: ScenarioContext) -> None:
     )
     session.key(b"\x1b[24~")
     session.wait_screen(
-        ("No configured Rust language server.", "caller!"),
+        ("Code navigation is unavailable for Rust: no language server was found.", "caller!"),
         "F12 without LSP reports unavailable and stays in place",
     )
 
@@ -1805,16 +1807,16 @@ CASES = (
         lsp_resilience_backoff_cleanup,
     ),
     ScenarioCase(
-        "basename-lsp",
+        "default-language-server",
         "code-navigation",
-        create_basename_lsp_fixture,
-        basename_lsp,
+        create_default_lsp_fixture,
+        default_lsp,
     ),
     ScenarioCase(
-        "invalid-lsp-config",
+        "invalid-product-config",
         "code-navigation",
-        create_invalid_lsp_config_fixture,
-        invalid_lsp_config,
+        create_invalid_product_config_fixture,
+        invalid_product_config,
     ),
 )
 

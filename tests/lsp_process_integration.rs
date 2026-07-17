@@ -65,24 +65,12 @@ fn repeated_real_crashes_back_off_and_fifth_failure_stops_spawning() {
     fs::write(workspace.join("caller.rs"), "caller!();\n").unwrap();
     let workspace = workspace.canonicalize().unwrap();
     let trace = container.path().join("crash.trace");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
-    fs::write(
-        &config,
-        serde_json::to_vec(&serde_json::json!({
-            "enabled": true,
-            "servers": {"rust": {
-                "enabled": true,
-                "program": helper,
-                "args": ["crash-initialize"]
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    set_test_env("LATTELENS_LSP_CONFIG", config.canonicalize().unwrap());
+    write_navigation_config(&config, &helper, &["crash-initialize"]);
+    set_test_env("LATTELENS_CONFIG", config.canonicalize().unwrap());
     set_test_env("LATTELENS_TEST_TRACE", &trace);
     let loaded = NavigationSettings::load_user_config(&workspace);
     assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
@@ -133,7 +121,7 @@ fn repeated_real_crashes_back_off_and_fifth_failure_stops_spawning() {
     assert_eq!(report.process_owners_dropped, 5);
     assert_eq!(report.io_threads_joined, 15);
     drop(app);
-    remove_test_env("LATTELENS_LSP_CONFIG");
+    remove_test_env("LATTELENS_CONFIG");
     remove_test_env("LATTELENS_TEST_TRACE");
 }
 
@@ -160,24 +148,12 @@ fn distinct_session_keys_have_no_fixed_count_cap_and_reuse_identical_key() {
     }
     let workspace = workspace.canonicalize().unwrap();
     let trace = container.path().join("session-reuse.trace");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
-    fs::write(
-        &config,
-        serde_json::to_vec(&serde_json::json!({
-            "enabled": true,
-            "servers": {"rust": {
-                "enabled": true,
-                "program": helper,
-                "args": ["session-reuse"]
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    set_test_env("LATTELENS_LSP_CONFIG", config.canonicalize().unwrap());
+    write_navigation_config(&config, &helper, &["session-reuse"]);
+    set_test_env("LATTELENS_CONFIG", config.canonicalize().unwrap());
     set_test_env("LATTELENS_TEST_TRACE", &trace);
 
     let loaded = NavigationSettings::load_user_config(&workspace);
@@ -231,7 +207,7 @@ fn distinct_session_keys_have_no_fixed_count_cap_and_reuse_identical_key() {
     assert_eq!(report.process_owners_dropped, 9);
     assert_eq!(trace_prefix_count(&trace, "session-exited="), 9);
 
-    remove_test_env("LATTELENS_LSP_CONFIG");
+    remove_test_env("LATTELENS_CONFIG");
     remove_test_env("LATTELENS_TEST_TRACE");
 }
 
@@ -259,24 +235,12 @@ fn twelve_stalled_session_trees_shutdown_with_one_process_wide_deadline() {
     }
     let workspace = workspace.canonicalize().unwrap();
     let trace = container.path().join("stalled-session.trace");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
-    fs::write(
-        &config,
-        serde_json::to_vec(&serde_json::json!({
-            "enabled": true,
-            "servers": {"rust": {
-                "enabled": true,
-                "program": helper,
-                "args": ["stalled-session-tree"]
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    set_test_env("LATTELENS_LSP_CONFIG", config.canonicalize().unwrap());
+    write_navigation_config(&config, &helper, &["stalled-session-tree"]);
+    set_test_env("LATTELENS_CONFIG", config.canonicalize().unwrap());
     set_test_env("LATTELENS_TEST_TRACE", &trace);
 
     let loaded = NavigationSettings::load_user_config(&workspace);
@@ -327,7 +291,7 @@ fn twelve_stalled_session_trees_shutdown_with_one_process_wide_deadline() {
     assert_eq!(report.process_owners_dropped, 12);
     assert_eq!(report.quarantined_process_owners, 0);
 
-    remove_test_env("LATTELENS_LSP_CONFIG");
+    remove_test_env("LATTELENS_CONFIG");
     remove_test_env("LATTELENS_TEST_TRACE");
 }
 
@@ -344,24 +308,12 @@ fn escaped_pipe_owner_is_quarantined_without_fake_cleanup_or_unbounded_drop() {
     fs::write(workspace.join("caller.rs"), "caller!();\n").unwrap();
     let workspace = workspace.canonicalize().unwrap();
     let trace = container.path().join("escaped.trace");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
-    fs::write(
-        &config,
-        serde_json::to_vec(&serde_json::json!({
-            "enabled": true,
-            "servers": {"rust": {
-                "enabled": true,
-                "program": helper,
-                "args": ["escaped-pipe-owner"]
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    set_test_env("LATTELENS_LSP_CONFIG", config.canonicalize().unwrap());
+    write_navigation_config(&config, &helper, &["escaped-pipe-owner"]);
+    set_test_env("LATTELENS_CONFIG", config.canonicalize().unwrap());
     set_test_env("LATTELENS_TEST_TRACE", &trace);
     let loaded = NavigationSettings::load_user_config(&workspace);
     assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
@@ -413,7 +365,7 @@ fn escaped_pipe_owner_is_quarantined_without_fake_cleanup_or_unbounded_drop() {
     assert!(process_is_alive(escaped_pid));
     kill_process(escaped_pid);
     wait_until(Duration::from_secs(2), || !process_is_alive(escaped_pid));
-    remove_test_env("LATTELENS_LSP_CONFIG");
+    remove_test_env("LATTELENS_CONFIG");
     remove_test_env("LATTELENS_TEST_TRACE");
 }
 
@@ -429,25 +381,13 @@ fn run_pipe_holding_descendant_cleanup(role: &str, ready_marker: Option<&str>) {
     fs::write(workspace.join("caller.rs"), "caller!();\n").unwrap();
     let workspace = workspace.canonicalize().unwrap();
     let trace = container.path().join("descendant.trace");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
-    fs::write(
-        &config,
-        serde_json::to_vec(&serde_json::json!({
-            "enabled": true,
-            "servers": {"rust": {
-                "enabled": true,
-                "program": helper,
-                "args": [role]
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    write_navigation_config(&config, &helper, &[role]);
     let config = config.canonicalize().unwrap();
-    set_test_env("LATTELENS_LSP_CONFIG", config.as_os_str());
+    set_test_env("LATTELENS_CONFIG", config.as_os_str());
     set_test_env("LATTELENS_TEST_TRACE", trace.as_os_str());
 
     let loaded = NavigationSettings::load_user_config(&workspace);
@@ -487,7 +427,7 @@ fn run_pipe_holding_descendant_cleanup(role: &str, ready_marker: Option<&str>) {
     assert_eq!(report.io_threads_joined, 3);
     assert_eq!(report.process_owners_dropped, 1);
 
-    remove_test_env("LATTELENS_LSP_CONFIG");
+    remove_test_env("LATTELENS_CONFIG");
     remove_test_env("LATTELENS_TEST_TRACE");
 }
 
@@ -502,24 +442,12 @@ fn run_incompatible_position_encoding_cleanup() {
     fs::write(workspace.join("caller.rs"), "caller!(); // 😀中\n").unwrap();
     let workspace = workspace.canonicalize().unwrap();
     let trace = container.path().join("utf8-initialize.trace");
-    let config = container.path().join("lsp.json");
+    let config = container.path().join("latte-lens.jsonc");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
         .canonicalize()
         .unwrap();
-    fs::write(
-        &config,
-        serde_json::to_vec(&serde_json::json!({
-            "enabled": true,
-            "servers": {"rust": {
-                "enabled": true,
-                "program": helper,
-                "args": ["utf8-initialize"]
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    set_test_env("LATTELENS_LSP_CONFIG", config.canonicalize().unwrap());
+    write_navigation_config(&config, &helper, &["utf8-initialize"]);
+    set_test_env("LATTELENS_CONFIG", config.canonicalize().unwrap());
     set_test_env("LATTELENS_TEST_TRACE", &trace);
     let loaded = NavigationSettings::load_user_config(&workspace);
     assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
@@ -553,8 +481,33 @@ fn run_incompatible_position_encoding_cleanup() {
     let started = Instant::now();
     drop(app);
     assert!(started.elapsed() < Duration::from_secs(2));
-    remove_test_env("LATTELENS_LSP_CONFIG");
+    remove_test_env("LATTELENS_CONFIG");
     remove_test_env("LATTELENS_TEST_TRACE");
+}
+
+fn write_navigation_config(path: &Path, helper: &Path, args: &[&str]) {
+    let mut command = vec![helper.to_string_lossy().into_owned()];
+    command.extend(args.iter().map(|argument| (*argument).to_owned()));
+    fs::write(
+        path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "code_navigation": {
+                "enabled": true,
+                "languages": {
+                    "rust": {
+                        "enabled": true,
+                        "engine": {
+                            "type": "language_server",
+                            "command": command
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 fn init_test_repo(root: &Path) {

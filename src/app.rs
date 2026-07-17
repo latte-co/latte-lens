@@ -7016,7 +7016,7 @@ mod tests {
         assert!(
             app.navigation_status
                 .as_ref()
-                .is_some_and(|status| status.message.contains("No configured Rust"))
+                .is_some_and(|status| status.message.contains("unavailable for Rust"))
         );
     }
 
@@ -7619,7 +7619,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_navigation_without_configured_lsp_keeps_the_preview_in_place() {
+    fn semantic_navigation_without_an_available_engine_keeps_the_preview_in_place() {
         let mut app = navigation_app("fn caller() {}\n");
         let before = app.content_lines.clone();
         let identity = app.content_identity.clone();
@@ -7638,7 +7638,7 @@ mod tests {
         assert!(
             app.navigation_status
                 .as_ref()
-                .is_some_and(|status| status.message.contains("No configured Rust"))
+                .is_some_and(|status| status.message.contains("unavailable for Rust"))
         );
         assert!(app.navigation_back.is_empty());
     }

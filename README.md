@@ -99,7 +99,7 @@ Inside the TUI:
 | `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
-| `f12` / `shift-f12` / `ctrl-f12` | In focused Preview content, find the definition, references, or implementations through an explicitly configured language server |
+| `f12` / `shift-f12` / `ctrl-f12` | In focused Preview content, find the definition, references, or implementations through the available code-navigation engine |
 | `@` | Open bounded local document symbols for the current Preview |
 | `alt-←` / `alt-→` | Move backward or forward through successful navigation locations |
 | `[` / `]` | In focused Preview content, jump to the previous or next visible fold marker |
@@ -123,7 +123,7 @@ Mouse controls:
 - Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
-- In a supported built-in source Preview, `Ctrl`-click (or `Command`-click on macOS) requests the clicked token's definition. Semantic navigation never falls back to a same-name AST/workspace guess: without an explicitly configured language server it reports the unavailable state and leaves the current view unchanged.
+- In a supported built-in source Preview, `Ctrl`-click (or `Command`-click on macOS) requests the clicked token's definition. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
 - In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
@@ -194,55 +194,53 @@ requests a fresh graph-aware snapshot.
 
 ## Code navigation
 
-Definition, references, and implementations are available on Linux, macOS,
-and Windows through a language server that the user explicitly enables. Latte
-Lens never discovers or starts a server merely because it is present on
-`PATH`, and it never installs one. Without a configured and usable server,
-semantic navigation reports the unavailable state and leaves the current file,
-tree, viewport, and history unchanged. Tree-sitter and Markdown parsing still
-provide bounded folding and local document symbols; they are not semantic
-fallbacks.
+Definition, references, and implementations are enabled by default on Linux,
+macOS, and Windows. Latte Lens looks for the standard language-server command
+for each supported language on `PATH` and starts it only when navigation for a
+file of that language is requested. It never installs a server. When the
+matching command is unavailable, semantic navigation reports the unavailable
+state and leaves the current file, tree, viewport, and history unchanged.
+Tree-sitter and Markdown parsing still provide bounded folding and local
+document symbols; they are not semantic fallbacks.
 
-Set `LATTELENS_LSP_CONFIG` to an absolute JSON path, or use the platform default:
+Latte Lens uses the same cross-platform Latte configuration directory as the
+other Latte applications: `~/.latte`. Its user configuration is
+`~/.latte/latte-lens.jsonc` on Linux, macOS, and Windows. Set
+`LATTELENS_CONFIG` to an absolute path only when an alternate product
+configuration file is required.
 
-- macOS: `~/Library/Application Support/latte-lens/lsp.json`
-- Windows: `%APPDATA%\\latte-lens\\lsp.json`
-- Linux and other Unix: `$XDG_CONFIG_HOME/latte-lens/lsp.json`, falling back to
-  `~/.config/latte-lens/lsp.json`
+`code_navigation` is the user-facing feature. A language server is its current
+engine, rather than a separate configuration domain. The built-in defaults are
+`rust-analyzer`, `typescript-language-server --stdio`, `pyright-langserver
+--stdio`, and `gopls serve`. The file is an optional field-by-field override:
+omit a field to inherit its built-in value, use `enabled: false` to disable the
+feature or one language, and provide `engine.command` only to replace a default
+command. The command is a shell-free argv array whose first item may be an
+absolute native executable or a basename:
 
-Every enabled entry is explicit. `program` may be an absolute native executable
-or a basename resolved only after that entry is enabled:
-
-```json
+```jsonc
 {
-  "enabled": true,
-  "servers": {
-    "rust": {
-      "enabled": true,
-      "program": "/absolute/path/to/rust-analyzer",
-      "args": []
-    },
-    "typescript": {
-      "enabled": true,
-      "program": "typescript-language-server",
-      "args": ["--stdio"]
-    },
-    "python": { "enabled": false },
-    "go": {
-      "enabled": true,
-      "program": "gopls",
-      "args": ["serve"]
+  "version": 1,
+  "code_navigation": {
+    "languages": {
+      "rust": {
+        "engine": {
+          "type": "language_server",
+          "command": ["/absolute/path/to/rust-analyzer"]
+        }
+      },
+      "python": { "enabled": false },
     }
   }
 }
 ```
 
-Configuration is user-level only. Workspace commands, Windows shell wrappers,
-symlink/reparse-point executables, and executables inside the opened workspace
-are rejected. Executable identity and workspace exclusion are checked again
-immediately before every spawn. The external language server remains trusted
-host tooling and may have capabilities outside Latte Lens's read-only protocol
-behavior.
+The file accepts JSONC line/block comments and trailing commas. Configuration is
+user-level only. Workspace commands, Windows shell wrappers, symlink/reparse-
+point executables, and executables inside the opened workspace are rejected.
+Executable identity and workspace exclusion are checked again immediately
+before every spawn. The external language server remains trusted host tooling
+and may have capabilities outside Latte Lens's read-only protocol behavior.
 
 Navigation uses logical payload admission limits of 32 MiB per session and
 192 MiB globally, including framed bodies, parse scratch reservations,

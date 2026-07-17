@@ -1280,7 +1280,7 @@ impl NavigationManager {
             self.complete_request(
                 &request,
                 NavigationProtocolResult::Unavailable(
-                    "No semantic language server for this file type.".to_owned(),
+                    "Code navigation is unavailable for this file type.".to_owned(),
                 ),
             );
             return;
@@ -1289,7 +1289,7 @@ impl NavigationManager {
             self.complete_request(
                 &request,
                 NavigationProtocolResult::Unavailable(format!(
-                    "No configured {} language server.",
+                    "Code navigation is unavailable for {}: no language server was found.",
                     family.display_name()
                 )),
             );
@@ -6546,13 +6546,22 @@ done
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let script = script.canonicalize().unwrap();
 
-        let config = container.path().join("lsp.json");
+        let config = container.path().join("latte-lens.jsonc");
         fs::write(
             &config,
             serde_json::to_vec(&serde_json::json!({
-                "enabled": true,
-                "servers": {
-                    "rust": {"enabled": true, "program": script.clone(), "args": []}
+                "version": 1,
+                "code_navigation": {
+                    "enabled": true,
+                    "languages": {
+                        "rust": {
+                            "enabled": true,
+                            "engine": {
+                                "type": "language_server",
+                                "command": [script.clone()]
+                            }
+                        }
+                    }
                 }
             }))
             .unwrap(),
@@ -6560,10 +6569,10 @@ done
         .unwrap();
         let config = config.canonicalize().unwrap();
         // SAFETY: this test serializes the process-wide configuration mutation.
-        unsafe { std::env::set_var("LATTELENS_LSP_CONFIG", &config) };
+        unsafe { std::env::set_var("LATTELENS_CONFIG", &config) };
         let loaded = NavigationSettings::load_user_config(&workspace);
         // SAFETY: paired with the serialized set above before any assertion can panic.
-        unsafe { std::env::remove_var("LATTELENS_LSP_CONFIG") };
+        unsafe { std::env::remove_var("LATTELENS_CONFIG") };
         assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
         assert!(loaded.settings.is_enabled());
 
