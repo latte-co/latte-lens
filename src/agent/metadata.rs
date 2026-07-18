@@ -1673,7 +1673,9 @@ pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<()
     use std::os::windows::ffi::OsStrExt;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-    const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
+    // ReplaceFileW documents its WRITE_THROUGH value as unsupported. Zero
+    // preserves the destination metadata and avoids ERROR_INVALID_PARAMETER.
+    const REPLACEFILE_FLAGS: u32 = 0;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
@@ -1706,7 +1708,7 @@ pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<()
                 destination.as_ptr(),
                 source.as_ptr(),
                 std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
+                REPLACEFILE_FLAGS,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )

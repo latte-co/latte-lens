@@ -1260,7 +1260,9 @@ mod tests {
         assert!(traex.contains(TRAEX_HOOK_OBSERVER_ID));
         let opencode = fs::read_to_string(options.opencode_dir.join("plugins/latte-lens.js"))
             .expect("opencode");
-        assert!(opencode.contains(options.binary.to_str().expect("binary path")));
+        let encoded_binary =
+            serde_json::to_string(options.binary.to_str().expect("binary path")).expect("encode");
+        assert!(opencode.contains(&encoded_binary));
 
         let snapshots = [
             fs::read(options.codex_dir.join("hooks.json")).expect("codex"),
