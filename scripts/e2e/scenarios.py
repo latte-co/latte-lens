@@ -354,9 +354,15 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"2")
     session.wait_screen(("Git changes", "Diff", "diff --git"), "Git Changes is ready for change cycling")
     session.wait_until(
-        lambda screen: "Refreshing workspace" not in screen.text() and "a-dir" in screen.text(),
+        lambda screen: all(
+            marker not in screen.text()
+            for marker in ("Refreshing workspace", "Loading directory", "Loading content", "LOADING")
+        ),
         "Git Changes refresh settles before directory interaction",
     )
+    if session.screen.find("a-dir") is None:
+        _click_disclosure(session, "root · main")
+        session.wait_screen(("a-dir",), "Git root reopens after the scope refresh")
     _click_tree_row(session, "a-dir")
     session.wait_screen(
         ("changed file", "directory"),

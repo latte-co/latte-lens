@@ -193,10 +193,17 @@ fn codex_hook_cli_falls_back_to_private_metadata_without_persisting_payload_fiel
     fs::create_dir_all(&child_workspace).expect("child workspace");
     fs::create_dir_all(&home).expect("home");
     let canary = "privacy-canary-codex-prompt-tool-transcript";
-    let payload = format!(
-        r#"{{"session_id":"native-session-{canary}","transcript_path":"/{canary}/transcript.jsonl","cwd":"{}","hook_event_name":"UserPromptSubmit","model":"gpt-test","permission_mode":"default","turn_id":"native-turn-{canary}","prompt":"{canary}"}}"#,
-        child_workspace.display()
-    );
+    let payload = serde_json::json!({
+        "session_id": format!("native-session-{canary}"),
+        "transcript_path": format!("/{canary}/transcript.jsonl"),
+        "cwd": child_workspace.to_string_lossy(),
+        "hook_event_name": "UserPromptSubmit",
+        "model": "gpt-test",
+        "permission_mode": "default",
+        "turn_id": format!("native-turn-{canary}"),
+        "prompt": canary,
+    })
+    .to_string();
 
     let output = run_hook_child(
         &child_workspace,
