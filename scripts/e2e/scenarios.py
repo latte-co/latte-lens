@@ -665,11 +665,19 @@ def search_controls(context: ScenarioContext) -> None:
         ("▌ · src/search-target.rs",),
         "first target click is processed before the second",
     )
-    file_result = _marker_position_on_line(session, "· src/search-target.rs")
-    session.click(*file_result)
+    if context.environment.get("CARGO_LLVM_COV") == "1":
+        # Coverage instrumentation can make the redraw between two separately
+        # observed clicks exceed the product's 400 ms double-click window. The
+        # regular Linux/macOS E2E jobs exercise that wall-clock interaction;
+        # the coverage runner uses the equivalent acceptance path after proving
+        # the production mouse hit box selected this result.
+        session.key(b"\r")
+    else:
+        file_result = _marker_position_on_line(session, "· src/search-target.rs")
+        session.click(*file_result)
     session.wait_screen(
         ("Preview", "searchable()"),
-        "double-click accepts the file-search result",
+        "the selected file-search result is accepted",
         absent=("Open File",),
     )
 
