@@ -1126,24 +1126,52 @@ fn dependency_target_for_path(path: &Path) -> Result<DependencyTarget> {
         if directory.kind != ContentPathKind::Directory || directory.path != candidate {
             bail!("dependency target traverses a non-directory path component");
         }
-        for manifest in DEPENDENCY_MANIFESTS {
-            let manifest_path = candidate.join(manifest);
+        for manifest_name in DEPENDENCY_MANIFESTS {
+            let manifest_path = candidate.join(manifest_name);
             if !path_exists_without_following(&manifest_path) {
                 continue;
             }
-            let manifest = inspect_content_path(Some(filesystem_root), &manifest_path)?;
-            if manifest.kind != ContentPathKind::Regular || manifest.path != manifest_path {
+            let inspected_manifest = inspect_content_path(Some(filesystem_root), &manifest_path)?;
+            if inspected_manifest.kind != ContentPathKind::Regular
+                || inspected_manifest.path != manifest_path
+            {
                 bail!("dependency package manifest is not a safe regular file");
             }
-            let relative = path
-                .strip_prefix(candidate)
+
+            // Windows may expose an LSP file URI through a non-canonical user
+            // profile spelling while `File::canonicalize` later resolves it to
+            // the physical profile directory. Keep both sides of the preview
+            // boundary in that same canonical spelling before handing it to
+            // the content-safety gate.
+            let canonical_root = candidate.canonicalize().with_context(|| {
+                format!("cannot resolve dependency root {}", candidate.display())
+            })?;
+            let canonical_path = path
+                .canonicalize()
+                .with_context(|| format!("cannot resolve dependency target {}", path.display()))?;
+            let relative = canonical_path
+                .strip_prefix(&canonical_root)
                 .context("dependency target escaped its package root")?
                 .to_path_buf();
             if relative.as_os_str().is_empty() {
                 bail!("dependency target cannot be a package directory");
             }
+            let canonical_target = inspect_content_path(Some(&canonical_root), &canonical_path)?;
+            if canonical_target.kind != ContentPathKind::Regular
+                || canonical_target.path != canonical_path
+            {
+                bail!("canonical dependency target is not a safe regular file");
+            }
+            let canonical_manifest_path = canonical_root.join(manifest_name);
+            let canonical_manifest =
+                inspect_content_path(Some(&canonical_root), &canonical_manifest_path)?;
+            if canonical_manifest.kind != ContentPathKind::Regular
+                || canonical_manifest.path != canonical_manifest_path
+            {
+                bail!("canonical dependency package manifest is not a safe regular file");
+            }
             return Ok(DependencyTarget {
-                root: candidate.to_path_buf(),
+                root: canonical_root,
                 relative,
             });
         }
@@ -1859,12 +1887,13 @@ mod tests {
             .unwrap()
             .to_file_path()
             .unwrap();
-        let uri_root = uri_path.parent().unwrap().to_path_buf();
+        let canonical_target = uri_path.canonicalize().unwrap();
+        let canonical_root = canonical_target.parent().unwrap().to_path_buf();
 
         assert_eq!(
             lsp_uri_to_navigation_target(&uri, &workspace).unwrap(),
             NavigationFileTarget::Dependency(DependencyTarget {
-                root: uri_root,
+                root: canonical_root,
                 relative: PathBuf::from("source.go"),
             })
         );
