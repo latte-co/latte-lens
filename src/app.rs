@@ -680,7 +680,6 @@ pub struct App {
     navigation_target_highlight: Option<SourceRange>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
-    last_navigation_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -847,7 +846,6 @@ impl App {
             navigation_target_highlight: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
-            last_navigation_click: None,
         };
         app.request_refresh(false);
         Ok(app)
@@ -4517,7 +4515,6 @@ impl App {
         }
         self.navigation_picker = None;
         self.navigation_hover_highlight = None;
-        self.last_navigation_click = None;
         self.navigation_generation = self
             .navigation_generation
             .checked_add(1)
@@ -5136,25 +5133,13 @@ impl App {
         if index >= count {
             return;
         }
-        let double_click = self
-            .last_navigation_click
-            .is_some_and(|(previous, instant)| {
-                previous == index && instant.elapsed() <= Duration::from_millis(400)
-            });
         if let Some(picker) = self.navigation_picker.as_mut() {
             picker.list_state.select(Some(index));
         }
-        self.last_navigation_click = Some((index, Instant::now()));
-        let group_selected = self
-            .navigation_picker
-            .as_ref()
-            .and_then(|picker| picker.visible_rows.get(index))
-            .is_some_and(|row| matches!(row, NavigationPickerRow::Group(_)));
-        if group_selected || double_click {
-            self.accept_navigation_picker_selection();
-        } else {
-            self.request_navigation_picker_preview();
-        }
+        // A concrete location has one unambiguous destination, so one click
+        // commits it just like Enter. File group headers remain structural
+        // controls: selecting one only toggles its expansion.
+        self.accept_navigation_picker_selection();
     }
 
     fn move_navigation_picker(&mut self, delta: isize) {
@@ -5219,7 +5204,6 @@ impl App {
         if let Some(picker) = self.navigation_picker.take() {
             self.focused_pane = picker.return_focus;
         }
-        self.last_navigation_click = None;
     }
 
     fn request_navigation_picker_preview(&mut self) {
@@ -7886,7 +7870,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolled_navigation_picker_mouse_uses_visible_offset_for_click_and_double_click() {
+    fn scrolled_navigation_picker_mouse_click_commits_the_visible_location() {
         let mut app = navigation_picker_app(40);
         app.navigation_picker
             .as_mut()
@@ -7922,21 +7906,12 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         app.handle_mouse(mouse);
-        assert_eq!(
-            app.navigation_picker
-                .as_ref()
-                .unwrap()
-                .list_state
-                .selected(),
-            Some(expected)
-        );
-        app.handle_mouse(mouse);
         assert!(app.navigation_picker.is_none());
         assert_eq!(app.navigation_caret.point.line, expected_result);
     }
 
     #[test]
-    fn resized_narrow_navigation_picker_clamps_mouse_hit_to_visible_items() {
+    fn resized_narrow_navigation_picker_ignores_outside_hit_and_commits_visible_location() {
         let mut app = navigation_picker_app(40);
         app.navigation_picker
             .as_mut()
@@ -7958,28 +7933,13 @@ mod tests {
         assert!(visible > 0);
         let last_visible = visible - 1;
         let expected = offset + last_visible;
-        assert!(expected < picker.results.len());
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: app.ui_regions.navigation_results.x,
-            row: app
-                .ui_regions
-                .navigation_results
-                .y
-                .saturating_add(u16::try_from(last_visible).unwrap()),
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(
-            app.navigation_picker
-                .as_ref()
-                .unwrap()
-                .list_state
-                .selected(),
-            Some(expected)
-        );
+        let expected_result = match picker.visible_rows.get(expected) {
+            Some(NavigationPickerRow::Result(index)) => *index,
+            row => panic!("expected a result row, got {row:?}"),
+        };
 
-        // The row immediately outside the results viewport must not select.
-        let selected = expected;
+        // The row immediately outside the results viewport must not select or
+        // commit a location.
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: app.ui_regions.navigation_results.x,
@@ -7992,8 +7952,21 @@ mod tests {
                 .unwrap()
                 .list_state
                 .selected(),
-            Some(selected)
+            Some(35)
         );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.ui_regions.navigation_results.x,
+            row: app
+                .ui_regions
+                .navigation_results
+                .y
+                .saturating_add(u16::try_from(last_visible).unwrap()),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.navigation_picker.is_none());
+        assert_eq!(app.navigation_caret.point.line, expected_result);
     }
 
     #[test]
@@ -8146,7 +8119,7 @@ mod tests {
         assert_eq!(preview.lines, ["fn target() {}"]);
         assert_eq!(app.content_identity.as_ref(), Some(&caller));
 
-        app.accept_navigation_picker_selection();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.wait_for_background();
         assert!(app.navigation_picker.is_none());
         assert_eq!(app.content_identity.as_ref(), Some(&target));
@@ -8154,15 +8127,24 @@ mod tests {
     }
 
     #[test]
-    fn result_file_groups_collapse_without_committing_navigation() {
+    fn navigation_file_group_click_only_collapses_without_committing() {
         let mut app = navigation_picker_app(3);
         assert_eq!(
             app.navigation_picker.as_ref().unwrap().visible_rows.len(),
             4
         );
 
-        app.move_navigation_picker(-1);
-        app.accept_navigation_picker_selection();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.ui_regions.navigation_results.x,
+            row: app.ui_regions.navigation_results.y,
+            modifiers: KeyModifiers::NONE,
+        });
 
         let picker = app.navigation_picker.as_ref().unwrap();
         assert_eq!(picker.visible_rows, [NavigationPickerRow::Group(0)]);

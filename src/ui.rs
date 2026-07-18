@@ -629,7 +629,7 @@ fn draw_navigation_picker(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(List::new(items), results, &mut picker.list_state);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "↑↓ select · Enter open/collapse · double-click open · Esc close",
+            "↑↓ select · Enter open/collapse · click location open · Esc close",
             Style::default().fg(MUTED),
         )),
         help,
@@ -1541,7 +1541,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "  ↑↓ select  Enter open/collapse  double-click open  Esc close",
+                    "  ↑↓ select  Enter open/collapse  click location open  Esc close",
                     Style::default().fg(MUTED),
                 ),
             ])),

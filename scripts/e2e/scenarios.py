@@ -1164,11 +1164,9 @@ def structure_navigation(context: ScenarioContext) -> None:
         session.key(key)
     omega = _marker_position_on_line(session, "omega")
     session.click(*omega)
-    session.wait_screen(("omega", "Document Symbols"), "symbol picker mouse selection settles")
-    session.click(*omega)
     session.wait_screen(
         ("Preview", "Navigation target opened.", "pub fn omega"),
-        "symbol picker double click reveals the local declaration",
+        "symbol picker click reveals the local declaration",
         absent=("Document Symbols",),
     )
     session.key(b"g")
