@@ -1086,8 +1086,14 @@ def code_navigation(context: ScenarioContext) -> None:
     )
     session.key(b"\x04")
     session.wait_screen(
-        ("Navigation target is outside the opened workspace or unsafe.", "b-target.rs"),
-        "an outside-workspace definition is rejected at the App safety boundary",
+        ("Dependency Source", "dependency_target", "Navigation target opened."),
+        "a recognized external dependency definition opens a temporary read-only source view",
+    )
+    session.key(b"\x1b[1;3D")
+    session.wait_screen(
+        ("Preview", "b-target.rs"),
+        "dependency source history returns to the workspace Preview",
+        absent=("Dependency Source",),
     )
     session.key(b"\x04")
     session.wait_screen(

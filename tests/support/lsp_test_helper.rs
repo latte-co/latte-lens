@@ -47,6 +47,8 @@ fn pty_lsp() {
     let mut reader = BufReader::new(input);
     let caller_uri = std::env::var("LATTELENS_TEST_CALLER_URI").unwrap();
     let target_uri = std::env::var("LATTELENS_TEST_TARGET_URI").unwrap();
+    let dependency_uri = std::env::var("LATTELENS_TEST_DEPENDENCY_URI")
+        .unwrap_or_else(|_| "file:///tmp/latte-lens-outside.rs".to_owned());
     let trace = PathBuf::from(std::env::var_os("LATTELENS_TEST_TRACE").unwrap());
     let release = PathBuf::from(std::env::var_os("LATTELENS_TEST_RELEASE").unwrap());
     append_trace(&trace, &format!("helper-started={}", std::process::id()));
@@ -121,7 +123,7 @@ fn pty_lsp() {
                         }
                     }),
                     6 => serde_json::json!({
-                        "uri":"file:///tmp/latte-lens-outside.rs",
+                        "uri":dependency_uri,
                         "range":{
                             "start":{"line":0,"character":0},
                             "end":{"line":0,"character":1}

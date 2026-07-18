@@ -203,14 +203,25 @@ def create_code_navigation_fixture(root: Path, environment: dict[str, str]) -> N
     init_repository(root, environment)
     caller = root / "a-caller.rs"
     target = root / "b-target.rs"
+    dependency_root = (
+        root.parent / "dependency-cache" / "example.com" / "module@v1.2.3"
+    )
+    dependency_source = dependency_root / "source.rs"
     caller.write_text("caller!(); // 😀中\n", encoding="utf-8")
     target.write_text("pub fn 目标😀() {}\n", encoding="utf-8")
+    dependency_root.mkdir(mode=0o700, parents=True)
+    dependency_root.joinpath("Cargo.toml").write_text(
+        "[package]\nname = \"navigation-fixture-dependency\"\nversion = \"1.2.3\"\n",
+        encoding="utf-8",
+    )
+    dependency_source.write_text("pub fn dependency_target() {}\n", encoding="utf-8")
     run("git", "add", "a-caller.rs", "b-target.rs", cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "navigation fixture", cwd=root, environment=environment)
 
     _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
     environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
     environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
+    environment["LATTELENS_TEST_DEPENDENCY_URI"] = dependency_source.resolve().as_uri()
     environment["LATTELENS_TEST_TRACE"] = str((root.parent / "lsp-trace.txt").resolve())
     environment["LATTELENS_TEST_RELEASE"] = str(
         (root.parent / "release-second-definition").resolve()

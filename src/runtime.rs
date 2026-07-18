@@ -63,6 +63,16 @@ pub(crate) enum ContentPurpose {
 #[derive(Clone, Debug)]
 pub(crate) enum ContentTarget {
     Workspace(PathBuf),
+    /// A source file owned by an externally resolved dependency package.
+    ///
+    /// This is deliberately not a workspace target: it is never added to the
+    /// tree or repository graph, and `root` is the package boundary that the
+    /// preview safety gate must enforce for every read.
+    Dependency {
+        root: PathBuf,
+        relative: PathBuf,
+        server_root: PathBuf,
+    },
     Repository(RepoChange),
 }
 
@@ -90,10 +100,29 @@ pub(crate) struct ContentSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ContentIdentity(PathBuf);
+pub(crate) enum ContentIdentity {
+    Workspace(PathBuf),
+    Dependency {
+        root: PathBuf,
+        relative: PathBuf,
+        server_root: PathBuf,
+    },
+}
 
 impl ContentIdentity {
     pub(crate) fn from_absolute(root: &Path, absolute: &Path) -> Option<Self> {
+        Self::normalized_relative(root, absolute).map(Self::Workspace)
+    }
+
+    pub(crate) fn dependency(root: PathBuf, absolute: &Path, server_root: PathBuf) -> Option<Self> {
+        Self::normalized_relative(&root, absolute).map(|relative| Self::Dependency {
+            root,
+            relative,
+            server_root,
+        })
+    }
+
+    fn normalized_relative(root: &Path, absolute: &Path) -> Option<PathBuf> {
         let relative = absolute.strip_prefix(root).ok()?;
         let mut normalized = PathBuf::new();
         for component in relative.components() {
@@ -105,11 +134,60 @@ impl ContentIdentity {
                 | Component::Prefix(_) => return None,
             }
         }
-        (!normalized.as_os_str().is_empty()).then_some(Self(normalized))
+        (!normalized.as_os_str().is_empty()).then_some(normalized)
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        match self {
+            Self::Workspace(path) => path,
+            Self::Dependency { relative, .. } => relative,
+        }
+    }
+
+    pub(crate) fn workspace_path(&self) -> Option<&Path> {
+        match self {
+            Self::Workspace(path) => Some(path),
+            Self::Dependency { .. } => None,
+        }
+    }
+
+    pub(crate) fn display_path(&self) -> PathBuf {
+        match self {
+            Self::Workspace(path) => path.clone(),
+            Self::Dependency { root, relative, .. } => {
+                let mut display = PathBuf::from("dependency");
+                display.push(root.file_name().unwrap_or_else(|| root.as_os_str()));
+                display.push(relative);
+                display
+            }
+        }
+    }
+
+    pub(crate) fn display_label(&self) -> String {
+        match self {
+            Self::Workspace(path) => path.display().to_string(),
+            Self::Dependency { root, relative, .. } => format!(
+                "Dependency · {}/{}",
+                root.file_name()
+                    .unwrap_or_else(|| root.as_os_str())
+                    .to_string_lossy(),
+                relative.display()
+            ),
+        }
+    }
+
+    pub(crate) fn content_root<'a>(&'a self, workspace_root: &'a Path) -> &'a Path {
+        match self {
+            Self::Workspace(_) => workspace_root,
+            Self::Dependency { root, .. } => root,
+        }
+    }
+
+    pub(crate) fn absolute_path(&self, workspace_root: &Path) -> PathBuf {
+        match self {
+            Self::Workspace(path) => workspace_root.join(path),
+            Self::Dependency { root, relative, .. } => root.join(relative),
+        }
     }
 }
 
@@ -608,25 +686,62 @@ fn execute_content(
             })
         }
         ContentKind::Preview => {
-            let (absolute, display_path) = match request.target {
-                ContentTarget::Workspace(relative) => (root.join(&relative), relative),
-                ContentTarget::Repository(change) => {
-                    let graph =
-                        graph.ok_or_else(|| anyhow!("repository graph is not available"))?;
-                    let snapshot = graph.repository(&change.path.repo_id).ok_or_else(|| {
-                        anyhow!(
-                            "repository {} is no longer available",
-                            change.path.repo_id.path().display()
+            let (absolute, display_path, content_root, identity, navigation_server_root) =
+                match request.target {
+                    ContentTarget::Workspace(relative) => {
+                        let absolute = root.join(&relative);
+                        (
+                            absolute.clone(),
+                            relative,
+                            root.to_path_buf(),
+                            ContentIdentity::from_absolute(root, &absolute),
+                            server_root_for_document(root, graph, &absolute),
                         )
-                    })?;
-                    (
-                        snapshot.node.worktree.join(&change.path.relative),
-                        change.path.relative,
-                    )
-                }
-            };
+                    }
+                    ContentTarget::Dependency {
+                        root: dependency_root,
+                        relative,
+                        server_root,
+                    } => {
+                        let absolute = dependency_root.join(&relative);
+                        let identity = ContentIdentity::dependency(
+                            dependency_root.clone(),
+                            &absolute,
+                            server_root.clone(),
+                        );
+                        let display_path = identity
+                            .as_ref()
+                            .map_or_else(|| relative.clone(), ContentIdentity::display_path);
+                        (
+                            absolute,
+                            display_path,
+                            dependency_root,
+                            identity,
+                            server_root,
+                        )
+                    }
+                    ContentTarget::Repository(change) => {
+                        let graph =
+                            graph.ok_or_else(|| anyhow!("repository graph is not available"))?;
+                        let snapshot = graph.repository(&change.path.repo_id).ok_or_else(|| {
+                            anyhow!(
+                                "repository {} is no longer available",
+                                change.path.repo_id.path().display()
+                            )
+                        })?;
+                        let relative = change.path.relative;
+                        let absolute = snapshot.node.worktree.join(&relative);
+                        (
+                            absolute.clone(),
+                            relative,
+                            root.to_path_buf(),
+                            ContentIdentity::from_absolute(root, &absolute),
+                            server_root_for_document(root, Some(graph), &absolute),
+                        )
+                    }
+                };
             let preview_request = PreviewRequest::new(&absolute, &display_path)
-                .within_root(root)
+                .within_root(&content_root)
                 .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES);
             let (preview, fold_source) = match registry.resolve(&preview_request)? {
                 PreviewResolution::Preview {
@@ -653,7 +768,9 @@ fn execute_content(
                     kind,
                     offending_path,
                 } => {
-                    let offending = offending_path.strip_prefix(root).unwrap_or(&offending_path);
+                    let offending = offending_path
+                        .strip_prefix(&content_root)
+                        .unwrap_or(&offending_path);
                     let location = if offending_path == absolute {
                         format!("{} is a {}", display_path.display(), kind.label())
                     } else {
@@ -681,7 +798,6 @@ fn execute_content(
                     });
                 }
             };
-            let identity = ContentIdentity::from_absolute(root, &absolute);
             let mut lines = preview.lines;
             let mut highlights = preview.highlights;
             let structure = if fold_source.allows_folding() {
@@ -705,8 +821,9 @@ fn execute_content(
                 Some(NavigationSource {
                     identity,
                     absolute_path: absolute.clone(),
+                    content_root,
                     disk_raw_len,
-                    server_root: server_root_for_document(root, graph, &absolute),
+                    server_root: navigation_server_root,
                     language,
                     text,
                     line_index,
@@ -781,13 +898,26 @@ pub(crate) fn rebind_navigation_source(
     graph: Option<&RepoGraph>,
     source: &NavigationSource,
 ) -> Option<NavigationSource> {
-    let identity = ContentIdentity::from_absolute(app_root, &source.absolute_path)?;
-    if identity != source.identity {
-        return None;
+    match &source.identity {
+        ContentIdentity::Workspace(_) => {
+            let identity = ContentIdentity::from_absolute(app_root, &source.absolute_path)?;
+            if identity != source.identity || source.content_root != app_root {
+                return None;
+            }
+            let mut rebound = source.clone();
+            rebound.server_root = server_root_for_document(app_root, graph, &source.absolute_path);
+            Some(rebound)
+        }
+        ContentIdentity::Dependency { .. } => {
+            let expected = source.identity.absolute_path(app_root);
+            if expected != source.absolute_path
+                || source.identity.content_root(app_root) != source.content_root
+            {
+                return None;
+            }
+            Some(source.clone())
+        }
     }
-    let mut rebound = source.clone();
-    rebound.server_root = server_root_for_document(app_root, graph, &source.absolute_path);
-    Some(rebound)
 }
 
 fn catch_worker_error<T>(work: impl FnOnce() -> Result<T>) -> Result<T, String> {

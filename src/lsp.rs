@@ -583,7 +583,7 @@ pub(crate) enum ServerState {
 #[derive(Clone, Debug)]
 pub(crate) struct DiskSnapshotJob {
     pub generation: u64,
-    pub workspace_root: PathBuf,
+    pub content_root: PathBuf,
     pub absolute_path: PathBuf,
     pub disk_raw_len: u64,
     pub expected_text: Arc<str>,
@@ -594,7 +594,7 @@ impl DiskSnapshotJob {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bounded(
         generation: u64,
-        workspace_root: PathBuf,
+        content_root: PathBuf,
         absolute_path: PathBuf,
         disk_raw_len: u64,
         expected_text: Arc<str>,
@@ -603,7 +603,7 @@ impl DiskSnapshotJob {
     ) -> Self {
         Self {
             generation,
-            workspace_root,
+            content_root,
             absolute_path,
             disk_raw_len,
             expected_text,
@@ -763,7 +763,7 @@ fn read_and_compare_snapshot(job: &DiskSnapshotJob, cancel: &AtomicBool) -> Resu
     if cancel.load(Ordering::Acquire) || Instant::now() >= job.deadline {
         return Ok(false);
     }
-    let mut file = match open_regular(Some(&job.workspace_root), &job.absolute_path)? {
+    let mut file = match open_regular(Some(&job.content_root), &job.absolute_path)? {
         OpenRegular::Opened(file) => file,
         OpenRegular::Declined(_) => return Ok(false),
     };
@@ -1597,7 +1597,7 @@ impl NavigationManager {
             let now = Instant::now();
             let job = DiskSnapshotJob::bounded(
                 pending.request.generation,
-                self.workspace_root.clone(),
+                pending.document.content_root.clone(),
                 pending.document.absolute_path.clone(),
                 pending.document.disk_raw_len,
                 Arc::clone(&pending.document.text),
@@ -1981,7 +1981,7 @@ impl NavigationManager {
                         match parse_document_symbol_result(
                             raw.get(),
                             &budget,
-                            &self.workspace_root,
+                            &document.content_root,
                             &document,
                         ) {
                             Ok(symbols) => {
@@ -4000,6 +4000,7 @@ mod tests {
         Arc::new(NavigationSource {
             identity: crate::runtime::ContentIdentity::from_absolute(&root, &path).unwrap(),
             absolute_path: path,
+            content_root: root.clone(),
             disk_raw_len: text.len() as u64,
             server_root: root,
             language: crate::navigation::language_for_path(Path::new(name)).unwrap(),
@@ -5602,7 +5603,7 @@ exec sleep 30
         let now = Instant::now();
         let make_job = |generation| DiskSnapshotJob {
             generation,
-            workspace_root: root.clone(),
+            content_root: root.clone(),
             absolute_path: source.absolute_path.clone(),
             disk_raw_len: source.disk_raw_len,
             expected_text: Arc::clone(&source.text),
@@ -6300,7 +6301,7 @@ exec sleep 30
         let lane = DiskRevalidationLane::start().unwrap();
         lane.try_submit(DiskSnapshotJob {
             generation: 1,
-            workspace_root: root,
+            content_root: root,
             absolute_path: path,
             disk_raw_len: 17,
             expected_text: Arc::from("fn main() {}"),
@@ -6338,7 +6339,7 @@ exec sleep 30
         assert_eq!(bounded.deadline, now + Duration::from_millis(500));
         let job = |path: &Path, raw_len, expected: &'static str| DiskSnapshotJob {
             generation: 1,
-            workspace_root: root.clone(),
+            content_root: root.clone(),
             absolute_path: path.to_path_buf(),
             disk_raw_len: raw_len,
             expected_text: Arc::from(expected),
@@ -6405,7 +6406,7 @@ exec sleep 30
         let directory = tempfile::tempdir().unwrap();
         lane.try_submit(DiskSnapshotJob {
             generation: 1,
-            workspace_root: directory.path().to_path_buf(),
+            content_root: directory.path().to_path_buf(),
             absolute_path: directory.path().join("blocked"),
             disk_raw_len: 0,
             expected_text: Arc::from(""),

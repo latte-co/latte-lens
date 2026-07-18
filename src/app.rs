@@ -32,8 +32,9 @@ use crate::{
         ProtocolLocation,
     },
     navigation::{
-        AppOptions, DocumentVersion, NavigationOperation, NavigationSettings, NavigationSource,
-        NavigationTargetRange, SourcePosition, SourceRange, lsp_uri_to_safe_path,
+        AppOptions, DocumentVersion, NavigationFileTarget, NavigationOperation, NavigationSettings,
+        NavigationSource, NavigationTargetRange, SourcePosition, SourceRange,
+        lsp_uri_to_navigation_target,
     },
     preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
     repo_graph::{
@@ -1043,6 +1044,13 @@ impl App {
     }
 
     pub fn selected_content_label(&self) -> String {
+        if let Some(identity) = self
+            .content_identity
+            .as_ref()
+            .filter(|identity| identity.workspace_path().is_none())
+        {
+            return identity.display_label();
+        }
         if let Some(result) = self.selected_search_result() {
             return result.line_number.map_or_else(
                 || display_workspace_path(&result.path),
@@ -1062,6 +1070,13 @@ impl App {
     }
 
     pub fn selected_content_title(&self) -> &'static str {
+        if self
+            .content_identity
+            .as_ref()
+            .is_some_and(|identity| identity.workspace_path().is_none())
+        {
+            return "Dependency Source";
+        }
         if let Some(result) = self.selected_search_result() {
             return if result.is_dir {
                 "Directory"
@@ -3746,7 +3761,7 @@ impl App {
         let visible_navigation_path = self
             .navigation_source
             .as_ref()
-            .map(|source| source.identity.path().to_path_buf());
+            .and_then(|source| source.identity.workspace_path().map(Path::to_path_buf));
 
         match self.tree_scope {
             TreeScope::AllFiles => {
@@ -3838,7 +3853,7 @@ impl App {
                 if let Some(path) = self
                     .navigation_source
                     .as_ref()
-                    .map(|source| source.identity.path().to_path_buf())
+                    .and_then(|source| source.identity.workspace_path().map(Path::to_path_buf))
                 {
                     self.reveal_navigation_tree_selection(path);
                 } else if let Some(path) = self.pending_all_scope_path.clone() {
@@ -4704,7 +4719,7 @@ impl App {
                     label: format!(
                         "{}{}:{}:{} · {}",
                         "  ".repeat(depth),
-                        source.identity.path().display(),
+                        source.identity.display_label(),
                         position.line.saturating_add(1),
                         position.character.saturating_add(1),
                         symbol.name
@@ -4825,11 +4840,27 @@ impl App {
         locations: Vec<ProtocolLocation>,
     ) {
         let had_locations = !locations.is_empty();
+        let source_server_root = self
+            .navigation_source
+            .as_ref()
+            .filter(|source| source.identity == invocation.source_identity)
+            .map(|source| source.server_root.clone());
         let mut targets: Vec<_> = locations
             .into_iter()
             .filter_map(|location| {
-                let absolute = lsp_uri_to_safe_path(&location.uri, &self.root).ok()?;
-                let document = ContentIdentity::from_absolute(&self.root, &absolute)?;
+                let document = match lsp_uri_to_navigation_target(&location.uri, &self.root).ok()? {
+                    NavigationFileTarget::Workspace(absolute) => {
+                        ContentIdentity::from_absolute(&self.root, &absolute)?
+                    }
+                    NavigationFileTarget::Dependency(dependency) => {
+                        let absolute = dependency.root.join(&dependency.relative);
+                        ContentIdentity::dependency(
+                            dependency.root,
+                            &absolute,
+                            source_server_root.clone()?,
+                        )?
+                    }
+                };
                 Some(NavigationTarget {
                     document,
                     range: NavigationTargetRange::Utf16(location.range),
@@ -4909,7 +4940,7 @@ impl App {
             purpose: ContentPurpose::NavigationStage {
                 navigation_generation: invocation.generation,
             },
-            target: ContentTarget::Workspace(target.document.path().to_path_buf()),
+            target: content_target_for_navigation(&target.document),
         });
         self.pending_navigation_stage = Some(PendingNavigationStage {
             invocation,
@@ -5043,10 +5074,12 @@ impl App {
         };
         self.navigation_target_highlight = Some(range);
         self.focused_pane = FocusPane::Content;
-        if self.tree_scope != TreeScope::AllFiles {
-            self.apply_tree_scope(TreeScope::AllFiles);
+        if let Some(workspace_path) = document.workspace_path() {
+            if self.tree_scope != TreeScope::AllFiles {
+                self.apply_tree_scope(TreeScope::AllFiles);
+            }
+            self.reveal_navigation_tree_selection(workspace_path.to_path_buf());
         }
-        self.reveal_navigation_tree_selection(document.path().to_path_buf());
         match invocation.history_intent {
             NavigationHistoryIntent::Jump => {
                 push_bounded_history(&mut self.navigation_back, invocation.origin.clone());
@@ -5241,7 +5274,7 @@ impl App {
             let preview = self
                 .resolve_target_in_current_document(&target)
                 .map(|range| NavigationPickerPreview {
-                    path: target.document.path().to_path_buf(),
+                    path: target.document.display_path(),
                     lines: self.content_lines.clone(),
                     highlights: self.content_highlights.clone(),
                     target: range,
@@ -5273,7 +5306,7 @@ impl App {
             purpose: ContentPurpose::NavigationPreview {
                 navigation_generation,
             },
-            target: ContentTarget::Workspace(target.document.path().to_path_buf()),
+            target: content_target_for_navigation(&target.document),
         });
     }
 
@@ -5336,7 +5369,7 @@ impl App {
                     return;
                 };
                 NavigationPickerPreview {
-                    path: target.document.path().to_path_buf(),
+                    path: target.document.display_path(),
                     lines: snapshot.lines,
                     highlights: snapshot.highlights,
                     target: range,
@@ -5585,7 +5618,7 @@ fn protocol_symbol_picker_items(
                 label: format!(
                     "{}{}:{}:{} · {}",
                     "  ".repeat(depth),
-                    source.identity.path().display(),
+                    source.identity.display_label(),
                     position.line.saturating_add(1),
                     position.character.saturating_add(1),
                     symbol.name
@@ -5624,7 +5657,7 @@ fn navigation_target_sort_key(target: &NavigationTarget) -> (PathBuf, u32, u32, 
         ),
     };
     (
-        target.document.path().to_path_buf(),
+        target.document.display_path(),
         start_line,
         start_character,
         end_line,
@@ -5632,13 +5665,29 @@ fn navigation_target_sort_key(target: &NavigationTarget) -> (PathBuf, u32, u32, 
     )
 }
 
+fn content_target_for_navigation(document: &ContentIdentity) -> ContentTarget {
+    match document {
+        ContentIdentity::Workspace(path) => ContentTarget::Workspace(path.clone()),
+        ContentIdentity::Dependency {
+            root,
+            relative,
+            server_root,
+        } => ContentTarget::Dependency {
+            root: root.clone(),
+            relative: relative.clone(),
+            server_root: server_root.clone(),
+        },
+    }
+}
+
 fn navigation_picker_groups(results: &[NavigationPickerItem]) -> Vec<NavigationPickerGroup> {
     let mut groups = Vec::new();
     let mut start = 0usize;
     while start < results.len() {
-        let path = results[start].target.document.path().to_path_buf();
+        let document = results[start].target.document.clone();
+        let path = document.display_path();
         let mut end = start.saturating_add(1);
-        while end < results.len() && results[end].target.document.path() == path {
+        while end < results.len() && results[end].target.document == document {
             end = end.saturating_add(1);
         }
         groups.push(NavigationPickerGroup {
@@ -5684,7 +5733,7 @@ fn navigation_target_label(target: &NavigationTarget) -> String {
     };
     format!(
         "{}:{}:{}",
-        target.document.path().display(),
+        target.document.display_label(),
         line.saturating_add(1),
         column.saturating_add(1)
     )
@@ -8072,6 +8121,59 @@ mod tests {
             );
             assert!(picker.preview.is_some());
         }
+    }
+
+    #[test]
+    fn navigation_opens_a_dependency_source_without_selecting_it_in_the_tree() {
+        let mut app = navigation_app("fn caller() {}\n");
+        let dependency = app
+            .root
+            .parent()
+            .unwrap()
+            .join("dependency-cache/example.com/module@v1.2.3");
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(dependency.join("go.mod"), "module example.com/module\n").unwrap();
+        fs::write(dependency.join("source.rs"), "pub fn dependency() {}\n").unwrap();
+        let dependency = dependency.canonicalize().unwrap();
+        let target_path = dependency.join("source.rs");
+        let uri = crate::navigation::path_to_lsp_uri(&target_path).unwrap();
+        let caller = app.content_identity.clone().unwrap();
+
+        app.request_semantic_navigation(NavigationOperation::Definition);
+        let invocation = app.navigation_invocation.clone().unwrap();
+        app.apply_navigation_completion(NavigationRuntimeCompletion {
+            generation: invocation.generation,
+            operation: invocation.operation,
+            source_identity: invocation.source_identity,
+            source_version: invocation.source_version,
+            result: NavigationProtocolResult::Locations(vec![ProtocolLocation::for_app_test(
+                uri,
+                lsp_types::Range::new(
+                    lsp_types::Position::new(0, 7),
+                    lsp_types::Position::new(0, 17),
+                ),
+            )]),
+        });
+        app.wait_for_background();
+
+        assert!(matches!(
+            app.content_identity,
+            Some(ContentIdentity::Dependency { ref root, ref relative, .. })
+                if root == &dependency && relative == Path::new("source.rs")
+        ));
+        assert_eq!(app.selected_content_title(), "Dependency Source");
+        assert!(app.selected_content_label().starts_with("Dependency ·"));
+        assert_eq!(app.tree_scope, TreeScope::AllFiles);
+        assert!(
+            app.all_entries
+                .iter()
+                .all(|entry| !entry.relative.starts_with("dependency-cache"))
+        );
+        assert_eq!(app.navigation_back.len(), 1);
+
+        app.navigate_history(NavigationHistoryIntent::Back);
+        app.wait_for_background();
+        assert_eq!(app.content_identity.as_ref(), Some(&caller));
     }
 
     #[test]

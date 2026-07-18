@@ -19,7 +19,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::{
-    content_safety::{ContentPathKind, OpenRegular, inspect_content_path, open_regular},
+    content_safety::{
+        ContentPathKind, OpenRegular, inspect_content_path, open_regular,
+        path_exists_without_following,
+    },
     folding::StructureSnapshot,
     lsp::{PayloadBudget, PayloadPermit},
     runtime::ContentIdentity,
@@ -166,10 +169,27 @@ pub(crate) enum NavigationTargetRange {
     Utf16(lsp_types::Range),
 }
 
+/// A package boundary discovered from a language-server location outside the
+/// opened workspace. Its root and every component beneath it have passed the
+/// shared no-follow content inspection before it reaches the preview runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DependencyTarget {
+    pub root: PathBuf,
+    pub relative: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NavigationFileTarget {
+    Workspace(PathBuf),
+    Dependency(DependencyTarget),
+}
+
 /// Complete, immutable, budget-owned source snapshot used by a session.
 pub(crate) struct NavigationDocument {
     pub identity: ContentIdentity,
     pub absolute_path: PathBuf,
+    /// No-link root used to revalidate the current document from disk.
+    pub content_root: PathBuf,
     pub disk_raw_len: u64,
     pub server_root: PathBuf,
     pub language: LanguageDescriptor,
@@ -184,6 +204,7 @@ pub(crate) struct NavigationDocument {
 pub(crate) struct NavigationSource {
     pub identity: ContentIdentity,
     pub absolute_path: PathBuf,
+    pub content_root: PathBuf,
     pub disk_raw_len: u64,
     pub server_root: PathBuf,
     pub language: LanguageDescriptor,
@@ -197,6 +218,7 @@ impl NavigationDocument {
     pub(crate) fn new(
         identity: ContentIdentity,
         absolute_path: PathBuf,
+        content_root: PathBuf,
         disk_raw_len: u64,
         server_root: PathBuf,
         language: LanguageDescriptor,
@@ -228,6 +250,7 @@ impl NavigationDocument {
         Ok(Self {
             identity,
             absolute_path,
+            content_root,
             disk_raw_len,
             server_root,
             language,
@@ -268,6 +291,7 @@ impl NavigationDocument {
         Ok(Self {
             identity: source.identity.clone(),
             absolute_path: source.absolute_path.clone(),
+            content_root: source.content_root.clone(),
             disk_raw_len: source.disk_raw_len,
             server_root: source.server_root.clone(),
             language: source.language,
@@ -1035,6 +1059,31 @@ pub(crate) fn path_to_lsp_uri(path: &Path) -> Result<lsp_types::Uri> {
 }
 
 pub(crate) fn lsp_uri_to_safe_path(uri: &lsp_types::Uri, workspace_root: &Path) -> Result<PathBuf> {
+    let path = lsp_uri_to_file_path(uri)?;
+    let path = normalize_lsp_target_path(workspace_root, &path)?;
+    let inspected = inspect_content_path(Some(workspace_root), &path)?;
+    if inspected.kind != ContentPathKind::Regular || inspected.path != path {
+        bail!("navigation target is not a safe regular workspace file");
+    }
+    Ok(path)
+}
+
+/// Classify an LSP location as either a normal workspace target or a
+/// transient dependency source. Dependency targets are intentionally limited
+/// to package roots with a language manifest and retain the same no-follow
+/// regular-file checks as workspace previews.
+pub(crate) fn lsp_uri_to_navigation_target(
+    uri: &lsp_types::Uri,
+    workspace_root: &Path,
+) -> Result<NavigationFileTarget> {
+    if let Ok(path) = lsp_uri_to_safe_path(uri, workspace_root) {
+        return Ok(NavigationFileTarget::Workspace(path));
+    }
+    let path = lsp_uri_to_file_path(uri)?;
+    dependency_target_for_path(&path).map(NavigationFileTarget::Dependency)
+}
+
+fn lsp_uri_to_file_path(uri: &lsp_types::Uri) -> Result<PathBuf> {
     let url = url::Url::parse(uri.as_str()).context("invalid LSP URI")?;
     if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
         bail!("navigation target must be an unqualified file URI");
@@ -1042,12 +1091,73 @@ pub(crate) fn lsp_uri_to_safe_path(uri: &lsp_types::Uri, workspace_root: &Path) 
     let path = url
         .to_file_path()
         .map_err(|_| anyhow!("file URI cannot be represented on this platform"))?;
-    let path = normalize_lsp_target_path(workspace_root, &path)?;
-    let inspected = inspect_content_path(Some(workspace_root), &path)?;
-    if inspected.kind != ContentPathKind::Regular || inspected.path != path {
-        bail!("navigation target is not a safe regular workspace file");
+    if !path.is_absolute() {
+        bail!("navigation target is not an absolute file path");
     }
     Ok(path)
+}
+
+const DEPENDENCY_MANIFESTS: [&str; 5] = [
+    "go.mod",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+];
+const MAX_DEPENDENCY_ROOT_ANCESTORS: usize = 32;
+
+fn dependency_target_for_path(path: &Path) -> Result<DependencyTarget> {
+    let filesystem_root = path
+        .ancestors()
+        .last()
+        .filter(|root| root.is_absolute())
+        .ok_or_else(|| anyhow!("dependency target has no filesystem root"))?;
+    let inspected = inspect_content_path(Some(filesystem_root), path)?;
+    if inspected.kind != ContentPathKind::Regular || inspected.path != path {
+        bail!("dependency target is not a safe regular file");
+    }
+
+    let mut candidate = path
+        .parent()
+        .filter(|parent| parent.starts_with(filesystem_root))
+        .ok_or_else(|| anyhow!("dependency target has no parent directory"))?;
+    for _ in 0..MAX_DEPENDENCY_ROOT_ANCESTORS {
+        let directory = inspect_content_path(Some(filesystem_root), candidate)?;
+        if directory.kind != ContentPathKind::Directory || directory.path != candidate {
+            bail!("dependency target traverses a non-directory path component");
+        }
+        for manifest in DEPENDENCY_MANIFESTS {
+            let manifest_path = candidate.join(manifest);
+            if !path_exists_without_following(&manifest_path) {
+                continue;
+            }
+            let manifest = inspect_content_path(Some(filesystem_root), &manifest_path)?;
+            if manifest.kind != ContentPathKind::Regular || manifest.path != manifest_path {
+                bail!("dependency package manifest is not a safe regular file");
+            }
+            let relative = path
+                .strip_prefix(candidate)
+                .context("dependency target escaped its package root")?
+                .to_path_buf();
+            if relative.as_os_str().is_empty() {
+                bail!("dependency target cannot be a package directory");
+            }
+            return Ok(DependencyTarget {
+                root: candidate.to_path_buf(),
+                relative,
+            });
+        }
+        let Some(parent) = candidate.parent() else {
+            break;
+        };
+        if parent == candidate || !parent.starts_with(filesystem_root) {
+            break;
+        }
+        candidate = parent;
+    }
+    bail!(
+        "navigation target is outside the opened workspace and not a recognized dependency source"
+    )
 }
 
 #[cfg(not(windows))]
@@ -1263,6 +1373,7 @@ mod tests {
         let document = NavigationDocument::new(
             identity.clone(),
             path.clone(),
+            root.clone(),
             text.len() as u64,
             root.clone(),
             language_for_path(&path).unwrap(),
@@ -1280,6 +1391,7 @@ mod tests {
         let source = NavigationSource {
             identity,
             absolute_path: path,
+            content_root: root.clone(),
             disk_raw_len: text.len() as u64,
             server_root: root,
             language: document.language,
@@ -1327,6 +1439,7 @@ mod tests {
             NavigationDocument::new(
                 huge_source.identity.clone(),
                 huge_source.absolute_path.clone(),
+                huge_source.content_root.clone(),
                 huge_source.disk_raw_len,
                 huge_source.server_root.clone(),
                 huge_source.language,
@@ -1727,6 +1840,43 @@ mod tests {
         assert!(lsp_uri_to_safe_path(&http, &workspace).is_err());
         let fragment = lsp_types::Uri::from_str("file:///tmp/main.rs#symbol").unwrap();
         assert!(lsp_uri_to_safe_path(&fragment, &workspace).is_err());
+    }
+
+    #[test]
+    fn lsp_uri_to_navigation_target_accepts_a_safe_external_package_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let dependency = directory.path().join("cache/example.com/module@v1.2.3");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(dependency.join("go.mod"), "module example.com/module\n").unwrap();
+        fs::write(dependency.join("source.go"), "package module\n").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let dependency = dependency.canonicalize().unwrap();
+        let source = dependency.join("source.go");
+        let uri = path_to_lsp_uri(&source).unwrap();
+
+        assert_eq!(
+            lsp_uri_to_navigation_target(&uri, &workspace).unwrap(),
+            NavigationFileTarget::Dependency(DependencyTarget {
+                root: dependency,
+                relative: PathBuf::from("source.go"),
+            })
+        );
+    }
+
+    #[test]
+    fn lsp_uri_to_navigation_target_rejects_external_files_without_a_package_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external = directory.path().join("external.rs");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&external, "fn external() {}\n").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let external = external.canonicalize().unwrap();
+        let uri = path_to_lsp_uri(&external).unwrap();
+
+        assert!(lsp_uri_to_navigation_target(&uri, &workspace).is_err());
     }
 
     #[cfg(unix)]
