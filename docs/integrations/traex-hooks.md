@@ -4,7 +4,9 @@ Latte Lens 通过 TraeX command Hooks 接收 session、turn、tool、permission 
 
 ## 安装
 
-推荐在 Lens 与 TraeX 共同使用的工作区安装项目级配置：
+TraeX 支持用户级 `$HOME/.trae/hooks.json`。安装器经用户确认后会运行 `latte-lens hooks setup`，把完整 Hook 集合语义合并到该文件，保留现有字段和 handler。Setup 只在 `$HOME/.trae` 已存在时接入，不通过创建目录猜测 TraeX 已安装；事务备份、失败回滚和恢复方法见 [Code Agent Hooks 安装与恢复](./hook-setup.md)。
+
+需要把配置跟随单个工作区时，也可以安装项目级配置：
 
 ```sh
 mkdir -p .trae
@@ -13,9 +15,7 @@ cp /path/to/latte-lens/integrations/traex/hooks.json .trae/hooks.json
 
 如果项目已经有 `.trae/hooks.json`，必须把 `integrations/traex/hooks.json` 中各事件的 handler 合并进现有 `hooks` 对象，不能覆盖其他 Hook。配置中的 `latte-lens` 必须位于 TraeX 继承的 `PATH`；也可以把每条 `command` 的开头替换为 binary 绝对路径。
 
-用户级 Hook 位置可能随 TraeX 版本变化。项目级 `.trae/hooks.json` 直接跟随工作区，因此是本集成唯一维护和推荐的配置方式。TraeX 会对 Hook 来源执行信任检查；首次启用后应审阅配置并按 TraeX 提示确认，不要在日常使用中关闭信任校验。
-
-Latte Lens 不会自动创建或修改 TraeX 配置，也不会保存 Hook 信任状态。
+TraeX 会对 Hook 来源执行信任检查；首次启用后应审阅配置并按 TraeX 提示确认，不要在日常使用中关闭信任校验。Latte Lens 不会保存或绕过 Hook 信任状态。
 
 ## 命令与工作区契约
 

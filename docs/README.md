@@ -14,9 +14,10 @@ Latte Lens 当前只维护中文版文档。文档按职责分层，不为尚未
 
 ## 集成
 
-- [Claude Code Hooks 集成](integrations/claude-code-hooks.md)：Claude Code command Hooks 的手工配置、exact-workspace 语义、验证方法与当前能力边界。
+- [Claude Code Hooks 集成](integrations/claude-code-hooks.md)：Claude Code command Hooks 的用户级 Setup、项目级手工配置、exact-workspace 语义与能力边界。
 - [OpenCode 插件集成](integrations/opencode-plugins.md)：OpenCode 本地插件的安装、native event 映射、exact-workspace 语义与数据边界。
-- [TraeX Hooks 集成](integrations/traex-hooks.md)：TraeX command Hooks 的项目配置、事件映射、数据边界与真实 CLI canary。
+- [TraeX Hooks 集成](integrations/traex-hooks.md)：TraeX command Hooks 的用户级与项目级配置、事件映射、数据边界与真实 CLI canary。
+- [Code Agent Hooks 安装与恢复](integrations/hook-setup.md)：用户级 Setup、安装器交互、事务备份、失败回滚与显式恢复。
 
 ## 工程
 

@@ -1,6 +1,16 @@
-& {
+[CmdletBinding()]
+param(
+    [Alias("y")]
+    [switch]$Yes
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if ($env:LATTE_LENS_YES -and $env:LATTE_LENS_YES -notin @("0", "1")) {
+    throw "LATTE_LENS_YES must be 0 or 1"
+}
+$AssumeYes = $Yes.IsPresent -or $env:LATTE_LENS_YES -eq "1"
 
 $Version = $env:LATTE_LENS_VERSION
 $InstallDir = $env:LATTE_LENS_INSTALL_DIR
@@ -173,6 +183,28 @@ function Add-InstallDirToUserPath {
     }
 }
 
+function Install-CodeAgentHooks {
+    param([string]$Destination)
+
+    $installHooks = $AssumeYes
+    if (-not $installHooks -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $answer = Read-Host "Configure Latte Lens hooks for detected Code Agents? [y/N]"
+        $installHooks = $answer -match '^(?i:y|yes)$'
+    }
+
+    if (-not $installHooks) {
+        Write-WarningMessage "Code Agent hooks were not configured; run '$Destination hooks setup' later"
+        return
+    }
+
+    Write-Step "configuring user-level Code Agent hooks"
+    & $Destination hooks setup
+    if ($LASTEXITCODE -ne 0) {
+        throw "hook setup failed; the binary remains installed and modified configs were rolled back"
+    }
+    Write-Step "configured Code Agent hooks"
+}
+
 function Install-LatteLens {
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         [Net.ServicePointManager]::SecurityProtocol =
@@ -231,6 +263,7 @@ function Install-LatteLens {
 
         Add-InstallDirToUserPath
         Write-Step "installed $reportedVersion to $destination"
+        Install-CodeAgentHooks $destination
     } finally {
         if ($destinationTemporary -and (Test-Path -LiteralPath $destinationTemporary)) {
             Remove-Item -Force -LiteralPath $destinationTemporary
@@ -242,4 +275,3 @@ function Install-LatteLens {
 }
 
 Install-LatteLens
-}

@@ -49,14 +49,23 @@ class WindowsInstallTests(unittest.TestCase):
     def environment(self, server) -> dict[str, str]:
         host, port = server.server_address
         environment = os.environ.copy()
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
         environment.update(
             {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
                 "LATTE_LENS_API_URL": f"http://{host}:{port}/api",
                 "LATTE_LENS_DOWNLOAD_URL": f"http://{host}:{port}/downloads",
                 "LATTE_LENS_INSTALL_DIR": str(self.root / "install"),
                 "LATTE_LENS_NO_MODIFY_PATH": "1",
+                "LATTE_LENS_STATE_DIR": str(self.root / "state"),
+                "TMP": str(self.root / "tmp"),
+                "TEMP": str(self.root / "tmp"),
+                "XDG_CONFIG_HOME": str(home / ".config"),
             }
         )
+        (self.root / "tmp").mkdir(exist_ok=True)
         environment.pop("GITHUB_TOKEN", None)
         environment.pop("LATTE_LENS_VERSION", None)
         return environment
@@ -147,6 +156,29 @@ class WindowsInstallTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"/api/releases/tags/{self.tag}", server.requests)
             self.assertNotIn("/api/releases/latest", server.requests)
+
+    def test_yes_environment_runs_user_level_traex_hook_setup(self) -> None:
+        with fixture_server() as server:
+            server.responses[f"/api/releases/tags/{self.tag}"] = (
+                200,
+                release_json(self.tag, prerelease=True),
+            )
+            self.add_package(server)
+            environment = self.environment(server)
+            environment["LATTE_LENS_VERSION"] = self.version
+            environment["LATTE_LENS_YES"] = "1"
+            traex_dir = Path(environment["HOME"]) / ".trae"
+            traex_dir.mkdir(parents=True)
+            hooks_path = traex_dir / "hooks.json"
+            hooks_path.write_text('{"other":true}', encoding="utf-8")
+
+            result = self.run_installer(environment, server)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            hooks = hooks_path.read_text(encoding="utf-8")
+            self.assertIn('"other": true', hooks)
+            self.assertIn("bytedance/traex-hook", hooks)
+            self.assertIn("configured Code Agent hooks", result.stdout)
 
 
 if __name__ == "__main__":

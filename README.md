@@ -44,7 +44,13 @@ curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh
 The installer detects the operating system and architecture, downloads the
 matching release archive, verifies its SHA-256 checksum, and installs the
 binary to `~/.local/bin`. Until the first stable release exists, it falls back
-to the newest preview and prints a warning.
+to the newest preview and prints a warning. After the binary is installed, an
+interactive terminal asks whether to configure user-level Code Agent hooks.
+For unattended installation, accept that step explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh | sh -s -- -y
+```
 
 ### Windows
 
@@ -59,6 +65,15 @@ The PowerShell installer downloads and verifies the Windows x64 package,
 installs it to `%LOCALAPPDATA%\Programs\latte-lens\bin`, and adds that directory
 to the current user's `PATH`. Open a new terminal if `latte-lens` is not yet
 available in the current session.
+
+The installer prompts before configuring user-level Code Agent hooks. A saved
+installer also accepts `-y`/`-Yes`; piped automation can use the equivalent
+environment opt-in:
+
+```powershell
+$env:LATTE_LENS_YES = "1"
+irm https://raw.githubusercontent.com/latte-co/latte-lens/main/install.ps1 | iex
+```
 
 Pin a release or change the destination before running the installer:
 
@@ -84,6 +99,14 @@ latte-lens /path/to/repository
 ```
 
 By default, Cargo installs `latte-lens` into `~/.cargo/bin`.
+
+Install hooks later, or restore the exact pre-setup configuration printed by a
+successful setup:
+
+```bash
+latte-lens hooks setup
+latte-lens hooks restore <transaction-id>
+```
 
 Inside the TUI:
 

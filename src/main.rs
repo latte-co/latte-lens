@@ -42,6 +42,8 @@ struct Cli {
 enum Command {
     /// Receive one bounded Code Agent hook event without starting the TUI.
     Hook(HookArgs),
+    /// Install or restore user-level Code Agent hook configuration.
+    Hooks(HooksArgs),
 }
 
 #[cfg(feature = "agent-observability")]
@@ -55,6 +57,25 @@ struct HookArgs {
     observer_version: Option<String>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+}
+
+#[cfg(feature = "agent-observability")]
+#[derive(Debug, Args)]
+struct HooksArgs {
+    #[command(subcommand)]
+    command: HooksCommand,
+}
+
+#[cfg(feature = "agent-observability")]
+#[derive(Debug, Subcommand)]
+enum HooksCommand {
+    /// Merge Latte Lens hooks into every existing user-level Agent config.
+    Setup,
+    /// Restore the exact pre-setup files when they have not changed since setup.
+    Restore {
+        /// Transaction identifier printed by `hooks setup`.
+        transaction_id: String,
+    },
 }
 
 #[cfg(feature = "agent-observability")]
@@ -79,12 +100,49 @@ fn main() -> Result<()> {
     };
 
     #[cfg(feature = "agent-observability")]
-    if let Some(Command::Hook(hook)) = cli.command {
-        let _ = run_hook(hook);
-        return Ok(());
+    if let Some(command) = cli.command {
+        match command {
+            Command::Hook(hook) => {
+                let _ = run_hook(hook);
+                return Ok(());
+            }
+            Command::Hooks(hooks) => return run_hooks_command(hooks),
+        }
     }
 
     run_tui(cli.path)
+}
+
+#[cfg(feature = "agent-observability")]
+fn run_hooks_command(hooks: HooksArgs) -> Result<()> {
+    let options = HookSetupOptions::from_environment(env::current_exe()?)?;
+    match hooks.command {
+        HooksCommand::Setup => {
+            let report = setup_user_hooks(options)?;
+            for agent in &report.configured {
+                println!("configured {agent}");
+            }
+            for agent in &report.skipped {
+                println!("skipped {agent}: configuration directory not found");
+            }
+            if let (Some(transaction), Some(backup)) =
+                (report.transaction_id, report.backup_directory)
+            {
+                println!("hook setup transaction: {transaction}");
+                println!("recovery backup: {}", backup.display());
+            } else {
+                println!("hooks already up to date");
+            }
+        }
+        HooksCommand::Restore { transaction_id } => {
+            let report = restore_user_hooks(options, &transaction_id)?;
+            for agent in &report.restored {
+                println!("restored {agent}");
+            }
+            println!("restored hook setup transaction: {}", report.transaction_id);
+        }
+    }
+    Ok(())
 }
 
 fn run_tui(path: PathBuf) -> Result<()> {

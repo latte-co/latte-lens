@@ -7,6 +7,7 @@ API_BASE=${LATTE_LENS_API_URL:-https://api.github.com/repos/$REPOSITORY}
 DOWNLOAD_BASE=${LATTE_LENS_DOWNLOAD_URL:-https://github.com/$REPOSITORY/releases/download}
 INSTALL_DIR=${LATTE_LENS_INSTALL_DIR:-$HOME/.local/bin}
 REQUESTED_VERSION=${LATTE_LENS_VERSION:-}
+YES=${LATTE_LENS_YES:-0}
 TMP=
 DESTINATION_TMP=
 
@@ -25,6 +26,32 @@ err() {
 
 need() {
   command -v "$1" >/dev/null 2>&1 || err "requires '$1'; install it first"
+}
+
+usage() {
+  cat <<'EOF'
+Install Latte Lens and optionally configure supported Code Agent hooks.
+
+Usage: install.sh [-y|--yes]
+
+  -y, --yes  Install user-level hooks without prompting.
+  -h, --help  Show this help.
+EOF
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -y|--yes) YES=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) err "unknown installer argument: $1" ;;
+    esac
+    shift
+  done
+  case "$YES" in
+    0|1) ;;
+    *) err "LATTE_LENS_YES must be 0 or 1" ;;
+  esac
 }
 
 cleanup() {
@@ -189,9 +216,40 @@ install_release() {
       printf '\n  export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
       ;;
   esac
+
+  setup_hooks "$destination"
+}
+
+setup_hooks() {
+  destination=$1
+  install_hooks=$YES
+  if [ "$install_hooks" -ne 1 ]; then
+    if [ -t 2 ] && [ -r /dev/tty ]; then
+      printf 'Configure Latte Lens hooks for detected Code Agents? [y/N] ' > /dev/tty
+      answer=
+      IFS= read -r answer < /dev/tty || true
+      case "$answer" in
+        y|Y|yes|YES|Yes) install_hooks=1 ;;
+      esac
+    fi
+  fi
+
+  if [ "$install_hooks" -ne 1 ]; then
+    warn "Code Agent hooks were not configured; run '$destination hooks setup' later"
+    return 0
+  fi
+
+  log "configuring user-level Code Agent hooks"
+  if "$destination" hooks setup; then
+    log "configured Code Agent hooks"
+  else
+    warn "hook setup failed; the binary remains installed and modified configs were rolled back"
+    return 1
+  fi
 }
 
 main() {
+  parse_args "$@"
   need curl
   need awk
   need tar

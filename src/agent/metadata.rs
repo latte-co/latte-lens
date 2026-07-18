@@ -1664,19 +1664,29 @@ pub(crate) fn set_private_file_permissions(path: &Path) -> Result<(), MetadataEr
 }
 
 #[cfg(unix)]
-fn replace_atomically(source: &Path, destination: &Path) -> Result<(), MetadataError> {
+pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<(), MetadataError> {
     fs::rename(source, destination).map_err(map_io_error)
 }
 
 #[cfg(windows)]
-fn replace_atomically(source: &Path, destination: &Path) -> Result<(), MetadataError> {
+pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<(), MetadataError> {
     use std::os::windows::ffi::OsStrExt;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
     }
+    let destination_exists = fs::symlink_metadata(destination).is_ok();
     let source = source
         .as_os_str()
         .encode_wide()
@@ -1687,16 +1697,30 @@ fn replace_atomically(source: &Path, destination: &Path) -> Result<(), MetadataE
         .encode_wide()
         .chain([0])
         .collect::<Vec<_>>();
-    // SAFETY: both paths are NUL-terminated UTF-16 buffers and refer to files
-    // in the same private metadata directory.
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers. ReplaceFileW keeps
+    // the existing destination's ACL and attributes; MoveFileExW handles a
+    // destination that does not exist yet.
+    let replaced = if destination_exists {
+        unsafe {
+            ReplaceFileW(
+                destination.as_ptr(),
+                source.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+    } else {
+        unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if replaced == 0 {
         Err(map_io_error(io::Error::last_os_error()))
     } else {
         Ok(())
@@ -1812,12 +1836,12 @@ fn metadata_file_exists(path: &Path) -> Result<bool, MetadataError> {
     }
 }
 
-struct FileLock {
+pub(crate) struct FileLock {
     file: File,
 }
 
 impl FileLock {
-    fn acquire(path: &Path, deadline: Instant) -> Result<Option<Self>, MetadataError> {
+    pub(crate) fn acquire(path: &Path, deadline: Instant) -> Result<Option<Self>, MetadataError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         set_private_file_options(&mut options);

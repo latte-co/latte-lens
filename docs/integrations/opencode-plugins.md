@@ -4,7 +4,9 @@ Latte Lens 通过 OpenCode 官方本地插件 API 接收 session、activity、tu
 
 ## 安装
 
-项目级插件放在 OpenCode 工作区的 `.opencode/plugins/`：
+安装器经用户确认后会运行 `latte-lens hooks setup`，把内置插件安装到 `~/.config/opencode/plugins/latte-lens.js`；设置 `XDG_CONFIG_HOME` 时使用该配置根。现有同名文件只有在能识别为 Latte Lens 插件时才会升级，否则 Setup 拒绝覆盖。事务备份、失败回滚和恢复方法见 [Code Agent Hooks 安装与恢复](./hook-setup.md)。
+
+需要只对单个项目启用时，把项目级插件放在 OpenCode 工作区的 `.opencode/plugins/`：
 
 ```sh
 mkdir -p .opencode/plugins
@@ -12,7 +14,7 @@ cp /path/to/latte-lens/integrations/opencode/latte-lens.js \
   .opencode/plugins/latte-lens.js
 ```
 
-需要对所有工作区启用时，复制到 `~/.config/opencode/plugins/latte-lens.js`。OpenCode 启动时会自动加载这些目录中的 JavaScript/TypeScript 文件。Latte Lens binary 必须位于 OpenCode 继承的 `PATH`；也可以显式指定：
+OpenCode 启动时会自动加载用户级或项目级插件目录中的 JavaScript/TypeScript 文件。Latte Lens binary 必须位于 OpenCode 继承的 `PATH`；也可以显式指定：
 
 ```sh
 LATTE_LENS_BIN=/absolute/path/to/latte-lens opencode

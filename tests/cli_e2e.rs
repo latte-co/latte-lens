@@ -1,10 +1,8 @@
 use std::process::Command;
 #[cfg(feature = "agent-observability")]
+use std::{fs, io::Write, path::Path, process::Stdio};
+#[cfg(all(feature = "agent-observability", unix))]
 use std::{
-    fs,
-    io::Write,
-    path::Path,
-    process::Stdio,
     sync::{Arc, Barrier, RwLock},
     thread,
     time::{Duration, Instant},
@@ -59,17 +57,113 @@ fn hook_cli_is_fail_open_and_silent_when_no_adapter_is_registered() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start hook CLI");
-    child
+    if let Err(error) = child
         .stdin
         .take()
         .expect("stdin")
         .write_all(b"privacy-canary-hook-payload")
-        .expect("write payload");
+    {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
     let output = child.wait_with_output().expect("hook output");
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "agent-observability")]
+#[test]
+fn hooks_setup_and_restore_update_user_configs_transactionally() {
+    let binary = env!("CARGO_BIN_EXE_latte-lens");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let home = sandbox.path().join("home");
+    let state = sandbox.path().join("state");
+    let temporary = sandbox.path().join("tmp");
+    let codex = home.join(".codex");
+    let claude = home.join(".claude");
+    let opencode = home.join(".config/opencode");
+    let traex = home.join(".trae");
+    for directory in [&codex, &claude, &opencode, &traex, &temporary] {
+        fs::create_dir_all(directory).expect("setup directory");
+    }
+    let codex_original = b"{}\n";
+    let claude_original = b"{\"other\":true}\n";
+    let traex_original = b"{\"other\":true}\n";
+    fs::write(codex.join("hooks.json"), codex_original).expect("codex config");
+    fs::write(claude.join("settings.json"), claude_original).expect("claude config");
+    fs::write(traex.join("hooks.json"), traex_original).expect("traex config");
+
+    let setup = Command::new(binary)
+        .args(["hooks", "setup"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LATTE_LENS_STATE_DIR", &state)
+        .env("TMPDIR", &temporary)
+        .output()
+        .expect("hook setup");
+    assert!(
+        setup.status.success(),
+        "hook setup failed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let stdout = String::from_utf8(setup.stdout).expect("UTF-8 setup output");
+    for agent in ["codex", "claude-code", "opencode", "traex"] {
+        assert!(stdout.contains(&format!("configured {agent}")));
+    }
+    let transaction = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("hook setup transaction: "))
+        .expect("transaction id");
+    assert!(
+        fs::read_to_string(codex.join("hooks.json"))
+            .expect("codex config")
+            .contains(CODEX_HOOK_OBSERVER_ID)
+    );
+    assert!(
+        fs::read_to_string(claude.join("settings.json"))
+            .expect("claude config")
+            .contains(CLAUDE_HOOK_OBSERVER_ID)
+    );
+    assert!(
+        fs::read_to_string(opencode.join("plugins/latte-lens.js"))
+            .expect("OpenCode plugin")
+            .contains(OPENCODE_PLUGIN_OBSERVER_ID)
+    );
+    assert!(
+        fs::read_to_string(traex.join("hooks.json"))
+            .expect("TraeX config")
+            .contains(TRAEX_HOOK_OBSERVER_ID)
+    );
+
+    let restore = Command::new(binary)
+        .args(["hooks", "restore", transaction])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LATTE_LENS_STATE_DIR", &state)
+        .env("TMPDIR", &temporary)
+        .output()
+        .expect("hook restore");
+    assert!(
+        restore.status.success(),
+        "hook restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(
+        fs::read(codex.join("hooks.json")).expect("codex"),
+        codex_original
+    );
+    assert_eq!(
+        fs::read(claude.join("settings.json")).expect("claude"),
+        claude_original
+    );
+    assert_eq!(
+        fs::read(traex.join("hooks.json")).expect("traex"),
+        traex_original
+    );
+    assert!(!opencode.join("plugins/latte-lens.js").exists());
 }
 
 #[cfg(feature = "agent-observability")]

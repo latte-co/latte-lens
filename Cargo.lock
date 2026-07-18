@@ -709,6 +709,7 @@ dependencies = [
  "libc",
  "ratatui",
  "regex",
+ "serde_json",
  "syntect",
  "tempfile",
  "two-face",

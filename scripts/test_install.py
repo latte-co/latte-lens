@@ -78,6 +78,12 @@ def archive_bytes(version: str, target: str) -> bytes:
         f"  printf 'latte-lens {version}\\n'\n"
         "  exit 0\n"
         "fi\n"
+        "if [ \"$1\" = \"hooks\" ] && [ \"$2\" = \"setup\" ]; then\n"
+        "  if [ -n \"${LATTE_LENS_TEST_HOOK_LOG:-}\" ]; then\n"
+        "    printf 'hooks setup\\n' >> \"$LATTE_LENS_TEST_HOOK_LOG\"\n"
+        "  fi\n"
+        "  exit \"${LATTE_LENS_TEST_HOOK_EXIT:-0}\"\n"
+        "fi\n"
         "exit 1\n"
     ).encode()
     output = io.BytesIO()
@@ -157,9 +163,10 @@ class InstallTests(unittest.TestCase):
     def run_installer(
         self,
         environment: dict[str, str],
+        *arguments: str,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["sh", str(INSTALLER)],
+            ["sh", str(INSTALLER), *arguments],
             cwd=ROOT,
             env=environment,
             capture_output=True,
@@ -190,6 +197,42 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(version, "latte-lens 1.2.3")
             self.assertIn("installed latte-lens 1.2.3", result.stdout)
             self.assertIn("is not in your PATH", result.stdout)
+            self.assertIn("Code Agent hooks were not configured", result.stdout)
+
+    def test_yes_flag_runs_hook_setup_after_binary_install(self) -> None:
+        with fixture_server() as server:
+            tag = "v1.2.3"
+            server.responses["/api/releases/latest"] = (
+                200,
+                release_json(tag, prerelease=False),
+            )
+            self.add_package(server, tag, "x86_64-unknown-linux-gnu")
+            environment = self.env(server)
+            hook_log = self.root / "hook-setup.log"
+            environment["LATTE_LENS_TEST_HOOK_LOG"] = str(hook_log)
+
+            result = self.run_installer(environment, "-y")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hook_log.read_text(encoding="utf-8"), "hooks setup\n")
+            self.assertIn("configured Code Agent hooks", result.stdout)
+
+    def test_hook_setup_failure_keeps_binary_and_reports_rollback(self) -> None:
+        with fixture_server() as server:
+            tag = "v1.2.3"
+            server.responses["/api/releases/latest"] = (
+                200,
+                release_json(tag, prerelease=False),
+            )
+            self.add_package(server, tag, "x86_64-unknown-linux-gnu")
+            environment = self.env(server)
+            environment["LATTE_LENS_TEST_HOOK_EXIT"] = "9"
+
+            result = self.run_installer(environment, "--yes")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((self.root / "install/latte-lens").is_file())
+            self.assertIn("modified configs were rolled back", result.stdout)
 
     def test_falls_back_to_latest_preview_on_macos_arm64(self) -> None:
         with fixture_server() as server:
