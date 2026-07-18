@@ -2,7 +2,7 @@ use std::{
     any::Any,
     collections::{HashSet, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::{self, JoinHandle},
 };
@@ -13,7 +13,9 @@ use crate::{
     content_safety::{
         ContentPathKind, ensure_beneath, inspect_content_path, path_exists_without_following,
     },
+    folding::{FoldRegion, FoldSource, StructureSnapshot, structure_snapshot},
     git::StatusMap,
+    navigation::{LineIndex, NavigationSource, language_for_path},
     preview::{HighlightSpan, PreviewRegistry, PreviewRequest, PreviewResolution},
     repo_graph::{DiscoveryOptions, RepoChange, RepoGraph},
     tree::{self, ScanResult},
@@ -47,12 +49,30 @@ pub(crate) struct DirectoryRequest {
 pub(crate) struct ContentRequest {
     pub generation: u64,
     pub kind: ContentKind,
+    pub purpose: ContentPurpose,
     pub target: ContentTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContentPurpose {
+    Display,
+    NavigationStage { navigation_generation: u64 },
+    NavigationPreview { navigation_generation: u64 },
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ContentTarget {
     Workspace(PathBuf),
+    /// A source file owned by an externally resolved dependency package.
+    ///
+    /// This is deliberately not a workspace target: it is never added to the
+    /// tree or repository graph, and `root` is the package boundary that the
+    /// preview safety gate must enforce for every read.
+    Dependency {
+        root: PathBuf,
+        relative: PathBuf,
+        server_root: PathBuf,
+    },
     Repository(RepoChange),
 }
 
@@ -72,6 +92,103 @@ pub(crate) struct ContentSnapshot {
     pub lines: Vec<String>,
     pub highlights: Vec<Vec<HighlightSpan>>,
     pub show_line_numbers: bool,
+    pub identity: Option<ContentIdentity>,
+    pub fold_source: FoldSource,
+    pub fold_regions: Vec<FoldRegion>,
+    pub structure: StructureSnapshot,
+    pub navigation_source: Option<NavigationSource>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ContentIdentity {
+    Workspace(PathBuf),
+    Dependency {
+        root: PathBuf,
+        relative: PathBuf,
+        server_root: PathBuf,
+    },
+}
+
+impl ContentIdentity {
+    pub(crate) fn from_absolute(root: &Path, absolute: &Path) -> Option<Self> {
+        Self::normalized_relative(root, absolute).map(Self::Workspace)
+    }
+
+    pub(crate) fn dependency(root: PathBuf, absolute: &Path, server_root: PathBuf) -> Option<Self> {
+        Self::normalized_relative(&root, absolute).map(|relative| Self::Dependency {
+            root,
+            relative,
+            server_root,
+        })
+    }
+
+    fn normalized_relative(root: &Path, absolute: &Path) -> Option<PathBuf> {
+        let relative = absolute.strip_prefix(root).ok()?;
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(value) => normalized.push(value),
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => return None,
+            }
+        }
+        (!normalized.as_os_str().is_empty()).then_some(normalized)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Workspace(path) => path,
+            Self::Dependency { relative, .. } => relative,
+        }
+    }
+
+    pub(crate) fn workspace_path(&self) -> Option<&Path> {
+        match self {
+            Self::Workspace(path) => Some(path),
+            Self::Dependency { .. } => None,
+        }
+    }
+
+    pub(crate) fn display_path(&self) -> PathBuf {
+        match self {
+            Self::Workspace(path) => path.clone(),
+            Self::Dependency { root, relative, .. } => {
+                let mut display = PathBuf::from("dependency");
+                display.push(root.file_name().unwrap_or_else(|| root.as_os_str()));
+                display.push(relative);
+                display
+            }
+        }
+    }
+
+    pub(crate) fn display_label(&self) -> String {
+        match self {
+            Self::Workspace(path) => path.display().to_string(),
+            Self::Dependency { root, relative, .. } => format!(
+                "Dependency · {}/{}",
+                root.file_name()
+                    .unwrap_or_else(|| root.as_os_str())
+                    .to_string_lossy(),
+                relative.display()
+            ),
+        }
+    }
+
+    pub(crate) fn content_root<'a>(&'a self, workspace_root: &'a Path) -> &'a Path {
+        match self {
+            Self::Workspace(_) => workspace_root,
+            Self::Dependency { root, .. } => root,
+        }
+    }
+
+    pub(crate) fn absolute_path(&self, workspace_root: &Path) -> PathBuf {
+        match self {
+            Self::Workspace(path) => workspace_root.join(path),
+            Self::Dependency { root, relative, .. } => root.join(relative),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -91,6 +208,7 @@ pub(crate) struct DirectoryCompletion {
 pub(crate) struct ContentCompletion {
     pub generation: u64,
     pub kind: ContentKind,
+    pub purpose: ContentPurpose,
     pub result: Result<ContentSnapshot, String>,
 }
 
@@ -420,6 +538,7 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
             Work::Content(request) => {
                 let generation = request.generation;
                 let kind = request.kind;
+                let purpose = request.purpose;
                 let result = catch_worker_error(|| {
                     execute_content(&root, graph.as_ref(), &preview_registry, request)
                 });
@@ -431,6 +550,7 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
                 state.completed_content = Some(ContentCompletion {
                     generation,
                     kind,
+                    purpose,
                     result,
                 });
                 shared.changed.notify_all();
@@ -558,31 +678,76 @@ fn execute_content(
                 )?,
                 highlights: Vec::new(),
                 show_line_numbers: false,
+                identity: None,
+                fold_source: FoldSource::None,
+                fold_regions: Vec::new(),
+                structure: StructureSnapshot::unavailable(),
+                navigation_source: None,
             })
         }
         ContentKind::Preview => {
-            let (absolute, display_path) = match request.target {
-                ContentTarget::Workspace(relative) => (root.join(&relative), relative),
-                ContentTarget::Repository(change) => {
-                    let graph =
-                        graph.ok_or_else(|| anyhow!("repository graph is not available"))?;
-                    let snapshot = graph.repository(&change.path.repo_id).ok_or_else(|| {
-                        anyhow!(
-                            "repository {} is no longer available",
-                            change.path.repo_id.path().display()
+            let (absolute, display_path, content_root, identity, navigation_server_root) =
+                match request.target {
+                    ContentTarget::Workspace(relative) => {
+                        let absolute = root.join(&relative);
+                        (
+                            absolute.clone(),
+                            relative,
+                            root.to_path_buf(),
+                            ContentIdentity::from_absolute(root, &absolute),
+                            server_root_for_document(root, graph, &absolute),
                         )
-                    })?;
-                    (
-                        snapshot.node.worktree.join(&change.path.relative),
-                        change.path.relative,
-                    )
-                }
-            };
+                    }
+                    ContentTarget::Dependency {
+                        root: dependency_root,
+                        relative,
+                        server_root,
+                    } => {
+                        let absolute = dependency_root.join(&relative);
+                        let identity = ContentIdentity::dependency(
+                            dependency_root.clone(),
+                            &absolute,
+                            server_root.clone(),
+                        );
+                        let display_path = identity
+                            .as_ref()
+                            .map_or_else(|| relative.clone(), ContentIdentity::display_path);
+                        (
+                            absolute,
+                            display_path,
+                            dependency_root,
+                            identity,
+                            server_root,
+                        )
+                    }
+                    ContentTarget::Repository(change) => {
+                        let graph =
+                            graph.ok_or_else(|| anyhow!("repository graph is not available"))?;
+                        let snapshot = graph.repository(&change.path.repo_id).ok_or_else(|| {
+                            anyhow!(
+                                "repository {} is no longer available",
+                                change.path.repo_id.path().display()
+                            )
+                        })?;
+                        let relative = change.path.relative;
+                        let absolute = snapshot.node.worktree.join(&relative);
+                        (
+                            absolute.clone(),
+                            relative,
+                            root.to_path_buf(),
+                            ContentIdentity::from_absolute(root, &absolute),
+                            server_root_for_document(root, Some(graph), &absolute),
+                        )
+                    }
+                };
             let preview_request = PreviewRequest::new(&absolute, &display_path)
-                .within_root(root)
+                .within_root(&content_root)
                 .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES);
-            let preview = match registry.resolve(&preview_request)? {
-                PreviewResolution::Preview(preview) => preview,
+            let (preview, fold_source) = match registry.resolve(&preview_request)? {
+                PreviewResolution::Preview {
+                    preview,
+                    fold_source,
+                } => (preview, fold_source),
                 PreviewResolution::Unsupported => {
                     return Ok(ContentSnapshot {
                         provider: None,
@@ -592,13 +757,20 @@ fn execute_content(
                         ],
                         highlights: Vec::new(),
                         show_line_numbers: false,
+                        identity: None,
+                        fold_source: FoldSource::None,
+                        fold_regions: Vec::new(),
+                        structure: StructureSnapshot::unavailable(),
+                        navigation_source: None,
                     });
                 }
                 PreviewResolution::Unsafe {
                     kind,
                     offending_path,
                 } => {
-                    let offending = offending_path.strip_prefix(root).unwrap_or(&offending_path);
+                    let offending = offending_path
+                        .strip_prefix(&content_root)
+                        .unwrap_or(&offending_path);
                     let location = if offending_path == absolute {
                         format!("{} is a {}", display_path.display(), kind.label())
                     } else {
@@ -618,11 +790,48 @@ fn execute_content(
                         ],
                         highlights: Vec::new(),
                         show_line_numbers: false,
+                        identity: None,
+                        fold_source: FoldSource::None,
+                        fold_regions: Vec::new(),
+                        structure: StructureSnapshot::unavailable(),
+                        navigation_source: None,
                     });
                 }
             };
             let mut lines = preview.lines;
             let mut highlights = preview.highlights;
+            let structure = if fold_source.allows_folding() {
+                identity
+                    .as_ref()
+                    .map_or_else(StructureSnapshot::unavailable, |identity| {
+                        structure_snapshot(identity.path(), &lines)
+                    })
+            } else {
+                StructureSnapshot::unavailable()
+            };
+            let fold_regions = structure.folds.clone();
+            let navigation_source = if fold_source == FoldSource::BuiltinText
+                && !preview.truncated
+                && let (Some(identity), Some(language)) =
+                    (identity.clone(), language_for_path(&display_path))
+            {
+                let text: Arc<str> = Arc::from(lines.join("\n"));
+                let line_index = Arc::new(LineIndex::new(Arc::clone(&text))?);
+                let disk_raw_len = preview_request.open_regular()?.map_or(0, |file| file.len());
+                Some(NavigationSource {
+                    identity,
+                    absolute_path: absolute.clone(),
+                    content_root,
+                    disk_raw_len,
+                    server_root: navigation_server_root,
+                    language,
+                    text,
+                    line_index,
+                    structure: Arc::new(structure.clone()),
+                })
+            } else {
+                None
+            };
             if preview.truncated {
                 lines.push(format!(
                     "… preview truncated at {PREVIEW_MAX_BYTES} bytes or {PREVIEW_MAX_LINES} lines"
@@ -634,6 +843,11 @@ fn execute_content(
                 lines,
                 highlights,
                 show_line_numbers: preview.show_line_numbers,
+                identity,
+                fold_source,
+                fold_regions,
+                structure,
+                navigation_source,
             })
         }
     }
@@ -651,6 +865,59 @@ fn workspace_statuses(root: &std::path::Path, graph: &RepoGraph) -> StatusMap {
             Some((relative, change.status))
         })
         .collect()
+}
+
+pub(crate) fn server_root_for_document(
+    app_root: &Path,
+    graph: Option<&RepoGraph>,
+    absolute: &Path,
+) -> PathBuf {
+    graph
+        .into_iter()
+        .flat_map(RepoGraph::repositories)
+        .filter(|repository| {
+            repository.node.repo.is_some()
+                && repository.node.worktree.starts_with(app_root)
+                && absolute.starts_with(&repository.node.worktree)
+        })
+        .max_by_key(|repository| repository.node.worktree.components().count())
+        .map_or_else(
+            || app_root.to_path_buf(),
+            |repository| repository.node.worktree.clone(),
+        )
+}
+
+/// Rebind an immutable preview source to the repository graph installed by a
+/// refresh without reopening the file or rebuilding its text indexes.
+///
+/// A source whose absolute path no longer agrees with its workspace identity
+/// is not safe to carry forward. Returning `None` makes navigation degrade
+/// closed instead of retaining a server root from the previous graph.
+pub(crate) fn rebind_navigation_source(
+    app_root: &Path,
+    graph: Option<&RepoGraph>,
+    source: &NavigationSource,
+) -> Option<NavigationSource> {
+    match &source.identity {
+        ContentIdentity::Workspace(_) => {
+            let identity = ContentIdentity::from_absolute(app_root, &source.absolute_path)?;
+            if identity != source.identity || source.content_root != app_root {
+                return None;
+            }
+            let mut rebound = source.clone();
+            rebound.server_root = server_root_for_document(app_root, graph, &source.absolute_path);
+            Some(rebound)
+        }
+        ContentIdentity::Dependency { .. } => {
+            let expected = source.identity.absolute_path(app_root);
+            if expected != source.absolute_path
+                || source.identity.content_root(app_root) != source.content_root
+            {
+                return None;
+            }
+            Some(source.clone())
+        }
+    }
 }
 
 fn catch_worker_error<T>(work: impl FnOnce() -> Result<T>) -> Result<T, String> {
@@ -692,6 +959,22 @@ mod tests {
     }
 
     #[test]
+    fn content_identity_normalizes_nested_repository_paths_and_rejects_escape_components() {
+        let root = Path::new("/workspace");
+        let nested = Path::new("/workspace/vendor/repo/src/lib.rs");
+        assert_eq!(
+            ContentIdentity::from_absolute(root, nested)
+                .expect("nested repository path should remain workspace relative")
+                .path(),
+            Path::new("vendor/repo/src/lib.rs")
+        );
+        assert!(ContentIdentity::from_absolute(root, Path::new("/outside/lib.rs")).is_none());
+        assert!(
+            ContentIdentity::from_absolute(root, Path::new("/workspace/../escape.rs")).is_none()
+        );
+    }
+
+    #[test]
     fn refresh_request_coalescing_keeps_only_one_active_and_latest_pending() {
         let mut slot = RequestSlot::default();
         slot.submit(1);
@@ -713,6 +996,7 @@ mod tests {
         slot.submit(ContentRequest {
             generation: 1,
             kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
         });
         assert_eq!(slot.start_next().unwrap().generation, 1);
@@ -721,6 +1005,7 @@ mod tests {
             slot.submit(ContentRequest {
                 generation,
                 kind: ContentKind::Preview,
+                purpose: ContentPurpose::Display,
                 target: ContentTarget::Workspace(PathBuf::from(format!("{generation}.txt"))),
             });
         }

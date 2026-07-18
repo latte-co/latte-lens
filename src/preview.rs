@@ -22,6 +22,7 @@ use syntect::{
 use crate::content_safety::{
     ContentPathKind, OpenRegular, SafeFile, inspect_content_path, open_regular,
 };
+use crate::folding::FoldSource;
 
 pub const DEFAULT_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_LINES: usize = 10_000;
@@ -40,6 +41,8 @@ pub enum HighlightKind {
     Attribute,
     SearchMatch,
     Search,
+    NavigationTarget,
+    NavigationHover,
 }
 
 /// A syntax-highlighted byte range within one logical preview line.
@@ -198,11 +201,20 @@ pub trait PreviewProvider: Send + Sync {
 /// Ordered collection of preview providers.
 #[derive(Clone)]
 pub struct PreviewRegistry {
-    providers: Vec<Arc<dyn PreviewProvider>>,
+    providers: Vec<ProviderEntry>,
+}
+
+#[derive(Clone)]
+struct ProviderEntry {
+    provider: Arc<dyn PreviewProvider>,
+    fold_source: FoldSource,
 }
 
 pub(crate) enum PreviewResolution {
-    Preview(Preview),
+    Preview {
+        preview: Preview,
+        fold_source: FoldSource,
+    },
     Unsupported,
     Unsafe {
         kind: ContentPathKind,
@@ -219,10 +231,13 @@ impl PreviewRegistry {
         }
     }
 
-    /// Construct a registry containing Latte Lens' dependency-free providers.
+    /// Construct a registry containing Latte Lens' built-in providers.
     pub fn with_builtins() -> Self {
         let mut registry = Self::empty();
-        registry.register(TextPreviewProvider);
+        registry.providers.push(ProviderEntry {
+            provider: Arc::new(TextPreviewProvider),
+            fold_source: FoldSource::BuiltinText,
+        });
         registry
     }
 
@@ -235,14 +250,17 @@ impl PreviewRegistry {
     where
         P: PreviewProvider + 'static,
     {
-        self.providers.push(Arc::new(provider));
+        self.providers.push(ProviderEntry {
+            provider: Arc::new(provider),
+            fold_source: FoldSource::None,
+        });
         self
     }
 
     /// Resolve a preview, returning `None` when every provider declines it.
     pub fn preview(&self, request: &PreviewRequest<'_>) -> Result<Option<Preview>> {
         match self.resolve(request)? {
-            PreviewResolution::Preview(preview) => Ok(Some(preview)),
+            PreviewResolution::Preview { preview, .. } => Ok(Some(preview)),
             PreviewResolution::Unsupported | PreviewResolution::Unsafe { .. } => Ok(None),
         }
     }
@@ -263,15 +281,18 @@ impl PreviewRegistry {
             });
         }
 
-        for provider in self.providers.iter().rev() {
-            if let Some(content) = provider.preview(request)? {
-                return Ok(PreviewResolution::Preview(Preview {
-                    provider_id: provider.id().to_owned(),
-                    lines: content.lines,
-                    highlights: content.highlights,
-                    truncated: content.truncated,
-                    show_line_numbers: content.show_line_numbers,
-                }));
+        for entry in self.providers.iter().rev() {
+            if let Some(content) = entry.provider.preview(request)? {
+                return Ok(PreviewResolution::Preview {
+                    preview: Preview {
+                        provider_id: entry.provider.id().to_owned(),
+                        lines: content.lines,
+                        highlights: content.highlights,
+                        truncated: content.truncated,
+                        show_line_numbers: content.show_line_numbers,
+                    },
+                    fold_source: entry.fold_source,
+                });
             }
         }
 
@@ -493,8 +514,9 @@ mod tests {
 
     use super::{
         HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest,
-        TextPreviewProvider,
+        PreviewResolution, TextPreviewProvider,
     };
+    use crate::folding::FoldSource;
 
     #[test]
     fn previews_code_and_extensionless_utf8_text() -> Result<()> {
@@ -733,6 +755,39 @@ mod tests {
         assert_eq!(preview.provider_id, "fake-pdf");
         assert_eq!(preview.lines, ["rendered PDF page"]);
         assert!(!preview.show_line_numbers);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_provider_named_text_does_not_gain_builtin_folding_capability() -> Result<()> {
+        struct CustomText;
+
+        impl PreviewProvider for CustomText {
+            fn id(&self) -> &'static str {
+                "text"
+            }
+
+            fn preview(&self, _: &PreviewRequest<'_>) -> Result<Option<PreviewContent>> {
+                Ok(Some(PreviewContent::new(vec![
+                    "fn deceptive() {".to_owned(),
+                    "}".to_owned(),
+                ])))
+            }
+        }
+
+        let directory = tempdir()?;
+        let source = directory.path().join("fake.rs");
+        fs::write(&source, "ignored")?;
+        let mut registry = PreviewRegistry::with_builtins();
+        registry.register(CustomText);
+        let resolution = registry.resolve(&PreviewRequest::new(&source, Path::new("fake.rs")))?;
+        assert!(matches!(
+            resolution,
+            PreviewResolution::Preview {
+                fold_source: FoldSource::None,
+                ..
+            }
+        ));
         Ok(())
     }
 

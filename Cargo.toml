@@ -10,28 +10,55 @@ repository = "https://github.com/latte-co/latte-lens"
 [features]
 default = []
 agent-observability = []
+navigation-test-support = []
 
 [[bin]]
 name = "latte-lens"
 path = "src/main.rs"
+
+[[bin]]
+name = "latte-lens-lsp-test-helper"
+path = "tests/support/lsp_test_helper.rs"
+required-features = ["navigation-test-support"]
 
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
+lsp-types = "=0.97.0"
+pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1.12"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["raw_value"] }
 syntect = { version = "5.3", default-features = false, features = ["regex-fancy"] }
+tree-sitter = "0.25.10"
+tree-sitter-go = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
+url = "=2.5.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_System_Environment",
+  "Win32_System_IO",
+  "Win32_System_JobObjects",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 criterion = "0.7"

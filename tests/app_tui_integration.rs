@@ -12,6 +12,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "navigation-test-support")]
+use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
     app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TreeScope},
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
@@ -51,6 +53,81 @@ fn startup_renders_before_the_initial_tree_snapshot_is_ready() {
             .iter()
             .any(|entry| entry.relative == Path::new("plain.txt"))
     );
+}
+
+#[test]
+fn preview_folding_renders_markers_and_find_reveals_hidden_body() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("fold.rs"),
+        "fn folded() {\n    let hidden_needle = 1;\n    println!(\"{}\", hidden_needle);\n}\n",
+    )
+    .unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(modified_key(KeyCode::Char('{'), KeyModifiers::SHIFT));
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains('▸'));
+    assert!(rendered.contains("lines"));
+    assert!(!rendered.contains("hidden_needle"));
+
+    let marker_index = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .position(|cell| cell.symbol() == "▸")
+        .unwrap();
+    let marker_column = u16::try_from(marker_index % 100).unwrap();
+    let marker_row = u16::try_from(marker_index / 100).unwrap();
+    app.handle_mouse(mouse_down(marker_column, marker_row.saturating_add(5)));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        rendered.contains('▸'),
+        "blank EOF rows must not alias the marker"
+    );
+
+    app.handle_mouse(mouse_down(marker_column, marker_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("hidden_needle"));
+
+    app.handle_key(modified_key(KeyCode::Char('{'), KeyModifiers::SHIFT));
+
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "hidden_needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("hidden_needle"));
+}
+
+#[test]
+fn huge_raw_content_scroll_renders_and_navigates_from_the_effective_end() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("plain.txt"), "one\ntwo\nthree\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('l')));
+    app.content_scroll = usize::MAX;
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("three"));
+
+    app.handle_key(key(KeyCode::Up));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("two"));
+    assert_ne!(app.content_scroll, usize::MAX);
 }
 
 #[test]
@@ -1623,7 +1700,7 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
     assert_eq!(app.content_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
 
-    app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::PageDown));
     assert_eq!(app.content_scroll, 12);
     app.handle_key(key(KeyCode::PageUp));
     assert_eq!(app.content_scroll, 0);
@@ -1723,7 +1800,8 @@ fn clean_source_defaults_to_numbered_text_preview() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("Preview"));
-    assert!(rendered.contains("1 │"));
+    assert!(rendered.contains("1 ▾"));
+    assert!(rendered.contains("2 │"));
     assert!(rendered.contains("println!"));
 }
 
@@ -3437,6 +3515,201 @@ fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
             .iter()
             .all(|cell| cell.bg == Color::Reset)
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[cfg(feature = "navigation-test-support")]
+fn production_spawner_runs_framed_definition_journey() {
+    run_production_spawner_framed_journey();
+}
+
+#[cfg(windows)]
+#[test]
+#[cfg(feature = "navigation-test-support")]
+fn windows_production_spawner_runs_framed_definition_journey() {
+    run_production_spawner_framed_journey();
+}
+
+#[cfg(feature = "navigation-test-support")]
+fn run_production_spawner_framed_journey() {
+    use std::{
+        sync::{Mutex, OnceLock},
+        time::{Duration, Instant},
+    };
+
+    static ENVIRONMENT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _environment = ENVIRONMENT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let container = tempfile::tempdir().unwrap();
+    let workspace = container.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let caller_text = "caller!(); // 😀中\n";
+    let target_text = "pub fn 目标😀() {}\n";
+    let caller_path = workspace.join("a-caller.rs");
+    let target_path = workspace.join("b-target.rs");
+    fs::write(&caller_path, caller_text).unwrap();
+    fs::write(&target_path, target_text).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let caller_path = caller_path.canonicalize().unwrap();
+    let target_path = target_path.canonicalize().unwrap();
+    let trace = container.path().join("framed.trace");
+    let release = container.path().join("release-definition");
+    let config = container.path().join("latte-lens.jsonc");
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_latte-lens-lsp-test-helper"))
+        .canonicalize()
+        .unwrap();
+    let config_value = serde_json::json!({
+        "code_navigation": {
+            "enabled": true,
+            "languages": {
+                "rust": {
+                    "enabled": true,
+                    "engine": {
+                        "type": "language_server",
+                        "command": [helper, "framed-lsp"]
+                    }
+                }
+            }
+        }
+    });
+    fs::write(&config, serde_json::to_vec(&config_value).unwrap()).unwrap();
+    let config = config.canonicalize().unwrap();
+
+    let root_uri = url::Url::from_file_path(&workspace).unwrap().to_string();
+    let caller_uri = url::Url::from_file_path(&caller_path).unwrap().to_string();
+    let target_uri = url::Url::from_file_path(&target_path).unwrap().to_string();
+    set_test_env("LATTELENS_CONFIG", config.as_os_str());
+    set_test_env("LATTELENS_TEST_HELPER_MODE", "framed-lsp");
+    set_test_env("LATTELENS_TEST_ROOT_URI", &root_uri);
+    set_test_env("LATTELENS_TEST_CALLER_URI", &caller_uri);
+    set_test_env("LATTELENS_TEST_TARGET_URI", &target_uri);
+    set_test_env("LATTELENS_TEST_CALLER_TEXT", caller_text);
+    set_test_env("LATTELENS_TEST_TRACE", trace.as_os_str());
+    set_test_env("LATTELENS_TEST_RELEASE", release.as_os_str());
+
+    let loaded = NavigationSettings::load_user_config(&workspace);
+    assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+    assert!(loaded.settings.is_enabled());
+    let mut app = App::with_options(
+        workspace.clone(),
+        PreviewRegistry::with_builtins(),
+        AppOptions {
+            navigation: loaded.settings,
+            navigation_config_warning: loaded.warning,
+        },
+    )
+    .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-caller.rs"))
+    );
+    assert_eq!(app.content_lines, [caller_text.trim_end()]);
+
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+    wait_until(Duration::from_secs(5), || {
+        app.poll_background();
+        trace_contains(&trace, "definition-received")
+    });
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-caller.rs"))
+    );
+    assert_eq!(app.content_lines, [caller_text.trim_end()]);
+
+    fs::write(&release, b"go").unwrap();
+    let target_deadline = Instant::now() + Duration::from_secs(5);
+    while {
+        app.poll_background();
+        app.selected_relative_path() != Some(PathBuf::from("b-target.rs"))
+            || app.content_lines != [target_text.trim_end()]
+    } {
+        if Instant::now() >= target_deadline {
+            let backend = TestBackend::new(120, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            panic!(
+                "target did not commit; selected={:?}, content={:?}, ui={rendered}",
+                app.selected_relative_path(),
+                app.content_lines
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(app.focused_pane, FocusPane::Content);
+
+    let probe = app.navigation_test_probe();
+    let drop_started = Instant::now();
+    drop(app);
+    assert!(drop_started.elapsed() < Duration::from_secs(4));
+    wait_until(Duration::from_secs(2), || {
+        trace_contains(&trace, "orderly-exit")
+    });
+    let report = probe.snapshot();
+    assert_eq!(report.sessions_cleaned, 1);
+    assert_eq!(report.clean_exits, 1);
+    assert_eq!(report.forced_tree_cleanups, 0);
+    assert_eq!(report.direct_children_reaped, 1);
+    assert_eq!(report.io_threads_joined, 3);
+    assert_eq!(report.process_owners_dropped, 1);
+
+    for key in [
+        "LATTELENS_CONFIG",
+        "LATTELENS_TEST_HELPER_MODE",
+        "LATTELENS_TEST_ROOT_URI",
+        "LATTELENS_TEST_CALLER_URI",
+        "LATTELENS_TEST_TARGET_URI",
+        "LATTELENS_TEST_CALLER_TEXT",
+        "LATTELENS_TEST_TRACE",
+        "LATTELENS_TEST_RELEASE",
+    ] {
+        remove_test_env(key);
+    }
+}
+
+#[cfg(feature = "navigation-test-support")]
+fn trace_contains(path: &Path, marker: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|contents| contents.lines().any(|line| line == marker))
+}
+
+#[cfg(feature = "navigation-test-support")]
+fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !predicate() {
+        if std::time::Instant::now() >= deadline {
+            let trace = std::env::var_os("LATTELENS_TEST_TRACE")
+                .and_then(|path| fs::read_to_string(path).ok())
+                .unwrap_or_else(|| "<no helper trace>".to_owned());
+            panic!("timed out after {timeout:?}; helper trace:\n{trace}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "navigation-test-support")]
+fn set_test_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+    // SAFETY: the real-spawner tests serialize their environment mutation and
+    // legacy App constructors never read this explicit configuration variable.
+    unsafe { std::env::set_var(key, value) };
+}
+
+#[cfg(feature = "navigation-test-support")]
+fn remove_test_env(key: &str) {
+    // SAFETY: paired with the serialized test-only mutation above.
+    unsafe { std::env::remove_var(key) };
 }
 
 fn key(code: KeyCode) -> KeyEvent {

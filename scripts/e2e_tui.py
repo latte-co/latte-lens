@@ -21,7 +21,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scenario",
-        choices=("files", "git-changes", "search-preview", "all"),
+        choices=("files", "git-changes", "search-preview", "code-navigation", "all"),
         default="all",
         help="named scenario group to execute (default: all)",
     )

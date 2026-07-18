@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -117,7 +119,8 @@ def create_search_fixture(root: Path, environment: dict[str, str]) -> None:
         "alpha needle\nsecond needle\n", encoding="utf-8"
     )
     (root / "src" / "search-target.rs").write_text(
-        "pub fn searchable() {}\n// unique_workspace_phrase\n", encoding="utf-8"
+        "pub fn searchable() {\n// unique_workspace_phrase\nlet folded_value = 1;\n}\n",
+        encoding="utf-8",
     )
     (root / "src" / "search-target-other.rs").write_text(
         "pub fn other_search_target() {}\n", encoding="utf-8"
@@ -136,6 +139,373 @@ def create_search_fixture(root: Path, environment: dict[str, str]) -> None:
         environment=environment,
     )
     run("git", "commit", "-q", "-m", "search fixture", cwd=root, environment=environment)
+
+
+def _navigation_helper() -> Path:
+    helper = (
+        Path(__file__).resolve().parents[2]
+        / "target"
+        / "debug"
+        / ("latte-lens-lsp-test-helper.exe" if os.name == "nt" else "latte-lens-lsp-test-helper")
+    ).resolve()
+    if not helper.is_file():
+        raise RuntimeError(f"navigation helper is not built: {helper}")
+    return helper
+
+
+def _isolated_path_with_git(environment: dict[str, str], *directories: Path) -> str:
+    git = shutil.which("git", path=environment.get("PATH"))
+    if git is None:
+        raise RuntimeError("git is required by the E2E read-only oracle")
+    entries = [str(directory.resolve()) for directory in directories]
+    entries.append(str(Path(git).resolve().parent))
+    return os.pathsep.join(entries)
+
+
+def _write_navigation_config(
+    root: Path, environment: dict[str, str], helper: Path, role: str
+) -> Path:
+    home = Path(environment["HOME"]).resolve()
+    environment["HOME"] = str(home)
+    config = home / ".latte" / "latte-lens.jsonc"
+    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        bin_dir = config.parent / "bin"
+        bin_dir.mkdir(mode=0o700)
+        helper_link = bin_dir / helper.name
+        helper_link.symlink_to(helper)
+        helper = helper_link
+    helper_json = json.dumps(str(helper))
+    role_json = json.dumps(role)
+    config.write_text(
+        f"""{{
+  // Code navigation is the feature; the language server is its engine.
+  "code_navigation": {{
+    "enabled": true,
+    "languages": {{
+      "rust": {{
+        "enabled": true,
+        "engine": {{
+          "type": "language_server",
+          "command": [{helper_json}, {role_json},],
+        }},
+      }},
+    }},
+  }},
+}}
+""",
+        encoding="utf-8",
+    )
+    return config
+
+
+def create_code_navigation_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "a-caller.rs"
+    target = root / "b-target.rs"
+    dependency_root = (
+        root.parent / "dependency-cache" / "example.com" / "module@v1.2.3"
+    )
+    dependency_source = dependency_root / "source.rs"
+    caller.write_text("caller!(); // 😀中\n", encoding="utf-8")
+    target.write_text("pub fn 目标😀() {}\n", encoding="utf-8")
+    dependency_root.mkdir(mode=0o700, parents=True)
+    dependency_root.joinpath("Cargo.toml").write_text(
+        "[package]\nname = \"navigation-fixture-dependency\"\nversion = \"1.2.3\"\n",
+        encoding="utf-8",
+    )
+    dependency_source.write_text("pub fn dependency_target() {}\n", encoding="utf-8")
+    run("git", "add", "a-caller.rs", "b-target.rs", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "navigation fixture", cwd=root, environment=environment)
+
+    _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
+    environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
+    environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
+    environment["LATTELENS_TEST_DEPENDENCY_URI"] = dependency_source.resolve().as_uri()
+    environment["LATTELENS_TEST_TRACE"] = str((root.parent / "lsp-trace.txt").resolve())
+    environment["LATTELENS_TEST_RELEASE"] = str(
+        (root.parent / "release-second-definition").resolve()
+    )
+
+
+def create_fold_mouse_navigation_fixture(
+    root: Path, environment: dict[str, str]
+) -> None:
+    init_repository(root, environment)
+    caller = root / "a-fold-caller.rs"
+    target = root / "b-fold-target.rs"
+    first_body = "\n".join(f"    let first_marker_{index:02} = {index};" for index in range(12))
+    middle_body = "\n".join(
+        ["    let middle_target_call = target_call();"]
+        + [f"    let middle_marker_{index:02} = {index};" for index in range(14)]
+        + ["    let middle_body_tail = 99;"]
+    )
+    caller.write_text(
+        "pub fn first_region() {\n"
+        f"{first_body}\n"
+        "}\n\n"
+        "pub fn middle_region_with_a_deliberately_long_anchor_that_forces_the_fold_summary_onto_a_synthetic_visual_row() {\n"
+        f"{middle_body}\n"
+        "}\n\n"
+        "pub fn third_region() {\n"
+        "    let third_body_marker = 3;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    target.write_text("pub fn target_destination() {}\n", encoding="utf-8")
+    run("git", "add", caller.name, target.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "fold mouse fixture", cwd=root, environment=environment)
+
+    _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
+    environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
+    environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
+    environment["LATTELENS_TEST_TRACE"] = str((root.parent / "fold-mouse-trace.txt").resolve())
+    environment["LATTELENS_TEST_RELEASE"] = str((root.parent / "unused-fold-release").resolve())
+
+
+def create_lsp_document_symbol_fixture(
+    root: Path, environment: dict[str, str]
+) -> None:
+    """Force the documented LSP symbol fallback with a bounded local overflow."""
+
+    init_repository(root, environment)
+    caller = root / "large-symbols.rs"
+    names = ["large_root", "nested_symbol", "flat_symbol"]
+    names.extend(f"fixture_symbol_{index:04}" for index in range(4_094))
+    caller.write_text(
+        " ".join(f"pub fn {name}() {{}}" for name in names) + "\n",
+        encoding="utf-8",
+    )
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "large symbol fixture", cwd=root, environment=environment)
+
+    _write_navigation_config(root, environment, _navigation_helper(), "pty-lsp")
+    environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
+    environment["LATTELENS_TEST_TARGET_URI"] = caller.resolve().as_uri()
+    environment["LATTELENS_TEST_TRACE"] = str((root.parent / "symbol-trace.txt").resolve())
+    environment["LATTELENS_TEST_RELEASE"] = str(
+        (root.parent / "unused-definition-release").resolve()
+    )
+
+
+def create_crashing_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "crash-caller.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "crash fixture", cwd=root, environment=environment)
+
+    _write_navigation_config(root, environment, _navigation_helper(), "crash-initialize")
+    environment["LATTELENS_TEST_TRACE"] = str((root.parent / "crash-trace.txt").resolve())
+
+
+def _create_role_lsp_fixture(
+    root: Path,
+    environment: dict[str, str],
+    *,
+    role: str,
+    trace_name: str,
+) -> None:
+    init_repository(root, environment)
+    caller = root / "role-caller.rs"
+    caller.write_text("caller!(); // 😀中\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", f"{role} fixture", cwd=root, environment=environment)
+    _write_navigation_config(root, environment, _navigation_helper(), role)
+    environment["LATTELENS_TEST_TRACE"] = str((root.parent / trace_name).resolve())
+
+
+def create_incompatible_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+    _create_role_lsp_fixture(
+        root,
+        environment,
+        role="utf8-initialize",
+        trace_name="utf8-trace.txt",
+    )
+
+
+def create_descendant_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+    _create_role_lsp_fixture(
+        root,
+        environment,
+        role="ready-descendant",
+        trace_name="descendant-trace.txt",
+    )
+
+
+def create_timeout_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+    _create_role_lsp_fixture(
+        root,
+        environment,
+        role="timeout-navigation",
+        trace_name="timeout-trace.txt",
+    )
+
+
+def create_batch_shutdown_lsp_fixture(
+    root: Path, environment: dict[str, str]
+) -> None:
+    for repository_name in ("repo-a", "repo-b"):
+        repository = root / repository_name
+        repository.mkdir()
+        init_repository(repository, environment)
+        caller = repository / "caller.rs"
+        caller.write_text(
+            f"{repository_name.replace('-', '_')}!();\n", encoding="utf-8"
+        )
+        run("git", "add", caller.name, cwd=repository, environment=environment)
+        run(
+            "git",
+            "commit",
+            "-q",
+            "-m",
+            f"{repository_name} batch shutdown fixture",
+            cwd=repository,
+            environment=environment,
+        )
+
+    _write_navigation_config(root, environment, _navigation_helper(), "stalled-session-tree")
+    environment["LATTELENS_TEST_TRACE"] = str(
+        (root.parent / "batch-shutdown-trace.txt").resolve()
+    )
+
+
+def create_resilience_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+    _create_role_lsp_fixture(
+        root,
+        environment,
+        role="pty-resilience",
+        trace_name="resilience-trace.txt",
+    )
+    environment["LATTELENS_TEST_LAUNCH_COUNT"] = str(
+        (root.parent / "resilience-launch-count.txt").resolve()
+    )
+
+
+def create_default_lsp_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "basename-caller.rs"
+    target = root / "basename-target.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    target.write_text("pub fn target() {}\n", encoding="utf-8")
+    run("git", "add", caller.name, target.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "basename fixture", cwd=root, environment=environment)
+
+    helper = _navigation_helper()
+    server_bin = root.parent / "default-server-bin"
+    server_bin.mkdir(mode=0o700)
+    server = server_bin / ("rust-analyzer.exe" if os.name == "nt" else "rust-analyzer")
+    shutil.copy2(helper, server)
+    if os.name != "nt":
+        server.chmod(0o700)
+    environment["PATH"] = _isolated_path_with_git(environment, server_bin)
+    environment["LATTELENS_TEST_CALLER_URI"] = caller.resolve().as_uri()
+    environment["LATTELENS_TEST_TARGET_URI"] = target.resolve().as_uri()
+    environment["LATTELENS_TEST_TRACE"] = str((root.parent / "basename-trace.txt").resolve())
+    environment["LATTELENS_TEST_RELEASE"] = str((root.parent / "basename-release").resolve())
+
+
+def create_invalid_product_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "invalid-config.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "invalid config fixture", cwd=root, environment=environment)
+    config = (root.parent / "invalid-latte-lens.jsonc").resolve()
+    config.write_text('{"code_navigation":', encoding="utf-8")
+    environment["LATTELENS_CONFIG"] = str(config)
+
+
+def create_code_navigation_without_lsp_fixture(
+    root: Path, environment: dict[str, str]
+) -> None:
+    init_repository(root, environment)
+    (root / "caller.rs").write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", "caller.rs", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "no LSP fixture", cwd=root, environment=environment)
+    empty_path = root.parent / "empty-path"
+    empty_path.mkdir(mode=0o700)
+    environment["PATH"] = _isolated_path_with_git(environment, empty_path)
+
+
+def create_structure_fixture(root: Path, environment: dict[str, str]) -> None:
+    """Create one compact file per supported folding/symbol language."""
+
+    init_repository(root, environment)
+    sources = {
+        "a-structure.rs": """pub struct Alpha {
+    value: i32,
+}
+
+impl Alpha {
+    pub fn first(&self) {
+        if self.value > 0 {
+            println!(\"positive\");
+        }
+    }
+
+    pub fn second(&self) {
+        println!(\"second\");
+    }
+}
+
+pub fn omega() {
+    println!(\"omega\");
+}
+""",
+        "b-structure.ts": """export class TypeScriptShape {
+  method(): number {
+    return 42;
+  }
+}
+
+export function typescriptFunction(): string {
+  return \"typescript\";
+}
+""",
+        "c-structure.py": """class PythonShape:
+    def method(self):
+        return \"python\"
+
+
+def python_function():
+    return PythonShape()
+""",
+        "d-structure.go": """package fixture
+
+type GoShape struct {
+    Value int
+}
+
+func (shape GoShape) Method() int {
+    return shape.Value
+}
+
+func GoFunction() GoShape {
+    return GoShape{Value: 42}
+}
+""",
+        "e-structure.md": """# Guide Root
+
+root introduction
+
+## Nested Topic
+
+nested body marker
+
+```rust
+fn fenced_body() {}
+```
+
+# Final Topic
+
+final body marker
+""",
+    }
+    for name, content in sources.items():
+        (root / name).write_text(content, encoding="utf-8")
+    run("git", "add", ".", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "structure fixture", cwd=root, environment=environment)
 
 
 def create_git_matrix_fixture(root: Path, environment: dict[str, str]) -> None:
@@ -163,6 +533,54 @@ def create_git_matrix_fixture(root: Path, environment: dict[str, str]) -> None:
     (root / "old-name.txt").rename(root / "renamed.txt")
     run("git", "add", "-A", "old-name.txt", "renamed.txt", cwd=root, environment=environment)
     (root / "untracked.txt").write_text("untracked content\n", encoding="utf-8")
+
+
+def create_repository_relation_fixture(root: Path, environment: dict[str, str]) -> None:
+    """Create an offline submodule projection with placeholder and issue rows."""
+
+    source = root.parent / "child-source"
+    source.mkdir()
+    init_repository(source, environment)
+    (source / "tracked.txt").write_text("child initial\n", encoding="utf-8")
+    run("git", "add", "tracked.txt", cwd=source, environment=environment)
+    run("git", "commit", "-q", "-m", "child initial", cwd=source, environment=environment)
+
+    init_repository(root, environment)
+    run(
+        "git",
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--quiet",
+        source.resolve().as_uri(),
+        "modules/child",
+        cwd=root,
+        environment=environment,
+    )
+    modules = root / ".gitmodules"
+    modules.write_text(
+        modules.read_text(encoding="utf-8")
+        + "\n[submodule \"missing\"]\n"
+        + "\tpath = modules/missing\n"
+        + "\turl = file:///latte-lens-e2e-missing\n"
+        + "\n[submodule \"symlinked\"]\n"
+        + "\tpath = modules/symlinked\n"
+        + f"\turl = {source.resolve().as_uri()}\n",
+        encoding="utf-8",
+    )
+    os.symlink(source.resolve(), root / "modules" / "symlinked")
+    run("git", "add", ".", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "declare local submodules", cwd=root, environment=environment)
+
+    child = root / "modules" / "child"
+    run("git", "config", "user.name", "Latte Lens E2E", cwd=child, environment=environment)
+    run("git", "config", "user.email", "e2e@latte.invalid", cwd=child, environment=environment)
+    (child / "tracked.txt").write_text("child advanced\n", encoding="utf-8")
+    run("git", "add", "tracked.txt", cwd=child, environment=environment)
+    run("git", "commit", "-q", "-m", "advance child", cwd=child, environment=environment)
+    (child / "tracked.txt").write_text("child dirty\n", encoding="utf-8")
+    (child / "untracked-child.txt").write_text("child untracked\n", encoding="utf-8")
 
 
 def _file_digest(path: Path) -> str:

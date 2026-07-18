@@ -12,7 +12,7 @@ E2E_ARTIFACT_DIR ?= target/e2e-artifacts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup fmt fmt-check check lint test installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e coverage coverage-unit coverage-e2e coverage-html bench ci build release package package-smoke install clean
+.PHONY: help setup fmt fmt-check check lint test test-navigation-real installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e-navigation e2e coverage coverage-unit coverage-e2e coverage-html bench ci build release package package-smoke install clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Latte Lens engineering commands:\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -36,6 +36,15 @@ lint: ## Run Clippy with warnings denied
 test: ## Run unit and integration tests
 	$(CARGO) test --all-targets --all-features --locked
 
+test-navigation-real: ## Run real framed-LSP and process-tree lifecycle journeys
+	$(CARGO) test --locked --features navigation-test-support --test app_tui_integration production_spawner_runs_framed_definition_journey -- --nocapture
+	$(CARGO) test --locked --features navigation-test-support --test lsp_process_integration cleanup_terminates_pipe_holding_descendant -- --nocapture
+	$(CARGO) test --locked --features navigation-test-support --test lsp_process_integration ready_session_cleanup_terminates_exit_first_descendant -- --nocapture
+	$(CARGO) test --locked --features navigation-test-support --test lsp_process_integration incompatible_position_encoding_forces_terminal_cleanup -- --nocapture
+	$(CARGO) test --locked --features navigation-test-support --test lsp_process_integration repeated_real_crashes_back_off_and_fifth_failure_stops_spawning -- --exact --nocapture
+	$(CARGO) test --locked --features navigation-test-support --test lsp_process_integration escaped_pipe_owner_is_quarantined_without_fake_cleanup_or_unbounded_drop -- --exact --nocapture
+	$(CARGO) test --locked --features navigation-test-support --test lsp_process_integration distinct_session_keys_have_no_fixed_count_cap_and_reuse_identical_key -- --exact --nocapture
+
 installer-check: ## Check the POSIX installer syntax
 	sh -n install.sh
 
@@ -57,8 +66,14 @@ e2e-search: e2e-self-test ## Exercise file/text search and Preview find through 
 	$(CARGO) build --locked
 	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY) --scenario search-preview --artifact-dir $(E2E_ARTIFACT_DIR)
 
+e2e-navigation: e2e-self-test ## Exercise configured and unavailable code navigation
+	$(CARGO) build --locked
+	$(CARGO) build --locked --features navigation-test-support --bin latte-lens-lsp-test-helper
+	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY) --scenario code-navigation --artifact-dir $(E2E_ARTIFACT_DIR)
+
 e2e: e2e-self-test ## Build and run every production TUI scenario
 	$(CARGO) build --locked
+	$(CARGO) build --locked --features navigation-test-support --bin latte-lens-lsp-test-helper
 	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY) --scenario all --artifact-dir $(E2E_ARTIFACT_DIR)
 
 coverage: coverage-unit coverage-e2e ## Enforce the UT and production PTY E2E line-coverage floors
