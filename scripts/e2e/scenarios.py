@@ -665,6 +665,7 @@ def search_controls(context: ScenarioContext) -> None:
         ("▌ · src/search-target.rs",),
         "first target click is processed before the second",
     )
+    file_result = _marker_position_on_line(session, "· src/search-target.rs")
     session.click(*file_result)
     session.wait_screen(
         ("Preview", "searchable()"),

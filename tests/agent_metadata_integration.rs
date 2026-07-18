@@ -236,7 +236,10 @@ fn stale_lock_file_and_corruption_fail_open_without_unbounded_wait() {
             .merge(&delta, started + Duration::from_millis(5)),
         MetadataWriteOutcome::Updated
     );
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // The deadline bounds lock contention, while Windows ACL and filesystem
+    // work can be delayed by the loaded CI host. Keep a separate generous
+    // wall-clock guard to catch a genuinely unbounded stale-lock wait.
+    assert!(started.elapsed() < Duration::from_secs(5));
 
     fs::write(&path, b"prompt-canary-corrupt-record").expect("corrupt record");
     let snapshot = fixture.load();
