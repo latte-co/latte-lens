@@ -8137,6 +8137,11 @@ mod tests {
         let dependency = dependency.canonicalize().unwrap();
         let target_path = dependency.join("source.rs");
         let uri = crate::navigation::path_to_lsp_uri(&target_path).unwrap();
+        let uri_path = url::Url::parse(uri.as_str())
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        let dependency = uri_path.parent().unwrap().to_path_buf();
         let caller = app.content_identity.clone().unwrap();
 
         app.request_semantic_navigation(NavigationOperation::Definition);

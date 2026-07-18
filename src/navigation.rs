@@ -1855,11 +1855,16 @@ mod tests {
         let dependency = dependency.canonicalize().unwrap();
         let source = dependency.join("source.go");
         let uri = path_to_lsp_uri(&source).unwrap();
+        let uri_path = url::Url::parse(uri.as_str())
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        let uri_root = uri_path.parent().unwrap().to_path_buf();
 
         assert_eq!(
             lsp_uri_to_navigation_target(&uri, &workspace).unwrap(),
             NavigationFileTarget::Dependency(DependencyTarget {
-                root: dependency,
+                root: uri_root,
                 relative: PathBuf::from("source.go"),
             })
         );
