@@ -8140,6 +8140,12 @@ mod tests {
         let dependency = dependency.canonicalize().unwrap();
         let target_path = dependency.join("source.rs");
         let uri = crate::navigation::path_to_lsp_uri(&target_path).unwrap();
+        let classified_target = crate::navigation::lsp_uri_to_navigation_target(&uri, &app.root)
+            .expect("the external package fixture must classify as a safe dependency target");
+        assert!(matches!(
+            classified_target,
+            NavigationFileTarget::Dependency(_)
+        ));
         let caller = app.content_identity.clone().unwrap();
 
         app.request_semantic_navigation(NavigationOperation::Definition);
@@ -8163,8 +8169,8 @@ mod tests {
             app.content_identity.as_ref()
         else {
             panic!(
-                "expected an external navigation target, got {:?}",
-                app.content_identity
+                "expected an external navigation target, got {:?}; status: {:?}",
+                app.content_identity, app.navigation_status
             );
         };
         assert!(root.ends_with(Path::new("dependency-cache/example.com/module@v1.2.3")));
