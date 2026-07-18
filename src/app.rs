@@ -8134,6 +8134,10 @@ mod tests {
         fs::create_dir_all(&dependency).unwrap();
         fs::write(dependency.join("go.mod"), "module example.com/module\n").unwrap();
         fs::write(dependency.join("source.rs"), "pub fn dependency() {}\n").unwrap();
+        // Windows temporary-directory paths can carry an extended-length
+        // prefix until normalized. Model the URI sent by a language server,
+        // which uses its canonical filesystem spelling.
+        let dependency = dependency.canonicalize().unwrap();
         let target_path = dependency.join("source.rs");
         let uri = crate::navigation::path_to_lsp_uri(&target_path).unwrap();
         let caller = app.content_identity.clone().unwrap();
