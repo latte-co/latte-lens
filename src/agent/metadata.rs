@@ -1974,6 +1974,12 @@ fn unlock_file(file: &File) {
 }
 
 fn map_io_error(error: io::Error) -> MetadataError {
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "metadata I/O failure: kind={:?}, raw_os_error={:?}",
+        error.kind(),
+        error.raw_os_error()
+    );
     match error.kind() {
         io::ErrorKind::PermissionDenied => MetadataError::PermissionDenied,
         io::ErrorKind::InvalidData => MetadataError::Corrupt,
