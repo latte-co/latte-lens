@@ -1500,7 +1500,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), MetadataError> {
 
 #[cfg(windows)]
 fn set_windows_current_user_acl(path: &Path) -> Result<(), MetadataError> {
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr::null_mut};
+    use std::{ffi::c_void, ptr::null_mut};
 
     const SDDL_REVISION_1: u32 = 1;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
@@ -1529,11 +1529,7 @@ fn set_windows_current_user_acl(path: &Path) -> Result<(), MetadataError> {
         .encode_utf16()
         .chain([0])
         .collect::<Vec<_>>();
-    let path = path
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
+    let path = windows_api_path(path)?;
     let mut descriptor = null_mut();
     // SAFETY: SDDL and output storage are valid for the conversion call.
     if unsafe {
@@ -1670,7 +1666,6 @@ pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<()
 
 #[cfg(windows)]
 pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<(), MetadataError> {
-    use std::os::windows::ffi::OsStrExt;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
     // ReplaceFileW documents its WRITE_THROUGH value as unsupported. Zero
@@ -1689,16 +1684,8 @@ pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<()
         ) -> i32;
     }
     let destination_exists = fs::symlink_metadata(destination).is_ok();
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
+    let source = windows_api_path(source)?;
+    let destination = windows_api_path(destination)?;
     // SAFETY: both paths are NUL-terminated UTF-16 buffers. ReplaceFileW keeps
     // the existing destination's ACL and attributes; MoveFileExW handles a
     // destination that does not exist yet.
@@ -1727,6 +1714,31 @@ pub(crate) fn replace_atomically(source: &Path, destination: &Path) -> Result<()
     } else {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn windows_api_path(path: &Path) -> Result<Vec<u16>, MetadataError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SEPARATOR: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    let absolute = std::path::absolute(path).map_err(map_io_error)?;
+    let path = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut verbatim = if path.starts_with(&[SEPARATOR, SEPARATOR, QUESTION, SEPARATOR])
+        || path.starts_with(&[SEPARATOR, SEPARATOR, DOT, SEPARATOR])
+    {
+        path
+    } else if path.starts_with(&[SEPARATOR, SEPARATOR]) {
+        "\\\\?\\UNC\\"
+            .encode_utf16()
+            .chain(path.into_iter().skip(2))
+            .collect()
+    } else {
+        "\\\\?\\".encode_utf16().chain(path).collect()
+    };
+    verbatim.push(0);
+    Ok(verbatim)
 }
 
 fn regular_file_paths_bounded(
@@ -1974,12 +1986,6 @@ fn unlock_file(file: &File) {
 }
 
 fn map_io_error(error: io::Error) -> MetadataError {
-    #[cfg(all(test, windows))]
-    eprintln!(
-        "metadata I/O failure: kind={:?}, raw_os_error={:?}",
-        error.kind(),
-        error.raw_os_error()
-    );
     match error.kind() {
         io::ErrorKind::PermissionDenied => MetadataError::PermissionDenied,
         io::ErrorKind::InvalidData => MetadataError::Corrupt,
