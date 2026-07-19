@@ -1577,7 +1577,7 @@ Contract 是 per-instance 且可按 revision 更新。以同时提供 screen inf
 ### 11.1 Codex Hooks
 
 - Codex adapter 以 `openai/codex-hook` 注册，不创建默认 decoder；
-- `latte-lens hook --observer openai/codex-hook --event <Event>` 解码 Codex 官方 command-hook JSON；
+- `latte-lens hook --observer openai/codex-hook --event <Event> --workspace .` 解码 Codex 官方 command-hook JSON；
 - 支持 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`SubagentStart`、`SubagentStop` 与 `Stop`；`PreCompact`/`PostCompact` 经过有界 JSON 校验后安全忽略；
 - 不读取或保存 `prompt`、`tool_input`、`tool_response`、`last_assistant_message`、`transcript_path`、`agent_transcript_path`、`model` 或 raw `cwd`；官方明确把 transcript 格式标为不稳定接口；
 - `session_id`、`turn_id`、`tool_use_id` 与 `agent_id` 只在 IdentityKeyer 边界内用于 install-scoped HMAC；core、metadata、IPC 和 UI 只接收稳定 digest；
@@ -1608,17 +1608,17 @@ Change 与 Artifact 当前为 Unsupported；Codex Hook adapter 不读取 diff、
 安装器经用户交互确认或 `-y` 自动化确认后执行 `latte-lens hooks setup`，把下列 command Hook 合并到 `$CODEX_HOME/hooks.json`，未设置 `CODEX_HOME` 时使用 `$HOME/.codex/hooks.json`。Setup 保留其他字段和 handler，失败时从事务备份恢复。手工验证时，也可以在隔离的 Codex 配置目录中为每个事件配置：
 
 ~~~text
-latte-lens hook --observer openai/codex-hook --event SessionStart
-latte-lens hook --observer openai/codex-hook --event UserPromptSubmit
-latte-lens hook --observer openai/codex-hook --event PreToolUse
-latte-lens hook --observer openai/codex-hook --event PermissionRequest
-latte-lens hook --observer openai/codex-hook --event PostToolUse
-latte-lens hook --observer openai/codex-hook --event SubagentStart
-latte-lens hook --observer openai/codex-hook --event SubagentStop
-latte-lens hook --observer openai/codex-hook --event Stop
+latte-lens hook --observer openai/codex-hook --event SessionStart --workspace .
+latte-lens hook --observer openai/codex-hook --event UserPromptSubmit --workspace .
+latte-lens hook --observer openai/codex-hook --event PreToolUse --workspace .
+latte-lens hook --observer openai/codex-hook --event PermissionRequest --workspace .
+latte-lens hook --observer openai/codex-hook --event PostToolUse --workspace .
+latte-lens hook --observer openai/codex-hook --event SubagentStart --workspace .
+latte-lens hook --observer openai/codex-hook --event SubagentStop --workspace .
+latte-lens hook --observer openai/codex-hook --event Stop --workspace .
 ~~~
 
-Codex 在 session cwd 中执行 command，因此无需把 raw cwd 拼进参数。Lens 与 Hook CLI 都把各自启动的 canonical 目录作为 workspace；只有目录精确相同时才实时感知。相同目录中的多个 Codex session 仍通过各自 SessionKey 独立展示。Hook 必须保持 stdout/stderr 为空并始终 fail-open；配置 timeout 建议为 1 秒，内部 live 与 metadata budget 仍分别受 5 ms 与 2 ms 上限约束。
+Codex 在 session cwd 中执行 command，`codex -C <path>` 选择的目录就是该 session cwd。因此每条 command 必须显式传递 `--workspace .`：它把 Hook 绑定到 `-C` 选择的精确目录，同时避免把 raw cwd 写进配置。Lens 与 Hook CLI 都把各自启动的 canonical 目录作为 workspace；只有目录精确相同时才实时感知。相同目录中的多个 Codex session 仍通过各自 SessionKey 独立展示。Hook 必须保持 stdout/stderr 为空并始终 fail-open；配置 timeout 建议为 1 秒，内部 live 与 metadata budget 仍分别受 5 ms 与 2 ms 上限约束。
 
 ### 11.2 Claude Code Hooks
 
