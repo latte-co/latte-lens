@@ -28,33 +28,36 @@ jobs:
             run_full_quality_gate: true
             run_native_e2e: false
             install_musl: true
-            install_cross_linker: false
-            linker: ""
+            install_cross_musl: false
+            linker: musl-gcc
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact_name: latte-lens-linux-aarch64
             run_full_quality_gate: false
             run_native_e2e: false
             install_musl: false
-            install_cross_linker: true
-            linker: aarch64-linux-gnu-gcc
+            install_cross_musl: true
+            linker: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: latte-lens-macos-aarch64
             run_full_quality_gate: false
             run_native_e2e: true
-            install_cross_linker: false
+            install_musl: false
+            install_cross_musl: false
             linker: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: latte-lens-macos-x86_64
             run_full_quality_gate: false
             run_native_e2e: false
-            install_cross_linker: false
+            install_musl: false
+            install_cross_musl: false
             linker: ""
     runs-on: ${{ matrix.os }}
     env:
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target == 'x86_64-unknown-linux-musl' && matrix.linker || '' }}
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-musl' && matrix.linker || '' }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -64,16 +67,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install musl toolchain
+      - name: Install musl toolchain (native x86_64)
         if: matrix.install_musl
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Install the Linux ARM64 musl cross-compiler
-        if: matrix.install_cross_linker
+      - name: Install aarch64 musl cross-toolchain
+        if: matrix.install_cross_musl
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Run the quality gate
         if: matrix.run_full_quality_gate
         run: make ci
