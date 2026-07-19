@@ -15,8 +15,9 @@ use crate::agent::{ActivityState, AgentViewSession, ObservationMode};
 
 use crate::{
     app::{
-        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, GitRowKind, GitTreeRow,
-        SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
+        App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
+        GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, SearchMode,
+        SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -78,6 +79,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let content_header = inset_left(content_header, 1);
     let content_rows = inset_left(content_rows, 1);
+    app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
         header,
@@ -96,7 +98,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
-    if app.search_is_active() {
+    if app.navigation_picker.is_some() {
+        dim_underlay(frame);
+        draw_navigation_picker(frame, app);
+    } else if app.search_is_active() {
         dim_underlay(frame);
         draw_search_popup(frame, app);
     }
@@ -192,6 +197,9 @@ fn regions(areas: DrawAreas) -> UiRegions {
         search_text_mode: Rect::default(),
         search_options: [Rect::default(); 4],
         search_results: Rect::default(),
+        navigation_popup: Rect::default(),
+        navigation_preview: Rect::default(),
+        navigation_results: Rect::default(),
         preview_find_input,
         preview_find_case,
         preview_find_position,
@@ -583,6 +591,248 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
         )),
         help,
     );
+}
+
+fn draw_navigation_picker(frame: &mut Frame, app: &mut App) {
+    let popup = search_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+    let (title, count) = app
+        .navigation_picker
+        .as_ref()
+        .map_or(("Navigation", 0), |picker| {
+            (picker.title.as_str(), picker.results.len())
+        });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(LAVENDER))
+        .title(Span::styled(
+            format!(" {title} ({count}) "),
+            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = inset_horizontal(block.inner(popup), 1);
+    frame.render_widget(block, popup);
+    let [body, help] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    app.ui_regions.navigation_popup = popup;
+    let (preview, results) = if body.width >= 84 {
+        let [preview, divider, results] = Layout::horizontal([
+            Constraint::Percentage(58),
+            Constraint::Length(1),
+            Constraint::Percentage(42),
+        ])
+        .areas(body);
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                std::iter::repeat_n(Line::from("│"), usize::from(divider.height))
+                    .collect::<Vec<_>>(),
+            ))
+            .style(Style::default().fg(SUBTLE)),
+            divider,
+        );
+        (preview, results)
+    } else {
+        (Rect::default(), body)
+    };
+    app.ui_regions.navigation_preview = preview;
+    app.ui_regions.navigation_results = results;
+    let Some(picker) = app.navigation_picker.as_mut() else {
+        return;
+    };
+    if preview.width > 0 {
+        draw_navigation_preview(frame, preview, picker);
+    }
+    let selected = picker.list_state.selected();
+    let items: Vec<ListItem> = picker
+        .visible_rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| navigation_picker_item(picker, *row, selected == Some(index)))
+        .collect();
+    frame.render_stateful_widget(List::new(items), results, &mut picker.list_state);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "↑↓ select · Enter open/collapse · click location open · Esc close",
+            Style::default().fg(MUTED),
+        )),
+        help,
+    );
+}
+
+fn navigation_picker_item(
+    picker: &NavigationPickerState,
+    row: NavigationPickerRow,
+    selected: bool,
+) -> ListItem<'static> {
+    let selected_style = Style::default()
+        .fg(Color::Reset)
+        .bg(Color::Rgb(54, 51, 58))
+        .add_modifier(Modifier::BOLD);
+    let style = if selected {
+        selected_style
+    } else {
+        Style::default().fg(MUTED)
+    };
+    match row {
+        NavigationPickerRow::Group(group_index) => {
+            let Some(group) = picker.groups.get(group_index) else {
+                return ListItem::new(Line::from(""));
+            };
+            let filename = group.path.file_name().map_or_else(
+                || group.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let parent = group
+                .path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| format!("  {}", display_workspace_path(parent)))
+                .unwrap_or_default();
+            ListItem::new(Line::from(vec![
+                Span::styled(if group.expanded { "▾ " } else { "▸ " }, style),
+                Span::styled(filename, style),
+                Span::styled(
+                    parent,
+                    if selected {
+                        selected_style
+                    } else {
+                        Style::default().fg(SUBTLE)
+                    },
+                ),
+                Span::styled(
+                    format!("  ({})", group.results.len()),
+                    if selected {
+                        selected_style
+                    } else {
+                        Style::default().fg(SUBTLE)
+                    },
+                ),
+            ]))
+        }
+        NavigationPickerRow::Result(result_index) => {
+            let Some(item) = picker.results.get(result_index) else {
+                return ListItem::new(Line::from(""));
+            };
+            let path = picker
+                .groups
+                .iter()
+                .find(|group| group.results.contains(&result_index))
+                .map(|group| group.path.display().to_string())
+                .unwrap_or_default();
+            let location = item
+                .label
+                .find(&path)
+                .map(|start| {
+                    let suffix = item
+                        .label
+                        .get(start.saturating_add(path.len()).saturating_add(1)..)
+                        .unwrap_or(item.label.as_str());
+                    format!("{}{}", &item.label[..start], suffix)
+                })
+                .unwrap_or_else(|| item.label.clone());
+            let mut spans = vec![Span::styled("  · ", style), Span::styled(location, style)];
+            if let Some(detail) = item.detail.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {detail}"),
+                    if selected {
+                        selected_style
+                    } else {
+                        Style::default().fg(SUBTLE)
+                    },
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        }
+    }
+}
+
+fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPickerState) {
+    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    let header_text = picker.preview.as_ref().map_or_else(
+        || "Preview".to_owned(),
+        |preview| display_workspace_path(&preview.path),
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            header_text,
+            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        )),
+        header,
+    );
+    if picker.preview_loading {
+        frame.render_widget(
+            Paragraph::new(Span::styled("Loading preview…", Style::default().fg(MUTED))),
+            body,
+        );
+        return;
+    }
+    if let Some(error) = picker.preview_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(error.to_owned(), Style::default().fg(ROSE))),
+            body,
+        );
+        return;
+    }
+    let Some(preview) = picker.preview.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Select a result to preview it.",
+                Style::default().fg(MUTED),
+            )),
+            body,
+        );
+        return;
+    };
+    let height = usize::from(body.height);
+    let start_line = preview
+        .target
+        .start
+        .line
+        .saturating_sub(height.saturating_div(3));
+    let number_width = preview.lines.len().max(1).to_string().len();
+    let lines = preview
+        .lines
+        .iter()
+        .enumerate()
+        .skip(start_line)
+        .take(height)
+        .map(|(line_index, line)| {
+            let mut highlights = preview
+                .highlights
+                .get(line_index)
+                .cloned()
+                .unwrap_or_default();
+            if preview.target.start.line <= line_index && line_index <= preview.target.end.line {
+                let start = if line_index == preview.target.start.line {
+                    preview.target.start.byte
+                } else {
+                    0
+                };
+                let end = if line_index == preview.target.end.line {
+                    preview.target.end.byte
+                } else {
+                    line.len()
+                };
+                if start < end && end <= line.len() {
+                    highlights.push(HighlightSpan {
+                        range: start..end,
+                        kind: HighlightKind::NavigationTarget,
+                    });
+                }
+            }
+            let mut spans = vec![Span::styled(
+                format!("{:>number_width$} │ ", line_index.saturating_add(1)),
+                Style::default().fg(MUTED),
+            )];
+            spans.extend(preview_content_spans(
+                line,
+                0,
+                &highlights,
+                None,
+                Style::default().fg(Color::Reset),
+            ));
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(lines)), body);
 }
 
 fn search_popup_area(area: Rect) -> Rect {
@@ -1265,18 +1515,35 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     }
     let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
-    let lines: Vec<Line> = visual_rows
+    let render_area = if app.content_mode == ContentMode::Info {
+        inset_top(rows, 1)
+    } else {
+        rows
+    };
+    let start = app.effective_content_scroll(visual_rows.len());
+    let end = start
+        .saturating_add(usize::from(render_area.height))
+        .min(visual_rows.len());
+    let lines: Vec<Line> = visual_rows[start..end]
         .iter()
         .filter_map(|visual_row| {
             let line = app.content_lines.get(visual_row.line_index)?;
             let segment = line.get(visual_row.byte_range.clone())?;
-            let mut highlights = app
-                .content_highlights
-                .get(visual_row.line_index)
-                .cloned()
-                .unwrap_or_default();
-            highlights.extend(app.preview_find_highlights(visual_row.line_index));
-            let selection = visual_row_selection(app, visual_row);
+            let mut highlights = if visual_row.synthetic {
+                Vec::new()
+            } else {
+                app.content_highlights
+                    .get(visual_row.line_index)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            if !visual_row.synthetic {
+                highlights.extend(app.preview_find_highlights(visual_row.line_index));
+                highlights.extend(app.navigation_highlights(visual_row.line_index));
+            }
+            let selection = (!visual_row.synthetic)
+                .then(|| visual_row_selection(app, visual_row))
+                .flatten();
             Some(match app.content_mode {
                 ContentMode::Diff => diff_line(
                     segment,
@@ -1291,9 +1558,9 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
                     line_number_width,
                     segment,
                     line.starts_with("… preview truncated"),
-                    visual_row.byte_range.start,
                     &highlights,
                     selection,
+                    visual_row,
                 ),
                 ContentMode::Preview => {
                     preview_text_line(segment, visual_row.byte_range.start, &highlights, selection)
@@ -1307,24 +1574,9 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             })
         })
         .collect();
-    let paragraph = Paragraph::new(Text::from(lines)).scroll((
-        app.content_scroll
-            .min(visual_rows.len().saturating_sub(1))
-            .min(u16::MAX as usize) as u16,
-        if app.content_wraps_lines() {
-            0
-        } else {
-            app.content_horizontal_scroll.min(u16::MAX as usize) as u16
-        },
-    ));
-    frame.render_widget(
-        paragraph,
-        if app.content_mode == ContentMode::Info {
-            inset_top(rows, 1)
-        } else {
-            rows
-        },
-    );
+    let paragraph = Paragraph::new(Text::from(lines))
+        .scroll((0, app.effective_content_horizontal_scroll() as u16));
+    frame.render_widget(paragraph, render_area);
 }
 
 fn draw_preview_find(frame: &mut Frame, app: &App) {
@@ -1391,6 +1643,22 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.navigation_picker.is_some() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Navigate ",
+                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  ↑↓ select  Enter open/collapse  click location open  Esc close",
+                    Style::default().fg(MUTED),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
     if app.preview_find_is_active() {
         let help = if area.width < 96 {
             "  type query  Enter/↓ next  Shift+Enter/↑ previous  F2 case  Esc close"
@@ -1439,15 +1707,19 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "1/2 scope"
     };
-    let help = if area.width < 96 {
+    let help = if area.width < 96 && app.content_mode == ContentMode::Preview {
+        format!(
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  q×2 quit"
+        )
+    } else if area.width < 96 {
         format!("  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  q×2 quit")
     } else if app.content_mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  ←→ focus  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  q×2 quit"
         )
     } else if app.content_mode == ContentMode::Diff {
         format!(
-            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  drag copies  Ctrl+C quit/copy selection  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
         )
     } else {
         format!(
@@ -1500,6 +1772,33 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled("  ", Style::default()),
             Span::styled(status, Style::default().fg(MINT)),
+        ])
+    } else if let Some(status) = &app.navigation_status {
+        Line::from(vec![
+            Span::styled(
+                format!(" {focus} "),
+                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                status.message.clone(),
+                Style::default().fg(match status.level {
+                    super::app::NavigationStatusLevel::Info => MINT,
+                    super::app::NavigationStatusLevel::Error => ROSE,
+                }),
+            ),
+        ])
+    } else if let Some(warning) = &app.navigation_config_warning {
+        Line::from(vec![
+            Span::styled(
+                format!(" {focus} "),
+                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("Configuration: {warning}"),
+                Style::default().fg(ROSE),
+            ),
         ])
     } else if let Some(status) = &app.clipboard_status {
         Line::from(vec![
@@ -1628,9 +1927,9 @@ fn preview_line(
     width: usize,
     line: &str,
     truncated: bool,
-    segment_start: usize,
     highlights: &[HighlightSpan],
     selection: Option<Range<usize>>,
+    visual_row: &ContentVisualRow,
 ) -> Line<'static> {
     let text_style = if truncated {
         Style::default().fg(PEACH)
@@ -1638,21 +1937,32 @@ fn preview_line(
         Style::default().fg(Color::Reset)
     };
     let number = number.map(|number| number.to_string()).unwrap_or_default();
+    let marker = match visual_row.fold_marker {
+        FoldVisualMarker::None => '│',
+        FoldVisualMarker::Expanded => '▾',
+        FoldVisualMarker::Collapsed => '▸',
+    };
     let mut spans = vec![Span::styled(
-        format!("{number:>width$} │ "),
+        format!("{number:>width$} {marker} "),
         Style::default().fg(MUTED),
     )];
     spans.extend(preview_content_spans(
         line,
-        segment_start,
+        visual_row.byte_range.start,
         if truncated { &[] } else { highlights },
         selection,
         text_style,
     ));
+    if let Some(summary) = visual_row.summary.as_deref() {
+        spans.push(Span::styled(summary.to_owned(), Style::default().fg(MUTED)));
+    }
     Line::from(spans)
 }
 
 fn visual_row_selection(app: &App, visual_row: &ContentVisualRow) -> Option<Range<usize>> {
+    if visual_row.synthetic {
+        return None;
+    }
     let selection = app.content_selection_range(visual_row.line_index)?;
     let start = selection.start.max(visual_row.byte_range.start);
     let end = selection.end.min(visual_row.byte_range.end);
@@ -1716,8 +2026,17 @@ fn preview_content_spans(
         let mut style = highlights
             .iter()
             .rev()
-            .find(|highlight| highlight.range.contains(&absolute_start))
+            .find(|highlight| {
+                highlight.kind != HighlightKind::NavigationHover
+                    && highlight.range.contains(&absolute_start)
+            })
             .map_or(default_style, |highlight| highlight_style(highlight.kind));
+        if highlights.iter().any(|highlight| {
+            highlight.kind == HighlightKind::NavigationHover
+                && highlight.range.contains(&absolute_start)
+        }) {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
         if selection
             .as_ref()
             .is_some_and(|selection| selection.contains(&start))
@@ -1750,6 +2069,11 @@ fn highlight_style(kind: HighlightKind) -> Style {
         HighlightKind::Search => Style::default()
             .fg(LAVENDER)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        HighlightKind::NavigationTarget => Style::default()
+            .fg(Color::Black)
+            .bg(MINT)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::NavigationHover => Style::default().add_modifier(Modifier::UNDERLINED),
     }
 }
 
@@ -2009,6 +2333,30 @@ mod tests {
                 .iter()
                 .all(|span| span.style.bg.unwrap_or(Color::Reset) == Color::Reset)
         );
+    }
+
+    #[test]
+    fn navigation_hover_adds_underlining_without_replacing_syntax_color() {
+        let spans = preview_content_spans(
+            "caller",
+            0,
+            &[
+                HighlightSpan {
+                    range: 0..6,
+                    kind: HighlightKind::Function,
+                },
+                HighlightSpan {
+                    range: 0..6,
+                    kind: HighlightKind::NavigationHover,
+                },
+            ],
+            None,
+            Style::default().fg(Color::Reset),
+        );
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style.fg, Some(MINT));
+        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

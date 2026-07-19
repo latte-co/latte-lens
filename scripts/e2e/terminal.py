@@ -385,6 +385,19 @@ class PtySession:
         os.write(self.master_fd, b"\x1b[<0;" + position + b"M")
         os.write(self.master_fd, b"\x1b[<0;" + position + b"m")
 
+    def alt_move(self, column: int, row: int) -> None:
+        """Send an SGR no-button mouse move with the Alt modifier."""
+
+        position = f"{column + 1};{row + 1}".encode()
+        os.write(self.master_fd, b"\x1b[<43;" + position + b"M")
+
+    def alt_click(self, column: int, row: int) -> None:
+        """Send a left click with the SGR Alt-modifier bit set."""
+
+        position = f"{column + 1};{row + 1}".encode()
+        os.write(self.master_fd, b"\x1b[<8;" + position + b"M")
+        os.write(self.master_fd, b"\x1b[<8;" + position + b"m")
+
     def double_click(self, column: int, row: int) -> None:
         position = f"{column + 1};{row + 1}".encode()
         down = b"\x1b[<0;" + position + b"M"

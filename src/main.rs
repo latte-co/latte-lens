@@ -8,13 +8,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 #[cfg(feature = "agent-observability")]
 use clap::{Args, Subcommand};
 #[cfg(feature = "agent-observability")]
 use latte_lens::agent::*;
-use latte_lens::app::App;
+use latte_lens::{
+    app::App,
+    navigation::{AppOptions, NavigationSettings},
+    preview::PreviewRegistry,
+};
 #[cfg(not(windows))]
 use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -146,9 +150,23 @@ fn run_hooks_command(hooks: HooksArgs) -> Result<()> {
 }
 
 fn run_tui(path: PathBuf) -> Result<()> {
-    let mut app = App::new(path.clone())?;
+    let workspace = path
+        .canonicalize()
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    if !workspace.is_dir() {
+        bail!("{} is not a directory", workspace.display());
+    }
+    let loaded = NavigationSettings::load_user_config(&workspace);
+    let mut app = App::with_options(
+        workspace.clone(),
+        PreviewRegistry::with_builtins(),
+        AppOptions {
+            navigation: loaded.settings,
+            navigation_config_warning: loaded.warning,
+        },
+    )?;
     #[cfg(feature = "agent-observability")]
-    if let Ok(agent) = start_production_agent_runtime(&path) {
+    if let Ok(agent) = start_production_agent_runtime(&workspace) {
         let _ = app.attach_agent_runtime(agent.runtime, agent.selector);
     }
 
