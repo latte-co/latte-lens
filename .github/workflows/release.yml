@@ -23,17 +23,19 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact_name: latte-lens-linux-x86_64
             run_full_quality_gate: true
             run_native_e2e: false
+            install_musl: true
             install_cross_linker: false
             linker: ""
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             artifact_name: latte-lens-linux-aarch64
             run_full_quality_gate: false
             run_native_e2e: false
+            install_musl: false
             install_cross_linker: true
             linker: aarch64-linux-gnu-gcc
           - os: macos-latest
@@ -52,7 +54,7 @@ jobs:
             linker: ""
     runs-on: ${{ matrix.os }}
     env:
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -62,7 +64,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install the Linux ARM64 cross-linker
+      - name: Install musl toolchain
+        if: matrix.install_musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Install the Linux ARM64 musl cross-compiler
         if: matrix.install_cross_linker
         run: |
           sudo apt-get update
