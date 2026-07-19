@@ -180,7 +180,7 @@ class InstallTests(unittest.TestCase):
                 200,
                 release_json(tag, prerelease=False),
             )
-            self.add_package(server, tag, "x86_64-unknown-linux-gnu")
+            self.add_package(server, tag, "x86_64-unknown-linux-musl")
 
             result = self.run_installer(self.env(server))
 
@@ -206,7 +206,7 @@ class InstallTests(unittest.TestCase):
                 200,
                 release_json(tag, prerelease=False),
             )
-            self.add_package(server, tag, "x86_64-unknown-linux-gnu")
+            self.add_package(server, tag, "x86_64-unknown-linux-musl")
             environment = self.env(server)
             hook_log = self.root / "hook-setup.log"
             environment["LATTE_LENS_TEST_HOOK_LOG"] = str(hook_log)
@@ -224,7 +224,7 @@ class InstallTests(unittest.TestCase):
                 200,
                 release_json(tag, prerelease=False),
             )
-            self.add_package(server, tag, "x86_64-unknown-linux-gnu")
+            self.add_package(server, tag, "x86_64-unknown-linux-musl")
             environment = self.env(server)
             environment["LATTE_LENS_TEST_HOOK_EXIT"] = "9"
 
@@ -290,7 +290,7 @@ class InstallTests(unittest.TestCase):
             self.add_package(
                 server,
                 tag,
-                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
                 valid_checksum=False,
             )
             install_dir = self.root / "install"
