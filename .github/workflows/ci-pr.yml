@@ -182,8 +182,8 @@ jobs:
         run: >-
           cargo test --locked --features navigation-test-support
           --test lsp_process_integration
-           repeated_real_crashes_back_off_and_fifth_failure_stops_spawning
-           -- --exact --nocapture
+          repeated_real_crashes_back_off_and_fifth_failure_stops_spawning
+          -- --exact --nocapture
       - name: Run unit and integration tests
         run: cargo test --all-targets --all-features --locked
       - name: Build the release binary
