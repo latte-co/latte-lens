@@ -44,7 +44,13 @@ curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh
 The installer detects the operating system and architecture, downloads the
 matching release archive, verifies its SHA-256 checksum, and installs the
 binary to `~/.local/bin`. Until the first stable release exists, it falls back
-to the newest preview and prints a warning.
+to the newest preview and prints a warning. After the binary is installed, an
+interactive terminal asks whether to configure user-level Code Agent hooks.
+For unattended installation, accept that step explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/latte-co/latte-lens/main/install.sh | sh -s -- -y
+```
 
 ### Windows
 
@@ -59,6 +65,15 @@ The PowerShell installer downloads and verifies the Windows x64 package,
 installs it to `%LOCALAPPDATA%\Programs\latte-lens\bin`, and adds that directory
 to the current user's `PATH`. Open a new terminal if `latte-lens` is not yet
 available in the current session.
+
+The installer prompts before configuring user-level Code Agent hooks. A saved
+installer also accepts `-y`/`-Yes`; piped automation can use the equivalent
+environment opt-in:
+
+```powershell
+$env:LATTE_LENS_YES = "1"
+irm https://raw.githubusercontent.com/latte-co/latte-lens/main/install.ps1 | iex
+```
 
 Pin a release or change the destination before running the installer:
 
@@ -84,6 +99,14 @@ latte-lens /path/to/repository
 ```
 
 By default, Cargo installs `latte-lens` into `~/.cargo/bin`.
+
+Install hooks later, or restore the exact pre-setup configuration printed by a
+successful setup:
+
+```bash
+latte-lens hooks setup
+latte-lens hooks restore <transaction-id>
+```
 
 Inside the TUI:
 
@@ -158,7 +181,7 @@ lavender dot and title, the selected tree row uses a slim accent rail, and the
 footer begins with `Tabs`, `Tree`, or `Content`. These cues use terminal text
 styles without painting a background or enclosing each pane in a box.
 Latte Lens does not paint its own canvas background, so it follows the host
-terminal theme—including embedded terminals such as herdr.
+terminal theme, including embedded terminals.
 
 Each filesystem traversal is capped at 50,000 entries to keep refreshes and
 on-demand directory loads bounded.
@@ -323,7 +346,7 @@ support selection. Line-number gutters are excluded from copied previews,
 multi-line selections preserve newlines, and Unicode grapheme clusters remain
 intact. By default Latte Lens writes both the native platform clipboard and an
 OSC 52 terminal clipboard sequence, which keeps copying reliable inside nested
-terminals and isolated sessions such as Herdr. A native clipboard success is
+terminals and isolated sessions. A native clipboard success is
 reported as copied; when only OSC 52 is available, Latte Lens instead reports
 that the text was sent to the terminal clipboard because terminals do not
 acknowledge whether they accepted the sequence.
@@ -356,23 +379,29 @@ The Chinese design, testing, and engineering documentation is indexed at
 Additional commands:
 
 ```bash
-make coverage       # enforce both independent coverage floors
+make coverage       # enforce all three independent coverage floors
 make coverage-unit  # enforce 93% on the direct unit-test responsibility surface
 make coverage-e2e   # enforce 85% on the production PTY interaction surface
+make coverage-agent # enforce 80% across the complete synthetic Agent Core
 make coverage-html  # generate an inspectable all-target HTML report
 make test-navigation-real # real framed LSP plus process-tree lifecycle
 make bench          # run performance benchmarks
 make package        # create a release archive and SHA-256 checksum
 make package-smoke  # build and verify the archive payload and checksum
+make codex-hooks-canary  # validate installed Codex SessionStart with isolated config
+make claude-hooks-canary # validate installed Claude SessionStart with isolated config
+make opencode-plugin-canary # validate installed OpenCode session.create with isolated plugin
+make traex-hooks-canary TRAEX_BIN=/absolute/path/to/traex # validate TraeX SessionStart
 ```
 
 `make setup` installs the optional local coverage command. The UT floor covers
 the Q1 support modules `clipboard.rs`, `diff.rs`, `preview.rs`, `search.rs`, and
-`text_layout.rs`; the E2E floor covers `app.rs`, `main.rs`, and `ui.rs` while
-exercising the production binary through a PTY. Integration and contract tests
-remain independent Q2 gates instead of being blended into either percentage.
+`text_layout.rs`; the E2E floor covers `app.rs`, `main.rs`, and `ui.rs` through
+the production PTY journeys, final-binary CLI E2E, and the feature-gated Agent
+PTY journey. Integration and contract tests remain independent Q2 gates instead
+of being blended into those percentages.
 CI runs the quality gate on Linux, the POSIX PTY E2E test on Linux and macOS,
-checks Rust 1.88 compatibility, enforces both coverage floors, and validates
+checks Rust 1.88 compatibility, enforces all three coverage floors, and validates
 release packages on Linux, macOS, and Windows.
 
 ## Publishing a release

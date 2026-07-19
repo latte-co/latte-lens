@@ -512,6 +512,8 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
+    use crate::content_safety::ContentPathKind;
+
     use super::{
         HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest,
         PreviewResolution, TextPreviewProvider,
@@ -585,6 +587,24 @@ mod tests {
             .open_regular()?
             .expect("empty regular file should still be openable");
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn registry_declines_directories_before_calling_any_provider() -> Result<()> {
+        let directory = tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let request = PreviewRequest::new(&root, Path::new("workspace")).within_root(&root);
+
+        let resolution = PreviewRegistry::with_builtins().resolve(&request)?;
+
+        assert!(matches!(
+            resolution,
+            PreviewResolution::Unsafe {
+                kind: ContentPathKind::Directory,
+                offending_path,
+            } if offending_path == root
+        ));
         Ok(())
     }
 

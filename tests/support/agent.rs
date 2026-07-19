@@ -198,6 +198,7 @@ impl ObservationProvider for FakeProvider {
         &mut self,
         _selector: &WorkspaceSelector,
         _limits: ProviderDiscoveryLimits,
+        _deadline: Instant,
     ) -> Result<BoundedVec<ProviderInstance, MAX_PROVIDER_INSTANCES>, ProviderError> {
         Ok(self.instances.clone())
     }
@@ -229,16 +230,55 @@ impl ObservationProvider for FakeProvider {
             .pop_front()
             .unwrap_or(ProviderEventOutcome::Idle)
     }
+
+    fn begin_draining(&mut self) {}
 }
 
-#[derive(Default)]
 pub struct InMemoryMetadataStore {
     writes: Mutex<Vec<SessionMetadataDelta>>,
+    snapshot: Mutex<MetadataSnapshot>,
+    prunes: Mutex<Vec<(RetentionPolicy, MaintenanceBudget)>>,
+    merge_deadlines: Mutex<Vec<Instant>>,
 }
 
 impl InMemoryMetadataStore {
+    pub fn new(snapshot: MetadataSnapshot) -> Self {
+        Self {
+            writes: Mutex::new(Vec::new()),
+            snapshot: Mutex::new(snapshot),
+            prunes: Mutex::new(Vec::new()),
+            merge_deadlines: Mutex::new(Vec::new()),
+        }
+    }
+
     pub fn writes(&self) -> Vec<SessionMetadataDelta> {
         self.writes.lock().expect("metadata writes lock").clone()
+    }
+
+    pub fn set_snapshot(&self, snapshot: MetadataSnapshot) {
+        *self.snapshot.lock().expect("metadata snapshot lock") = snapshot;
+    }
+
+    pub fn prunes(&self) -> Vec<(RetentionPolicy, MaintenanceBudget)> {
+        self.prunes.lock().expect("metadata prunes lock").clone()
+    }
+
+    pub fn merge_deadlines(&self) -> Vec<Instant> {
+        self.merge_deadlines
+            .lock()
+            .expect("metadata merge deadlines lock")
+            .clone()
+    }
+}
+
+impl Default for InMemoryMetadataStore {
+    fn default() -> Self {
+        Self::new(MetadataSnapshot {
+            workspaces: BoundedVec::new(),
+            sessions: BoundedVec::new(),
+            truncated: false,
+            corrupt_records_ignored: 0,
+        })
     }
 }
 
@@ -248,27 +288,34 @@ impl SessionMetadataStore for InMemoryMetadataStore {
         _selector: &WorkspaceSelector,
         _limits: MetadataLoadLimits,
     ) -> Result<MetadataSnapshot, MetadataError> {
-        Ok(MetadataSnapshot {
-            workspaces: BoundedVec::new(),
-            sessions: BoundedVec::new(),
-            truncated: false,
-            corrupt_records_ignored: 0,
-        })
+        Ok(self
+            .snapshot
+            .lock()
+            .expect("metadata snapshot lock")
+            .clone())
     }
 
-    fn merge(&self, delta: &SessionMetadataDelta, _deadline: Instant) -> MetadataWriteOutcome {
+    fn merge(&self, delta: &SessionMetadataDelta, deadline: Instant) -> MetadataWriteOutcome {
         self.writes
             .lock()
             .expect("metadata writes lock")
             .push(delta.clone());
+        self.merge_deadlines
+            .lock()
+            .expect("metadata merge deadlines lock")
+            .push(deadline);
         MetadataWriteOutcome::Updated
     }
 
     fn prune(
         &self,
-        _policy: &RetentionPolicy,
-        _budget: MaintenanceBudget,
+        policy: &RetentionPolicy,
+        budget: MaintenanceBudget,
     ) -> Result<PruneSummary, MetadataError> {
+        self.prunes
+            .lock()
+            .expect("metadata prunes lock")
+            .push((*policy, budget));
         Ok(PruneSummary {
             inspected: 0,
             removed: 0,

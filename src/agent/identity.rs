@@ -75,6 +75,47 @@ impl StableDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub fn to_hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(64);
+        for byte in self.0 {
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        output
+    }
+
+    pub fn parse_hex(value: &str) -> Result<Self, StableDigestParseError> {
+        if value.len() != 64 {
+            return Err(StableDigestParseError);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = (hex_nibble(pair[0]).ok_or(StableDigestParseError)? << 4)
+                | hex_nibble(pair[1]).ok_or(StableDigestParseError)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StableDigestParseError;
+
+impl fmt::Display for StableDigestParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid stable digest")
+    }
+}
+
+impl Error for StableDigestParseError {}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 impl fmt::Debug for StableDigest {
@@ -282,6 +323,14 @@ impl TurnKey {
     pub const fn session(&self) -> &SessionKey {
         &self.session
     }
+
+    pub const fn authority_id(&self) -> &AuthorityId {
+        &self.authority_id
+    }
+
+    pub const fn stable_id(&self) -> &StableDigest {
+        &self.stable_id
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -306,6 +355,10 @@ impl PresenceRef {
 
     pub const fn subject_hint(&self) -> Option<&SubjectNamespace> {
         self.subject_hint.as_ref()
+    }
+
+    pub const fn stable_id(&self) -> &StableDigest {
+        &self.stable_id
     }
 
     pub const fn workspace(&self) -> Option<&WorkspaceHint> {
@@ -353,6 +406,15 @@ impl ObserverDescriptor {
 }
 
 /// Raw native identity visible only while an adapter calls [`IdentityKeyer`].
+///
+/// It deliberately implements neither `Debug` nor `Display`, so accidental
+/// formatting cannot move a native identifier into logs or diagnostics.
+///
+/// ```compile_fail
+/// use latte_lens::agent::SensitiveId;
+/// let native = SensitiveId::new(b"native-session-canary");
+/// let _ = format!("{native:?}");
+/// ```
 pub struct SensitiveId<'a>(&'a [u8]);
 
 impl<'a> SensitiveId<'a> {
@@ -366,6 +428,12 @@ impl<'a> SensitiveId<'a> {
 }
 
 /// Raw workspace locator visible only at the identity boundary.
+///
+/// ```compile_fail
+/// use latte_lens::agent::SensitiveWorkspaceLocator;
+/// let locator = SensitiveWorkspaceLocator::new(b"/raw/workspace/canary");
+/// let _ = locator.to_string();
+/// ```
 pub struct SensitiveWorkspaceLocator<'a>(&'a [u8]);
 
 impl<'a> SensitiveWorkspaceLocator<'a> {
@@ -460,5 +528,13 @@ mod tests {
         let digest = StableDigest::from_bytes([0xab; 32]);
         assert_eq!(format!("{digest:?}"), "StableDigest(<redacted>)");
         assert!(!format!("{digest:?}").contains("abababab"));
+    }
+
+    #[test]
+    fn stable_digest_hex_round_trip_is_strict() {
+        let digest = StableDigest::from_bytes([0xab; 32]);
+        assert_eq!(StableDigest::parse_hex(&digest.to_hex()), Ok(digest));
+        assert!(StableDigest::parse_hex(&"A".repeat(64)).is_err());
+        assert!(StableDigest::parse_hex("00").is_err());
     }
 }

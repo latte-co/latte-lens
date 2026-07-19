@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use super::{
-    AgentObservation, BoundedVec, ContractRevision, IdentityKeyer, InstanceContract,
+    AgentObservation, BoundedVec, ContractRevision, EventEnvelope, IdentityKeyer, InstanceContract,
     InstanceContractTemplate, ObservationEnvelope, ObservationError, ObserverDescriptor,
-    ObserverId, Timestamp,
+    ObserverId, Timestamp, WorkspaceHint,
 };
 
 pub const MAX_ADAPTER_INPUT_BYTES: usize = 64 * 1024;
@@ -22,6 +22,7 @@ pub struct AdapterInput<'a> {
     pub event_name: &'a str,
     pub observer_version: Option<&'a str>,
     pub observed_at: Timestamp,
+    pub workspace: Option<WorkspaceHint>,
     pub payload: &'a [u8],
 }
 
@@ -57,6 +58,12 @@ pub enum DecodeOutcome {
     Ignore(IgnoreReason),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HookDecodeOutcome {
+    Event(Box<EventEnvelope>),
+    Ignore(IgnoreReason),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdapterError {
     InputTooLarge,
@@ -87,6 +94,20 @@ pub trait CodeAgentAdapter: Send + Sync {
         input: AdapterInput<'_>,
         identity: &dyn IdentityKeyer,
     ) -> Result<DecodeOutcome, AdapterError>;
+
+    /// Decode a Hook invocation into a complete event envelope.
+    ///
+    /// The default remains inert so core infrastructure never enables an
+    /// implicit vendor integration. A future Hook adapter must derive stable
+    /// stream and event identities from its native, bounded payload.
+    fn decode_hook(
+        &self,
+        input: AdapterInput<'_>,
+        identity: &dyn IdentityKeyer,
+    ) -> Result<HookDecodeOutcome, AdapterError> {
+        let _ = (input, identity);
+        Ok(HookDecodeOutcome::Ignore(IgnoreReason::UnsupportedEvent))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

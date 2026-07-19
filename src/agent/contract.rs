@@ -154,6 +154,29 @@ impl InstanceContractTemplate {
             && (!self.requires_instrumentation || contract.requires_instrumentation)
             && contract.stability.rank() <= self.stability.rank()
     }
+
+    /// Materialize the static Hook contract for one logical emitter instance.
+    /// Dynamic read-only providers continue to use probe-based narrowing.
+    pub fn hook_contract(
+        &self,
+        instance: ObserverInstanceId,
+        revision: ContractRevision,
+        observer_version: Option<BoundedText<64>>,
+    ) -> InstanceContract {
+        InstanceContract {
+            observer: self.observer.clone(),
+            instance,
+            revision,
+            observer_version,
+            subjects: self.subjects.clone(),
+            acquisition: self.acquisition.clone(),
+            capabilities: self.capabilities.clone(),
+            snapshot_semantics: self.snapshot_semantics,
+            stream_semantics: self.stream_semantics,
+            requires_instrumentation: self.requires_instrumentation,
+            stability: self.stability,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +195,33 @@ pub struct InstanceContract {
 }
 
 impl InstanceContract {
+    pub fn supports_subject_domain(
+        &self,
+        subject: &SubjectNamespace,
+        domain: EvidenceDomain,
+    ) -> bool {
+        self.subjects.contains(subject)
+            && self.capabilities.get(&domain).is_some_and(|claim| {
+                matches!(
+                    claim.support,
+                    super::CapabilitySupport::Confirmed | super::CapabilitySupport::Partial
+                )
+            })
+    }
+
+    pub fn permits_evidence(
+        &self,
+        subject: &SubjectNamespace,
+        domain: EvidenceDomain,
+        evidence: super::EvidenceClaim,
+    ) -> bool {
+        self.subjects.contains(subject)
+            && self
+                .capabilities
+                .get(&domain)
+                .is_some_and(|claim| claim.permits(&evidence).is_ok())
+    }
+
     pub fn validate_envelope(
         &self,
         envelope: &ObservationEnvelope,
@@ -219,6 +269,12 @@ impl InstanceContract {
             if matches!(event.op, StreamOp::Reset | StreamOp::Gap { .. })
                 && !self.stream_semantics.supported
             {
+                return Err(ObservationError::UnsupportedCapability);
+            }
+            if matches!(event.op, StreamOp::Reset) && !self.stream_semantics.reports_reset {
+                return Err(ObservationError::UnsupportedCapability);
+            }
+            if matches!(event.op, StreamOp::Gap { .. }) && !self.stream_semantics.reports_gap {
                 return Err(ObservationError::UnsupportedCapability);
             }
             if let StreamOp::Delete { entity, domains } = &event.op {

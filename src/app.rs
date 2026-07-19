@@ -21,6 +21,13 @@ use regex::RegexBuilder;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(feature = "agent-observability")]
+use crate::agent::{
+    ActivityState, AgentRuntime, AgentRuntimeCompletion, AgentRuntimeRequest, AgentState,
+    AgentViewSession, AgentViewState, ApplyResult, EvidenceExpiry, ObservationFreshness,
+    ObservationMode, ObserverId, RuntimeBackpressure, SessionLifecycle, WorkspaceSelector,
+};
+
 use crate::{
     clipboard,
     diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
@@ -98,6 +105,8 @@ pub enum TreeScope {
     #[default]
     AllFiles,
     GitChanges,
+    #[cfg(feature = "agent-observability")]
+    Agents,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -171,12 +180,31 @@ impl TreeScope {
     pub const fn next(self) -> Self {
         match self {
             Self::AllFiles => Self::GitChanges,
+            #[cfg(feature = "agent-observability")]
+            Self::GitChanges => Self::Agents,
+            #[cfg(not(feature = "agent-observability"))]
             Self::GitChanges => Self::AllFiles,
+            #[cfg(feature = "agent-observability")]
+            Self::Agents => Self::AllFiles,
         }
     }
 
     pub const fn previous(self) -> Self {
-        self.next()
+        match self {
+            Self::AllFiles => {
+                #[cfg(feature = "agent-observability")]
+                {
+                    Self::Agents
+                }
+                #[cfg(not(feature = "agent-observability"))]
+                {
+                    Self::GitChanges
+                }
+            }
+            Self::GitChanges => Self::AllFiles,
+            #[cfg(feature = "agent-observability")]
+            Self::Agents => Self::GitChanges,
+        }
     }
 }
 
@@ -534,6 +562,8 @@ impl ContentSelection {
 pub struct UiRegions {
     pub all_files_tab: Rect,
     pub git_changes_tab: Rect,
+    #[cfg(feature = "agent-observability")]
+    pub agents_tab: Rect,
     pub refresh_button: Rect,
     pub file_search_button: Rect,
     pub text_search_button: Rect,
@@ -567,6 +597,30 @@ impl UiRegions {
             Some(TreeScope::AllFiles)
         } else if contains(self.git_changes_tab, column, row) {
             Some(TreeScope::GitChanges)
+        } else if cfg!(feature = "agent-observability")
+            && contains(
+                {
+                    #[cfg(feature = "agent-observability")]
+                    {
+                        self.agents_tab
+                    }
+                    #[cfg(not(feature = "agent-observability"))]
+                    {
+                        Rect::default()
+                    }
+                },
+                column,
+                row,
+            )
+        {
+            #[cfg(feature = "agent-observability")]
+            {
+                Some(TreeScope::Agents)
+            }
+            #[cfg(not(feature = "agent-observability"))]
+            {
+                None
+            }
         } else {
             None
         }
@@ -665,6 +719,16 @@ pub struct App {
     has_refresh_snapshot: bool,
     quit_confirmation: Option<QuitConfirmation>,
     should_quit: bool,
+    #[cfg(feature = "agent-observability")]
+    agent_runtime: Option<AgentRuntime>,
+    #[cfg(feature = "agent-observability")]
+    agent_state: AgentState,
+    #[cfg(feature = "agent-observability")]
+    agent_view: AgentViewState,
+    #[cfg(feature = "agent-observability")]
+    agent_generation: u64,
+    #[cfg(feature = "agent-observability")]
+    agent_selection: Option<crate::agent::SessionKey>,
     #[allow(dead_code)] // Consumed by the following App/navigation integration node.
     pub(crate) navigation_settings: NavigationSettings,
     pub(crate) navigation_config_warning: Option<String>,
@@ -829,6 +893,16 @@ impl App {
             has_refresh_snapshot: false,
             quit_confirmation: None,
             should_quit: false,
+            #[cfg(feature = "agent-observability")]
+            agent_runtime: None,
+            #[cfg(feature = "agent-observability")]
+            agent_state: AgentState::new(0),
+            #[cfg(feature = "agent-observability")]
+            agent_view: AgentViewState::default(),
+            #[cfg(feature = "agent-observability")]
+            agent_generation: 0,
+            #[cfg(feature = "agent-observability")]
+            agent_selection: None,
             navigation_settings: options.navigation,
             navigation_config_warning: options.navigation_config_warning,
             navigation_runtime,
@@ -850,6 +924,41 @@ impl App {
         };
         app.request_refresh(false);
         Ok(app)
+    }
+
+    /// Attach an explicitly constructed Agent runtime. Production construction
+    /// keeps the registry empty; synthetic harnesses inject services here
+    /// without adding hidden CLI flags or test-only environment behavior.
+    #[cfg(feature = "agent-observability")]
+    pub fn attach_agent_runtime(
+        &mut self,
+        runtime: AgentRuntime,
+        selector: WorkspaceSelector,
+    ) -> Result<(), RuntimeBackpressure> {
+        self.agent_generation = self.agent_generation.saturating_add(1);
+        self.agent_state.select_generation(self.agent_generation);
+        self.agent_view = self.agent_state.view();
+        runtime.submit(AgentRuntimeRequest::SelectWorkspace {
+            generation: self.agent_generation,
+            selector,
+        })?;
+        runtime.submit(AgentRuntimeRequest::RefreshProviders {
+            generation: self.agent_generation,
+        })?;
+        self.agent_runtime = Some(runtime);
+        Ok(())
+    }
+
+    #[cfg(feature = "agent-observability")]
+    pub fn agent_view(&self) -> &AgentViewState {
+        &self.agent_view
+    }
+
+    #[cfg(feature = "agent-observability")]
+    pub fn selected_agent_session(&self) -> Option<&AgentViewSession> {
+        self.tree_state
+            .selected()
+            .and_then(|index| self.agent_view.sessions.get(index))
     }
 
     pub fn register_preview_provider<P>(&mut self, provider: P)
@@ -888,6 +997,10 @@ impl App {
                 }
             }
         }
+        #[cfg(feature = "agent-observability")]
+        if let Some(runtime) = &self.agent_runtime {
+            runtime.begin_shutdown();
+        }
         Ok(())
     }
 
@@ -895,6 +1008,8 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => &self.visible_rows,
             TreeScope::GitChanges => &self.visible_changed_entries,
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => &[],
         }
     }
 
@@ -906,6 +1021,8 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => self.visible_rows.len(),
             TreeScope::GitChanges => self.visible_git_rows.len(),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.agent_view.sessions.len(),
         }
     }
 
@@ -921,6 +1038,8 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => self.all_entries.len(),
             TreeScope::GitChanges => self.changed_count,
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.agent_view.known_count,
         }
     }
 
@@ -928,6 +1047,8 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => self.all_files_truncated,
             TreeScope::GitChanges => self.git_changes_truncated,
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.agent_view.truncated,
         }
     }
 
@@ -940,6 +1061,8 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => self.visible_rows.get(index),
             TreeScope::GitChanges => self.visible_git_rows.get(index)?.file_entry(),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => None,
         }
     }
 
@@ -964,6 +1087,8 @@ impl App {
                 .selected_git_row()
                 .map(|row| self.git_row_is_expanded(row))
                 .unwrap_or(true),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => false,
         }
     }
 
@@ -980,6 +1105,8 @@ impl App {
                 GitRowKind::Directory => row.file_entry().map(|entry| entry.relative.clone()),
                 GitRowKind::Repository { .. } | GitRowKind::Issue(_) => None,
             }),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => None,
         }
     }
 
@@ -1066,6 +1193,11 @@ impl App {
                 .selected_git_row()
                 .map(|row| row.label.clone())
                 .unwrap_or_default(),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self
+                .selected_agent_session()
+                .map(AgentViewSession::short_key)
+                .unwrap_or_default(),
         }
     }
 
@@ -1083,6 +1215,10 @@ impl App {
             } else {
                 "Preview"
             };
+        }
+        #[cfg(feature = "agent-observability")]
+        if self.tree_scope == TreeScope::Agents {
+            return "Agent session";
         }
         let Some(row) = self.selected_git_row() else {
             return if self.selected_entry().is_some_and(|entry| entry.is_dir) {
@@ -1410,9 +1546,20 @@ impl App {
             (KeyCode::Char('2'), KeyModifiers::NONE) => {
                 self.set_tree_scope(TreeScope::GitChanges);
             }
+            #[cfg(feature = "agent-observability")]
+            (KeyCode::Char('3'), KeyModifiers::NONE) => {
+                self.set_tree_scope(TreeScope::Agents);
+            }
             (KeyCode::Char('h'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             (KeyCode::Char('l'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
             (KeyCode::Char('r'), _) => {
+                #[cfg(feature = "agent-observability")]
+                if self.tree_scope == TreeScope::Agents {
+                    self.request_agent_refresh();
+                } else {
+                    self.request_refresh(self.tree_scope == TreeScope::GitChanges);
+                }
+                #[cfg(not(feature = "agent-observability"))]
                 self.request_refresh(self.tree_scope == TreeScope::GitChanges);
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
@@ -2585,6 +2732,8 @@ impl App {
                             TreeScope::GitChanges => self
                                 .selected_git_row()
                                 .is_some_and(GitTreeRow::is_container),
+                            #[cfg(feature = "agent-observability")]
+                            TreeScope::Agents => false,
                         };
                         if is_container {
                             self.toggle_selected_directory();
@@ -3046,6 +3195,10 @@ impl App {
         if scope == TreeScope::GitChanges {
             self.request_refresh(true);
         }
+        #[cfg(feature = "agent-observability")]
+        if scope == TreeScope::Agents {
+            self.request_agent_refresh();
+        }
 
         self.apply_tree_scope(scope);
         // A clean repository row is a valid fallback, but on the first entry
@@ -3085,6 +3238,8 @@ impl App {
                 }
                 self.restore_git_selection(synchronized.or(self.git_changes_selection.clone()));
             }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.restore_agent_selection(),
         }
     }
 
@@ -3118,8 +3273,12 @@ impl App {
 
     fn handle_scope_tabs_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::Left, KeyModifiers::NONE) => self.set_tree_scope(TreeScope::AllFiles),
-            (KeyCode::Right, KeyModifiers::NONE) => self.set_tree_scope(TreeScope::GitChanges),
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                self.set_tree_scope(self.tree_scope.previous());
+            }
+            (KeyCode::Right, KeyModifiers::NONE) => {
+                self.set_tree_scope(self.tree_scope.next());
+            }
             (KeyCode::Down, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             _ => {}
         }
@@ -3253,6 +3412,14 @@ impl App {
     }
 
     fn activate_selected_tree_entry(&mut self) {
+        #[cfg(feature = "agent-observability")]
+        if self.tree_scope == TreeScope::Agents {
+            if self.selected_agent_session().is_some() {
+                self.focused_pane = FocusPane::Content;
+                self.load_selected_agent_detail();
+            }
+            return;
+        }
         if self.tree_scope == TreeScope::GitChanges {
             match self.selected_git_row() {
                 Some(row) if row.is_container() => self.toggle_selected_directory(),
@@ -3353,6 +3520,8 @@ impl App {
                     .get(index)
                     .is_some_and(GitTreeRow::is_change)
                     .then_some(index),
+                #[cfg(feature = "agent-observability")]
+                TreeScope::Agents => None,
             }
         });
         if let Some(index) = target {
@@ -3568,6 +3737,21 @@ impl App {
         generation
     }
 
+    #[cfg(feature = "agent-observability")]
+    fn request_agent_refresh(&mut self) {
+        if let Some(runtime) = &self.agent_runtime {
+            let metadata = runtime.submit(AgentRuntimeRequest::RefreshMetadata {
+                generation: self.agent_generation,
+            });
+            let providers = runtime.submit(AgentRuntimeRequest::RefreshProviders {
+                generation: self.agent_generation,
+            });
+            if metadata.is_err() || providers.is_err() {
+                self.last_error = Some("Agent refresh queue is full".to_owned());
+            }
+        }
+    }
+
     pub fn poll_background(&mut self) {
         if self
             .quit_confirmation
@@ -3600,6 +3784,114 @@ impl App {
             self.apply_document_symbol_completion(completion);
         }
         self.apply_search_events();
+        #[cfg(feature = "agent-observability")]
+        self.poll_agent_background();
+    }
+
+    #[cfg(feature = "agent-observability")]
+    fn poll_agent_background(&mut self) {
+        let completions = self
+            .agent_runtime
+            .as_ref()
+            .map(|runtime| {
+                std::iter::from_fn(|| runtime.try_next())
+                    .take(64)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for completion in completions {
+            let result = match completion {
+                AgentRuntimeCompletion::MetadataLoaded {
+                    generation,
+                    snapshot,
+                } => Some(self.agent_state.bootstrap_metadata(generation, snapshot)),
+                AgentRuntimeCompletion::EnvelopeReceived {
+                    generation,
+                    workspace_hints: _,
+                    envelope,
+                } => Some(self.agent_state.apply_envelope(generation, *envelope)),
+                AgentRuntimeCompletion::EvidenceExpired { generation, keys } => {
+                    Some(self.agent_state.expire_evidence(generation, &keys))
+                }
+                AgentRuntimeCompletion::LiveDropped {
+                    generation,
+                    sessions,
+                    unattributed,
+                } if generation == self.agent_generation => {
+                    let mut changed = false;
+                    for dropped in sessions {
+                        changed |= self
+                            .agent_state
+                            .record_live_drop(Some(&dropped.session), dropped.count);
+                    }
+                    changed |= self.agent_state.record_live_drop(None, unattributed);
+                    if changed {
+                        self.agent_view = self.agent_state.view();
+                        self.restore_agent_selection();
+                        if self.tree_scope == TreeScope::Agents {
+                            self.load_selected_agent_detail();
+                        }
+                    }
+                    None
+                }
+                AgentRuntimeCompletion::LiveDropped { .. } => None,
+                AgentRuntimeCompletion::ProviderStatus { .. }
+                | AgentRuntimeCompletion::RuntimeStatus { .. }
+                | AgentRuntimeCompletion::MetadataWriteStatus { .. }
+                | AgentRuntimeCompletion::IngressRejected { .. } => None,
+                AgentRuntimeCompletion::ContractUpdated {
+                    generation,
+                    contract,
+                } => Some(
+                    self.agent_state
+                        .apply_contract_update(generation, &contract),
+                ),
+            };
+            if let Some(result) = result {
+                self.reduce_agent_apply_result(result);
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-observability")]
+    fn reduce_agent_apply_result(&mut self, result: ApplyResult) {
+        if let Some(runtime) = &self.agent_runtime {
+            for delta in result.metadata_deltas {
+                if runtime
+                    .submit(AgentRuntimeRequest::PersistMetadata {
+                        generation: self.agent_generation,
+                        delta,
+                    })
+                    .is_err()
+                {
+                    self.last_error = Some(
+                        "Agent metadata queue is full; live state remains available".to_owned(),
+                    );
+                }
+            }
+            for update in result.expiry_updates {
+                if runtime
+                    .submit(AgentRuntimeRequest::ScheduleExpiry {
+                        generation: self.agent_generation,
+                        expiry: EvidenceExpiry {
+                            key: update.key,
+                            valid_until: update.valid_until,
+                        },
+                    })
+                    .is_err()
+                {
+                    self.last_error =
+                        Some("Agent expiry queue is full; coverage is partial".to_owned());
+                }
+            }
+        }
+        if result.changed {
+            self.agent_view = self.agent_state.view();
+            self.restore_agent_selection();
+            if self.tree_scope == TreeScope::Agents {
+                self.load_selected_agent_detail();
+            }
+        }
     }
 
     /// Return a handle to bounded process/thread cleanup evidence used by the
@@ -3795,6 +4087,8 @@ impl App {
                     self.navigation_source.is_none(),
                 );
             }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.restore_agent_selection(),
         }
 
         self.last_refresh_error = None;
@@ -3872,6 +4166,8 @@ impl App {
                     self.navigation_source.is_none(),
                 );
             }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.restore_agent_selection(),
         }
         self.last_error = None;
         if let Some(session) = &mut self.search_sessions[SearchMode::Files.index()] {
@@ -3894,6 +4190,17 @@ impl App {
                 .iter()
                 .position(GitTreeRow::is_change)
                 .or_else(|| (!self.visible_git_rows.is_empty()).then_some(0)),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self
+                .agent_selection
+                .as_ref()
+                .and_then(|session| {
+                    self.agent_view
+                        .sessions
+                        .iter()
+                        .position(|candidate| &candidate.session == session)
+                })
+                .or_else(|| (!self.agent_view.sessions.is_empty()).then_some(0)),
         }
     }
 
@@ -3903,6 +4210,12 @@ impl App {
             TreeScope::GitChanges => {
                 self.git_changes_selection =
                     self.selected_git_row().map(|row| row.identity.clone());
+            }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => {
+                self.agent_selection = self
+                    .selected_agent_session()
+                    .map(|session| session.session.clone());
             }
         }
     }
@@ -3920,6 +4233,8 @@ impl App {
                 };
                 self.workspace_path_for_change(change)
             }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => None,
         }
     }
 
@@ -4104,6 +4419,8 @@ impl App {
         match scope {
             TreeScope::AllFiles => &self.all_entries,
             TreeScope::GitChanges => &self.changed_entries,
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => &[],
         }
     }
 
@@ -4160,6 +4477,21 @@ impl App {
         }
     }
 
+    #[cfg(feature = "agent-observability")]
+    fn restore_agent_selection(&mut self) {
+        let index = self
+            .agent_selection
+            .as_ref()
+            .and_then(|selected| {
+                self.agent_view
+                    .sessions
+                    .iter()
+                    .position(|candidate| &candidate.session == selected)
+            })
+            .or_else(|| (!self.agent_view.sessions.is_empty()).then_some(0));
+        self.select_optional(index);
+    }
+
     fn visible_index_for_path(&self, path: &Path) -> Option<usize> {
         self.visible_entries()
             .iter()
@@ -4207,6 +4539,8 @@ impl App {
                 (TreeScope::GitChanges, true) => {
                     "No Git changes found in the partial filesystem results."
                 }
+                #[cfg(feature = "agent-observability")]
+                (TreeScope::Agents, _) => "No observed Agent sessions in this workspace.",
             };
             self.set_info(vec![message.to_owned()]);
             return;
@@ -4215,10 +4549,127 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => self.load_selected_preview(),
             TreeScope::GitChanges => self.load_selected_diff(),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.load_selected_agent_detail(),
         }
     }
 
+    #[cfg(feature = "agent-observability")]
+    fn load_selected_agent_detail(&mut self) {
+        let Some(session) = self.selected_agent_session().cloned() else {
+            self.set_info(vec!["No observed Agent session selected.".to_owned()]);
+            return;
+        };
+        let observers = if session.observers.is_empty() {
+            "none".to_owned()
+        } else {
+            session
+                .observers
+                .iter()
+                .map(|observer| observer.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut lines = vec![
+            format!("Subject       {}", session.subject.as_str()),
+            format!("Session       {}", session.short_key()),
+            format!(
+                "Discovery     {}",
+                match session.discovery {
+                    crate::agent::SessionDiscovery::StartConfirmed => "Start confirmed",
+                    crate::agent::SessionDiscovery::DiscoveredMidSession => "Mid-session",
+                }
+            ),
+            format!(
+                "Mode          {}",
+                match session.mode {
+                    ObservationMode::MetadataOnly => "Metadata only",
+                    ObservationMode::LiveObserved => "Live observed",
+                }
+            ),
+            format!("Lifecycle     {}", lifecycle_label(session.lifecycle)),
+            format!("Activity      {}", activity_label(session.activity)),
+            format!("Freshness     {}", freshness_label(session.freshness)),
+            format!(
+                "Coverage      {:?}{} · gaps {} · dropped {}",
+                session.completeness,
+                if session.reconciling {
+                    " · Reconciling"
+                } else {
+                    ""
+                },
+                session.gap_count,
+                session.dropped_live_events
+            ),
+            format!("Observers     {observers}"),
+            format!(
+                "Agents        {}/{} live{}",
+                session.live_agents,
+                session.known_agents,
+                if session.agents_truncated {
+                    "+ · Partial"
+                } else {
+                    ""
+                }
+            ),
+            format!("Turns         {} live", session.turns),
+            format!("Changes       {} live-only", session.changes),
+            format!("Artifacts     {} live-only", session.artifacts),
+            String::new(),
+            "Observer coverage".to_owned(),
+        ];
+        for coverage in &session.coverage.observers {
+            let instance = coverage
+                .instance
+                .as_ref()
+                .map(|instance| {
+                    instance
+                        .digest()
+                        .to_hex()
+                        .chars()
+                        .take(8)
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| "metadata".to_owned());
+            lines.push(format!(
+                "{}@{} · since {} · snapshot {:?} · gaps {}{}",
+                coverage.observer.as_str(),
+                instance,
+                coverage.observing_since.as_unix_millis(),
+                coverage.snapshot_completeness,
+                coverage.stream_gap_count,
+                if coverage.reconciling {
+                    " · Reconciling"
+                } else {
+                    ""
+                }
+            ));
+        }
+        lines.extend([String::new(), "Explain".to_owned()]);
+        for decision in &session.decisions {
+            let observer = decision
+                .winning_observer
+                .as_ref()
+                .map(ObserverId::as_str)
+                .unwrap_or("none");
+            lines.push(format!(
+                "{:?}: {:?} · {:?} · {:?} · observer {}",
+                decision.domain,
+                decision.effective_value,
+                decision.disposition,
+                decision.authority,
+                observer
+            ));
+        }
+        self.set_info(lines);
+    }
+
     fn load_selected_info(&mut self) {
+        #[cfg(feature = "agent-observability")]
+        if self.tree_scope == TreeScope::Agents {
+            self.load_selected_agent_detail();
+            return;
+        }
         if let Some(row) = self.selected_git_row().cloned() {
             let action = if row.is_container() {
                 if self.git_row_is_expanded(&row) {
@@ -4317,6 +4768,11 @@ impl App {
     }
 
     fn load_selected_diff(&mut self) {
+        #[cfg(feature = "agent-observability")]
+        if self.tree_scope == TreeScope::Agents {
+            self.load_selected_agent_detail();
+            return;
+        }
         if self.tree_scope == TreeScope::GitChanges {
             let Some(row) = self.selected_git_row().cloned() else {
                 self.set_info(vec!["No repository row selected.".to_owned()]);
@@ -4372,6 +4828,11 @@ impl App {
     }
 
     fn load_selected_preview(&mut self) {
+        #[cfg(feature = "agent-observability")]
+        if self.tree_scope == TreeScope::Agents {
+            self.load_selected_agent_detail();
+            return;
+        }
         if self.tree_scope == TreeScope::GitChanges {
             let Some(row) = self.selected_git_row().cloned() else {
                 self.set_info(vec!["No repository row selected.".to_owned()]);
@@ -6341,6 +6802,35 @@ fn contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+#[cfg(feature = "agent-observability")]
+const fn lifecycle_label(value: SessionLifecycle) -> &'static str {
+    match value {
+        SessionLifecycle::Unknown => "Unknown",
+        SessionLifecycle::Open => "Open",
+        SessionLifecycle::Ended => "Ended",
+        SessionLifecycle::Failed => "Failed",
+    }
+}
+
+#[cfg(feature = "agent-observability")]
+const fn activity_label(value: ActivityState) -> &'static str {
+    match value {
+        ActivityState::Unknown => "Unknown",
+        ActivityState::Working => "Working",
+        ActivityState::WaitingPermission => "Waiting permission",
+        ActivityState::Idle => "Idle",
+    }
+}
+
+#[cfg(feature = "agent-observability")]
+const fn freshness_label(value: ObservationFreshness) -> &'static str {
+    match value {
+        ObservationFreshness::Unknown => "Unknown",
+        ObservationFreshness::Current => "Current",
+        ObservationFreshness::Stale => "Stale",
+    }
 }
 
 #[cfg(test)]

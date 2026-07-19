@@ -256,12 +256,13 @@ Q3 开始前和退出后计算：
 CI 映射：
 
 - Linux quality：Q0–Q2；
-- Linux/macOS PTY：Q3 Files + Git Changes + Search + Code Navigation；
+- Linux/macOS PTY：Q3 Files + Git Changes + Search + Code Navigation，以及 required 的 Agent journey；
 - Windows：Q0–Q2、package；ConPTY 未持续验证前不声称 Q3；
 - Agent jobs：按专项文档增加 Q4，不替代主 PTY job；
 - coverage-unit：分母以 Makefile 的 `UT_COVERAGE_IGNORE_REGEX` 为准。当前过滤后由 Q1 直接单测负责的 surface 包含 `clipboard.rs`、`diff.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`navigation.rs`、`preview.rs`、`search.rs` 和 `text_layout.rs`，保持 93% line floor；
 - coverage-e2e：用 production binary + PTY 执行全部 required scenarios，分母以 Makefile 的 `E2E_COVERAGE_IGNORE_REGEX` 为准。当前 production PTY surface 包含 `app.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`main.rs`、`navigation.rs` 和 `ui.rs`，保持 85% line floor；
-- 被上述过滤器排除的边界模块仍由 Q2 integration/contract tests 独立阻断；`lsp_process_unix.rs` 与 `lsp_process_windows.rs` 只在各自适用的 target 编译和计量，覆盖率报告不替代上述 Windows native PR CI 证据。`make coverage` 顺序执行两个 coverage gate；
+- coverage-agent：统计完整 synthetic Agent Core 的 G1–G3 Rust 执行路径，保持 80% line floor；不得通过排除新增 Agent 模块维持数字；
+- 被上述过滤器排除的其余边界模块仍由 Q2 integration/contract tests 独立阻断；`lsp_process_unix.rs` 与 `lsp_process_windows.rs` 只在各自适用的 target 编译和计量，覆盖率报告不替代上述 Windows native PR CI 证据。`make coverage` 顺序执行三个 coverage gate；
 - package：Q5，并验证只有 production binary/资产。
 
 ## 11. 改动与卡点映射

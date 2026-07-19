@@ -1,9 +1,9 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{
     AdapterRegistry, EventEnvelope, InstanceContract, LiveObservationPublisher,
-    MetadataWriteOutcome, ObservationEnvelope, PublishOutcome, SessionMetadataDelta,
-    SessionMetadataStore, StreamOp,
+    MetadataWriteOutcome, ObservationEnvelope, PublishOutcome, SessionMetadataStore,
+    project_metadata,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,54 +43,54 @@ impl<'a> ObservationDispatcher<'a> {
         contract: &InstanceContract,
         deadline: Instant,
     ) -> DispatchOutcome {
+        self.dispatch_with_budget(
+            event,
+            contract,
+            deadline,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+    }
+
+    /// Dispatch one event with independent live and metadata fallback budgets.
+    pub fn dispatch_with_budget(
+        &self,
+        event: EventEnvelope,
+        contract: &InstanceContract,
+        live_deadline: Instant,
+        metadata_budget: Duration,
+    ) -> DispatchOutcome {
         let Ok(validated) = self
             .adapters
             .validate_envelope(ObservationEnvelope::Event(event), contract)
         else {
             return DispatchOutcome::RejectedInvalid;
         };
+        let metadata_deltas = project_metadata(&validated);
         let ObservationEnvelope::Event(event) = validated.into_inner() else {
             unreachable!("dispatcher only validates event envelopes");
         };
 
+        let publish = self.publisher.publish(&event, live_deadline);
         if let PublishOutcome::Accepted {
             receiver_generation,
-        } = self.publisher.publish(&event, deadline)
+        } = publish
         {
             return DispatchOutcome::LiveAccepted {
                 receiver_generation,
             };
         }
 
-        let StreamOp::Upsert(observations) = &event.op else {
-            return DispatchOutcome::IgnoredNoSession;
-        };
-        let mut selected: Option<super::SessionRef> = None;
-        let mut observed_at: Option<super::Timestamp> = None;
-        for observation in observations {
-            let Some(session) = &observation.session else {
-                continue;
-            };
-            if selected
-                .as_ref()
-                .is_some_and(|selected| selected != session)
-            {
-                return DispatchOutcome::RejectedInvalid;
+        let [delta] = metadata_deltas.as_ref() else {
+            if metadata_deltas.is_empty() {
+                return DispatchOutcome::IgnoredNoSession;
             }
-            selected = Some(session.clone());
-            observed_at = Some(observed_at.map_or(observation.observed_at, |current| {
-                current.max(observation.observed_at)
-            }));
-        }
-        let (Some(session), Some(observed_at)) = (selected, observed_at) else {
-            return DispatchOutcome::IgnoredNoSession;
+            // Hook frames must describe one session so fallback remains a
+            // single bounded update under the emitter deadline.
+            return DispatchOutcome::RejectedInvalid;
         };
-        DispatchOutcome::Metadata(self.metadata.merge(
-            &SessionMetadataDelta {
-                session,
-                observed_at,
-            },
-            deadline,
-        ))
+        if !matches!(event.op, super::StreamOp::Upsert(_)) {
+            return DispatchOutcome::IgnoredNoSession;
+        }
+        DispatchOutcome::Metadata(self.metadata.merge(delta, Instant::now() + metadata_budget))
     }
 }

@@ -12,6 +12,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "agent-observability")]
+use latte_lens::agent::*;
 #[cfg(feature = "navigation-test-support")]
 use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
@@ -26,6 +28,8 @@ use ratatui::{
     style::{Color, Modifier},
 };
 use support::TestRepo;
+#[cfg(feature = "agent-observability")]
+use support::agent::{FakeAdapter, digest};
 use unicode_width::UnicodeWidthStr;
 
 #[test]
@@ -436,6 +440,12 @@ fn scope_tab_arrows_switch_scope_through_the_refresh_path() {
     app.handle_key(key(KeyCode::Up));
     assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
     app.handle_key(key(KeyCode::Left));
+    #[cfg(feature = "agent-observability")]
+    assert_eq!(app.tree_scope, TreeScope::Agents);
+    #[cfg(not(feature = "agent-observability"))]
+    assert_eq!(app.tree_scope, TreeScope::GitChanges);
+    app.handle_key(key(KeyCode::Right));
+    settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::AllFiles);
     assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
     assert_eq!(
@@ -3515,6 +3525,173 @@ fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
             .iter()
             .all(|cell| cell.bg == Color::Reset)
     );
+}
+
+#[cfg(feature = "agent-observability")]
+#[test]
+fn agents_scope_renders_metadata_live_and_explain_states_from_the_view_model() {
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    let (handle, endpoint) = agent_runtime_channel(8, 8);
+    let workspace = WorkspaceHint::from_digest(digest(3));
+    let subject = SubjectNamespace::parse("synthetic/agent").unwrap();
+    let session = SessionRef::new(
+        SessionKey::new(
+            subject.clone(),
+            InstallId::from_digest(digest(4)),
+            AuthorityId::from_digest(digest(5)),
+            digest(6),
+        ),
+        workspace.clone(),
+    );
+    app.attach_agent_runtime(
+        AgentRuntime::from_channel(handle),
+        WorkspaceSelector::new(BoundedVec::try_from_vec(vec![workspace.clone()]).unwrap()),
+    )
+    .unwrap();
+    assert!(endpoint.try_request().is_some());
+    assert!(endpoint.try_request().is_some());
+    endpoint
+        .complete(AgentRuntimeCompletion::MetadataLoaded {
+            generation: 1,
+            snapshot: MetadataSnapshot {
+                workspaces: BoundedVec::new(),
+                sessions: BoundedVec::try_from_vec(vec![SessionMetadata {
+                    session: session.clone(),
+                    observers: BoundedVec::try_from_vec(vec![
+                        ObserverId::parse("synthetic/hook").unwrap(),
+                    ])
+                    .unwrap(),
+                    observers_truncated: false,
+                    discovery: SessionDiscovery::DiscoveredMidSession,
+                    first_observed_at: Timestamp::from_unix_millis(1),
+                    last_observed_at: Timestamp::from_unix_millis(2),
+                    lifecycle_hint: SessionLifecycleHint::Open,
+                    last_activity_hint: ActivityStateHint::Working,
+                    last_event_kind: ObservationKindTag::Activity,
+                    known_agents: BoundedVec::new(),
+                    agents_truncated: false,
+                    start_observed: false,
+                    terminal: None,
+                    generation: 1,
+                    partial: true,
+                    revived: false,
+                }])
+                .unwrap(),
+                truncated: false,
+                corrupt_records_ignored: 0,
+            },
+        })
+        .unwrap();
+    app.poll_background();
+    app.set_tree_scope(TreeScope::Agents);
+
+    let backend = TestBackend::new(120, 36);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("3 Agents"));
+    assert!(rendered.contains("0/1 live"));
+    assert!(rendered.contains("synthetic/agent"));
+    assert!(rendered.contains("Unknown"));
+    assert!(rendered.contains("metadata"));
+    assert!(!rendered.contains("metadata Working"));
+    assert!(rendered.contains("1/2/3 scope"));
+
+    let observer = ObserverId::parse("synthetic/hook").unwrap();
+    let instance = ObserverInstanceId::from_digest(digest(10));
+    let epoch = StreamEpoch::from_digest(digest(11));
+    let claim = CapabilityClaim {
+        support: CapabilitySupport::Confirmed,
+        max_authority: EvidenceAuthority::Authoritative,
+        provenance: EvidenceProvenance::InstrumentedHook,
+        reason: BoundedText::try_new("synthetic UI").unwrap(),
+        lease_backed: false,
+    };
+    let subjects = BoundedSet::try_from_iter([subject]).unwrap();
+    let acquisition = BoundedSet::try_from_iter([AcquisitionMode::HookEvent]).unwrap();
+    let capabilities = std::collections::BTreeMap::from([(EvidenceDomain::Activity, claim)]);
+    let contract = InstanceContract {
+        observer: observer.clone(),
+        instance: instance.clone(),
+        revision: ContractRevision::new(1),
+        observer_version: None,
+        subjects: subjects.clone(),
+        acquisition: acquisition.clone(),
+        capabilities: capabilities.clone(),
+        snapshot_semantics: SnapshotSemantics::unsupported(),
+        stream_semantics: StreamSemantics::unsupported(),
+        requires_instrumentation: true,
+        stability: InterfaceStability::Stable,
+    };
+    let template = InstanceContractTemplate {
+        observer: observer.clone(),
+        subjects,
+        acquisition,
+        capabilities,
+        snapshot_semantics: SnapshotSemantics::unsupported(),
+        stream_semantics: StreamSemantics::unsupported(),
+        requires_instrumentation: true,
+        stability: InterfaceStability::Stable,
+    };
+    let observation = AgentObservation {
+        observed_at: Timestamp::from_unix_millis(3),
+        valid_until: None,
+        presence: None,
+        session: Some(session),
+        agent: None,
+        turn: None,
+        workspace: Some(workspace),
+        kind: ObservationKind::Activity(ActivityOp::Set(ReportedActivityState::Working)),
+        evidence: EvidenceClaim {
+            support: CapabilitySupport::Confirmed,
+            authority: EvidenceAuthority::Authoritative,
+            provenance: EvidenceProvenance::InstrumentedHook,
+        },
+    };
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register(Arc::new(FakeAdapter::new(
+            ObserverDescriptor::new(observer.clone(), "Synthetic", "1").unwrap(),
+            template,
+            DecodeOutcome::Ignore(IgnoreReason::NoObservableFact),
+        )))
+        .unwrap();
+    let validated = registry
+        .validate_envelope(
+            ObservationEnvelope::Event(EventEnvelope {
+                stream: StreamRef {
+                    observer,
+                    instance,
+                    epoch,
+                },
+                event_id: EventId::from_digest(digest(12)),
+                sequence: Some(StreamSequence::new(1)),
+                op: StreamOp::Upsert(BoundedVec::try_from_vec(vec![observation]).unwrap()),
+            }),
+            &contract,
+        )
+        .unwrap();
+    endpoint
+        .complete(AgentRuntimeCompletion::EnvelopeReceived {
+            generation: 1,
+            workspace_hints: BoundedVec::new(),
+            envelope: Box::new(validated),
+        })
+        .unwrap();
+    app.poll_background();
+    app.handle_key(key(KeyCode::Enter));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("1/1 live"));
+    assert!(rendered.contains("Working"));
+    assert!(rendered.contains("live"));
+    assert!(rendered.contains("Explain"));
+    assert!(rendered.contains("Authoritative"));
+    assert!(rendered.contains("synthetic/hook"));
+    assert!(!rendered.contains("prompt-canary"));
 }
 
 #[cfg(unix)]
