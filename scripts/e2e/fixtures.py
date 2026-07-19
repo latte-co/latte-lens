@@ -416,6 +416,40 @@ def create_invalid_product_config_fixture(root: Path, environment: dict[str, str
     environment["LATTELENS_CONFIG"] = str(config)
 
 
+def create_missing_product_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "missing-config.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "missing config fixture", cwd=root, environment=environment)
+    environment["LATTELENS_CONFIG"] = str((root.parent / "missing-latte-lens.jsonc").resolve())
+
+
+def create_directory_product_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "directory-config.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "directory config fixture", cwd=root, environment=environment)
+    config = (root.parent / "directory-latte-lens.jsonc").resolve()
+    config.mkdir()
+    environment["LATTELENS_CONFIG"] = str(config)
+
+
+def create_disabled_product_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "disabled-config.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "disabled config fixture", cwd=root, environment=environment)
+    config = (root.parent / "disabled-latte-lens.jsonc").resolve()
+    config.write_text(
+        '/* Explicit product policy. */\n{"code_navigation":{"enabled":false}}\n',
+        encoding="utf-8",
+    )
+    environment["LATTELENS_CONFIG"] = str(config)
+
+
 def create_code_navigation_without_lsp_fixture(
     root: Path, environment: dict[str, str]
 ) -> None:

@@ -19,11 +19,14 @@ from .fixtures import (
     create_code_navigation_without_lsp_fixture,
     create_crashing_lsp_fixture,
     create_descendant_lsp_fixture,
+    create_directory_product_config_fixture,
+    create_disabled_product_config_fixture,
     create_fold_mouse_navigation_fixture,
     create_git_matrix_fixture,
     create_incompatible_lsp_fixture,
     create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
+    create_missing_product_config_fixture,
     create_navigation_fixture,
     create_repository_relation_fixture,
     create_resilience_lsp_fixture,
@@ -1717,6 +1720,37 @@ def invalid_product_config(context: ScenarioContext) -> None:
     )
 
 
+def missing_product_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("missing-config.rs", "Configuration:", "explicit Latte Lens config does not exist"),
+        "missing explicit config is surfaced without blocking startup",
+    )
+
+
+def directory_product_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("directory-config.rs", "Configuration:", "not a regular file"),
+        "directory config is rejected and surfaced without blocking startup",
+    )
+
+
+def disabled_product_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("disabled-config.rs", "caller!"),
+        "explicitly disabled navigation starts without a configuration warning",
+        absent=("Configuration:",),
+    )
+    session.key(b"l")
+    session.key(b"\x04")
+    session.wait_screen(
+        ("Code navigation is unavailable for Rust: no language server was found.", "caller!"),
+        "explicitly disabled navigation remains unavailable without affecting the Preview",
+    )
+
+
 def code_navigation_without_lsp(context: ScenarioContext) -> None:
     session = context.session
     session.wait_raw((b"?1000h",), "no-LSP terminal enables mouse capture")
@@ -1836,6 +1870,24 @@ CASES = (
         "code-navigation",
         create_invalid_product_config_fixture,
         invalid_product_config,
+    ),
+    ScenarioCase(
+        "missing-product-config",
+        "code-navigation",
+        create_missing_product_config_fixture,
+        missing_product_config,
+    ),
+    ScenarioCase(
+        "directory-product-config",
+        "code-navigation",
+        create_directory_product_config_fixture,
+        directory_product_config,
+    ),
+    ScenarioCase(
+        "disabled-product-config",
+        "code-navigation",
+        create_disabled_product_config_fixture,
+        disabled_product_config,
     ),
 )
 
