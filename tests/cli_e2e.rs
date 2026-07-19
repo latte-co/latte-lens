@@ -116,10 +116,11 @@ fn hooks_setup_and_restore_update_user_configs_transactionally() {
         .lines()
         .find_map(|line| line.strip_prefix("hook setup transaction: "))
         .expect("transaction id");
+    let codex_config = fs::read_to_string(codex.join("hooks.json")).expect("codex config");
+    assert!(codex_config.contains(CODEX_HOOK_OBSERVER_ID));
     assert!(
-        fs::read_to_string(codex.join("hooks.json"))
-            .expect("codex config")
-            .contains(CODEX_HOOK_OBSERVER_ID)
+        codex_config.contains("--workspace ."),
+        "Codex hooks must explicitly route the session working directory"
     );
     assert!(
         fs::read_to_string(claude.join("settings.json"))

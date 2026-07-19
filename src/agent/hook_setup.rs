@@ -536,7 +536,12 @@ where
 fn install_codex_hooks(root: &mut Value, binary: &Path) -> Result<()> {
     let hooks = hooks_object(root, HookSetupAgent::Codex)?;
     for event in CODEX_EVENTS {
-        let command = hook_command(binary, CODEX_HOOK_OBSERVER_ID, event, None);
+        let command = hook_command(
+            binary,
+            CODEX_HOOK_OBSERVER_ID,
+            event,
+            Some(("--workspace", ".")),
+        );
         let mut group = Map::new();
         if *event == "SessionStart" {
             group.insert(
@@ -1252,6 +1257,11 @@ mod tests {
         let codex = fs::read_to_string(options.codex_dir.join("hooks.json")).expect("codex");
         assert!(codex.contains("other"));
         assert!(codex.contains(CODEX_HOOK_OBSERVER_ID));
+        assert_eq!(
+            codex.matches("--workspace .").count(),
+            CODEX_EVENTS.len(),
+            "every Codex hook must explicitly bind the session working directory"
+        );
         let claude = fs::read_to_string(options.claude_dir.join("settings.json")).expect("claude");
         assert!(claude.contains("\"theme\": \"dark\""));
         assert!(claude.contains(CLAUDE_HOOK_OBSERVER_ID));

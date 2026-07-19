@@ -14,6 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use latte_lens::agent::{
+    FilesystemMetadataStore, MetadataLoadLimits, SessionMetadataStore,
+    load_or_create_install_identity, resolve_workspace,
+};
+
 /// Local-only compatibility canary for an installed Codex CLI.
 ///
 /// It is ignored in normal test/CI runs because the Codex binary is an external
@@ -34,7 +39,7 @@ fn installed_codex_session_start_invokes_the_production_latte_lens_hook() {
     fs::create_dir_all(&home).expect("home");
 
     let hook_command = format!(
-        "{} hook --observer openai/codex-hook --event SessionStart --observer-version compatibility-canary",
+        "{} hook --observer openai/codex-hook --event SessionStart --workspace . --observer-version compatibility-canary",
         shell_quote(binary)
     );
     let hooks = format!(
@@ -78,6 +83,7 @@ fn installed_codex_session_start_invokes_the_production_latte_lens_hook() {
         .args(["--dangerously-bypass-hook-trust", "-C"])
         .arg(&workspace)
         .args(["exec", "compatibility canary; do not call tools"])
+        .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -118,6 +124,24 @@ fn installed_codex_session_start_invokes_the_production_latte_lens_hook() {
         invoked,
         "installed Codex did not invoke the SessionStart hook from the isolated CODEX_HOME; status={:?}; stderr={stderr}",
         status.code(),
+    );
+    let identity = load_or_create_install_identity(state.clone()).expect("Lens install identity");
+    let resolved = resolve_workspace(&workspace, &identity).expect("Codex -C workspace");
+    let store =
+        FilesystemMetadataStore::new(state, identity.install_id().clone()).expect("metadata store");
+    let snapshot = store
+        .load_workspace(resolved.selector(), MetadataLoadLimits::default())
+        .expect("workspace metadata");
+    assert!(
+        !snapshot.sessions.is_empty(),
+        "Codex SessionStart metadata was not routed to the -C workspace"
+    );
+    assert!(
+        snapshot
+            .sessions
+            .iter()
+            .all(|session| session.session.workspace() == resolved.primary()),
+        "Codex hook metadata did not preserve the exact -C workspace identity"
     );
 }
 
