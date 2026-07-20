@@ -18,24 +18,38 @@ Provider 必须遵守以下规则：
    `request.absolute_path`。
 
 Registry 按注册顺序的逆序查询 Provider。专用 Provider 应注册在内置实现之后，
-以便优先处理对应格式。Registry 使用不跟随链接的 metadata 检查选中工作区下的每个
-路径组件。最终组件是符号链接时，Registry 直接以 `symlink` provider id 返回有界的
-target 路径文本，不打开 target，也不把链接交给 Provider；中间路径符号链接仍被拒绝。
-FIFO、socket、device、目录和 Windows reparse point 同样不会交给 Provider。
+以便优先处理对应格式。
 
-`PreviewRequest::open_regular` 会重复上述检查，以 no-follow 语义打开最终组件，
-验证句柄仍指向同一个普通文件，并在返回可读、可 seek 的 `PreviewFile` 前检查其
-canonical 位置。在 Unix 上还会使用非阻塞打开，避免竞争产生的 FIFO 卡住 worker；
-在 Windows 上打开 reparse point 本身而不是其目标。
+Registry 有两种符号链接策略，由请求上的 `following_symlinks` 决定：
+
+- **交互式 All Files（`following_symlinks(true)`）**：把工作区当作文件系统视图，
+  跟随符号链接。最终组件是文件软链（或经由目录软链到达的普通文件，例如
+  `linked-repo/src/main.rs`）时，Registry 解析到 target 后按普通文件走 Provider
+  分发；最终组件是目录软链或特殊文件时仍拒绝，交由调用方展开或提示。目录软链
+  在文件树里是可展开目录，但初始扫描不会自动递归它（避免环），仅在展开时懒加载。
+- **仓库/依赖等其他读取（默认 no-follow）**：Registry 使用不跟随链接的 metadata
+  检查选中工作区下的每个路径组件。最终组件是符号链接时，直接以 `symlink`
+  provider id 返回有界的 target 路径文本，不打开 target，也不把链接交给 Provider；
+  中间路径符号链接仍被拒绝。Git Changes 因此把被追踪的软链渲染为其 target 路径，
+  永远不读取 target 的字节。
+
+两种策略下，FIFO、socket、device、目录（在 no-follow 分支）和 Windows reparse
+point 都不会交给 Provider。
+
+`PreviewRequest::open_regular` 会重复上述检查后打开文件：no-follow 请求以 no-follow
+语义打开最终组件；following 请求先把最终软链 canonical 化到其 target（该 target 已
+不含链接，`O_NOFOLLOW` 仍成立），再交给同一道闸门。两条路径都验证句柄仍指向普通
+文件、检查 canonical 位置、在 Unix 上使用非阻塞打开避免 FIFO 卡住 worker，并在
+Windows 上打开 reparse point 本身而不是其目标。
 
 这里有一个有意保留的兼容性边界：可选的第三方 Provider 可能忽略
-`open_regular()`，并把 `absolute_path` 交给会重新打开路径的库。符号链接和特殊文件
-仍不会被 dispatch，但 Latte Lens 无法消除该 Provider 后续从 dispatch 到 open 之间的
-竞争，也无法取消任意阻塞代码。安全要求严格的 Provider 必须直接消费
-`PreviewFile`，或者为其子进程、第三方库提供等价的 no-follow 和有界 I/O 契约。
-在 Unix、Windows 以外的平台，标准库回退实现会执行不跟随链接的 metadata 与
-canonical 边界检查，但无法让最终打开具备原子的 no-follow 语义，也无法验证可移植的
-文件 identity。Latte Lens 的发布 CI 和安装包当前覆盖 Linux、macOS 与 Windows。
+`open_regular()`，并把 `absolute_path` 交给会重新打开路径的库。特殊文件仍不会被
+dispatch，但 Latte Lens 无法消除该 Provider 后续从 dispatch 到 open 之间的竞争，也
+无法取消任意阻塞代码。安全要求严格的 Provider 必须直接消费 `PreviewFile`，或者为其
+子进程、第三方库提供等价的有界 I/O 契约。在 Unix、Windows 以外的平台，标准库回退
+实现会执行 metadata 与 canonical 边界检查，但无法让最终打开具备原子的 no-follow
+语义，也无法验证可移植的文件 identity。Latte Lens 的发布 CI 和安装包当前覆盖
+Linux、macOS 与 Windows。
 
 ## 最小实现
 

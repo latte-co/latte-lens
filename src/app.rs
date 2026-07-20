@@ -1201,6 +1201,21 @@ impl App {
         }
     }
 
+    /// Canonical real path of the selected All Files symbolic link, if any.
+    ///
+    /// Returned for the content header so a followed link shows exactly where
+    /// it points on disk. Only the interactive All Files view resolves links,
+    /// so Git Changes and dependency previews never surface a resolved path.
+    pub fn selected_symlink_real_path(&self) -> Option<PathBuf> {
+        if self.tree_scope != TreeScope::AllFiles {
+            return None;
+        }
+        let entry = self.selected_entry()?;
+        entry.symlink_target.as_ref()?;
+        let absolute = self.root.join(&entry.relative);
+        Some(absolute.canonicalize().unwrap_or(absolute))
+    }
+
     pub fn selected_content_title(&self) -> &'static str {
         if self
             .content_identity
@@ -4742,6 +4757,18 @@ impl App {
             return;
         };
         let relative = entry.relative.clone();
+        // When the selected entry is a symbolic link, surface where it points.
+        // Directory links reach this info pane (they never enter Preview mode),
+        // so this is the only place their real target is shown.
+        let symlink_lines = entry.symlink_target.as_ref().map(|target| {
+            let absolute = self.root.join(&entry.relative);
+            let real = absolute.canonicalize().unwrap_or(absolute);
+            vec![
+                format!("⇢ symlink → {}", target.display()),
+                format!("↗ resolves to {}", real.display()),
+                String::new(),
+            ]
+        });
         let expanded = self.directory_is_expanded(entry);
         let count = self
             .entries_for_scope(self.tree_scope)
@@ -4764,7 +4791,11 @@ impl App {
         } else {
             "Collapsed · Enter or click to expand."
         };
-        self.set_info(vec![summary, String::new(), action.to_owned()]);
+        let mut info = symlink_lines.unwrap_or_default();
+        info.push(summary);
+        info.push(String::new());
+        info.push(action.to_owned());
+        self.set_info(info);
     }
 
     fn load_selected_diff(&mut self) {
@@ -6625,6 +6656,7 @@ fn append_change_rows(
                 status: Some(change.status),
                 contains_changes: true,
                 exists: projection.existing_changes.contains(&change.path),
+                symlink_target: None,
             };
             rows.push(GitTreeRow {
                 identity: GitRowIdentity::Change(change.path.clone()),
@@ -6652,6 +6684,7 @@ fn append_change_rows(
                 status: None,
                 contains_changes: true,
                 exists: true,
+                symlink_target: None,
             };
             rows.push(GitTreeRow {
                 identity,

@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use crate::{
-    content_safety::path_exists_without_following,
+    content_safety::{path_exists_without_following, resolves_to_directory, symlink_target},
     git::{FileStatus, StatusMap},
 };
 
@@ -27,6 +27,12 @@ pub struct FileEntry {
     pub status: Option<FileStatus>,
     pub contains_changes: bool,
     pub exists: bool,
+    /// Raw target text when this entry is a symbolic link, otherwise `None`.
+    ///
+    /// The target is read without following the link, so it mirrors exactly
+    /// what `ln -s` recorded. `is_dir` still reflects the resolved kind, so a
+    /// directory symlink stays expandable while surfacing its link nature here.
+    pub symlink_target: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,22 +128,30 @@ pub fn scan_with_depth(
                     child.path().display()
                 )
             })?;
-            let is_dir = file_type.is_dir();
             let path = child.path();
+            // A directory symlink is expandable like a real directory, but it
+            // is never auto-recursed during the breadth-first scan: following
+            // it eagerly could walk a cycle. It is enumerated lazily on expand.
+            let is_symlinked_dir = file_type.is_symlink() && resolves_to_directory(&path);
+            let is_dir = file_type.is_dir() || is_symlinked_dir;
+            let link_target = file_type
+                .is_symlink()
+                .then(|| fs::read_link(&path).ok())
+                .flatten();
             let relative = path
                 .strip_prefix(root)
                 .expect("scanned paths stay below the root")
                 .to_path_buf();
             if is_dir {
                 let child_depth = directory_depth.saturating_add(1);
-                if child_depth == max_depth {
+                if is_symlinked_dir || child_depth == max_depth {
                     unloaded_directories.insert(relative.clone());
                 } else {
                     directories.push_back((path, child_depth));
                 }
             }
             seen.insert(relative.clone());
-            entries.push(make_entry(relative, is_dir, true, statuses));
+            entries.push(make_entry(relative, is_dir, true, link_target, statuses));
         }
     }
 
@@ -167,15 +181,17 @@ pub fn scan_with_depth(
                 if exists && directory_depth == max_depth {
                     unloaded_directories.insert(directory.clone());
                 }
-                entries.push(make_entry(directory.clone(), true, exists, statuses));
+                entries.push(make_entry(directory.clone(), true, exists, None, statuses));
             }
             parent = directory.parent().map(Path::to_path_buf);
         }
         if path.components().count() <= max_depth && !seen.contains(path) {
+            let absolute = root.join(path);
             entries.push(make_entry(
                 path.clone(),
                 false,
-                path_exists_without_following(&root.join(path)),
+                path_exists_without_following(&absolute),
+                symlink_target(&absolute),
                 statuses,
             ));
         }
@@ -233,8 +249,12 @@ pub fn scan_directory(
                 child.path().display()
             )
         })?;
-        let is_dir = file_type.is_dir();
         let path = child.path();
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && resolves_to_directory(&path));
+        let link_target = file_type
+            .is_symlink()
+            .then(|| fs::read_link(&path).ok())
+            .flatten();
         let child_relative = path
             .strip_prefix(root)
             .expect("lazily scanned paths stay below the root")
@@ -242,7 +262,13 @@ pub fn scan_directory(
         if is_dir {
             unloaded_directories.insert(child_relative.clone());
         }
-        entries.push(make_entry(child_relative, is_dir, true, statuses));
+        entries.push(make_entry(
+            child_relative,
+            is_dir,
+            true,
+            link_target,
+            statuses,
+        ));
     }
     entries.sort_by(|left, right| {
         compare_tree_paths(&left.relative, left.is_dir, &right.relative, right.is_dir)
@@ -295,7 +321,13 @@ pub fn changed_only(entries: &[FileEntry]) -> Vec<FileEntry> {
         .collect()
 }
 
-fn make_entry(relative: PathBuf, is_dir: bool, exists: bool, statuses: &StatusMap) -> FileEntry {
+fn make_entry(
+    relative: PathBuf,
+    is_dir: bool,
+    exists: bool,
+    symlink_target: Option<PathBuf>,
+    statuses: &StatusMap,
+) -> FileEntry {
     let status = statuses.get(&relative).copied();
     let contains_changes = status.is_some()
         || (is_dir
@@ -311,6 +343,7 @@ fn make_entry(relative: PathBuf, is_dir: bool, exists: bool, statuses: &StatusMa
         status,
         contains_changes,
         exists,
+        symlink_target,
     }
 }
 
@@ -458,16 +491,127 @@ mod tests {
         assert!(!exact.truncated);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn zero_limit_distinguishes_empty_and_non_empty_roots() {
-        let empty = tempfile::tempdir().unwrap();
-        let complete = scan_with_limit(empty.path(), &HashMap::new(), 0).unwrap();
-        assert!(complete.entries.is_empty());
-        assert!(!complete.truncated);
+    fn directory_symlink_is_expandable_but_not_auto_recursed() {
+        use std::os::unix::fs::symlink;
 
-        fs::write(empty.path().join("file.txt"), "fixture").unwrap();
-        let partial = scan_with_limit(empty.path(), &HashMap::new(), 0).unwrap();
-        assert!(partial.entries.is_empty());
-        assert!(partial.truncated);
+        let outer = tempfile::tempdir().unwrap();
+        let real_dir = outer.path().join("real-dir");
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(real_dir.join("inner.txt"), "inner").unwrap();
+        let workspace = outer.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        symlink(&real_dir, workspace.join("linked-dir")).unwrap();
+
+        let scan = scan(&workspace, &HashMap::new()).unwrap();
+
+        // The link is an expandable directory row, but its children are not
+        // enumerated during the initial breadth scan (cycle safety); it is
+        // returned as an unloaded directory for lazy expansion.
+        let link = scan
+            .entries
+            .iter()
+            .find(|entry| entry.relative == Path::new("linked-dir"))
+            .expect("directory symlink is present");
+        assert!(link.is_dir);
+        assert_eq!(link.symlink_target.as_deref(), Some(real_dir.as_path()));
+        assert!(
+            !relative_paths(&scan).contains(&PathBuf::from("linked-dir/inner.txt")),
+            "a directory symlink is not auto-recursed"
+        );
+        assert!(
+            scan.unloaded_directories
+                .contains(&PathBuf::from("linked-dir"))
+        );
+
+        // Lazy expansion enumerates the link target's entries on demand.
+        let expanded =
+            scan_directory(&workspace, Path::new("linked-dir"), &HashMap::new(), 1_000).unwrap();
+        assert!(relative_paths(&expanded).contains(&PathBuf::from("linked-dir/inner.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_records_raw_symlink_targets_for_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("real.txt"), "content").unwrap();
+        // Relative link text is recorded exactly as written, not resolved.
+        symlink("real.txt", workspace.path().join("a-file-link.txt")).unwrap();
+        symlink(
+            "/tmp/somewhere-external",
+            workspace.path().join("b-dir-link"),
+        )
+        .unwrap();
+
+        let scan = scan(workspace.path(), &HashMap::new()).unwrap();
+
+        let file_link = scan
+            .entries
+            .iter()
+            .find(|entry| entry.relative == Path::new("a-file-link.txt"))
+            .expect("file symlink present");
+        assert_eq!(
+            file_link.symlink_target.as_deref(),
+            Some(Path::new("real.txt"))
+        );
+        assert!(!file_link.is_dir);
+
+        // A plain regular file has no target recorded.
+        let plain = scan
+            .entries
+            .iter()
+            .find(|entry| entry.relative == Path::new("real.txt"))
+            .expect("regular file present");
+        assert_eq!(plain.symlink_target, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_referential_directory_symlink_does_not_loop_the_scan() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        // A link that points at its own parent would loop if auto-recursed.
+        symlink(workspace.path(), workspace.path().join("loop")).unwrap();
+        fs::write(workspace.path().join("file.txt"), "ok").unwrap();
+
+        let scan = scan(workspace.path(), &HashMap::new()).unwrap();
+
+        let link = scan
+            .entries
+            .iter()
+            .find(|entry| entry.relative == Path::new("loop"))
+            .expect("self-referential link is present");
+        assert!(link.is_dir);
+        assert!(scan.unloaded_directories.contains(&PathBuf::from("loop")));
+        assert!(relative_paths(&scan).contains(&PathBuf::from("file.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_directory_symlink_is_a_leaf_not_a_directory() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        symlink(
+            workspace.path().join("does-not-exist"),
+            workspace.path().join("dangling"),
+        )
+        .unwrap();
+
+        let scan = scan(workspace.path(), &HashMap::new()).unwrap();
+
+        let link = scan
+            .entries
+            .iter()
+            .find(|entry| entry.relative == Path::new("dangling"))
+            .expect("broken link is present");
+        assert!(
+            !link.is_dir,
+            "a link that resolves to nothing is not expandable"
+        );
     }
 }

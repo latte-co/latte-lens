@@ -309,11 +309,15 @@ src/ui.rs     Latte-styled Ratatui rendering
 
 Clean text and code files open in preview mode automatically. Changed files
 open in diff mode; press `p` to inspect their current source or `d` to return to
-the diff. Preview reads are capped by both bytes and lines. A final symbolic
-link is previewed as bounded target-path text without opening its target or
-dispatching a provider. Content previews never traverse symbolic links and
-decline FIFOs, sockets, devices, directories, and Windows reparse points before
-provider dispatch.
+the diff. Preview reads are capped by both bytes and lines. The All Files view
+is a filesystem view: it follows symbolic links, so a directory symlink expands
+like a directory and a file symlink previews its target's content. A symlink row
+is marked in the tree with `⇢ target` (the raw link text), and previewing a link
+shows its resolved real path in the content header (`↗`). Git Changes and other
+repository reads keep the strict policy, rendering a tracked symlink as its
+bounded target-path text without opening the target. Every read still declines
+FIFOs, sockets, devices, and Windows reparse points, and applies the same
+non-blocking, byte-and-line-bounded I/O to a link's target.
 
 Preview and diff text wrap to the current pane width. A logical source or diff
 line keeps one line-number entry; wrapped continuation rows leave the number

@@ -86,7 +86,7 @@ Q3 是当前 Files/Git Changes 的正式门禁。Q4 不是 Q3 的替代品：未
 | F-UT-002 | All Files 语义固定 | Q2 | dotfile、ignored、exclude `.git`、directory-first sorting |
 | F-UT-003 | shallow startup + lazy expand | Q2 | 两层启动、boundary directory、逐层异步加载、stale epoch |
 | F-UT-004 | selection/expansion 稳定 | Q2 | refresh、隐藏 selection fallback、新目录默认 |
-| F-UT-005 | content safety fail-closed | Q1/Q2 | final symlink target-text-only、intermediate symlink、reparse、FIFO、socket、device、missing/race |
+| F-UT-005 | content safety：All Files follow / 仓库 no-follow | Q1/Q2 | All Files 跟随文件软链与经目录软链的普通文件、拒绝目录/特殊/断链；仓库读取 final symlink target-text-only、intermediate symlink、reparse、FIFO、socket、device、missing/race |
 | F-UT-006 | preview 有界且可回退 | Q1/Q2 | bytes/lines、binary、invalid UTF-8、provider decline |
 | F-UT-007 | wrap/copy 保持原文 | Q1/Q2 | tabs、wide/combining grapheme、logical lines、highlight ranges |
 | F-UT-008 | search lazy/cancellable | Q1/Q2 | ignored toggle、regex、generation cancel、result cap、no eager inventory |
@@ -109,8 +109,11 @@ Q3 是当前 Files/Git Changes 的正式门禁。Q4 不是 Q3 的替代品：未
 | F-E2E-011 | graceful exit | mouse mode/alternate screen 恢复；PTY drain 完成 | covered |
 
 F-E2E-007 至 F-E2E-010 不要求一个超大场景完成。它们应使用独立 fixture/scenario，避免已有基础导航失败时掩盖搜索或安全问题。
-最终组件文件/目录软链另有 `symlink-preview-smoke` production-binary 场景：fixture 只在
-一次性测试沙箱中创建链接与 target，断言面板只显示 target 路径文本且不读取 target 内容。
+All Files 跟随软链另有 `symlink-preview-smoke` production-binary 场景：fixture 只在
+一次性测试沙箱中创建指向工作区外的文件软链与目录软链（目录 target 内含一个文件）。
+断言 All Files 跟随文件软链、显示 target 文件内容；展开目录软链后能预览其中文件的
+真实内容。Git Changes 对软链保持 no-follow 由 `git_changes_preview_does_not_follow_a_changed_symlink`
+集成测试覆盖。
 
 ## 5. Git Changes 测试卡点
 

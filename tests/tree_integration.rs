@@ -248,6 +248,7 @@ fn file_entry_name_uses_the_final_path_component() {
         status: None,
         contains_changes: false,
         exists: true,
+        symlink_target: None,
     };
     assert_eq!(entry.name(), "latte.rs");
 }

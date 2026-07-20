@@ -10,9 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 
 use crate::{
-    content_safety::{
-        ContentPathKind, ensure_beneath, inspect_content_path, path_exists_without_following,
-    },
+    content_safety::{ensure_beneath, path_exists_without_following, resolves_to_directory},
     folding::{FoldRegion, FoldSource, StructureSnapshot, structure_snapshot},
     git::StatusMap,
     navigation::{LineIndex, NavigationSource, language_for_path},
@@ -637,8 +635,10 @@ fn execute_directory(
     request: DirectoryRequest,
 ) -> Result<ScanResult> {
     let absolute = root.join(&request.relative);
-    let inspected = inspect_content_path(Some(root), &absolute)?;
-    if inspected.kind != ContentPathKind::Directory || inspected.path != absolute {
+    // All Files follows symlinks, so a directory symlink (or a directory
+    // reached through one) is a valid, expandable target. `scan_directory`
+    // still rejects any relative path that escapes the scan root textually.
+    if !resolves_to_directory(&absolute) {
         anyhow::bail!("{} is not a readable directory", request.relative.display());
     }
     tree::scan_directory(root, &request.relative, statuses, request.scan_entry_limit)
@@ -686,6 +686,11 @@ fn execute_content(
             })
         }
         ContentKind::Preview => {
+            // Only the interactive All Files view (a Workspace target) follows a
+            // final symbolic link to preview its target content. Repository and
+            // dependency previews keep the strict no-follow policy so a tracked
+            // link renders as its target path, never its target's bytes.
+            let follow_symlinks = matches!(request.target, ContentTarget::Workspace(_));
             let (absolute, display_path, content_root, identity, navigation_server_root) =
                 match request.target {
                     ContentTarget::Workspace(relative) => {
@@ -742,6 +747,7 @@ fn execute_content(
                 };
             let preview_request = PreviewRequest::new(&absolute, &display_path)
                 .within_root(&content_root)
+                .following_symlinks(follow_symlinks)
                 .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES);
             let (preview, fold_source) = match registry.resolve(&preview_request)? {
                 PreviewResolution::Preview {

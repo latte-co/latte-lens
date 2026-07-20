@@ -299,20 +299,26 @@ def files_refresh(context: ScenarioContext) -> None:
 def symlink_preview_smoke(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
-    session.wait_screen(
-        (
-            "a-directory-link",
-            "Preview",
-            "../linked-repositories/sample-framework",
-        ),
-        "production binary previews a sandboxed directory symlink target",
-        absent=("Preview unavailable", "target-content-must-not-be-read"),
-    )
+    # All Files follows a file symlink and previews the target file's content.
     _click_tree_row(session, "b-file-link.txt")
     session.wait_screen(
-        ("b-file-link.txt", "Preview", "../linked-files/sample.txt"),
-        "production binary previews a sandboxed file symlink target",
-        absent=("Preview unavailable", "file-target-content-must-not-be-read"),
+        ("b-file-link.txt", "Preview", "linked-file-target-content"),
+        "production binary follows a sandboxed file symlink and previews its target content",
+        absent=("Preview unavailable",),
+    )
+    # A directory symlink is expandable; opening it reveals the file inside the
+    # target directory, which then previews normally.
+    _click_disclosure(session, "a-directory-link")
+    session.wait_screen(
+        ("a-directory-link", "inside.txt"),
+        "production binary expands a sandboxed directory symlink",
+        absent=("Preview unavailable",),
+    )
+    _click_tree_row(session, "inside.txt")
+    session.wait_screen(
+        ("inside.txt", "Preview", "linked-directory-inner-content"),
+        "production binary previews a file reached through a directory symlink",
+        absent=("Preview unavailable",),
     )
 
 

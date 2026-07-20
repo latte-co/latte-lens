@@ -1351,27 +1351,40 @@ fn tree_line(
         Style::default().fg(ROSE)
     };
 
+    // A symbolic link shows a muted "⇢ target" suffix after its name so the
+    // link's real destination is visible without opening it. The target uses
+    // the raw link text (what `ln -s` recorded), truncated with the row width.
+    let mut content = vec![Span::styled(label, label_style)];
+    if let Some(target) = entry.symlink_target.as_ref() {
+        content.push(Span::styled(
+            format!("  ⇢ {}", target.display()),
+            Style::default().fg(MUTED),
+        ));
+    }
+
     if let Some(status) = entry.status {
-        tree_row_with_hint(
+        tree_row_with_styled_hint(
             spans,
-            label,
-            label_style,
+            content,
             compact_tree_status_label(status),
             Style::default().fg(status_color(status)),
             width,
         )
     } else if entry.is_dir && entry.contains_changes {
-        tree_row_with_hint(
+        tree_row_with_styled_hint(
             spans,
-            label,
-            label_style,
+            content,
             "•".to_owned(),
             Style::default().fg(TREE_CHANGE_HINT),
             width,
         )
+    } else if entry.symlink_target.is_some() {
+        // Reuse the width-aware layout so a long target truncates cleanly even
+        // without a trailing status hint.
+        tree_row_with_styled_spans_hint(spans, content, Vec::new(), width)
     } else {
         let mut spans = spans;
-        spans.push(Span::styled(label, label_style));
+        spans.extend(content);
         Line::from(spans)
     }
 }
@@ -1384,6 +1397,7 @@ fn compact_tree_status_label(status: FileStatus) -> String {
 
 /// Keeps Git state in a quiet, fixed column instead of attaching it to names.
 /// The trailing cell leaves visual space before the Tree/content divider.
+#[cfg(test)]
 fn tree_row_with_hint(
     leading: Vec<Span<'static>>,
     label: String,
@@ -1501,6 +1515,11 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             && let Some(provider) = app.content_provider.as_deref()
         {
             detail.push_str(&format!(" · {provider}"));
+        }
+        if app.content_mode == ContentMode::Preview
+            && let Some(real_path) = app.selected_symlink_real_path()
+        {
+            detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
         }
         if app.is_content_loading() {
             detail.push_str(" · LOADING");
