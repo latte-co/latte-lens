@@ -1238,8 +1238,10 @@ impl App {
             // Real path for All Files symlinks (canonicalize follows the link).
             Some(absolute.canonicalize().unwrap_or(absolute))
         } else {
-            // Absolute path; Git Changes entries never resolve a symlink target.
-            Some(absolute.canonicalize().unwrap_or(absolute))
+            // Absolute path; Git Changes entries never resolve a symlink target,
+            // and ordinary files/directories already have a truthful absolute
+            // path, so there is nothing to canonicalize.
+            Some(absolute)
         }
     }
 
@@ -1618,7 +1620,7 @@ impl App {
             (KeyCode::Char('y'), KeyModifiers::NONE) => {
                 self.queue_selected_path_copy(false);
             }
-            (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+            (KeyCode::Char('Y'), _) => {
                 self.queue_selected_path_copy(true);
             }
             _ => match self.focused_pane {
@@ -3205,14 +3207,12 @@ impl App {
         // not overwrite the path status set below.
         self.pending_clipboard_text = None;
         let Some(path) = self.selected_copy_path(resolve) else {
-            self.clipboard_status =
-                Some("Select a file or directory to copy its path".to_owned());
+            self.clipboard_status = Some("Select a file or directory to copy its path".to_owned());
             return;
         };
-        let is_dir = self.selected_entry().is_some_and(|entry| entry.is_dir);
-        let is_symlink = self
-            .selected_entry()
-            .is_some_and(|entry| entry.symlink_target.is_some());
+        let entry = self.selected_entry();
+        let is_dir = entry.is_some_and(|entry| entry.is_dir);
+        let is_symlink = entry.is_some_and(|entry| entry.symlink_target.is_some());
         let mut text = path.display().to_string();
         if is_dir && !text.ends_with('/') {
             text.push('/');
@@ -9055,6 +9055,260 @@ mod tests {
         assert_eq!(app.content_identity.as_ref(), Some(&target));
         assert_eq!(app.navigation_back.len(), 1);
         assert!(app.navigation_forward.is_empty());
+    }
+
+    #[test]
+    fn copy_path_relative_returns_workspace_relative_path() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        let path = app
+            .selected_copy_path(false)
+            .expect("selected_copy_path returns Some for a file");
+        assert_eq!(path, PathBuf::from("helper.rs"));
+    }
+
+    #[test]
+    fn copy_path_relative_for_directory_has_no_trailing_slash() {
+        let directory = tempfile::tempdir().unwrap();
+        let src = directory.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("lib.rs"), "// lib\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Select the directory entry (first entry should be "src").
+        let dir_path = app
+            .all_entries
+            .iter()
+            .find(|e| e.relative == Path::new("src"))
+            .map(|e| e.relative.clone())
+            .expect("src directory is present");
+        assert_eq!(dir_path, PathBuf::from("src"));
+
+        let path = app
+            .selected_copy_path(false)
+            .expect("selected_copy_path returns Some");
+        // The method does not append a slash; the caller adds it.
+        assert_eq!(path, PathBuf::from("src"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_path_resolve_returns_real_path_for_all_files_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real-target.txt");
+        fs::write(&target, "real content\n").unwrap();
+        symlink(&target, workspace.join("a-link.txt")).unwrap();
+
+        let mut app = App::new(workspace.clone()).unwrap();
+        app.wait_for_background();
+        assert_eq!(app.tree_scope, TreeScope::AllFiles);
+
+        let resolved = app
+            .selected_copy_path(true)
+            .expect("selected_copy_path(true) returns Some");
+        // The resolved real path should point to the target, not the link.
+        assert_eq!(resolved, target.canonicalize().unwrap_or(target.clone()));
+        assert_ne!(resolved, workspace.join("a-link.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_path_resolve_git_changes_scope_returns_none_without_git_repo() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real-target.txt");
+        fs::write(&target, "real content\n").unwrap();
+        symlink(&target, workspace.join("a-link.txt")).unwrap();
+
+        let mut app = App::new(workspace.clone()).unwrap();
+        app.wait_for_background();
+        // Switch to Git Changes scope: without a git repo there are no rows,
+        // so selected_entry() yields None and selected_copy_path() returns None.
+        app.tree_scope = TreeScope::GitChanges;
+        assert!(app.selected_copy_path(true).is_none());
+    }
+
+    #[test]
+    fn copy_path_resolve_regular_file_returns_absolute_path() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        let path = app
+            .selected_copy_path(true)
+            .expect("selected_copy_path returns Some");
+        // App::new canonicalizes the root, so the resolved path uses the
+        // canonical root. It does NOT additionally canonicalize the entry.
+        let expected = directory
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| directory.path().to_path_buf())
+            .join("plain.txt");
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn queue_selected_path_copy_sets_status_for_relative_file() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        app.queue_selected_path_copy(false);
+
+        // Either the clipboard succeeded (status set) or failed (last_error set).
+        // The path must appear in the status message on success.
+        if let Some(status) = &app.clipboard_status {
+            assert!(status.contains("Copied path"), "status: {status}");
+            assert!(status.contains("helper.rs"), "status: {status}");
+        } else {
+            // Clipboard unavailable in test env: last_error should be set.
+            assert!(app.last_error.is_some());
+        }
+    }
+
+    #[test]
+    fn queue_selected_path_copy_directory_gets_trailing_slash() {
+        let directory = tempfile::tempdir().unwrap();
+        let src = directory.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("lib.rs"), "// lib\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Select the "src" directory.
+        let idx = app
+            .all_entries
+            .iter()
+            .position(|e| e.relative == Path::new("src"))
+            .expect("src directory exists");
+        app.tree_state.select(Some(idx));
+        app.queue_selected_path_copy(false);
+
+        if let Some(status) = &app.clipboard_status {
+            assert!(
+                status.ends_with("src/"),
+                "directory path should end with slash: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_selected_path_copy_no_selection_shows_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Clear the selection to simulate no entry selected.
+        app.tree_state.select(None);
+        app.queue_selected_path_copy(false);
+
+        assert_eq!(
+            app.clipboard_status.as_deref(),
+            Some("Select a file or directory to copy its path")
+        );
+    }
+
+    #[test]
+    fn queue_selected_path_copy_sets_status_for_absolute_file() {
+        // Force OSC52 so the copy always succeeds (writes to stdout) regardless
+        // of whether a native clipboard command is available in the test env.
+        // SAFETY: see the env helper in the integration tests; osc52 is benign.
+        unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        app.queue_selected_path_copy(true);
+
+        // App::new canonicalizes the root, so use app.root for the expected path.
+        let expected = app.root.join("helper.rs").display().to_string();
+        let status = app
+            .clipboard_status
+            .as_deref()
+            .expect("clipboard_status is set on successful copy");
+        assert_eq!(status, format!("Copied absolute path: {expected}"));
+    }
+
+    #[test]
+    fn queue_selected_path_copy_clears_pending_clipboard_text() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Simulate a stale content-selection copy pending flush.
+        app.pending_clipboard_text = Some("stale selection text".to_owned());
+        app.queue_selected_path_copy(false);
+
+        // The path copy always clears the pending content-selection copy.
+        assert!(
+            app.pending_clipboard_text.is_none(),
+            "pending_clipboard_text must be cleared after a path copy"
+        );
+    }
+
+    #[test]
+    fn queue_selected_path_copy_clears_last_error_on_success() {
+        // SAFETY: osc52 makes the copy deterministic (always succeeds).
+        unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Simulate a stale copy error from a previous attempt.
+        app.last_error = Some("copy failed: stale clipboard error".to_owned());
+        app.queue_selected_path_copy(false);
+
+        // A successful copy clears a prior "copy failed:" error.
+        assert!(
+            app.last_error.is_none(),
+            "last_error should be cleared after a successful copy"
+        );
+        assert!(
+            app.clipboard_status.is_some(),
+            "clipboard_status should be set on success"
+        );
+    }
+
+    #[test]
+    fn queue_selected_path_copy_preserves_non_copy_error() {
+        // SAFETY: osc52 makes the copy deterministic (always succeeds).
+        unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // A non-copy error (not starting with "copy failed:") must be preserved.
+        app.last_error = Some("scan failed: permission denied".to_owned());
+        app.queue_selected_path_copy(false);
+
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("scan failed: permission denied"),
+            "non-copy errors must not be cleared by a successful path copy"
+        );
     }
 
     fn drag_content(

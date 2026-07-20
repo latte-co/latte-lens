@@ -1728,10 +1728,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let help = if area.width < 96 && app.content_mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
         )
     } else if area.width < 96 {
-        format!("  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y copy path Y real/abs  q×2 quit")
+        format!(
+            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y path Y real  q×2 quit"
+        )
     } else if app.content_mode == ContentMode::Preview {
         format!(
             "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
