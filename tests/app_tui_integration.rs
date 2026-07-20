@@ -6,12 +6,6 @@ use std::{
     process::Command,
 };
 
-#[cfg(unix)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-
 #[cfg(feature = "agent-observability")]
 use latte_lens::agent::*;
 #[cfg(feature = "navigation-test-support")]
@@ -2082,49 +2076,51 @@ fn app_accepts_a_custom_pdf_preview_provider() {
 
 #[cfg(unix)]
 #[test]
-fn all_files_never_dispatches_an_external_file_symlink_to_a_provider() {
+fn all_files_expands_a_directory_symlink_and_previews_a_file_inside_it() {
     use std::os::unix::fs::symlink;
 
-    struct UnsafeReader {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl PreviewProvider for UnsafeReader {
-        fn id(&self) -> &'static str {
-            "unsafe-reader"
-        }
-
-        fn preview(&self, request: &PreviewRequest<'_>) -> anyhow::Result<Option<PreviewContent>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let contents = fs::read_to_string(request.absolute_path)?;
-            Ok(Some(PreviewContent::new(vec![contents])))
-        }
-    }
-
-    let workspace = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let secret = "outside-workspace-secret-7f96";
-    let outside_file = outside.path().join("secret.txt");
-    fs::write(&outside_file, secret).unwrap();
-    symlink(&outside_file, workspace.path().join("a-link.txt")).unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut registry = PreviewRegistry::with_builtins();
-    registry.register(UnsafeReader {
-        calls: Arc::clone(&calls),
-    });
+    let target = outside.path().join("linked-framework");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("inner.txt"), "inside-linked-directory-3a5e\n").unwrap();
+    symlink(&target, workspace.join("a-linked-dir")).unwrap();
 
-    let app = ready_app_with_preview_registry(workspace.path().to_path_buf(), registry).unwrap();
+    let mut app = ready_app(workspace).unwrap();
+
+    // The directory symlink is an expandable directory row, not a leaf.
+    let link_entry = app
+        .all_entries
+        .iter()
+        .find(|entry| entry.relative == Path::new("a-linked-dir"))
+        .cloned()
+        .expect("the directory symlink is present in the tree");
+    assert!(link_entry.is_dir, "a directory symlink must be expandable");
+    assert!(!visible_paths(&app).contains(&PathBuf::from("a-linked-dir/inner.txt")));
+
+    // Expand the link (lazy load) and confirm the target's file becomes visible.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert!(visible_paths(&app).contains(&PathBuf::from("a-linked-dir/inner.txt")));
+
+    // Select the file reached through the link and preview its content.
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-linked-dir/inner.txt"))
+    );
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
     let content = app.content_lines.join("\n");
-
-    assert!(content.contains("symbolic link"));
-    assert!(content.contains("never follows symbolic links"));
-    assert!(!content.contains(secret));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert!(content.contains("inside-linked-directory-3a5e"));
 }
 
 #[cfg(unix)]
 #[test]
-fn all_files_does_not_follow_a_symlink_to_an_internal_regular_file() {
+fn all_files_follows_an_internal_file_symlink_and_previews_target_content() {
     use std::os::unix::fs::symlink;
 
     let workspace = tempfile::tempdir().unwrap();
@@ -2139,8 +2135,132 @@ fn all_files_does_not_follow_a_symlink_to_an_internal_regular_file() {
         app.selected_relative_path(),
         Some(PathBuf::from("a-link.txt"))
     );
-    assert!(content.contains("symbolic link"));
-    assert!(!content.contains("internal-target-content-1d61"));
+    // All Files follows the link and previews the target file as if it were a
+    // regular file: the target content shows and the text provider handles it.
+    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert!(content.contains("internal-target-content-1d61"));
+}
+
+#[cfg(unix)]
+#[test]
+fn all_files_follows_an_external_file_symlink_and_previews_target_content() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("a-secret-notes.txt");
+    fs::write(&outside_file, "external-target-content-4c02\n").unwrap();
+    symlink(&outside_file, workspace.path().join("a-link.txt")).unwrap();
+
+    let app = ready_app(workspace.path().to_path_buf()).unwrap();
+    let content = app.content_lines.join("\n");
+
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-link.txt"))
+    );
+    // A file symlink pointing outside the workspace is followed too: All Files
+    // is a filesystem view, so the user sees the linked file's content.
+    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert!(content.contains("external-target-content-4c02"));
+}
+
+#[cfg(unix)]
+#[test]
+fn all_files_treats_a_directory_symlink_as_an_expandable_directory() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("AspectCore-Framework");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("README.md"), "directory-target-content-778e").unwrap();
+    symlink(&target, workspace.path().join("AspectCore-Framework")).unwrap();
+
+    let mut app = ready_app(workspace.path().to_path_buf()).unwrap();
+
+    // A directory symlink is a directory row: it is expandable and is not
+    // rendered through the link-text "symlink" preview provider.
+    let link_entry = app
+        .visible_entries()
+        .iter()
+        .find(|entry| entry.relative == Path::new("AspectCore-Framework"))
+        .cloned()
+        .expect("the directory symlink is present in the tree");
+    assert!(
+        link_entry.is_dir,
+        "a directory symlink must be an expandable directory"
+    );
+    assert_ne!(app.content_provider.as_deref(), Some("symlink"));
+
+    // Selecting the directory symlink shows its resolved real path in the info
+    // pane (directory links never enter Preview mode, so this is where the
+    // target surfaces).
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("AspectCore-Framework"))
+    );
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    let info = app.content_lines.join("\n");
+    assert!(
+        info.contains('↗'),
+        "info pane marks the resolved path with ↗"
+    );
+    assert!(
+        info.contains(&target.canonicalize().unwrap().display().to_string()),
+        "info pane shows the directory symlink's real path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn all_files_tree_marks_symlinks_with_their_target_and_header_shows_real_path() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("real-target.txt");
+    fs::write(&target, "linked-file-body\n").unwrap();
+    symlink(&target, workspace.path().join("a-link.txt")).unwrap();
+
+    let mut app = ready_app(workspace.path().to_path_buf()).unwrap();
+
+    // The tree row surfaces the symlink target after a ⇢ marker. Wide layout so
+    // the (short, relative) marker text is not truncated away.
+    let backend = TestBackend::new(160, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains('⇢'), "tree marks a symlink with ⇢");
+    // The entry itself carries the raw link target regardless of pane width.
+    let link_entry = app
+        .visible_entries()
+        .iter()
+        .find(|entry| entry.relative == Path::new("a-link.txt"))
+        .cloned()
+        .expect("the file symlink is present in the tree");
+    assert_eq!(link_entry.symlink_target.as_deref(), Some(target.as_path()));
+
+    // Selecting and previewing the link surfaces its canonical real path in the
+    // content header (↗ marker), alongside the followed text content.
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("a-link.txt"))
+    );
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    let real_path = app
+        .selected_symlink_real_path()
+        .expect("a selected symlink resolves to a real path");
+    assert_eq!(real_path, target.canonicalize().unwrap());
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        rendered.contains('↗'),
+        "content header marks the resolved link path with ↗"
+    );
 }
 
 #[cfg(unix)]
@@ -2168,7 +2288,7 @@ fn git_changes_preview_does_not_follow_a_changed_symlink() {
     let content = app.content_lines.join("\n");
 
     assert_eq!(app.content_mode, ContentMode::Preview);
-    assert!(content.contains("symbolic link"));
+    assert!(content.contains(&outside_file.display().to_string()));
     assert!(!content.contains(secret));
 }
 

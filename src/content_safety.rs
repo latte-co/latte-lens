@@ -202,11 +202,11 @@ pub(crate) fn open_regular(content_root: Option<&Path>, path: &Path) -> Result<O
 
 /// Read a final symlink's target text without opening the target.
 pub(crate) fn read_link_bounded(
-    content_root: &Path,
+    content_root: Option<&Path>,
     path: &Path,
     max_bytes: usize,
 ) -> Result<Option<(String, bool)>> {
-    let inspected = inspect_content_path(Some(content_root), path)?;
+    let inspected = inspect_content_path(content_root, path)?;
     if inspected.kind != ContentPathKind::SymbolicLink || inspected.path != path {
         return Ok(None);
     }
@@ -237,6 +237,64 @@ pub(crate) fn read_link_bounded(
 
 pub(crate) fn path_exists_without_following(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+/// Classify a path by following symbolic links to their ultimate target.
+///
+/// Unlike [`inspect_content_path`], this resolves every link on the path and
+/// reports the target's kind (a link to a regular file is [`Regular`], a link
+/// to a directory is [`Directory`]). Special files and broken or looping links
+/// surface as errors or non-regular kinds so callers still fail closed.
+///
+/// This is the deliberate All Files exception to the no-follow policy: it lets
+/// the interactive filesystem view browse link targets, including targets that
+/// live outside the selected workspace. Bulk and repository readers keep using
+/// the non-following [`inspect_content_path`]/[`open_regular`] path.
+///
+/// [`Regular`]: ContentPathKind::Regular
+/// [`Directory`]: ContentPathKind::Directory
+pub(crate) fn inspect_following(path: &Path) -> Result<ContentPathInspection> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("cannot resolve {}", path.display()))?;
+    Ok(ContentPathInspection {
+        kind: classify(&metadata),
+        path: path.to_path_buf(),
+        metadata,
+    })
+}
+
+/// Report whether `path` resolves to a directory after following links.
+///
+/// Broken or looping links resolve to `false`, so a dangling directory link is
+/// treated as a non-expandable leaf rather than crashing traversal.
+pub(crate) fn resolves_to_directory(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Return the raw target text of a symbolic link, or `None` when `path` is not
+/// a symbolic link. The target is read without following it, so it reflects
+/// exactly what `ln -s` recorded (relative or absolute), never the resolved
+/// destination.
+pub(crate) fn symlink_target(path: &Path) -> Option<PathBuf> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_symlink() {
+        return None;
+    }
+    fs::read_link(path).ok()
+}
+
+/// Open a followed link target (or plain regular file) for reading.
+///
+/// The link is resolved to its canonical target first, then handed to the same
+/// no-follow gate as [`open_regular`]. Because the canonical target contains no
+/// links, `O_NOFOLLOW` still succeeds, and every special-file, TOCTOU, and
+/// non-blocking guard from that gate keeps applying. This intentionally does
+/// not enforce a workspace root: All Files browses link targets by design.
+pub(crate) fn open_following(path: &Path) -> Result<OpenRegular> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    open_regular(None, &canonical)
 }
 
 pub(crate) fn ensure_beneath(root: &Path, path: &Path) -> Result<()> {

@@ -20,7 +20,8 @@ use syntect::{
 };
 
 use crate::content_safety::{
-    ContentPathKind, OpenRegular, SafeFile, inspect_content_path, open_regular,
+    ContentPathKind, OpenRegular, SafeFile, inspect_content_path, inspect_following,
+    open_following, open_regular, read_link_bounded,
 };
 use crate::folding::FoldSource;
 
@@ -64,6 +65,10 @@ pub struct PreviewRequest<'a> {
     /// Canonical content boundary used to reject link-bearing path components
     /// and paths outside the selected workspace.
     content_root: Option<&'a Path>,
+    /// Follow a final symbolic link to its target and preview the target's
+    /// content. Enabled only for interactive All Files browsing; repository,
+    /// dependency, search, and LSP reads keep the strict no-follow policy.
+    follow_symlinks: bool,
     pub max_bytes: usize,
     pub max_lines: usize,
 }
@@ -74,6 +79,7 @@ impl<'a> PreviewRequest<'a> {
             absolute_path,
             display_path,
             content_root: None,
+            follow_symlinks: false,
             max_bytes: DEFAULT_MAX_BYTES,
             max_lines: DEFAULT_MAX_LINES,
         }
@@ -82,6 +88,13 @@ impl<'a> PreviewRequest<'a> {
     /// Constrain this request to a canonical workspace or repository root.
     pub fn within_root(mut self, content_root: &'a Path) -> Self {
         self.content_root = Some(content_root);
+        self
+    }
+
+    /// Follow a final symbolic link and preview its target instead of the link
+    /// target text. Used by the interactive All Files view only.
+    pub fn following_symlinks(mut self, follow: bool) -> Self {
+        self.follow_symlinks = follow;
         self
     }
 
@@ -95,8 +108,21 @@ impl<'a> PreviewRequest<'a> {
     ///
     /// Optional providers should use this method instead of reopening
     /// `absolute_path`; it applies the same no-link, non-blocking policy as the
-    /// built-in text preview and Git's untracked-file renderer.
+    /// built-in text preview and Git's untracked-file renderer. When the
+    /// request follows symlinks, a final link is resolved to its canonical
+    /// target before the same gate opens it.
     pub fn open_regular(&self) -> Result<Option<PreviewFile>> {
+        if self.follow_symlinks {
+            return match open_following(self.absolute_path).with_context(|| {
+                format!(
+                    "cannot safely open preview file {}",
+                    self.display_path.display()
+                )
+            })? {
+                OpenRegular::Opened(file) => Ok(Some(PreviewFile { file })),
+                OpenRegular::Declined(_) => Ok(None),
+            };
+        }
         match open_regular(self.content_root, self.absolute_path).with_context(|| {
             format!(
                 "cannot safely open preview file {}",
@@ -266,6 +292,28 @@ impl PreviewRegistry {
     }
 
     pub(crate) fn resolve(&self, request: &PreviewRequest<'_>) -> Result<PreviewResolution> {
+        if request.follow_symlinks {
+            // All Files browses the filesystem as the user sees it: links are
+            // followed to their target. `inspect_following` resolves every path
+            // component, so a regular file reached through a symlinked directory
+            // (for example `linked-repo/src/main.rs`) previews normally, while a
+            // link to a directory or special file still declines here and the
+            // caller expands or reports it instead.
+            let followed = inspect_following(request.absolute_path).with_context(|| {
+                format!(
+                    "cannot resolve preview file {}",
+                    request.display_path.display()
+                )
+            })?;
+            if followed.kind != ContentPathKind::Regular {
+                return Ok(PreviewResolution::Unsafe {
+                    kind: followed.kind,
+                    offending_path: request.absolute_path.to_path_buf(),
+                });
+            }
+            return self.dispatch_providers(request);
+        }
+
         let inspected = inspect_content_path(request.content_root, request.absolute_path)
             .with_context(|| {
                 format!(
@@ -274,6 +322,41 @@ impl PreviewRegistry {
                 )
             })?;
 
+        if inspected.kind == ContentPathKind::SymbolicLink
+            && inspected.path == request.absolute_path
+        {
+            let Some((target, truncated_by_bytes)) = read_link_bounded(
+                request.content_root,
+                request.absolute_path,
+                request.max_bytes,
+            )?
+            else {
+                return Ok(PreviewResolution::Unsafe {
+                    kind: inspected.kind,
+                    offending_path: inspected.path,
+                });
+            };
+            let mut target_lines = target.lines();
+            let lines = target_lines
+                .by_ref()
+                .take(request.max_lines)
+                .map(ToOwned::to_owned)
+                .collect();
+            let truncated_by_lines = target_lines.next().is_some();
+            let content =
+                PreviewContent::new(lines).with_truncated(truncated_by_bytes || truncated_by_lines);
+            return Ok(PreviewResolution::Preview {
+                preview: Preview {
+                    provider_id: "symlink".to_owned(),
+                    lines: content.lines,
+                    highlights: content.highlights,
+                    truncated: content.truncated,
+                    show_line_numbers: content.show_line_numbers,
+                },
+                fold_source: FoldSource::None,
+            });
+        }
+
         if inspected.kind != ContentPathKind::Regular || inspected.path != request.absolute_path {
             return Ok(PreviewResolution::Unsafe {
                 kind: inspected.kind,
@@ -281,6 +364,12 @@ impl PreviewRegistry {
             });
         }
 
+        self.dispatch_providers(request)
+    }
+
+    /// Query registered providers in reverse order for an already-vetted
+    /// regular file (or a followed regular-file target).
+    fn dispatch_providers(&self, request: &PreviewRequest<'_>) -> Result<PreviewResolution> {
         for entry in self.providers.iter().rev() {
             if let Some(content) = entry.provider.preview(request)? {
                 return Ok(PreviewResolution::Preview {
@@ -605,6 +694,142 @@ mod tests {
                 offending_path,
             } if offending_path == root
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_previews_a_final_symlink_target_without_following_it() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let link = root.join("notes-link");
+        symlink("missing-target\nsecond-line\nthird-line", &link)?;
+
+        let preview = PreviewRegistry::with_builtins()
+            .preview(
+                &PreviewRequest::new(&link, Path::new("notes-link"))
+                    .within_root(&root)
+                    .with_limits(1_024, 2),
+            )?
+            .expect("a final symlink should have a target-text preview");
+
+        assert_eq!(preview.provider_id, "symlink");
+        assert_eq!(preview.lines, ["missing-target", "second-line"]);
+        assert!(preview.truncated);
+        assert!(!preview.show_line_numbers);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn following_request_previews_a_file_symlink_target_content() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let target = root.join("real.txt");
+        std::fs::write(&target, "followed-target-content\nsecond\n")?;
+        let link = root.join("link.txt");
+        symlink("real.txt", &link)?;
+
+        let preview = PreviewRegistry::with_builtins()
+            .preview(
+                &PreviewRequest::new(&link, Path::new("link.txt"))
+                    .within_root(&root)
+                    .following_symlinks(true),
+            )?
+            .expect("a followed file symlink previews the target content");
+
+        // Following resolves to the regular target, so the text provider runs
+        // and the link text itself is never shown.
+        assert_eq!(preview.provider_id, "text");
+        assert_eq!(preview.lines, ["followed-target-content", "second"]);
+        assert!(preview.show_line_numbers);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn following_request_previews_a_regular_file_inside_a_directory_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempdir()?;
+        let root = outer.path().join("workspace");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let real_dir = outer.path().join("real-dir");
+        std::fs::create_dir(&real_dir)?;
+        std::fs::write(real_dir.join("inner.rs"), "fn inside_link() {}\n")?;
+        symlink(&real_dir, root.join("linked-dir"))?;
+
+        let inner = root.join("linked-dir").join("inner.rs");
+        let preview = PreviewRegistry::with_builtins()
+            .preview(
+                &PreviewRequest::new(&inner, Path::new("linked-dir/inner.rs"))
+                    .within_root(&root)
+                    .following_symlinks(true),
+            )?
+            .expect("a file reached through a directory symlink previews normally");
+
+        assert_eq!(preview.provider_id, "text");
+        assert_eq!(preview.lines, ["fn inside_link() {}"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn following_request_declines_a_directory_symlink_as_unsafe() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempdir()?;
+        let root = outer.path().join("workspace");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let real_dir = outer.path().join("real-dir");
+        std::fs::create_dir(&real_dir)?;
+        let link = root.join("linked-dir");
+        symlink(&real_dir, &link)?;
+
+        let resolution = PreviewRegistry::with_builtins().resolve(
+            &PreviewRequest::new(&link, Path::new("linked-dir"))
+                .within_root(&root)
+                .following_symlinks(true),
+        )?;
+
+        // A directory symlink is not content: the caller expands it instead.
+        assert!(matches!(
+            resolution,
+            PreviewResolution::Unsafe {
+                kind: ContentPathKind::Directory,
+                offending_path,
+            } if offending_path == link
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn following_request_declines_a_special_file_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempdir()?;
+        let root = outer.path().join("workspace");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let link = root.join("dangling");
+        // A broken link resolves to nothing: following must fail closed rather
+        // than dispatch a provider on a missing target.
+        symlink(outer.path().join("does-not-exist"), &link)?;
+
+        let resolution = PreviewRegistry::with_builtins().resolve(
+            &PreviewRequest::new(&link, Path::new("dangling"))
+                .within_root(&root)
+                .following_symlinks(true),
+        );
+
+        assert!(resolution.is_err(), "a broken followed link is an error");
         Ok(())
     }
 

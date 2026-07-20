@@ -335,7 +335,7 @@ impl GitRepo {
         let inspected = inspect_content_path(Some(&content_root), &absolute_path)?;
         if inspected.kind == ContentPathKind::SymbolicLink && inspected.path == absolute_path {
             let Some((target, truncated)) = read_link_bounded(
-                &content_root,
+                Some(&content_root),
                 &absolute_path,
                 usize::try_from(UNTRACKED_MAX_BYTES).unwrap_or(usize::MAX),
             )?
@@ -443,7 +443,7 @@ impl GitRepo {
         let inspected = inspect_content_path(Some(&content_root), &absolute_path)?;
         if inspected.kind == ContentPathKind::SymbolicLink && inspected.path == absolute_path {
             let Some((target, truncated)) = read_link_bounded(
-                &content_root,
+                Some(&content_root),
                 &absolute_path,
                 usize::try_from(UNTRACKED_MAX_BYTES).unwrap_or(usize::MAX),
             )?

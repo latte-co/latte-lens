@@ -31,6 +31,7 @@ from .fixtures import (
     create_repository_relation_fixture,
     create_resilience_lsp_fixture,
     create_search_fixture,
+    create_symlink_preview_fixture,
     create_structure_fixture,
     create_timeout_lsp_fixture,
 )
@@ -292,6 +293,32 @@ def files_refresh(context: ScenarioContext) -> None:
         ("clean()",),
         "Files refresh removes a file and preserves selected preview",
         absent=("refresh-added.txt",),
+    )
+
+
+def symlink_preview_smoke(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    # All Files follows a file symlink and previews the target file's content.
+    _click_tree_row(session, "b-file-link.txt")
+    session.wait_screen(
+        ("b-file-link.txt", "Preview", "linked-file-target-content"),
+        "production binary follows a sandboxed file symlink and previews its target content",
+        absent=("Preview unavailable",),
+    )
+    # A directory symlink is expandable; opening it reveals the file inside the
+    # target directory, which then previews normally.
+    _click_disclosure(session, "a-directory-link")
+    session.wait_screen(
+        ("a-directory-link", "inside.txt"),
+        "production binary expands a sandboxed directory symlink",
+        absent=("Preview unavailable",),
+    )
+    _click_tree_row(session, "inside.txt")
+    session.wait_screen(
+        ("inside.txt", "Preview", "linked-directory-inner-content"),
+        "production binary previews a file reached through a directory symlink",
+        absent=("Preview unavailable",),
     )
 
 
@@ -1784,6 +1811,12 @@ def code_navigation_without_lsp(context: ScenarioContext) -> None:
 CASES = (
     ScenarioCase("files-navigation", "files", create_navigation_fixture, files_navigation),
     ScenarioCase("files-refresh", "files", create_navigation_fixture, files_refresh),
+    ScenarioCase(
+        "symlink-preview-smoke",
+        "files",
+        create_symlink_preview_fixture,
+        symlink_preview_smoke,
+    ),
     ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
