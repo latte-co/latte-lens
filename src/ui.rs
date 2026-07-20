@@ -1728,21 +1728,23 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let help = if area.width < 96 && app.content_mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
         )
     } else if area.width < 96 {
-        format!("  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  q×2 quit")
+        format!(
+            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y path Y real  q×2 quit"
+        )
     } else if app.content_mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
         )
     } else if app.content_mode == ContentMode::Diff {
         format!(
-            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
     } else {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {scope_keys}  p preview  d diff  r refresh  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
     };
     let content = if let Some(message) = app.quit_confirmation_message() {

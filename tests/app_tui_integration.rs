@@ -2982,6 +2982,72 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
 }
 
 #[test]
+fn y_key_copies_relative_path_of_selected_entry() {
+    let fixture = TestRepo::new();
+    fixture.write("notes.txt", "hello\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let status = app
+        .clipboard_status
+        .as_deref()
+        .expect("clipboard_status should be set after pressing y");
+    assert!(
+        status.contains("Copied path"),
+        "unexpected status: {status}"
+    );
+    assert!(status.contains("notes.txt"), "unexpected status: {status}");
+}
+
+#[test]
+fn uppercase_y_key_copies_absolute_path_of_selected_entry() {
+    let fixture = TestRepo::new();
+    fixture.write("notes.txt", "hello\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('Y')));
+
+    let status = app
+        .clipboard_status
+        .as_deref()
+        .expect("clipboard_status should be set after pressing Y");
+    assert!(
+        status.contains("Copied absolute path"),
+        "unexpected status: {status}"
+    );
+    assert!(status.contains("notes.txt"), "unexpected status: {status}");
+}
+
+#[test]
+fn y_key_copies_directory_path_with_trailing_slash() {
+    let fixture = TestRepo::new();
+    let src = fixture.root().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("lib.rs"), "// lib\n").unwrap();
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Select the "src" directory entry.
+    let idx = app
+        .all_entries
+        .iter()
+        .position(|entry| entry.relative == Path::new("src"))
+        .expect("src directory exists in the tree");
+    app.tree_state.select(Some(idx));
+
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let status = app
+        .clipboard_status
+        .as_deref()
+        .expect("clipboard_status should be set after pressing y");
+    assert!(
+        status.ends_with("src/"),
+        "directory path should end with a trailing slash: {status}"
+    );
+}
+
+#[test]
 fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     let fixture = TestRepo::new();
     fixture.write("src/lib.rs", "before\n");
@@ -3975,6 +4041,54 @@ fn run_production_spawner_framed_journey() {
     ] {
         remove_test_env(key);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn y_key_copies_real_path_for_symlink_in_all_files() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("real-target.txt");
+    fs::write(&target, "real content\n").unwrap();
+    symlink(&target, workspace.join("a-link.txt")).unwrap();
+
+    let mut app = ready_app(workspace).unwrap();
+    assert_eq!(app.tree_scope, TreeScope::AllFiles);
+
+    app.handle_key(key(KeyCode::Char('Y')));
+
+    let status = app
+        .clipboard_status
+        .as_deref()
+        .expect("clipboard_status is set after Y");
+    assert!(
+        status.starts_with("Copied real path: "),
+        "unexpected status: {status}"
+    );
+    assert!(
+        status.contains("real-target.txt"),
+        "status should contain real target: {status}"
+    );
+}
+
+#[test]
+fn y_key_without_selection_shows_guidance() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+
+    // Clear selection.
+    app.tree_state.select(None);
+    app.handle_key(key(KeyCode::Char('y')));
+
+    assert_eq!(
+        app.clipboard_status.as_deref(),
+        Some("Select a file or directory to copy its path")
+    );
 }
 
 #[cfg(feature = "navigation-test-support")]
