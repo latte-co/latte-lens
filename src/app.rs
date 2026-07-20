@@ -1216,6 +1216,33 @@ impl App {
         Some(absolute.canonicalize().unwrap_or(absolute))
     }
 
+    /// Compute the path to copy for the selected entry.
+    ///
+    /// - `resolve=false`: relative path (the link path for symlinks), suitable
+    ///   for pasting relative to the workspace root.
+    /// - `resolve=true`: the real/absolute path. All Files symlinks resolve to
+    ///   their target on disk (canonicalize follows the link); everything else
+    ///   — including Git Changes entries, which never carry a symlink target —
+    ///   resolves to the absolute path under the workspace root.
+    ///
+    /// The returned `PathBuf` does **not** include a trailing slash for
+    /// directories; callers add one when formatting the copy string.
+    fn selected_copy_path(&self, resolve: bool) -> Option<PathBuf> {
+        let entry = self.selected_entry()?;
+        let relative = &entry.relative;
+        if !resolve {
+            return Some(relative.clone());
+        }
+        let absolute = self.root.join(relative);
+        if entry.symlink_target.is_some() && self.tree_scope == TreeScope::AllFiles {
+            // Real path for All Files symlinks (canonicalize follows the link).
+            Some(absolute.canonicalize().unwrap_or(absolute))
+        } else {
+            // Absolute path; Git Changes entries never resolve a symlink target.
+            Some(absolute.canonicalize().unwrap_or(absolute))
+        }
+    }
+
     pub fn selected_content_title(&self) -> &'static str {
         if self
             .content_identity
@@ -1587,6 +1614,12 @@ impl App {
             }
             (KeyCode::Char('N'), _) if self.content_mode == ContentMode::Diff => {
                 self.select_changed(-1);
+            }
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                self.queue_selected_path_copy(false);
+            }
+            (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+                self.queue_selected_path_copy(true);
             }
             _ => match self.focused_pane {
                 FocusPane::ScopeTabs => self.handle_scope_tabs_key(key),
@@ -3155,6 +3188,58 @@ impl App {
             "Copying {character_count} character{}…",
             if character_count == 1 { "" } else { "s" }
         ));
+    }
+
+    /// Copy the selected entry's path to the clipboard.
+    ///
+    /// - `resolve=false`: relative path (link path for symlinks), with a
+    ///   trailing slash for directories.
+    /// - `resolve=true`: real/absolute path, with a trailing slash for
+    ///   directories.
+    ///
+    /// Sets `clipboard_status` to a descriptive message showing exactly what
+    /// was copied. Clears any pending content-selection copy so the deferred
+    /// `flush_clipboard_request` does not overwrite this status.
+    fn queue_selected_path_copy(&mut self, resolve: bool) {
+        // Clear any pending content-selection copy so the deferred flush does
+        // not overwrite the path status set below.
+        self.pending_clipboard_text = None;
+        let Some(path) = self.selected_copy_path(resolve) else {
+            self.clipboard_status =
+                Some("Select a file or directory to copy its path".to_owned());
+            return;
+        };
+        let is_dir = self.selected_entry().is_some_and(|entry| entry.is_dir);
+        let is_symlink = self
+            .selected_entry()
+            .is_some_and(|entry| entry.symlink_target.is_some());
+        let mut text = path.display().to_string();
+        if is_dir && !text.ends_with('/') {
+            text.push('/');
+        }
+        let label = match (resolve, is_symlink, self.tree_scope == TreeScope::AllFiles) {
+            (false, true, _) => "Copied link path",
+            (false, false, _) => "Copied path",
+            (true, true, true) => "Copied real path",
+            (true, true, false) => "Copied link path",
+            (true, false, _) => "Copied absolute path",
+        };
+        match clipboard::copy_text(&text) {
+            Ok(_delivery) => {
+                if self
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("copy failed:"))
+                {
+                    self.last_error = None;
+                }
+                self.clipboard_status = Some(format!("{label}: {text}"));
+            }
+            Err(error) => {
+                self.clipboard_status = None;
+                self.last_error = Some(format!("copy failed: {error}"));
+            }
+        }
     }
 
     fn flush_clipboard_request(&mut self) {

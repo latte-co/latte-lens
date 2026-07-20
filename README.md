@@ -133,9 +133,9 @@ Inside the TUI:
 | `{` / `}` | In focused Preview content, collapse or expand all folds |
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
+| `y` / `Y` | Copy the selected path: `y` copies the relative path (the link path for symlinks), `Y` copies the real/absolute path (resolved target for symlinks in All Files scope); directories get a trailing `/` |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
 | `n` / `N` | Next or previous changed file in Diff |
-| `ctrl-d` / `ctrl-u` | Page through content |
 | `r` | Refresh repository state |
 | `q` / `esc` | Press twice within 1.5 seconds to quit; `esc` closes an active search first |
 | `ctrl-c` | Quit immediately when no content is selected; copy the current selection otherwise |
