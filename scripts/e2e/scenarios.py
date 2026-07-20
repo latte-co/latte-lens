@@ -322,6 +322,46 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
     )
 
 
+def symlink_copy_path(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    # In All Files scope, symlinks are followed so Y copies the resolved real
+    # path. y always copies the link's own relative path. We verify the
+    # clipboard write via the OSC52 raw output.
+    _click_tree_row(session, "b-file-link.txt")
+    session.wait_screen(
+        ("b-file-link.txt", "Preview"),
+        "file symlink is selected for copy-path",
+    )
+    y1_start = len(session.output)
+    session.key(b"y")
+    session.wait_raw(
+        (b"52;c;",),
+        "y copies the symlink's own link path",
+        start=y1_start,
+    )
+    Y1_start = len(session.output)
+    session.key(b"Y")
+    session.wait_raw(
+        (b"52;c;",),
+        "Y copies the symlink's resolved real target path in All Files scope",
+        start=Y1_start,
+    )
+    # A directory symlink also gets a trailing slash on its link path.
+    _click_tree_row(session, "a-directory-link")
+    session.wait_screen(
+        ("a-directory-link",),
+        "directory symlink is selected for copy-path",
+    )
+    y2_start = len(session.output)
+    session.key(b"y")
+    session.wait_raw(
+        (b"52;c;",),
+        "y copies the directory symlink's link path with a trailing slash",
+        start=y2_start,
+    )
+
+
 def keyboard_controls(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
@@ -430,6 +470,27 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.wait_screen(("Git changes", "Diff"), "mouse refresh preserves Git Changes")
     session.key(b"1")
     session.wait_screen(("Files", "a-dir"), "1 switches back to the complete file tree")
+
+    # Copy-path shortcuts: y copies the relative path, Y copies the
+    # real/absolute path. We verify the clipboard write via the OSC52 raw
+    # output (footer status text is unreliable in the PTY harness).
+    session.key(b"G")
+    session.wait_screen(("z-clean.rs",), "G selects the last file for copy-path")
+    y_start = len(session.output)
+    session.key(b"y")
+    session.wait_raw(
+        (b"52;c;",),
+        "y copies the selected file's relative path to the clipboard",
+        start=y_start,
+    )
+    Y_start = len(session.output)
+    session.key(b"Y")
+    session.wait_raw(
+        (b"52;c;",),
+        "Y copies the selected file's real/absolute path to the clipboard",
+        start=Y_start,
+    )
+
     session.key(b"\x1b")
     session.wait_screen(("Press Esc again to quit",), "Esc requests quit confirmation")
 
@@ -1818,6 +1879,12 @@ CASES = (
         symlink_preview_smoke,
     ),
     ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
+    ScenarioCase(
+        "symlink-copy-path",
+        "files",
+        create_symlink_preview_fixture,
+        symlink_copy_path,
+    ),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
     ScenarioCase("git-review-state", "git-changes", create_git_matrix_fixture, git_review_state),
