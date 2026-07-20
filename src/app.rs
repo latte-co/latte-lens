@@ -9226,11 +9226,6 @@ mod tests {
 
     #[test]
     fn queue_selected_path_copy_sets_status_for_absolute_file() {
-        // Force OSC52 so the copy always succeeds (writes to stdout) regardless
-        // of whether a native clipboard command is available in the test env.
-        // SAFETY: see the env helper in the integration tests; osc52 is benign.
-        unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
-
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
@@ -9267,9 +9262,6 @@ mod tests {
 
     #[test]
     fn queue_selected_path_copy_clears_last_error_on_success() {
-        // SAFETY: osc52 makes the copy deterministic (always succeeds).
-        unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
-
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
@@ -9292,9 +9284,6 @@ mod tests {
 
     #[test]
     fn queue_selected_path_copy_preserves_non_copy_error() {
-        // SAFETY: osc52 makes the copy deterministic (always succeeds).
-        unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
-
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("helper.rs"), "fn h() {}\n").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();

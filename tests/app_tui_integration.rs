@@ -2983,10 +2983,6 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
 
 #[test]
 fn y_key_copies_relative_path_of_selected_entry() {
-    // Force OSC52 so the copy always succeeds (writes to stdout) regardless of
-    // whether a native clipboard command is available in the test environment.
-    // SAFETY: tests serialize environment access; osc52 is benign.
-    unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
     let fixture = TestRepo::new();
     fixture.write("notes.txt", "hello\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
@@ -3006,8 +3002,6 @@ fn y_key_copies_relative_path_of_selected_entry() {
 
 #[test]
 fn uppercase_y_key_copies_absolute_path_of_selected_entry() {
-    // SAFETY: see the y_key test above; osc52 makes the copy deterministic.
-    unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
     let fixture = TestRepo::new();
     fixture.write("notes.txt", "hello\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
@@ -3027,8 +3021,6 @@ fn uppercase_y_key_copies_absolute_path_of_selected_entry() {
 
 #[test]
 fn y_key_copies_directory_path_with_trailing_slash() {
-    // SAFETY: see the y_key test above; osc52 makes the copy deterministic.
-    unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
     let fixture = TestRepo::new();
     let src = fixture.root().join("src");
     fs::create_dir(&src).unwrap();
@@ -4055,9 +4047,6 @@ fn run_production_spawner_framed_journey() {
 #[test]
 fn y_key_copies_real_path_for_symlink_in_all_files() {
     use std::os::unix::fs::symlink;
-
-    // SAFETY: osc52 makes the copy deterministic (always succeeds).
-    unsafe { std::env::set_var("LATTELENS_CLIPBOARD", "osc52") };
 
     let parent = tempfile::tempdir().unwrap();
     let workspace = parent.path().join("workspace");
