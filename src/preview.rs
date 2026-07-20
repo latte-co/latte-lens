@@ -20,7 +20,7 @@ use syntect::{
 };
 
 use crate::content_safety::{
-    ContentPathKind, OpenRegular, SafeFile, inspect_content_path, open_regular,
+    ContentPathKind, OpenRegular, SafeFile, inspect_content_path, open_regular, read_link_bounded,
 };
 use crate::folding::FoldSource;
 
@@ -273,6 +273,41 @@ impl PreviewRegistry {
                     request.display_path.display()
                 )
             })?;
+
+        if inspected.kind == ContentPathKind::SymbolicLink
+            && inspected.path == request.absolute_path
+        {
+            let Some((target, truncated_by_bytes)) = read_link_bounded(
+                request.content_root,
+                request.absolute_path,
+                request.max_bytes,
+            )?
+            else {
+                return Ok(PreviewResolution::Unsafe {
+                    kind: inspected.kind,
+                    offending_path: inspected.path,
+                });
+            };
+            let mut target_lines = target.lines();
+            let lines = target_lines
+                .by_ref()
+                .take(request.max_lines)
+                .map(ToOwned::to_owned)
+                .collect();
+            let truncated_by_lines = target_lines.next().is_some();
+            let content =
+                PreviewContent::new(lines).with_truncated(truncated_by_bytes || truncated_by_lines);
+            return Ok(PreviewResolution::Preview {
+                preview: Preview {
+                    provider_id: "symlink".to_owned(),
+                    lines: content.lines,
+                    highlights: content.highlights,
+                    truncated: content.truncated,
+                    show_line_numbers: content.show_line_numbers,
+                },
+                fold_source: FoldSource::None,
+            });
+        }
 
         if inspected.kind != ContentPathKind::Regular || inspected.path != request.absolute_path {
             return Ok(PreviewResolution::Unsafe {
@@ -605,6 +640,31 @@ mod tests {
                 offending_path,
             } if offending_path == root
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_previews_a_final_symlink_target_without_following_it() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let link = root.join("notes-link");
+        symlink("missing-target\nsecond-line\nthird-line", &link)?;
+
+        let preview = PreviewRegistry::with_builtins()
+            .preview(
+                &PreviewRequest::new(&link, Path::new("notes-link"))
+                    .within_root(&root)
+                    .with_limits(1_024, 2),
+            )?
+            .expect("a final symlink should have a target-text preview");
+
+        assert_eq!(preview.provider_id, "symlink");
+        assert_eq!(preview.lines, ["missing-target", "second-line"]);
+        assert!(preview.truncated);
+        assert!(!preview.show_line_numbers);
         Ok(())
     }
 

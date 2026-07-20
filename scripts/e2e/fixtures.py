@@ -109,6 +109,25 @@ def create_navigation_fixture(root: Path, environment: dict[str, str]) -> None:
     nested_file.write_text("nested changed\n", encoding="utf-8")
 
 
+def create_symlink_preview_fixture(root: Path, environment: dict[str, str]) -> None:
+    del environment
+    linked_repositories = root.parent / "linked-repositories"
+    target = linked_repositories / "sample-framework"
+    target.mkdir(mode=0o700, parents=True)
+    target.joinpath("README.md").write_text(
+        "target-content-must-not-be-read\n", encoding="utf-8"
+    )
+    root.joinpath("a-directory-link").symlink_to(
+        Path("../linked-repositories/sample-framework"), target_is_directory=True
+    )
+    linked_files = root.parent / "linked-files"
+    linked_files.mkdir(mode=0o700)
+    linked_files.joinpath("sample.txt").write_text(
+        "file-target-content-must-not-be-read\n", encoding="utf-8"
+    )
+    root.joinpath("b-file-link.txt").symlink_to(Path("../linked-files/sample.txt"))
+
+
 def create_search_fixture(root: Path, environment: dict[str, str]) -> None:
     init_repository(root, environment)
     (root / "docs").mkdir()

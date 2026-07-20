@@ -202,11 +202,11 @@ pub(crate) fn open_regular(content_root: Option<&Path>, path: &Path) -> Result<O
 
 /// Read a final symlink's target text without opening the target.
 pub(crate) fn read_link_bounded(
-    content_root: &Path,
+    content_root: Option<&Path>,
     path: &Path,
     max_bytes: usize,
 ) -> Result<Option<(String, bool)>> {
-    let inspected = inspect_content_path(Some(content_root), path)?;
+    let inspected = inspect_content_path(content_root, path)?;
     if inspected.kind != ContentPathKind::SymbolicLink || inspected.path != path {
         return Ok(None);
     }

@@ -309,9 +309,11 @@ src/ui.rs     Latte-styled Ratatui rendering
 
 Clean text and code files open in preview mode automatically. Changed files
 open in diff mode; press `p` to inspect their current source or `d` to return to
-the diff. Preview reads are capped by both bytes and lines. Content previews
-never follow symbolic links and decline FIFOs, sockets, devices, directories,
-and Windows reparse points before provider dispatch.
+the diff. Preview reads are capped by both bytes and lines. A final symbolic
+link is previewed as bounded target-path text without opening its target or
+dispatching a provider. Content previews never traverse symbolic links and
+decline FIFOs, sockets, devices, directories, and Windows reparse points before
+provider dispatch.
 
 Preview and diff text wrap to the current pane width. A logical source or diff
 line keeps one line-number entry; wrapped continuation rows leave the number

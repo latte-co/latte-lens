@@ -2082,7 +2082,7 @@ fn app_accepts_a_custom_pdf_preview_provider() {
 
 #[cfg(unix)]
 #[test]
-fn all_files_never_dispatches_an_external_file_symlink_to_a_provider() {
+fn all_files_previews_an_external_symlink_target_without_dispatching_a_provider() {
     use std::os::unix::fs::symlink;
 
     struct UnsafeReader {
@@ -2116,15 +2116,14 @@ fn all_files_never_dispatches_an_external_file_symlink_to_a_provider() {
     let app = ready_app_with_preview_registry(workspace.path().to_path_buf(), registry).unwrap();
     let content = app.content_lines.join("\n");
 
-    assert!(content.contains("symbolic link"));
-    assert!(content.contains("never follows symbolic links"));
+    assert!(content.contains(&outside_file.display().to_string()));
     assert!(!content.contains(secret));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[cfg(unix)]
 #[test]
-fn all_files_does_not_follow_a_symlink_to_an_internal_regular_file() {
+fn all_files_previews_an_internal_symlink_target_without_following_it() {
     use std::os::unix::fs::symlink;
 
     let workspace = tempfile::tempdir().unwrap();
@@ -2139,8 +2138,32 @@ fn all_files_does_not_follow_a_symlink_to_an_internal_regular_file() {
         app.selected_relative_path(),
         Some(PathBuf::from("a-link.txt"))
     );
-    assert!(content.contains("symbolic link"));
+    assert!(content.contains("z-target.txt"));
     assert!(!content.contains("internal-target-content-1d61"));
+}
+
+#[cfg(unix)]
+#[test]
+fn all_files_previews_a_directory_symlink_as_target_text() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("AspectCore-Framework");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("README.md"), "directory-target-content-778e").unwrap();
+    symlink(&target, workspace.path().join("AspectCore-Framework")).unwrap();
+
+    let app = ready_app(workspace.path().to_path_buf()).unwrap();
+    let content = app.content_lines.join("\n");
+
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("AspectCore-Framework"))
+    );
+    assert_eq!(app.content_provider.as_deref(), Some("symlink"));
+    assert!(content.contains(&target.display().to_string()));
+    assert!(!content.contains("directory-target-content-778e"));
 }
 
 #[cfg(unix)]
@@ -2168,7 +2191,7 @@ fn git_changes_preview_does_not_follow_a_changed_symlink() {
     let content = app.content_lines.join("\n");
 
     assert_eq!(app.content_mode, ContentMode::Preview);
-    assert!(content.contains("symbolic link"));
+    assert!(content.contains(&outside_file.display().to_string()));
     assert!(!content.contains(secret));
 }
 
