@@ -44,6 +44,7 @@ const AGENTS_TAB_LABEL: &str = "  3 Agents ";
 const REFRESH_LABEL: &str = " r  Refresh ";
 const FILE_SEARCH_LABEL: &str = "/ Open ";
 const TEXT_SEARCH_LABEL: &str = " ^T Text ";
+const EXTERNAL_OPEN_WIDTH: u16 = 16;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
@@ -170,6 +171,15 @@ fn regions(areas: DrawAreas) -> UiRegions {
         preview_find_next,
         preview_find_close,
     ) = preview_find_controls(content_header);
+    let external_open_width = EXTERNAL_OPEN_WIDTH.min(content_header.width);
+    let external_open_button = Rect::new(
+        content_header
+            .x
+            .saturating_add(content_header.width.saturating_sub(external_open_width)),
+        content_header.y,
+        external_open_width,
+        content_header.height,
+    );
 
     UiRegions {
         all_files_tab: Rect::new(
@@ -206,6 +216,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
         preview_find_previous,
         preview_find_next,
         preview_find_close,
+        external_open_button,
         tree_body,
         tree_inner: tree_rows,
         divider,
@@ -1524,13 +1535,41 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         if app.is_content_loading() {
             detail.push_str(" · LOADING");
         }
+        let heading = if app.can_open_content_externally() {
+            Rect::new(
+                header.x,
+                header.y,
+                header
+                    .width
+                    .saturating_sub(app.ui_regions.external_open_button.width),
+                header.height,
+            )
+        } else {
+            header
+        };
         draw_panel_heading(
             frame,
-            header,
+            heading,
             app.selected_content_title(),
             &detail,
             app.content_is_focused(),
         );
+        if app.can_open_content_externally() {
+            let label = if app.external_open_confirmation_for_content() {
+                " [Open anyway] "
+            } else if app.ui_regions.external_open_button.width >= EXTERNAL_OPEN_WIDTH {
+                "  o  [Open]    "
+            } else {
+                " [Open] "
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                ))),
+                app.ui_regions.external_open_button,
+            );
+        }
     }
     let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
@@ -1726,7 +1765,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "1/2 scope"
     };
-    let help = if area.width < 96 && app.content_mode == ContentMode::Preview {
+    let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
+        format!(
+            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click/o open  disclosure toggles  y path  q×2 quit"
+        )
+    } else if app.focused_pane == FocusPane::Tree {
+        format!(
+            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click/o system open  disclosure toggles  →/l content  y/Y path  q×2 quit"
+        )
+    } else if area.width < 96 && app.content_mode == ContentMode::Preview {
         format!(
             "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
         )
@@ -2095,6 +2142,19 @@ fn highlight_style(kind: HighlightKind) -> Style {
             .bg(MINT)
             .add_modifier(Modifier::BOLD),
         HighlightKind::NavigationHover => Style::default().add_modifier(Modifier::UNDERLINED),
+        HighlightKind::ImagePixel {
+            foreground,
+            background,
+        } => {
+            let mut style = Style::default();
+            if let Some(color) = foreground {
+                style = style.fg(Color::Rgb(color.red, color.green, color.blue));
+            }
+            if let Some(color) = background {
+                style = style.bg(Color::Rgb(color.red, color.green, color.blue));
+            }
+            style
+        }
     }
 }
 
@@ -2200,6 +2260,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preview::RgbColor;
 
     #[test]
     fn long_search_queries_keep_the_cursor_end_visible() {
@@ -2378,6 +2439,39 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].style.fg, Some(MINT));
         assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn image_half_block_colors_are_local_to_the_exact_glyph() {
+        let line = "▀x";
+        let spans = preview_content_spans(
+            line,
+            0,
+            &[HighlightSpan {
+                range: 0..'▀'.len_utf8(),
+                kind: HighlightKind::ImagePixel {
+                    foreground: Some(RgbColor {
+                        red: 255,
+                        green: 32,
+                        blue: 16,
+                    }),
+                    background: Some(RgbColor {
+                        red: 8,
+                        green: 64,
+                        blue: 192,
+                    }),
+                },
+            }],
+            None,
+            Style::default().fg(Color::Reset),
+        );
+
+        assert_eq!(spans[0].content.as_ref(), "▀");
+        assert_eq!(spans[0].style.fg, Some(Color::Rgb(255, 32, 16)));
+        assert_eq!(spans[0].style.bg, Some(Color::Rgb(8, 64, 192)));
+        assert_eq!(spans[1].content.as_ref(), "x");
+        assert_eq!(spans[1].style.fg, Some(Color::Reset));
+        assert_eq!(spans[1].style.bg.unwrap_or(Color::Reset), Color::Reset);
     }
 
     #[test]

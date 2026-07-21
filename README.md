@@ -15,7 +15,7 @@ keyboard-driven TUI.
 - Colorized staged and working-tree diffs with old/new line numbers and emphasized additions/deletions
 - Per-file added/deleted line counts and review markers that become stale when the diff changes
 - Numbered, syntax-highlighted previews for recognized source files, with plain-text fallback
-- Extensible preview providers for formats such as PDF and Word
+- Built-in bounded previews for PNG, JPEG, GIF, WebP, PDF, and DOCX, plus custom providers
 - Side-by-side tree and content panes, so context stays visible while reading
 - A bounded file sidebar, single divider, and quiet focus/selection accents instead of boxed panels
 - Left-pane tabs for the complete workspace tree or repository-grouped Git changes
@@ -119,7 +119,7 @@ Inside the TUI:
 | `1` / `2` | Show all files, or refresh and show only Git changes, while retaining focus |
 | `tab` / `shift-tab` | Switch the left tree scope while retaining focus |
 | `h` / `l` | Focus the tree or content pane |
-| `enter` | Expand/collapse the selected repository/directory, or focus Content for a selected file/pointer diff |
+| `enter` | With Tree focused, expand/collapse a directory or safely open an existing file with the system default app; with Preview focused, retain the fold action below |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
 | `ctrl-d` | In focused Preview content, go to the definition; one result jumps directly and multiple results open the navigation popup |
@@ -133,6 +133,8 @@ Inside the TUI:
 | `{` / `}` | In focused Preview content, collapse or expand all folds |
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
+| `o` | Safely open the current Tree/Content file with the system default app; confirm an unknown non-executable file only after Lens explicitly asks |
+| `i` | Only after Lens reports that no system app is available for a verified image, confirm a bounded TrueColor terminal preview |
 | `y` / `Y` | Copy the selected path: `y` copies the relative path (the link path for symlinks), `Y` copies the real/absolute path (resolved target for symlinks in All Files scope); directories get a trailing `/` |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
 | `n` / `N` | Next or previous changed file in Diff |
@@ -144,13 +146,15 @@ Mouse controls:
 
 - Click `Files` or `Git changes` to switch the left tree dataset; entering Git Changes refreshes it first.
 - Click `Refresh` in the header (or press `r`) to re-scan the repository without leaving the current view.
+- A tree-row click only selects and internally previews it. Click a directory's `▸`/`▾` disclosure to toggle it immediately; double-click a directory row to toggle it once, or double-click a file row to request the same safe system-open action as `Enter`/`o`.
+- Click `[Open]` in the Content heading to use the same system-open action. Unknown non-executable files change it to `[Open anyway]`; only that explicit button or a second `o` confirms, never `Enter`, double-click, or key repeat.
 - Click `Open` or `Text` in the Files heading to open file or workspace text search. Search uses a centered popup whose width is independent of the Files pane; text matches show their path and source line separately.
 - In the popup, type directly, use `↑`/`↓` to preview results, and press `Enter` to open one. `Esc`, the close button, and opening a result hide the popup without clearing its query, results, selection, or scroll position. Reopening File or Text search restores that mode's previous session.
 - Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
 - In a supported built-in source Preview, hold `Alt` while moving the mouse to underline a complete navigable token, then `Alt`-click to request its definition. Keyboard navigation uses the same `Ctrl` + mnemonic style as search: `Ctrl+D` definition, `Ctrl+R` references, `Ctrl+O` implementations, and `Ctrl+S` document symbols. References and implementations always open a file-grouped results popup; on wide terminals it previews the selected location without replacing the main Content pane. Press `Enter` or click a location to commit its jump; file-group headers only expand or collapse their locations. A safe external result inside a recognized dependency package (`go.mod`, `Cargo.toml`, `package.json`, `pyproject.toml`, or `setup.py`) opens a read-only `Dependency Source` view without adding it to the workspace Tree or Git scopes; use `Alt`+`←` to return. Other external results are rejected. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
-- In Git Changes, click a repository or directory row to expand/collapse it; click a file or submodule-pointer row to open its owning-repository diff. All Files keeps its existing directory/file behavior.
+- In Git Changes, selecting a file keeps its owning-repository diff in Content. Use the disclosure/row double-click rules above for containers, and `Right`/`l` to focus the diff; `Enter`, file double-click, `o`, or `[Open]` requests the system default app only for an existing regular file.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
 
@@ -319,6 +323,37 @@ bounded target-path text without opening the target. Every read still declines
 FIFOs, sockets, devices, and Windows reparse points, and applies the same
 non-blocking, byte-and-line-bounded I/O to a link's target.
 
+PNG, JPEG, GIF, and WebP files initially show verified metadata only. Press `o`,
+use Tree `Enter`/double-click, or click `[Open]` to explicitly open the image in
+the host system's default viewer. When a Linux
+session has no graphical display, or an opener is unavailable or fails, Lens
+does not silently substitute a lossy rendering: it asks whether to press `i`
+for a bounded TrueColor half-block preview sized to the current Content pane,
+or `Esc` to cancel. `TERM=dumb` keeps metadata only. Animated images use the
+first frame for the confirmed terminal fallback.
+
+PDF previews report metadata and the exact page count, then extract every
+page's text unless an output or safety budget is reached. Pages without a text
+layer are marked individually, and an all-textless document is identified as a
+possible scan; OCR is not performed. DOCX previews extract core properties,
+headings, paragraphs, lists, and tables. These binary previews are limited to
+32 MiB of input, validate the actual file signature/container instead of
+trusting the extension, sanitize terminal control characters, and never run
+macros, PDF actions, attachments, external relationships, scripts, or network
+requests during Lens' internal preview.
+
+System opening is a separate, format-independent user action. Verified passive
+images, PDF, non-macro OOXML documents, bounded text/source, common media, and
+archives can use the host default app even when their Lens preview is textual or
+unsupported. Unknown regular non-executable files require a second `o` or
+`[Open anyway]`; scripts, executable/installer signatures or permission bits,
+launchers, shortcuts, macro-capable Office files, special filesystem objects,
+and recognizable extension/content mismatches are blocked without an override.
+The worker reopens and compares the file fingerprint immediately before using a
+shell-free platform adapter. Linux without `DISPLAY`/`WAYLAND_DISPLAY` reports
+that no desktop app is available and preserves the internal preview; only a
+verified image additionally offers the explicit `i` TrueColor fallback.
+
 Preview and diff text wrap to the current pane width. A logical source or diff
 line keeps one line-number entry; wrapped continuation rows leave the number
 gutter blank. Tabs render at four-column stops. Scrolling and mouse selection
@@ -357,11 +392,12 @@ reported as copied; when only OSC 52 is available, Latte Lens instead reports
 that the text was sent to the terminal clipboard because terminals do not
 acknowledge whether they accepted the sequence.
 
-Optional formats stay outside the core binary. Implement the public
-`PreviewProvider` trait and register it with `App::register_preview_provider` or
-inject a `PreviewRegistry` through `App::with_preview_registry`. Providers
-registered later have higher priority, so a PDF or Word provider can override
-the built-in text detector without changing the application or UI.
+Custom formats and alternative renderers implement the public `PreviewProvider`
+trait and register it with `App::register_preview_provider`, or inject a
+`PreviewRegistry` through `App::with_preview_registry`. Providers registered
+later have higher priority, so a custom PDF, DOCX, or image renderer can
+override the built-in common-file provider without changing the application or
+UI.
 
 See [docs/design/preview-providers.md](docs/design/preview-providers.md) for the provider
 contract and an integration example.

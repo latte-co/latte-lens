@@ -1,8 +1,14 @@
 //! Extensible, read-only file previews.
 //!
-//! Providers are queried in reverse registration order. This lets an optional
-//! format-specific provider (for example, PDF or Word) override the built-in
-//! text sniffer without coupling Latte Lens to that format or its dependencies.
+//! Providers are queried in reverse registration order. This lets callers
+//! override the built-in text and common-file implementations with a custom
+//! format-specific renderer without coupling the UI to that renderer.
+
+mod common;
+mod common_files;
+mod docx_preview;
+mod image_preview;
+mod pdf_preview;
 
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -44,6 +50,50 @@ pub enum HighlightKind {
     Search,
     NavigationTarget,
     NavigationHover,
+    /// One terminal half-block cell. The foreground colors the upper pixel and
+    /// the background colors the lower pixel; `None` preserves the inherited
+    /// terminal color for transparent pixels.
+    ImagePixel {
+        foreground: Option<RgbColor>,
+        background: Option<RgbColor>,
+    },
+}
+
+/// A terminal-safe 24-bit color used by confirmed inline image previews.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RgbColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+/// Semantic kind of a resolved preview.
+///
+/// Custom providers remain textual unless they explicitly opt into a future
+/// typed presentation. Only the built-in image provider currently emits
+/// [`Image`](Self::Image).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewKind {
+    #[default]
+    Text,
+    Image(ImagePreviewFormat),
+}
+
+/// Supported image content detected from bytes, never inferred from a suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImagePreviewFormat {
+    Png,
+    Jpeg,
+    Gif,
+    WebP,
+}
+
+/// Maximum terminal cell viewport requested for an explicitly confirmed
+/// inline image preview.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TerminalImageSize {
+    pub columns: u16,
+    pub rows: u16,
 }
 
 /// A syntax-highlighted byte range within one logical preview line.
@@ -71,6 +121,7 @@ pub struct PreviewRequest<'a> {
     follow_symlinks: bool,
     pub max_bytes: usize,
     pub max_lines: usize,
+    terminal_image_size: Option<TerminalImageSize>,
 }
 
 impl<'a> PreviewRequest<'a> {
@@ -82,6 +133,7 @@ impl<'a> PreviewRequest<'a> {
             follow_symlinks: false,
             max_bytes: DEFAULT_MAX_BYTES,
             max_lines: DEFAULT_MAX_LINES,
+            terminal_image_size: None,
         }
     }
 
@@ -102,6 +154,17 @@ impl<'a> PreviewRequest<'a> {
         self.max_bytes = max_bytes;
         self.max_lines = max_lines;
         self
+    }
+
+    /// Request a bounded TrueColor half-block image for a user-confirmed
+    /// terminal fallback. Providers that do not render images ignore it.
+    pub fn with_terminal_image_size(mut self, columns: u16, rows: u16) -> Self {
+        self.terminal_image_size = Some(TerminalImageSize { columns, rows });
+        self
+    }
+
+    pub const fn terminal_image_size(&self) -> Option<TerminalImageSize> {
+        self.terminal_image_size
     }
 
     /// Open the selected object only when it is still a real regular file.
@@ -172,6 +235,7 @@ pub struct PreviewContent {
     pub highlights: Vec<Vec<HighlightSpan>>,
     pub truncated: bool,
     pub show_line_numbers: bool,
+    pub kind: PreviewKind,
 }
 
 impl PreviewContent {
@@ -182,6 +246,7 @@ impl PreviewContent {
             highlights,
             truncated: false,
             show_line_numbers: false,
+            kind: PreviewKind::Text,
         }
     }
 
@@ -201,6 +266,11 @@ impl PreviewContent {
         }
         self
     }
+
+    pub fn with_kind(mut self, kind: PreviewKind) -> Self {
+        self.kind = kind;
+        self
+    }
 }
 
 /// A resolved preview ready for the application or UI layer.
@@ -211,6 +281,7 @@ pub struct Preview {
     pub highlights: Vec<Vec<HighlightSpan>>,
     pub truncated: bool,
     pub show_line_numbers: bool,
+    pub kind: PreviewKind,
 }
 
 /// Extension point for optional preview implementations.
@@ -263,6 +334,10 @@ impl PreviewRegistry {
         registry.providers.push(ProviderEntry {
             provider: Arc::new(TextPreviewProvider),
             fold_source: FoldSource::BuiltinText,
+        });
+        registry.providers.push(ProviderEntry {
+            provider: Arc::new(common_files::CommonFilePreviewProvider::default()),
+            fold_source: FoldSource::None,
         });
         registry
     }
@@ -352,6 +427,7 @@ impl PreviewRegistry {
                     highlights: content.highlights,
                     truncated: content.truncated,
                     show_line_numbers: content.show_line_numbers,
+                    kind: content.kind,
                 },
                 fold_source: FoldSource::None,
             });
@@ -379,6 +455,7 @@ impl PreviewRegistry {
                         highlights: content.highlights,
                         truncated: content.truncated,
                         show_line_numbers: content.show_line_numbers,
+                        kind: content.kind,
                     },
                     fold_source: entry.fold_source,
                 });

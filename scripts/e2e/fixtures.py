@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
+import zlib
 from pathlib import Path
 
 
@@ -131,6 +133,122 @@ def create_symlink_preview_fixture(root: Path, environment: dict[str, str]) -> N
         "linked-file-target-content\n", encoding="utf-8"
     )
     root.joinpath("b-file-link.txt").symlink_to(Path("../linked-files/sample.txt"))
+
+
+def create_image_preview_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+
+    def png_chunk(kind: bytes, payload: bytes) -> bytes:
+        checksum = zlib.crc32(kind + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+    rows = (
+        b"\x00" + b"\xff\x00\x00\xff" + b"\x00\xff\x00\xff",
+        b"\x00" + b"\x00\x00\xff\xff" + b"\xff\xff\xff\xff",
+    )
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(b"".join(rows)))
+        + png_chunk(b"IEND", b"")
+    )
+    root.joinpath("sample.png").write_bytes(png)
+    run("git", "add", "sample.png", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "image fixture", cwd=root, environment=environment)
+
+    # Never hand an E2E fixture to a real desktop application. macOS reaches
+    # the prompt through this deterministic failing opener; headless Linux
+    # reaches it before xdg-open because both display variables are absent.
+    viewer_bin = root.parent / "viewer-bin"
+    viewer_bin.mkdir(mode=0o700)
+    environment["LATTELENS_E2E_VIEWER_MARKER"] = str(root.parent / "viewer-invoked")
+    for name in ("open", "xdg-open"):
+        opener = viewer_bin / name
+        opener.write_text(
+            '#!/bin/sh\n: > "$LATTELENS_E2E_VIEWER_MARKER"\nexit 23\n',
+            encoding="utf-8",
+        )
+        opener.chmod(0o700)
+    git = shutil.which("git", path=environment["PATH"])
+    if git is None:
+        raise RuntimeError("git is required for the image preview fixture")
+    viewer_bin.joinpath("git").symlink_to(Path(git).resolve())
+    environment["PATH"] = str(viewer_bin)
+    environment.pop("DISPLAY", None)
+    environment.pop("WAYLAND_DISPLAY", None)
+    environment["TERM"] = "xterm-truecolor"
+
+
+def create_system_open_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length 51 >>\nstream\nBT /F1 12 Tf 72 720 Td "
+        b"(Unified system open) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    )
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for object_number, payload in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{object_number} 0 obj\n".encode())
+        pdf.extend(payload)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode())
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode())
+    pdf.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+
+    root.joinpath("a-preview.pdf").write_bytes(pdf)
+    root.joinpath("b-unknown.data").write_bytes(b"\x00\x01\x02\x03")
+    root.joinpath("c-danger.sh").write_text(
+        "#!/bin/sh\necho should-never-run\n", encoding="utf-8"
+    )
+    run(
+        "git",
+        "add",
+        "a-preview.pdf",
+        "b-unknown.data",
+        "c-danger.sh",
+        cwd=root,
+        environment=environment,
+    )
+    run("git", "commit", "-q", "-m", "system open fixture", cwd=root, environment=environment)
+
+    # The production binary must reach an isolated adapter, never a real host
+    # application. The trace lives outside the guarded repository so it cannot
+    # be confused with a Lens write to the user's workspace.
+    opener_bin = root.parent / "system-open-bin"
+    opener_bin.mkdir(mode=0o700)
+    trace = root.parent / "system-open-trace"
+    environment["LATTELENS_E2E_OPEN_TRACE"] = str(trace)
+    for name in ("open", "xdg-open"):
+        opener = opener_bin / name
+        opener.write_text(
+            "#!/bin/sh\n"
+            "target=\n"
+            "for argument do target=$argument; done\n"
+            'printf "%s\\n" "$target" >> "$LATTELENS_E2E_OPEN_TRACE"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        opener.chmod(0o700)
+    git = shutil.which("git", path=environment["PATH"])
+    if git is None:
+        raise RuntimeError("git is required for the system open fixture")
+    opener_bin.joinpath("git").symlink_to(Path(git).resolve())
+    environment["PATH"] = str(opener_bin)
+    environment["DISPLAY"] = ":99"
+    environment.pop("WAYLAND_DISPLAY", None)
 
 
 def create_search_fixture(root: Path, environment: dict[str, str]) -> None:

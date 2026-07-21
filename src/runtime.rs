@@ -10,12 +10,18 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 
 use crate::{
-    content_safety::{ensure_beneath, path_exists_without_following, resolves_to_directory},
+    content_safety::{
+        FileFingerprint, ensure_beneath, path_exists_without_following, resolves_to_directory,
+    },
     folding::{FoldRegion, FoldSource, StructureSnapshot, structure_snapshot},
     git::StatusMap,
     navigation::{LineIndex, NavigationSource, language_for_path},
-    preview::{HighlightSpan, PreviewRegistry, PreviewRequest, PreviewResolution},
+    preview::{
+        HighlightSpan, PreviewKind, PreviewRegistry, PreviewRequest, PreviewResolution,
+        TerminalImageSize,
+    },
     repo_graph::{DiscoveryOptions, RepoChange, RepoGraph},
+    system_preview::{self, ExternalOpenOutcome, SystemOpenAdapter},
     tree::{self, ScanResult},
 };
 
@@ -49,6 +55,15 @@ pub(crate) struct ContentRequest {
     pub kind: ContentKind,
     pub purpose: ContentPurpose,
     pub target: ContentTarget,
+    pub terminal_image_size: Option<TerminalImageSize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExternalOpenRequest {
+    pub generation: u64,
+    pub target: ContentTarget,
+    pub label: String,
+    pub confirmed_fingerprint: Option<FileFingerprint>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,7 +73,7 @@ pub(crate) enum ContentPurpose {
     NavigationPreview { navigation_generation: u64 },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContentTarget {
     Workspace(PathBuf),
     /// A source file owned by an externally resolved dependency package.
@@ -95,6 +110,8 @@ pub(crate) struct ContentSnapshot {
     pub fold_regions: Vec<FoldRegion>,
     pub structure: StructureSnapshot,
     pub navigation_source: Option<NavigationSource>,
+    pub preview_kind: PreviewKind,
+    pub source_target: Option<ContentTarget>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -208,6 +225,14 @@ pub(crate) struct ContentCompletion {
     pub kind: ContentKind,
     pub purpose: ContentPurpose,
     pub result: Result<ContentSnapshot, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExternalOpenCompletion {
+    pub generation: u64,
+    pub target: ContentTarget,
+    pub label: String,
+    pub result: Result<ExternalOpenOutcome, String>,
 }
 
 #[derive(Debug)]
@@ -336,9 +361,11 @@ struct SharedState {
     refresh: RequestSlot<RefreshRequest>,
     directory: DirectoryQueue,
     content: RequestSlot<ContentRequest>,
+    external_open: RequestSlot<ExternalOpenRequest>,
     completed_refresh: Option<RefreshCompletion>,
     completed_directories: VecDeque<DirectoryCompletion>,
     completed_content: Option<ContentCompletion>,
+    completed_external_open: Option<ExternalOpenCompletion>,
     preview_registry_update: Option<PreviewRegistry>,
 }
 
@@ -353,7 +380,11 @@ pub(crate) struct WorkerRuntime {
 }
 
 impl WorkerRuntime {
-    pub fn start(root: PathBuf, preview_registry: PreviewRegistry) -> Result<Self> {
+    pub fn start(
+        root: PathBuf,
+        preview_registry: PreviewRegistry,
+        system_open_adapter: SystemOpenAdapter,
+    ) -> Result<Self> {
         // Content paths come from the canonical repository graph, so keep the
         // worker boundary in the same representation on every platform.
         let root = root
@@ -366,7 +397,9 @@ impl WorkerRuntime {
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("latte-lens-io".to_owned())
-            .spawn(move || worker_loop(worker_shared, root, preview_registry))?;
+            .spawn(move || {
+                worker_loop(worker_shared, root, preview_registry, system_open_adapter)
+            })?;
         Ok(Self {
             shared,
             worker: Some(worker),
@@ -391,9 +424,20 @@ impl WorkerRuntime {
         self.shared.changed.notify_one();
     }
 
+    pub fn request_external_open(&self, request: ExternalOpenRequest) {
+        let mut state = self.lock_state();
+        state.external_open.submit(request);
+        self.shared.changed.notify_one();
+    }
+
     pub fn cancel_pending_content(&self) {
         let mut state = self.lock_state();
         state.content.cancel_pending();
+    }
+
+    pub fn cancel_pending_external_open(&self) {
+        let mut state = self.lock_state();
+        state.external_open.cancel_pending();
     }
 
     pub fn update_preview_registry(&self, registry: PreviewRegistry) {
@@ -408,12 +452,14 @@ impl WorkerRuntime {
         Option<RefreshCompletion>,
         Vec<DirectoryCompletion>,
         Option<ContentCompletion>,
+        Option<ExternalOpenCompletion>,
     ) {
         let mut state = self.lock_state();
         (
             state.completed_refresh.take(),
             state.completed_directories.drain(..).collect(),
             state.completed_content.take(),
+            state.completed_external_open.take(),
         )
     }
 
@@ -425,7 +471,11 @@ impl WorkerRuntime {
             && state.completed_refresh.is_none()
             && state.completed_directories.is_empty()
             && state.completed_content.is_none()
-            && (state.refresh.has_work() || state.directory.has_work() || state.content.has_work())
+            && state.completed_external_open.is_none()
+            && (state.refresh.has_work()
+                || state.directory.has_work()
+                || state.content.has_work()
+                || state.external_open.has_work())
         {
             state = self
                 .shared
@@ -436,6 +486,7 @@ impl WorkerRuntime {
         state.completed_refresh.is_some()
             || !state.completed_directories.is_empty()
             || state.completed_content.is_some()
+            || state.completed_external_open.is_some()
     }
 
     fn lock_state(&self) -> MutexGuard<'_, SharedState> {
@@ -454,6 +505,7 @@ impl Drop for WorkerRuntime {
             state.refresh.cancel_pending();
             state.directory.cancel_pending();
             state.content.cancel_pending();
+            state.external_open.cancel_pending();
             self.shared.changed.notify_all();
         }
         if let Some(worker) = self.worker.take() {
@@ -466,9 +518,15 @@ enum Work {
     Refresh(RefreshRequest),
     Directory(DirectoryRequest),
     Content(ContentRequest),
+    ExternalOpen(ExternalOpenRequest),
 }
 
-fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: PreviewRegistry) {
+fn worker_loop(
+    shared: Arc<Shared>,
+    root: PathBuf,
+    mut preview_registry: PreviewRegistry,
+    system_open_adapter: SystemOpenAdapter,
+) {
     let mut graph = None;
     let mut statuses = StatusMap::new();
     loop {
@@ -481,6 +539,7 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
                 && state.refresh.pending.is_none()
                 && state.directory.pending.is_empty()
                 && state.content.pending.is_none()
+                && state.external_open.pending.is_none()
                 && state.preview_registry_update.is_none()
             {
                 state = shared
@@ -553,6 +612,26 @@ fn worker_loop(shared: Arc<Shared>, root: PathBuf, mut preview_registry: Preview
                 });
                 shared.changed.notify_all();
             }
+            Work::ExternalOpen(request) => {
+                let generation = request.generation;
+                let target = request.target.clone();
+                let label = request.label.clone();
+                let result = catch_worker_error(|| {
+                    execute_external_open(&root, graph.as_ref(), &system_open_adapter, request)
+                });
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.external_open.complete();
+                state.completed_external_open = Some(ExternalOpenCompletion {
+                    generation,
+                    target,
+                    label,
+                    result,
+                });
+                shared.changed.notify_all();
+            }
         }
     }
 }
@@ -564,7 +643,10 @@ fn take_next_work(state: &mut SharedState) -> Option<Work> {
     if let Some(request) = state.directory.start_next() {
         return Some(Work::Directory(request));
     }
-    state.content.start_next().map(Work::Content)
+    if let Some(request) = state.content.start_next() {
+        return Some(Work::Content(request));
+    }
+    state.external_open.start_next().map(Work::ExternalOpen)
 }
 
 struct ExecutedRefresh {
@@ -644,6 +726,85 @@ fn execute_directory(
     tree::scan_directory(root, &request.relative, statuses, request.scan_entry_limit)
 }
 
+struct ResolvedPreviewTarget {
+    absolute: PathBuf,
+    display_path: PathBuf,
+    content_root: PathBuf,
+    identity: Option<ContentIdentity>,
+    navigation_server_root: PathBuf,
+    follow_symlinks: bool,
+}
+
+fn resolve_preview_target(
+    root: &std::path::Path,
+    graph: Option<&RepoGraph>,
+    target: ContentTarget,
+) -> Result<ResolvedPreviewTarget> {
+    // Only the interactive All Files view follows a final symbolic link.
+    // Repository and dependency previews keep the strict no-follow policy.
+    let follow_symlinks = matches!(target, ContentTarget::Workspace(_));
+    let (absolute, display_path, content_root, identity, navigation_server_root) = match target {
+        ContentTarget::Workspace(relative) => {
+            let absolute = root.join(&relative);
+            (
+                absolute.clone(),
+                relative,
+                root.to_path_buf(),
+                ContentIdentity::from_absolute(root, &absolute),
+                server_root_for_document(root, graph, &absolute),
+            )
+        }
+        ContentTarget::Dependency {
+            root: dependency_root,
+            relative,
+            server_root,
+        } => {
+            let absolute = dependency_root.join(&relative);
+            let identity = ContentIdentity::dependency(
+                dependency_root.clone(),
+                &absolute,
+                server_root.clone(),
+            );
+            let display_path = identity
+                .as_ref()
+                .map_or_else(|| relative.clone(), ContentIdentity::display_path);
+            (
+                absolute,
+                display_path,
+                dependency_root,
+                identity,
+                server_root,
+            )
+        }
+        ContentTarget::Repository(change) => {
+            let graph = graph.ok_or_else(|| anyhow!("repository graph is not available"))?;
+            let snapshot = graph.repository(&change.path.repo_id).ok_or_else(|| {
+                anyhow!(
+                    "repository {} is no longer available",
+                    change.path.repo_id.path().display()
+                )
+            })?;
+            let relative = change.path.relative;
+            let absolute = snapshot.node.worktree.join(&relative);
+            (
+                absolute.clone(),
+                relative,
+                root.to_path_buf(),
+                ContentIdentity::from_absolute(root, &absolute),
+                server_root_for_document(root, Some(graph), &absolute),
+            )
+        }
+    };
+    Ok(ResolvedPreviewTarget {
+        absolute,
+        display_path,
+        content_root,
+        identity,
+        navigation_server_root,
+        follow_symlinks,
+    })
+}
+
 fn execute_content(
     root: &std::path::Path,
     graph: Option<&RepoGraph>,
@@ -683,72 +844,25 @@ fn execute_content(
                 fold_regions: Vec::new(),
                 structure: StructureSnapshot::unavailable(),
                 navigation_source: None,
+                preview_kind: PreviewKind::Text,
+                source_target: None,
             })
         }
         ContentKind::Preview => {
-            // Only the interactive All Files view (a Workspace target) follows a
-            // final symbolic link to preview its target content. Repository and
-            // dependency previews keep the strict no-follow policy so a tracked
-            // link renders as its target path, never its target's bytes.
-            let follow_symlinks = matches!(request.target, ContentTarget::Workspace(_));
-            let (absolute, display_path, content_root, identity, navigation_server_root) =
-                match request.target {
-                    ContentTarget::Workspace(relative) => {
-                        let absolute = root.join(&relative);
-                        (
-                            absolute.clone(),
-                            relative,
-                            root.to_path_buf(),
-                            ContentIdentity::from_absolute(root, &absolute),
-                            server_root_for_document(root, graph, &absolute),
-                        )
-                    }
-                    ContentTarget::Dependency {
-                        root: dependency_root,
-                        relative,
-                        server_root,
-                    } => {
-                        let absolute = dependency_root.join(&relative);
-                        let identity = ContentIdentity::dependency(
-                            dependency_root.clone(),
-                            &absolute,
-                            server_root.clone(),
-                        );
-                        let display_path = identity
-                            .as_ref()
-                            .map_or_else(|| relative.clone(), ContentIdentity::display_path);
-                        (
-                            absolute,
-                            display_path,
-                            dependency_root,
-                            identity,
-                            server_root,
-                        )
-                    }
-                    ContentTarget::Repository(change) => {
-                        let graph =
-                            graph.ok_or_else(|| anyhow!("repository graph is not available"))?;
-                        let snapshot = graph.repository(&change.path.repo_id).ok_or_else(|| {
-                            anyhow!(
-                                "repository {} is no longer available",
-                                change.path.repo_id.path().display()
-                            )
-                        })?;
-                        let relative = change.path.relative;
-                        let absolute = snapshot.node.worktree.join(&relative);
-                        (
-                            absolute.clone(),
-                            relative,
-                            root.to_path_buf(),
-                            ContentIdentity::from_absolute(root, &absolute),
-                            server_root_for_document(root, Some(graph), &absolute),
-                        )
-                    }
-                };
-            let preview_request = PreviewRequest::new(&absolute, &display_path)
+            let source_target = request.target.clone();
+            let resolved = resolve_preview_target(root, graph, request.target)?;
+            let absolute = resolved.absolute;
+            let display_path = resolved.display_path;
+            let content_root = resolved.content_root;
+            let identity = resolved.identity;
+            let navigation_server_root = resolved.navigation_server_root;
+            let mut preview_request = PreviewRequest::new(&absolute, &display_path)
                 .within_root(&content_root)
-                .following_symlinks(follow_symlinks)
+                .following_symlinks(resolved.follow_symlinks)
                 .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES);
+            if let Some(size) = request.terminal_image_size {
+                preview_request = preview_request.with_terminal_image_size(size.columns, size.rows);
+            }
             let (preview, fold_source) = match registry.resolve(&preview_request)? {
                 PreviewResolution::Preview {
                     preview,
@@ -768,6 +882,8 @@ fn execute_content(
                         fold_regions: Vec::new(),
                         structure: StructureSnapshot::unavailable(),
                         navigation_source: None,
+                        preview_kind: PreviewKind::Text,
+                        source_target: None,
                     });
                 }
                 PreviewResolution::Unsafe {
@@ -801,9 +917,12 @@ fn execute_content(
                         fold_regions: Vec::new(),
                         structure: StructureSnapshot::unavailable(),
                         navigation_source: None,
+                        preview_kind: PreviewKind::Text,
+                        source_target: None,
                     });
                 }
             };
+            let preview_kind = preview.kind;
             let mut lines = preview.lines;
             let mut highlights = preview.highlights;
             let structure = if fold_source.allows_folding() {
@@ -854,9 +973,27 @@ fn execute_content(
                 fold_regions,
                 structure,
                 navigation_source,
+                preview_kind,
+                source_target: Some(source_target),
             })
         }
     }
+}
+
+fn execute_external_open(
+    root: &std::path::Path,
+    graph: Option<&RepoGraph>,
+    system_open_adapter: &SystemOpenAdapter,
+    request: ExternalOpenRequest,
+) -> Result<ExternalOpenOutcome> {
+    let resolved = resolve_preview_target(root, graph, request.target)?;
+    system_preview::open_file(
+        &resolved.absolute,
+        Some(&resolved.content_root),
+        resolved.follow_symlinks,
+        request.confirmed_fingerprint.as_ref(),
+        system_open_adapter,
+    )
 }
 
 fn workspace_statuses(root: &std::path::Path, graph: &RepoGraph) -> StatusMap {
@@ -946,7 +1083,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, io::Cursor, path::Path, process::Command};
 
     use super::*;
 
@@ -1004,6 +1141,7 @@ mod tests {
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
+            terminal_image_size: None,
         });
         assert_eq!(slot.start_next().unwrap().generation, 1);
 
@@ -1013,6 +1151,7 @@ mod tests {
                 kind: ContentKind::Preview,
                 purpose: ContentPurpose::Display,
                 target: ContentTarget::Workspace(PathBuf::from(format!("{generation}.txt"))),
+                terminal_image_size: None,
             });
         }
         slot.complete();
@@ -1025,6 +1164,59 @@ mod tests {
         ));
         slot.complete();
         assert!(!slot.has_work());
+    }
+
+    #[test]
+    fn external_open_revalidates_magic_and_blocks_disguised_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.png");
+        fs::write(&path, b"#!/bin/sh\necho unsafe\n").unwrap();
+        let result = execute_external_open(
+            directory.path(),
+            None,
+            &SystemOpenAdapter::Disabled("test adapter".to_owned()),
+            ExternalOpenRequest {
+                generation: 1,
+                target: ContentTarget::Workspace(PathBuf::from("payload.png")),
+                label: "payload.png".to_owned(),
+                confirmed_fingerprint: None,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn external_open_requires_confirmation_for_an_unknown_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            1,
+            1,
+            image::Rgba([20, 40, 60, 255]),
+        ));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        fs::write(directory.path().join("renamed.txt"), bytes.into_inner()).unwrap();
+
+        let outcome = execute_external_open(
+            directory.path(),
+            None,
+            &SystemOpenAdapter::Disabled("test adapter".to_owned()),
+            ExternalOpenRequest {
+                generation: 1,
+                target: ContentTarget::Workspace(PathBuf::from("renamed.txt")),
+                label: "renamed.txt".to_owned(),
+                confirmed_fingerprint: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ExternalOpenOutcome::ConfirmationRequired { detected, .. }
+                if detected == "PNG image"
+        ));
     }
 
     #[test]

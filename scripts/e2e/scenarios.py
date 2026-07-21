@@ -23,6 +23,7 @@ from .fixtures import (
     create_disabled_product_config_fixture,
     create_fold_mouse_navigation_fixture,
     create_git_matrix_fixture,
+    create_image_preview_fixture,
     create_incompatible_lsp_fixture,
     create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
@@ -31,6 +32,7 @@ from .fixtures import (
     create_repository_relation_fixture,
     create_resilience_lsp_fixture,
     create_search_fixture,
+    create_system_open_fixture,
     create_symlink_preview_fixture,
     create_structure_fixture,
     create_timeout_lsp_fixture,
@@ -320,6 +322,109 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
         "production binary previews a file reached through a directory symlink",
         absent=("Preview unavailable",),
     )
+
+
+def image_preview_fallback(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    _click_tree_row(session, "sample.png")
+    session.wait_screen(
+        (
+            "Format: PNG",
+            "Dimensions: 2 x 2",
+            "Press o to open with the system default app.",
+        ),
+        "image preview defaults to bounded metadata",
+    )
+
+    session.key(b"o")
+    session.wait_screen(
+        (
+            "System default app unavailable:",
+            "Press i to preview in this terminal using TrueColor half-block pixels.",
+            "Press Esc to cancel.",
+        ),
+        "unavailable system app requires an explicit terminal-preview decision",
+    )
+    session.key(b"\x1b")
+    session.wait_screen(
+        ("Format: PNG", "Press o to open with the system default app."),
+        "Escape cancels terminal rendering and restores image metadata",
+    )
+
+    session.key(b"o")
+    session.wait_screen(
+        ("System default app unavailable:", "Press i to preview"),
+        "terminal image confirmation prompt can be opened again",
+    )
+    session.key(b"i")
+    session.wait_screen(
+        ("Terminal preview", "press o for the system default app", "▀"),
+        "confirmed terminal preview uses half-block pixels",
+    )
+
+
+def unified_system_open(context: ScenarioContext) -> None:
+    session = context.session
+    trace = Path(context.environment["LATTELENS_E2E_OPEN_TRACE"])
+    expected_pdf = str((context.repository / "a-preview.pdf").resolve())
+    expected_unknown = str((context.repository / "b-unknown.data").resolve())
+    wait_for_initial_files(session)
+
+    _click_tree_row(session, "a-preview.pdf")
+    session.wait_screen(
+        ("Format: PDF", "Pages: 1", "Unified system open"),
+        "PDF keeps its internal bounded preview before external opening",
+    )
+    session.key(b"o")
+    session.wait_screen(
+        ("Opened a-preview.pdf with the system default app.",),
+        "PDF uses the unified default-app action",
+    )
+    session.wait_until(
+        lambda _screen: trace.is_file()
+        and trace.read_text(encoding="utf-8").splitlines()
+        == [expected_pdf],
+        "stub opener receives the verified PDF path exactly once",
+    )
+    _click_marker_on_line(session, "[Open]", alongside=("Preview", "a-preview.pdf"))
+    session.wait_screen(
+        ("a-preview.pdf was already handed to the system app.",),
+        "clickable Open shares the short duplicate-suppression window",
+    )
+
+    _click_tree_row(session, "b-unknown.data")
+    session.wait_screen(("b-unknown.data",), "unknown file is selected")
+    session.key(b"o")
+    session.wait_screen(
+        ("b-unknown.data is unknown regular file; press o again", "Open anyway"),
+        "unknown binary requires explicit confirmation",
+    )
+    session.key(b"\r")
+    session.wait_screen(
+        ("Unknown file type. Press o or click Open anyway to confirm.",),
+        "Enter cannot consume an unknown-file confirmation",
+    )
+    assert trace.read_text(encoding="utf-8").splitlines() == [expected_pdf]
+    session.key(b"o")
+    session.wait_screen(
+        ("Opened b-unknown.data with the system default app.",),
+        "second explicit o confirms the same unknown fingerprint",
+    )
+    session.wait_until(
+        lambda _screen: trace.read_text(encoding="utf-8").splitlines()
+        == [expected_pdf, expected_unknown],
+        "stub opener receives the confirmed unknown path exactly once",
+    )
+
+    _click_tree_row(session, "c-danger.sh")
+    session.wait_screen(("c-danger.sh",), "script is selected")
+    session.key(b"o")
+    session.wait_screen(
+        ("System open blocked:", "script"),
+        "script activation is blocked before the platform adapter",
+    )
+    assert trace.read_text(encoding="utf-8").splitlines() == [expected_pdf, expected_unknown]
 
 
 def symlink_copy_path(context: ScenarioContext) -> None:
@@ -634,8 +739,9 @@ def git_review_state(context: ScenarioContext) -> None:
 
     _click_tree_row(session, "worktree.txt")
     session.wait_screen(
-        ("worktree.txt", "+worktree after", "Space review"),
+        ("worktree.txt", "+worktree after", "── WORKTREE ──"),
         "reviewable worktree diff is fully loaded",
+        absent=("LOADING",),
     )
     session.key(b" ")
     session.wait_until(
@@ -720,13 +826,13 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
         "repository issue selection explains the symlink boundary",
     )
 
-    _click_tree_row(session, "modules/child")
+    _click_disclosure(session, "modules/child")
     session.wait_screen(
         ("submodule repository", "pointer changed", "internal modified", "internal untracked"),
         "child relation details survive deliberate collapse",
         absent=("tracked.txt", "untracked-child.txt"),
     )
-    _click_tree_row(session, "modules/child")
+    _click_disclosure(session, "modules/child")
     session.wait_screen(
         ("tracked.txt", "untracked-child.txt"),
         "child repository reopens with both internal changes",
@@ -1877,6 +1983,18 @@ CASES = (
         "files",
         create_symlink_preview_fixture,
         symlink_preview_smoke,
+    ),
+    ScenarioCase(
+        "image-preview-fallback",
+        "files",
+        create_image_preview_fixture,
+        image_preview_fallback,
+    ),
+    ScenarioCase(
+        "unified-system-open",
+        "files",
+        create_system_open_fixture,
+        unified_system_open,
     ),
     ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
     ScenarioCase(

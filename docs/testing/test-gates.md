@@ -87,10 +87,13 @@ Q3 是当前 Files/Git Changes 的正式门禁。Q4 不是 Q3 的替代品：未
 | F-UT-003 | shallow startup + lazy expand | Q2 | 两层启动、boundary directory、逐层异步加载、stale epoch |
 | F-UT-004 | selection/expansion 稳定 | Q2 | refresh、隐藏 selection fallback、新目录默认 |
 | F-UT-005 | content safety：All Files follow / 仓库 no-follow | Q1/Q2 | All Files 跟随文件软链与经目录软链的普通文件、拒绝目录/特殊/断链；仓库读取 final symlink target-text-only、intermediate symlink、reparse、FIFO、socket、device、missing/race |
-| F-UT-006 | preview 有界且可回退 | Q1/Q2 | bytes/lines、binary、invalid UTF-8、provider decline |
+| F-UT-006 | preview 有界且可回退 | Q1/Q2 | bytes/lines、binary、invalid UTF-8、provider decline；PNG/JPEG/GIF/WebP metadata-only 默认、统一 external open、显式提示后的 `i` TrueColor fallback；PDF 全页/页数/扫描提示；DOCX 段落/列表/表格 |
 | F-UT-007 | wrap/copy 保持原文 | Q1/Q2 | tabs、wide/combining grapheme、logical lines、highlight ranges |
 | F-UT-008 | search lazy/cancellable | Q1/Q2 | ignored toggle、regex、generation cancel、result cap、no eager inventory |
 | F-UT-009 | worker stale result 不污染 UI | Q1/Q2 | refresh/content/search generations 与 workspace switch |
+| F-UT-010 | binary preview 不执行不可信内容 | Q1/Q2 | magic/extension mismatch、script/polyglot、macro/DOCTYPE、active PDF action ignore、terminal-control sanitization、解压/尺寸/页/对象/输出预算与 cache limits 隔离 |
+| F-UT-011 | 统一系统打开与 headless 状态机安全 | Q1/Q2 | PDF/图片/Office/文本/媒体/压缩包分类；主动后缀、executable bit、shebang/PE/ELF/Mach-O、macro、mismatch、unknown confirmation；fingerprint 重验、无 shell 参数边界、Linux 无 display、opener unavailable/failure、dedupe/stale generation；只有图片可在明确提示后用 `i`，`Esc` 取消 |
+| F-UT-012 | Tree 激活交互一致 | Q2 | 单击只选中、disclosure 单击切换、目录双击只切换一次；文件 `Enter`/双击/`o`/`[Open]` 同 request；Content fold Enter 和 popup Enter 不回归；未知格式只有第二个 `o`/`[Open anyway]` 可确认 |
 
 ### 4.2 Files production E2E
 
@@ -107,6 +110,7 @@ Q3 是当前 Files/Git Changes 的正式门禁。Q4 不是 Q3 的替代品：未
 | F-E2E-009 | Preview find/mode | Ctrl+F、next/previous、tabs/wrap、changed file Preview↔Diff | gap |
 | F-E2E-010 | unsafe/partial UX | symlink/FIFO 不挂起；大 workspace 显示 PARTIAL 而非完整 | gap |
 | F-E2E-011 | graceful exit | mouse mode/alternate screen 恢复；PTY drain 完成 | covered |
+| F-E2E-012 | unified system open | 隔离 stub opener；PDF 用 `o` 打开；图片 failure→`i`/`Esc`；未知格式二次确认；伪装脚本调用计数为 0 | covered |
 
 F-E2E-007 至 F-E2E-010 不要求一个超大场景完成。它们应使用独立 fixture/scenario，避免已有基础导航失败时掩盖搜索或安全问题。
 All Files 跟随软链另有 `symlink-preview-smoke` production-binary 场景：fixture 只在
@@ -264,10 +268,10 @@ CI 映射：
 - Linux/macOS PTY：Q3 Files + Git Changes + Search + Code Navigation，以及 required 的 Agent journey；
 - Windows：Q0–Q2、package；ConPTY 未持续验证前不声称 Q3；
 - Agent jobs：按专项文档增加 Q4，不替代主 PTY job；
-- coverage-unit：分母以 Makefile 的 `UT_COVERAGE_IGNORE_REGEX` 为准。当前过滤后由 Q1 直接单测负责的 surface 包含 `clipboard.rs`、`diff.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`navigation.rs`、`preview.rs`、`search.rs` 和 `text_layout.rs`，保持 93% line floor；
+- coverage-unit：分母以 Makefile 的 `UT_COVERAGE_IGNORE_REGEX` 为准。当前过滤后由 Q1 直接单测负责的 surface 包含 `clipboard.rs`、`diff.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`navigation.rs`、`preview.rs` 与 `preview/*`、`search.rs`、`system_preview.rs` 和 `text_layout.rs`，保持 93% line floor；
 - coverage-e2e：用 production binary + PTY 执行全部 required scenarios，分母以 Makefile 的 `E2E_COVERAGE_IGNORE_REGEX` 为准。当前 production PTY surface 包含 `app.rs`、`folding.rs`、`lsp.rs`、`lsp_process.rs`、当前 target 编译的 process backend、`main.rs`、`navigation.rs` 和 `ui.rs`，保持 85% line floor；
 - coverage-agent：统计完整 synthetic Agent Core 的 G1–G3 Rust 执行路径，保持 80% line floor；不得通过排除新增 Agent 模块维持数字；
-- 被上述过滤器排除的其余边界模块仍由 Q2 integration/contract tests 独立阻断；`lsp_process_unix.rs` 与 `lsp_process_windows.rs` 只在各自适用的 target 编译和计量，覆盖率报告不替代上述 Windows native PR CI 证据。`make coverage` 顺序执行三个 coverage gate；
+- 被上述过滤器排除的其余边界模块仍由 Q2 integration/contract tests 独立阻断；格式解析的 `preview/*` 归 Q1/Q2，不进入 production PTY 或 Agent coverage 分母；`lsp_process_unix.rs` 与 `lsp_process_windows.rs` 只在各自适用的 target 编译和计量，覆盖率报告不替代上述 Windows native PR CI 证据。`make coverage` 顺序执行三个 coverage gate；
 - package：Q5，并验证只有 production binary/资产。
 
 ## 11. 改动与卡点映射
@@ -277,7 +281,7 @@ CI 映射：
 | `tree.rs` / Files traversal | F-UT-001..004 + 受影响 F-E2E |
 | `git.rs` parser/read-only boundary | G-UT-001..003/007；用户 marker/diff 变化时加 G-E2E（当前 review state/line stats：G-E2E-011） |
 | `repo_graph.rs` | G-UT-004..006 + G-E2E-003/004/007/008 |
-| `preview.rs` / content safety | F-UT-005..007 + F-E2E-004/009/010 |
+| `preview.rs` / content safety | F-UT-005..007/010 + F-E2E-004/009/010 |
 | `search.rs` | F-UT-008 + S-E2E-001..004 |
 | `runtime.rs` generation/backpressure | F-UT-009/G-UT-008 + 对应 scope refresh E2E |
 | `app.rs` / `ui.rs` | Q2 TestBackend + 对应 Files/Git/Search Q3 |
