@@ -44,10 +44,10 @@ V1 的核心用户心智是：
 
 | 输入 | 普通文件 | 目录/容器行 | 无可打开目标 |
 | --- | --- | --- | --- |
-| 单击文件树行 / 方向键 | 选中并触发 Lens 内部预览 | 只选中 | 无副作用 |
-| 单击 disclosure 图标 | 同单击行 | 立即展开/折叠 | 无副作用 |
+| 单击文件树行 / 方向键 | 单击选中并触发 Lens 内部预览；方向键只移动选择 | 单击立即展开/折叠；方向键只移动选择 | 无副作用 |
+| 单击 disclosure 图标 | 同单击文件行 | 同单击目录/容器行 | 无副作用 |
 | `Enter`（Tree 焦点） | 请求 Open Externally | 展开/折叠 | 显示短提示 |
-| 双击文件树行 | 请求 Open Externally | 展开/折叠 | 无副作用 |
+| 双击文件树行 | 请求 Open Externally | 等价于两次单击；目录不需要双击 | 无副作用 |
 | `o` | 打开当前焦点对应的文件 | 不处理 | 显示短提示 |
 | Content 标题栏 `[Open]` | 请求 Open Externally | 不显示 | 不显示 |
 
@@ -65,12 +65,12 @@ Git Changes 仍会在选择时自动加载内部 diff；`Enter` 激活文件，`
 
 ### 3.2 鼠标细节
 
-- 文件树单击从当前“单击目录即展开”调整为“单击只选择”；否则双击目录会连续切换两次；
-- 双击由同一 scope、同一稳定 row identity、相同主按键且间隔不超过 400 ms 判定；仅比较
-  屏幕行号不够，因为展开和异步刷新会移动行；
-- 第一次单击只选择，第二次才提交激活动作；双击本身永远不能完成未知格式的二次确认；
+- 目录/容器行任意位置单击立即展开或折叠，包括 disclosure glyph；不等待双击；
+- 文件行双击由同一 scope、同一稳定 row identity、相同主按键且间隔不超过 400 ms 判定；
+  仅比较屏幕行号不够，因为展开和异步刷新会移动行；
+- 文件第一次单击只选择，第二次才提交激活动作；双击本身永远不能完成未知格式的二次确认；
 - Content 区域的双击保留给文本选择，不绑定系统打开；
-- disclosure glyph 有独立 hit region，点击它不参与 row double-click 计数。
+- 目录/容器不参与 row double-click 计数，避免把文件激活状态泄漏到目录交互。
 
 ### 3.3 可发现性
 
@@ -255,7 +255,7 @@ src/app.rs
   统一 intent、焦点/选中目标、confirmation token、generation、状态反馈
 
 src/ui.rs
-  disclosure / row double-click hit region、[Open] / [Open anyway]、footer 提示
+  directory row / file double-click hit region、[Open] / [Open anyway]、footer 提示
 
 src/runtime.rs
   ExternalOpenRequest queue、target resolve、background classify/revalidate、stale reject
@@ -288,7 +288,7 @@ enum ExternalOpenOutcome {
    External Open intent 与 typed outcome；保留图片 `i` fallback；
 2. 实现 classifier、主动类型基线、常见被动格式 probe、fingerprint 和重验；
 3. 接入 `o`，验证 PDF/DOCX/文本与图片使用同一 runtime path；
-4. 修改 Tree `Enter` / 单击 / disclosure / 双击语义并增加稳定 identity 防抖；
+4. 修改 Tree `Enter` / 目录单击 / 文件双击语义并增加稳定 identity 防抖；
 5. 增加 Content `[Open]` / `[Open anyway]` hit region 与窄屏文案；
 6. 实现 macOS、Linux、Windows adapter 与 headless 分支；
 7. 更新 README、Preview Provider 文档、测试门禁和 PTY E2E；
@@ -309,7 +309,7 @@ enum ExternalOpenOutcome {
 
 ### App / UI integration
 
-- Tree 单击只选择，disclosure 单击展开，目录双击只切换一次；
+- Tree 目录/容器行任意位置单击展开或折叠，文件单击只选择；
 - 文件 `Enter`、双击、`o`、`[Open]` 产生相同 request；
 - Content `Enter` 仍切换 fold，popup `Enter` 不触发系统打开；
 - Git Changes 选择仍加载 diff，Tree `Enter` 打开存在文件，deleted/pointer 被禁用；
@@ -342,7 +342,7 @@ enum ExternalOpenOutcome {
 V1 只有同时满足以下条件才算完成：
 
 - PDF、图片、DOCX 和普通文本从 `o`、Tree `Enter`、双击与 `[Open]` 进入同一 runtime 动作；
-- Tree 单击/双击/目录展开语义无二次 toggle 回归；
+- Tree 目录单击、文件双击和键盘展开语义无回归；
 - 主动类型、伪装脚本、mismatch、特殊文件和路径变化不会到达 platform opener；
 - 未知格式有不可被双击/按键 repeat 越过的显式确认；
 - macOS、Windows、Linux desktop/headless 的结果与错误可见；

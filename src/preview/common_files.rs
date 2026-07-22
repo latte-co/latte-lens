@@ -72,6 +72,17 @@ impl PreviewProvider for CommonFilePreviewProvider {
                 CommonFormat::Png | CommonFormat::Jpeg | CommonFormat::Gif | CommonFormat::WebP
             )
         {
+            let key = self.cache_key(
+                request,
+                format,
+                usize::try_from(file.len()).unwrap_or(usize::MAX),
+                &probe,
+            );
+            if let Some(content) = self.cache.lock().expect("preview cache poisoned").get(&key) {
+                return Ok(Some(with_mismatch_notice(
+                    content, request, claimed, format,
+                )));
+            }
             file.seek(SeekFrom::Start(0))
                 .with_context(|| format!("cannot rewind {}", request.display_path.display()))?;
             let content = match image_preview::metadata_preview(file, &probe, format, request) {
@@ -86,6 +97,10 @@ impl PreviewProvider for CommonFilePreviewProvider {
                     false,
                 ),
             };
+            self.cache
+                .lock()
+                .expect("preview cache poisoned")
+                .insert(key, content.clone());
             return Ok(Some(with_mismatch_notice(
                 content, request, claimed, format,
             )));
@@ -112,18 +127,24 @@ impl PreviewProvider for CommonFilePreviewProvider {
             )));
         }
 
+        let mut inspected_docx = None;
         let detected = match initial_probe {
             ProbeFormat::Supported(format) => Some(format),
-            ProbeFormat::Zip => match docx_preview::detect(&bytes) {
-                Ok(DocxDetection::Docx) => Some(CommonFormat::Docx),
-                Ok(DocxDetection::MacroEnabled) => {
-                    return Ok(Some(blocked_preview(
-                        request,
-                        "Preview blocked: macro-enabled Word documents are not supported.",
-                        false,
-                    )));
-                }
-                Ok(DocxDetection::NotDocx) => None,
+            ProbeFormat::Zip => match docx_preview::inspect(&bytes) {
+                Ok(inspected) => match inspected.detection() {
+                    DocxDetection::Docx => {
+                        inspected_docx = Some(inspected);
+                        Some(CommonFormat::Docx)
+                    }
+                    DocxDetection::MacroEnabled => {
+                        return Ok(Some(blocked_preview(
+                            request,
+                            "Preview blocked: macro-enabled Word documents are not supported.",
+                            false,
+                        )));
+                    }
+                    DocxDetection::NotDocx => None,
+                },
                 Err(error) if claimed.is_some() => {
                     return Ok(Some(blocked_preview(
                         request,
@@ -161,16 +182,7 @@ impl PreviewProvider for CommonFilePreviewProvider {
             )));
         }
 
-        let digest = self.digest(&bytes);
-        let key = CacheKey {
-            path: request.absolute_path.to_path_buf(),
-            format: detected,
-            input_len: bytes.len(),
-            digest,
-            max_bytes: request.max_bytes,
-            max_lines: request.max_lines,
-            terminal_image_size: request.terminal_image_size(),
-        };
+        let key = self.cache_key(request, detected, bytes.len(), &bytes);
         if let Some(content) = self.cache.lock().expect("preview cache poisoned").get(&key) {
             return Ok(Some(with_mismatch_notice(
                 content, request, claimed, detected,
@@ -182,7 +194,10 @@ impl PreviewProvider for CommonFilePreviewProvider {
                 image_preview::preview(&bytes, detected, request)
             }
             CommonFormat::Pdf => pdf_preview::preview(&bytes, request),
-            CommonFormat::Docx => docx_preview::preview(&bytes, request),
+            CommonFormat::Docx => docx_preview::preview(
+                inspected_docx.expect("DOCX detection retains its inspected archive"),
+                request,
+            ),
         };
         let content = match parsed {
             Ok(content) => content,
@@ -209,6 +224,24 @@ impl PreviewProvider for CommonFilePreviewProvider {
 impl CommonFilePreviewProvider {
     fn digest(&self, bytes: &[u8]) -> u64 {
         self.hash_state.hash_one(bytes)
+    }
+
+    fn cache_key(
+        &self,
+        request: &PreviewRequest<'_>,
+        format: CommonFormat,
+        input_len: usize,
+        digest_bytes: &[u8],
+    ) -> CacheKey {
+        CacheKey {
+            path: request.absolute_path.to_path_buf(),
+            format,
+            input_len,
+            digest: self.digest(digest_bytes),
+            max_bytes: request.max_bytes,
+            max_lines: request.max_lines,
+            terminal_image_size: request.terminal_image_size(),
+        }
     }
 }
 
@@ -256,9 +289,10 @@ fn is_docm(request: &PreviewRequest<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, io::Cursor, path::Path};
 
     use anyhow::Result;
+    use image::{DynamicImage, ImageFormat};
     use tempfile::tempdir;
 
     use super::*;
@@ -286,6 +320,23 @@ mod tests {
             .expect("claimed common formats return an explanatory preview");
         assert!(content.lines[0].contains("Preview blocked"));
         assert!(content.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_only_image_previews_populate_the_shared_cache() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("cached.png");
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(2, 3).write_to(&mut bytes, ImageFormat::Png)?;
+        fs::write(&path, bytes.into_inner())?;
+        let provider = CommonFilePreviewProvider::default();
+        let request = PreviewRequest::new(&path, Path::new("cached.png"));
+
+        provider.preview(&request)?.expect("image preview");
+        assert_eq!(provider.cache.lock().unwrap().len(), 1);
+        provider.preview(&request)?.expect("cached image preview");
+        assert_eq!(provider.cache.lock().unwrap().len(), 1);
         Ok(())
     }
 }

@@ -2889,16 +2889,17 @@ impl App {
                     let index = self.tree_state.offset().saturating_add(visible_row);
                     if index < self.tree_row_count() {
                         let identity = self.tree_click_identity(index);
-                        let disclosure = self.tree_disclosure_at(index, mouse.column);
-                        let double_click = identity.as_ref().is_some_and(|identity| {
-                            self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
-                                previous == identity
-                                    && Instant::now().saturating_duration_since(*at)
-                                        <= TREE_DOUBLE_CLICK_WINDOW
-                            })
-                        });
+                        let container = self.tree_row_is_container(index);
+                        let double_click = !container
+                            && identity.as_ref().is_some_and(|identity| {
+                                self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
+                                    previous == identity
+                                        && Instant::now().saturating_duration_since(*at)
+                                            <= TREE_DOUBLE_CLICK_WINDOW
+                                })
+                            });
                         self.select(index);
-                        if disclosure {
+                        if container {
                             self.last_tree_click = None;
                             self.toggle_selected_directory();
                         } else if double_click {
@@ -3015,38 +3016,19 @@ impl App {
         }
     }
 
-    fn tree_disclosure_at(&self, index: usize, column: u16) -> bool {
-        let depth = match self.tree_scope {
-            TreeScope::AllFiles => {
-                let Some(entry) = self
-                    .visible_entries()
-                    .get(index)
-                    .filter(|entry| entry.is_dir)
-                else {
-                    return false;
-                };
-                entry.depth
-            }
-            TreeScope::GitChanges => {
-                let Some(row) = self
-                    .visible_git_rows()
-                    .get(index)
-                    .filter(|row| row.is_container())
-                else {
-                    return false;
-                };
-                row.depth
-            }
+    fn tree_row_is_container(&self, index: usize) -> bool {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .is_some_and(|entry| entry.is_dir),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .is_some_and(GitTreeRow::is_container),
             #[cfg(feature = "agent-observability")]
-            TreeScope::Agents => return false,
-        };
-        let start = self
-            .ui_regions
-            .tree_inner
-            .x
-            .saturating_add(2)
-            .saturating_add(u16::try_from(depth).unwrap_or(u16::MAX).saturating_mul(2));
-        column >= start && column < start.saturating_add(2)
+            TreeScope::Agents => false,
+        }
     }
 
     fn handle_search_mouse_down(&mut self, mouse: MouseEvent) -> bool {

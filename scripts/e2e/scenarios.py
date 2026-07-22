@@ -94,28 +94,6 @@ def wait_for_initial_files(session: PtySession) -> None:
     )
 
 
-def _click_disclosure(session: PtySession, marker: str) -> None:
-    session.drain()
-    divider = _interior_divider(session.screen) or session.screen.columns
-    for row, cells in enumerate(session.screen.cells):
-        line = "".join(cells[:divider])
-        marker_column = line.find(marker)
-        if marker_column < 0:
-            continue
-        disclosure = next(
-            (
-                column
-                for column in range(marker_column - 1, -1, -1)
-                if cells[column] in "▾▸"
-            ),
-            None,
-        )
-        if disclosure is not None:
-            session.click(disclosure, row)
-            return
-    raise E2EAssertionError("input_target", f"cannot find tree disclosure for: {marker}")
-
-
 def _click_tree_row(session: PtySession, marker: str) -> None:
     session.drain()
     divider = _interior_divider(session.screen) or session.screen.columns
@@ -207,13 +185,13 @@ def files_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("▾ a-dir", "nested"), "keyboard-opened collapsed All Files directory"
     )
-    _click_disclosure(session, "a-dir")
+    _click_tree_row(session, "a-dir")
     session.wait_screen(
         ("a-dir", "Tree"),
         "mouse-closed directory with one click",
         absent=("nested", "b-changed.rs"),
     )
-    _click_disclosure(session, "a-dir")
+    _click_tree_row(session, "a-dir")
     session.wait_screen(("a-dir", "nested"), "mouse-opened directory with one click")
     session.key(b"\r")
     session.wait_screen(
@@ -310,7 +288,7 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
     )
     # A directory symlink is expandable; opening it reveals the file inside the
     # target directory, which then previews normally.
-    _click_disclosure(session, "a-directory-link")
+    _click_tree_row(session, "a-directory-link")
     session.wait_screen(
         ("a-directory-link", "inside.txt"),
         "production binary expands a sandboxed directory symlink",
@@ -510,7 +488,7 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"g")
     session.key(b"\r")
     session.wait_screen(("▾ a-dir", "nested"), "tree Home and Enter expand the first directory")
-    _click_disclosure(session, "nested")
+    _click_tree_row(session, "nested")
     session.wait_screen(
         ("b-changed.rs",),
         "nested directory loading makes the changed file searchable",
@@ -631,13 +609,13 @@ def git_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("b-changed.rs", "nested-owned.txt"), "keyboard-reopened repository group"
     )
-    _click_disclosure(session, ".")
+    _click_tree_row(session, ".")
     session.wait_screen(
         ("Git changes",),
         "mouse-collapsed repository group",
         absent=("b-changed.rs", "nested-owned.txt"),
     )
-    _click_disclosure(session, ".")
+    _click_tree_row(session, ".")
     session.wait_screen(
         ("vendor/nested", "nested-owned.txt"), "mouse-reopened repository group"
     )
@@ -826,13 +804,13 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
         "repository issue selection explains the symlink boundary",
     )
 
-    _click_disclosure(session, "modules/child")
+    _click_tree_row(session, "modules/child")
     session.wait_screen(
         ("submodule repository", "pointer changed", "internal modified", "internal untracked"),
         "child relation details survive deliberate collapse",
         absent=("tracked.txt", "untracked-child.txt"),
     )
-    _click_disclosure(session, "modules/child")
+    _click_tree_row(session, "modules/child")
     session.wait_screen(
         ("tracked.txt", "untracked-child.txt"),
         "child repository reopens with both internal changes",

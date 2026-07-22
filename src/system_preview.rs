@@ -6,6 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use quick_xml::{
+    Reader,
+    events::{BytesStart, Event},
+};
 use zip::ZipArchive;
 
 use crate::content_safety::{FileFingerprint, OpenRegular, SafeFile, open_regular};
@@ -21,6 +25,8 @@ use std::{
 const OPEN_PROBE_BYTES: usize = 8 * 1024;
 const MAX_OOXML_ENTRIES: usize = 4_096;
 const MAX_CONTENT_TYPES_BYTES: u64 = 1024 * 1024;
+const MAX_CONTENT_TYPES_EVENTS: usize = 100_000;
+const MAX_CONTENT_TYPES_DEPTH: usize = 128;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 // macOS can spend a few hundred milliseconds starting even a tiny executable
@@ -474,26 +480,87 @@ fn detect_ooxml(file: SafeFile) -> Result<Option<PassiveType>> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CONTENT_TYPES_BYTES {
         bail!("OOXML content types grew beyond the inspection limit");
     }
-    let text = std::str::from_utf8(&bytes).context("OOXML content types are not UTF-8")?;
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("macroenabled") {
+    parse_ooxml_content_types(&bytes)
+}
+
+fn parse_ooxml_content_types(bytes: &[u8]) -> Result<Option<PassiveType>> {
+    std::str::from_utf8(bytes).context("OOXML content types are not UTF-8")?;
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().check_end_names = true;
+    let mut events = 0usize;
+    let mut depth = 0usize;
+    let mut detected = None;
+    loop {
+        events = events.saturating_add(1);
+        if events > MAX_CONTENT_TYPES_EVENTS {
+            bail!("OOXML content types exceed the XML event limit");
+        }
+        match reader.read_event()? {
+            Event::Start(start) => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("OOXML content types depth overflow"))?;
+                if depth > MAX_CONTENT_TYPES_DEPTH {
+                    bail!("OOXML content types exceed the XML depth limit");
+                }
+                inspect_ooxml_content_type(&start, &mut detected)?;
+            }
+            Event::Empty(start) => inspect_ooxml_content_type(&start, &mut detected)?,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            Event::DocType(_) => bail!("DOCTYPE is forbidden in OOXML content types"),
+            Event::Eof if depth == 0 => return Ok(detected),
+            Event::Eof => bail!("OOXML content types ended before all elements were closed"),
+            _ => {}
+        }
+    }
+}
+
+fn inspect_ooxml_content_type(
+    element: &BytesStart<'_>,
+    detected: &mut Option<PassiveType>,
+) -> Result<()> {
+    let Some(content_type) = xml_attribute(element, b"ContentType")? else {
+        return Ok(());
+    };
+    if content_type.to_ascii_lowercase().contains("macroenabled") {
         bail!("macro-capable OOXML content was blocked from system opening");
     }
-    if text.contains(
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
-    ) {
-        Ok(Some(PassiveType::Docx))
-    } else if text
-        .contains("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml")
-    {
-        Ok(Some(PassiveType::Xlsx))
-    } else if text.contains(
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
-    ) {
-        Ok(Some(PassiveType::Pptx))
-    } else {
-        Ok(None)
+    let Some(part_name) = xml_attribute(element, b"PartName")? else {
+        return Ok(());
+    };
+    let candidate = match (part_name.as_str(), content_type.as_str()) {
+        (
+            "/word/document.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        ) => Some(PassiveType::Docx),
+        (
+            "/xl/workbook.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        ) => Some(PassiveType::Xlsx),
+        (
+            "/ppt/presentation.xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+        ) => Some(PassiveType::Pptx),
+        _ => None,
+    };
+    if let Some(candidate) = candidate {
+        if detected.is_some_and(|current| current != candidate) {
+            bail!("OOXML content types declare multiple main document families");
+        }
+        *detected = Some(candidate);
     }
+    Ok(())
+}
+
+fn xml_attribute(element: &BytesStart<'_>, name: &[u8]) -> Result<Option<String>> {
+    for attribute in element.attributes().with_checks(true) {
+        let attribute = attribute?;
+        if attribute.key.as_ref().rsplit(|byte| *byte == b':').next() == Some(name) {
+            let raw = String::from_utf8_lossy(attribute.value.as_ref());
+            return Ok(Some(quick_xml::escape::unescape(&raw)?.into_owned()));
+        }
+    }
+    Ok(None)
 }
 
 fn is_claimed_binary_format(extension: &str) -> bool {
@@ -677,7 +744,11 @@ fn outcome_from_status(name: &str, status: ExitStatus) -> PlatformOpenOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, path::Path};
+    use std::{
+        fs,
+        io::{Cursor, Write},
+        path::Path,
+    };
 
     use super::*;
 
@@ -687,6 +758,16 @@ mod tests {
         let path = root.join(name);
         fs::write(&path, bytes)?;
         classify_file(&path, Some(&root), false)
+    }
+
+    fn ooxml_fixture(content_types: &[u8]) -> Vec<u8> {
+        use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("[Content_Types].xml", options).unwrap();
+        writer.write_all(content_types).unwrap();
+        writer.finish().unwrap().into_inner()
     }
 
     #[test]
@@ -835,6 +916,7 @@ mod tests {
         for (name, expected) in [
             ("payload.exe", "executable or installer"),
             ("payload.PS1", "script"),
+            ("payload.js", "script"),
             ("payload.desktop", "launcher or shortcut"),
             ("payload.docm", "macro-capable Office"),
         ] {
@@ -855,18 +937,9 @@ mod tests {
 
     #[test]
     fn ooxml_content_type_must_match_the_passive_suffix() {
-        use std::io::Write as _;
-        use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
-
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        writer.start_file("[Content_Types].xml", options).unwrap();
-        writer
-            .write_all(
-                br#"<Types><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#,
-            )
-            .unwrap();
-        let bytes = writer.finish().unwrap().into_inner();
+        let bytes = ooxml_fixture(
+            br#"<Types><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#,
+        );
 
         let workbook = classify_fixture("fixture.xlsx", &bytes).unwrap();
         assert_eq!(workbook.eligibility, Eligibility::Direct);
@@ -874,6 +947,21 @@ mod tests {
 
         let mismatch = classify_fixture("fixture.docx", &bytes).unwrap_err();
         assert!(mismatch.to_string().contains("extension claims docx"));
+    }
+
+    #[test]
+    fn ooxml_parser_ignores_comment_text_but_blocks_real_macro_content_types() {
+        let commented = ooxml_fixture(
+            br#"<Types><!-- macroEnabled is inert here --><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+        );
+        let document = classify_fixture("fixture.docx", &commented).unwrap();
+        assert_eq!(document.detected, "DOCX document");
+
+        let macro_enabled = ooxml_fixture(
+            br#"<Types><Override PartName="/word/document.xml" ContentType="application/vnd.ms-word.document.macroEnabled.main+xml"/></Types>"#,
+        );
+        let error = classify_fixture("fixture.docx", &macro_enabled).unwrap_err();
+        assert!(error.to_string().contains("macro-capable OOXML"));
     }
 
     #[test]

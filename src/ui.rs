@@ -1767,11 +1767,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
-            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click/o open  disclosure toggles  y path  q×2 quit"
+            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  click dir  Enter/double-click/o file open  y path  q×2 quit"
         )
     } else if app.focused_pane == FocusPane::Tree {
         format!(
-            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click/o system open  disclosure toggles  →/l content  y/Y path  q×2 quit"
+            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  click dir  Enter/double-click/o file open  →/l content  y/Y path  q×2 quit"
         )
     } else if area.width < 96 && app.content_mode == ContentMode::Preview {
         format!(

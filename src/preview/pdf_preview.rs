@@ -31,7 +31,7 @@ pub(super) fn preview(bytes: &[u8], request: &PreviewRequest<'_>) -> Result<Prev
     output.push_line("Format: PDF");
     output.push_line(format!("Pages: {}", pages.len()));
     append_metadata(&document, &mut output);
-    if has_active_content(&document) {
+    if has_active_content(&document, &mut budget)? {
         output.push_line("Security: active content and external actions are ignored");
     }
     output.push_line("");
@@ -132,12 +132,19 @@ fn append_metadata(document: &Document, output: &mut BoundedPreview) {
     }
 }
 
-fn has_active_content(document: &Document) -> bool {
-    document.objects.values().any(|object| match object {
-        Object::Dictionary(dictionary) => dictionary_has_active_content(dictionary),
-        Object::Stream(stream) => dictionary_has_active_content(&stream.dict),
-        _ => false,
-    })
+fn has_active_content(document: &Document, budget: &mut ParseBudget) -> Result<bool> {
+    for object in document.objects.values() {
+        budget.check()?;
+        let active = match object {
+            Object::Dictionary(dictionary) => dictionary_has_active_content(dictionary),
+            Object::Stream(stream) => dictionary_has_active_content(&stream.dict),
+            _ => false,
+        };
+        if active {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn dictionary_has_active_content(dictionary: &Dictionary) -> bool {
@@ -256,6 +263,14 @@ mod tests {
         assert!(validate_structure_counts(MAX_PDF_OBJECTS, MAX_PDF_PAGES).is_ok());
         assert!(validate_structure_counts(MAX_PDF_OBJECTS + 1, 1).is_err());
         assert!(validate_structure_counts(1, MAX_PDF_PAGES + 1).is_err());
+    }
+
+    #[test]
+    fn active_content_scan_obeys_the_cooperative_budget() {
+        let mut document = Document::with_version("1.5");
+        document.add_object(dictionary! { "Type" => "Catalog" });
+        let mut budget = ParseBudget::new(0);
+        assert!(has_active_content(&document, &mut budget).is_err());
     }
 
     fn pdf_fixture(pages: &[Option<&str>]) -> Result<Vec<u8>> {

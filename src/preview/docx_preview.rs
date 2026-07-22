@@ -29,10 +29,26 @@ pub(super) enum DocxDetection {
     NotDocx,
 }
 
-pub(super) fn detect(bytes: &[u8]) -> Result<DocxDetection> {
+pub(super) struct InspectedDocx<'a> {
+    archive: ZipArchive<Cursor<&'a [u8]>>,
+    detection: DocxDetection,
+    input_len: usize,
+}
+
+impl InspectedDocx<'_> {
+    pub(super) const fn detection(&self) -> DocxDetection {
+        self.detection
+    }
+}
+
+pub(super) fn inspect(bytes: &[u8]) -> Result<InspectedDocx<'_>> {
     let mut archive = ZipArchive::new(Cursor::new(bytes)).context("cannot read ZIP container")?;
     if archive.offset() != 0 {
-        return Ok(DocxDetection::NotDocx);
+        return Ok(InspectedDocx {
+            archive,
+            detection: DocxDetection::NotDocx,
+            input_len: bytes.len(),
+        });
     }
     let mut has_content_types = false;
     let mut has_document = false;
@@ -44,31 +60,41 @@ pub(super) fn detect(bytes: &[u8]) -> Result<DocxDetection> {
         has_document |= file.name() == DOCUMENT_XML;
     }
     if !has_content_types || !has_document {
-        return Ok(DocxDetection::NotDocx);
+        return Ok(InspectedDocx {
+            archive,
+            detection: DocxDetection::NotDocx,
+            input_len: bytes.len(),
+        });
     }
     preflight_archive(&mut archive)?;
     let content_types = read_entry(&mut archive, CONTENT_TYPES)?;
-    content_type_detection(&content_types)
+    let detection = content_type_detection(&content_types)?;
+    Ok(InspectedDocx {
+        archive,
+        detection,
+        input_len: bytes.len(),
+    })
 }
 
-pub(super) fn preview(bytes: &[u8], request: &PreviewRequest<'_>) -> Result<PreviewContent> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).context("cannot read DOCX container")?;
+pub(super) fn preview(
+    mut inspected: InspectedDocx<'_>,
+    request: &PreviewRequest<'_>,
+) -> Result<PreviewContent> {
+    let archive = &mut inspected.archive;
     if archive.offset() != 0 {
         bail!("DOCX container has prepended data and is rejected as a polyglot");
     }
-    preflight_archive(&mut archive)?;
-    let content_types = read_entry(&mut archive, CONTENT_TYPES)?;
-    match content_type_detection(&content_types)? {
+    match inspected.detection {
         DocxDetection::Docx => {}
         DocxDetection::MacroEnabled => bail!("macro-enabled Word documents are not supported"),
         DocxDetection::NotDocx => bail!("ZIP container is not a standard DOCX document"),
     }
 
-    let core_properties = read_optional_entry(&mut archive, CORE_PROPERTIES)?;
-    let document_xml = read_entry(&mut archive, DOCUMENT_XML)?;
+    let core_properties = read_optional_entry(archive, CORE_PROPERTIES)?;
+    let document_xml = read_entry(archive, DOCUMENT_XML)?;
     let mut output = BoundedPreview::new(request.max_bytes, request.max_lines);
     output.push_line("Format: DOCX");
-    output.push_line(format!("File size: {} bytes", bytes.len()));
+    output.push_line(format!("File size: {} bytes", inspected.input_len));
     if let Some(core_properties) = core_properties
         && let Err(error) = append_core_properties(&core_properties, &mut output)
     {
@@ -410,13 +436,14 @@ mod tests {
     #[test]
     fn extracts_docx_headings_lists_tables_and_metadata() -> Result<()> {
         let bytes = docx_fixture(false, false)?;
-        assert_eq!(detect(&bytes)?, DocxDetection::Docx);
+        let inspected = inspect(&bytes)?;
+        assert_eq!(inspected.detection(), DocxDetection::Docx);
         let request = PreviewRequest::new(
             std::path::Path::new("fixture.docx"),
             std::path::Path::new("fixture.docx"),
         )
         .with_limits(32_768, 256);
-        let content = preview(&bytes, &request)?;
+        let content = preview(inspected, &request)?;
         assert!(content.lines.contains(&"Title: Safe preview".to_owned()));
         assert!(content.lines.contains(&"# Heading".to_owned()));
         assert!(content.lines.contains(&"- Item".to_owned()));
@@ -427,13 +454,16 @@ mod tests {
     #[test]
     fn rejects_macro_content_and_doctype() -> Result<()> {
         let macro_bytes = docx_fixture(true, false)?;
-        assert_eq!(detect(&macro_bytes)?, DocxDetection::MacroEnabled);
+        assert_eq!(
+            inspect(&macro_bytes)?.detection(),
+            DocxDetection::MacroEnabled
+        );
         let doctype = docx_fixture(false, true)?;
         let request = PreviewRequest::new(
             std::path::Path::new("unsafe.docx"),
             std::path::Path::new("unsafe.docx"),
         );
-        assert!(preview(&doctype, &request).is_err());
+        assert!(preview(inspect(&doctype)?, &request).is_err());
         Ok(())
     }
 
@@ -441,12 +471,12 @@ mod tests {
     fn rejects_prepended_polyglot_data() -> Result<()> {
         let mut bytes = b"#!/bin/sh\n".to_vec();
         bytes.extend(docx_fixture(false, false)?);
-        assert_eq!(detect(&bytes)?, DocxDetection::NotDocx);
+        assert_eq!(inspect(&bytes)?.detection(), DocxDetection::NotDocx);
         let request = PreviewRequest::new(
             std::path::Path::new("polyglot.docx"),
             std::path::Path::new("polyglot.docx"),
         );
-        assert!(preview(&bytes, &request).is_err());
+        assert!(preview(inspect(&bytes)?, &request).is_err());
         Ok(())
     }
 
@@ -457,7 +487,7 @@ mod tests {
             std::path::Path::new("metadata.docx"),
             std::path::Path::new("metadata.docx"),
         );
-        let content = preview(&bytes, &request)?;
+        let content = preview(inspect(&bytes)?, &request)?;
         assert!(
             content
                 .lines

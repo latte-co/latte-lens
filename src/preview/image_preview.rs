@@ -14,6 +14,7 @@ const MAX_IMAGE_PIXELS: u64 = 24_000_000;
 const MAX_IMAGE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TERMINAL_COLUMNS: u32 = 160;
 const MAX_TERMINAL_ROWS: u32 = 80;
+const ANIMATION_PROBE_BYTES: usize = 64 * 1024;
 
 pub(super) fn preview(
     bytes: &[u8],
@@ -268,9 +269,10 @@ fn terminal_pixel_dimensions(
 }
 
 fn is_animated(bytes: &[u8], format: CommonFormat) -> bool {
+    let probe = &bytes[..bytes.len().min(ANIMATION_PROBE_BYTES)];
     match format {
-        CommonFormat::Gif => bytes.windows(11).any(|window| window == b"NETSCAPE2.0"),
-        CommonFormat::WebP => bytes
+        CommonFormat::Gif => probe.windows(11).any(|window| window == b"NETSCAPE2.0"),
+        CommonFormat::WebP => probe
             .windows(4)
             .any(|window| window == b"ANIM" || window == b"ANMF"),
         _ => false,
@@ -405,6 +407,10 @@ mod tests {
         assert!(is_animated(b"RIFF----WEBPANMF", CommonFormat::WebP));
         assert!(!is_animated(b"GIF89a", CommonFormat::Gif));
         assert!(!is_animated(b"ANMF", CommonFormat::Png));
+
+        let mut bounded = vec![b'-'; ANIMATION_PROBE_BYTES + 16];
+        bounded[ANIMATION_PROBE_BYTES..ANIMATION_PROBE_BYTES + 4].copy_from_slice(b"ANMF");
+        assert!(!is_animated(&bounded, CommonFormat::WebP));
     }
 
     #[test]

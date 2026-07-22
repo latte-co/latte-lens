@@ -336,6 +336,11 @@ impl PreviewCache {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[cfg(test)]

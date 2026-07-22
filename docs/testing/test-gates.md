@@ -93,7 +93,7 @@ Q3 是当前 Files/Git Changes 的正式门禁。Q4 不是 Q3 的替代品：未
 | F-UT-009 | worker stale result 不污染 UI | Q1/Q2 | refresh/content/search generations 与 workspace switch |
 | F-UT-010 | binary preview 不执行不可信内容 | Q1/Q2 | magic/extension mismatch、script/polyglot、macro/DOCTYPE、active PDF action ignore、terminal-control sanitization、解压/尺寸/页/对象/输出预算与 cache limits 隔离 |
 | F-UT-011 | 统一系统打开与 headless 状态机安全 | Q1/Q2 | PDF/图片/Office/文本/媒体/压缩包分类；主动后缀、executable bit、shebang/PE/ELF/Mach-O、macro、mismatch、unknown confirmation；fingerprint 重验、无 shell 参数边界、Linux 无 display、opener unavailable/failure、dedupe/stale generation；只有图片可在明确提示后用 `i`，`Esc` 取消 |
-| F-UT-012 | Tree 激活交互一致 | Q2 | 单击只选中、disclosure 单击切换、目录双击只切换一次；文件 `Enter`/双击/`o`/`[Open]` 同 request；Content fold Enter 和 popup Enter 不回归；未知格式只有第二个 `o`/`[Open anyway]` 可确认 |
+| F-UT-012 | Tree 激活交互一致 | Q2 | 目录/容器行任意位置单击立即切换，文件单击只选中；文件 `Enter`/双击/`o`/`[Open]` 同 request；Content fold Enter 和 popup Enter 不回归；未知格式只有第二个 `o`/`[Open anyway]` 可确认 |
 
 ### 4.2 Files production E2E
 

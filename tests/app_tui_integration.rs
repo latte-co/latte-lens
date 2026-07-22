@@ -600,7 +600,7 @@ fn enter_toggles_directories_and_requests_system_open_for_files() {
 }
 
 #[test]
-fn mouse_single_click_selects_double_click_activates_and_disclosure_toggles() {
+fn mouse_single_click_toggles_directories_and_double_click_opens_files() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -620,17 +620,9 @@ fn mouse_single_click_selects_double_click_activates_and_disclosure_toggles() {
         [
             "No changed files in this directory.",
             "",
-            "Collapsed · Enter or click to expand."
+            "Expanded · Enter or click to collapse."
         ]
     );
-    assert_eq!(
-        visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
-    );
-
-    // The second row click is a double-click activation and expands exactly
-    // once; the first click did not mutate directory state.
-    app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
         [
@@ -640,12 +632,15 @@ fn mouse_single_click_selects_double_click_activates_and_disclosure_toggles() {
         ]
     );
 
-    // The disclosure glyph remains a one-click directory control.
-    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
+    // Every directory-row click is the expand/collapse action; it does not
+    // wait for a double-click or require the disclosure glyph.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
+
+    // Clicking at the disclosure position has the same one-click row action.
     app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     let rows_before_file_click = visible_paths(&app);
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
@@ -663,6 +658,36 @@ fn mouse_single_click_selects_double_click_activates_and_disclosure_toggles() {
     assert!(
         status.is_some_and(|message| message.contains("unavailable")),
         "unexpected external-open status: {status:?}"
+    );
+}
+
+#[test]
+fn mouse_single_click_toggles_git_changes_containers() {
+    let fixture = TestRepo::new();
+    fixture.write("src/file.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("src/file.txt", "after\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("src/file.txt")]
+    );
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    let directory_row = tree_y + 1; // Repository group occupies the first Git Changes row.
+    app.handle_mouse(mouse_down(tree_x, directory_row));
+    assert_eq!(visible_paths(&app), [PathBuf::from("src")]);
+    app.handle_mouse(mouse_down(tree_x, directory_row));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("src/file.txt")]
     );
 }
 
