@@ -110,7 +110,7 @@ Q3 是当前 Files/Git Changes 的正式门禁。Q4 不是 Q3 的替代品：未
 | F-E2E-009 | Preview find/mode | Ctrl+F、next/previous、tabs/wrap、changed file Preview↔Diff | gap |
 | F-E2E-010 | unsafe/partial UX | symlink/FIFO 不挂起；大 workspace 显示 PARTIAL 而非完整 | gap |
 | F-E2E-011 | graceful exit | mouse mode/alternate screen 恢复；PTY drain 完成 | covered |
-| F-E2E-012 | unified system open | 隔离 stub opener；PDF 用 `o` 打开；图片 failure→`i`/`Esc`；未知格式二次确认；伪装脚本调用计数为 0 | covered |
+| F-E2E-012 | unified system open | 隔离 stub opener；PDF 与解析验证后的被动 DOCX 用 `o` 打开；图片 failure→`i`/`Esc`；未知格式二次确认；伪装脚本调用计数为 0 | covered |
 
 F-E2E-007 至 F-E2E-010 不要求一个超大场景完成。它们应使用独立 fixture/scenario，避免已有基础导航失败时掩盖搜索或安全问题。
 All Files 跟随软链另有 `symlink-preview-smoke` production-binary 场景：fixture 只在

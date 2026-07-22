@@ -9,6 +9,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import zipfile
 import zlib
 from pathlib import Path
 
@@ -213,12 +214,27 @@ def create_system_open_fixture(root: Path, environment: dict[str, str]) -> None:
     root.joinpath("c-danger.sh").write_text(
         "#!/bin/sh\necho should-never-run\n", encoding="utf-8"
     )
+    with zipfile.ZipFile(root / "d-passive.docx", "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body><w:p><w:r><w:t>Passive OOXML document</w:t></w:r></w:p></w:body>"
+            "</w:document>",
+        )
     run(
         "git",
         "add",
         "a-preview.pdf",
         "b-unknown.data",
         "c-danger.sh",
+        "d-passive.docx",
         cwd=root,
         environment=environment,
     )

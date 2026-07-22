@@ -347,6 +347,7 @@ def unified_system_open(context: ScenarioContext) -> None:
     trace = Path(context.environment["LATTELENS_E2E_OPEN_TRACE"])
     expected_pdf = str((context.repository / "a-preview.pdf").resolve())
     expected_unknown = str((context.repository / "b-unknown.data").resolve())
+    expected_docx = str((context.repository / "d-passive.docx").resolve())
     wait_for_initial_files(session)
 
     _click_tree_row(session, "a-preview.pdf")
@@ -395,6 +396,22 @@ def unified_system_open(context: ScenarioContext) -> None:
         "stub opener receives the confirmed unknown path exactly once",
     )
 
+    _click_tree_row(session, "d-passive.docx")
+    session.wait_screen(
+        ("Format: DOCX", "Passive OOXML document"),
+        "passive DOCX keeps its bounded internal preview",
+    )
+    session.key(b"o")
+    session.wait_screen(
+        ("Opened d-passive.docx with the system default app.",),
+        "passive DOCX is classified from parsed OOXML content types",
+    )
+    session.wait_until(
+        lambda _screen: trace.read_text(encoding="utf-8").splitlines()
+        == [expected_pdf, expected_unknown, expected_docx],
+        "stub opener receives the parsed passive DOCX exactly once",
+    )
+
     _click_tree_row(session, "c-danger.sh")
     session.wait_screen(("c-danger.sh",), "script is selected")
     session.key(b"o")
@@ -402,7 +419,11 @@ def unified_system_open(context: ScenarioContext) -> None:
         ("System open blocked:", "script"),
         "script activation is blocked before the platform adapter",
     )
-    assert trace.read_text(encoding="utf-8").splitlines() == [expected_pdf, expected_unknown]
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        expected_pdf,
+        expected_unknown,
+        expected_docx,
+    ]
 
 
 def symlink_copy_path(context: ScenarioContext) -> None:
