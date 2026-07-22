@@ -4190,6 +4190,7 @@ fn production_spawner_runs_framed_definition_journey() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "run separately in Windows CI to isolate the real process journey"]
 #[cfg(feature = "navigation-test-support")]
 fn windows_production_spawner_runs_framed_definition_journey() {
     run_production_spawner_framed_journey();
