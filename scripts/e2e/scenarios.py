@@ -95,14 +95,21 @@ def wait_for_initial_files(session: PtySession) -> None:
 
 
 def _click_tree_row(session: PtySession, marker: str) -> None:
+    session.click(*_tree_row_position(session, marker))
+
+
+def _double_click_tree_row(session: PtySession, marker: str) -> None:
+    session.double_click(*_tree_row_position(session, marker))
+
+
+def _tree_row_position(session: PtySession, marker: str) -> tuple[int, int]:
     session.drain()
     divider = _interior_divider(session.screen) or session.screen.columns
     for row, cells in enumerate(session.screen.cells):
         line = "".join(cells[:divider])
         column = line.find(marker)
         if column >= 0:
-            session.click(column, row)
-            return
+            return column, row
     raise E2EAssertionError("input_target", f"cannot find tree row for: {marker}")
 
 
@@ -396,15 +403,15 @@ def unified_system_open(context: ScenarioContext) -> None:
         "stub opener receives the confirmed unknown path exactly once",
     )
 
-    _click_tree_row(session, "d-passive.docx")
+    session.key(b"G")
     session.wait_screen(
         ("Format: DOCX", "Passive OOXML document"),
         "passive DOCX keeps its bounded internal preview",
     )
-    session.key(b"o")
+    _double_click_tree_row(session, "d-passive.docx")
     session.wait_screen(
         ("Opened d-passive.docx with the system default app.",),
-        "passive DOCX is classified from parsed OOXML content types",
+        "Tree double-click opens a passive DOCX classified from parsed OOXML content types",
     )
     session.wait_until(
         lambda _screen: trace.read_text(encoding="utf-8").splitlines()
