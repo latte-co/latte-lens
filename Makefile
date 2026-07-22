@@ -1,5 +1,11 @@
 SHELL := /bin/bash
 
+# Auto-enable sccache if installed; CI/dev environments without it are unaffected
+SCCACHE := $(shell command -v sccache 2>/dev/null)
+ifneq ($(SCCACHE),)
+export RUSTC_WRAPPER := sccache
+endif
+
 CARGO ?= cargo
 PYTHON ?= python3
 TRAEX_BIN ?=
