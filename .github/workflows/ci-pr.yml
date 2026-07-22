@@ -155,36 +155,36 @@ jobs:
           cargo test --locked --features navigation-test-support
           --test app_tui_integration
           windows_production_spawner_runs_framed_definition_journey
-          -- --exact --nocapture
+          -- --ignored --exact --nocapture
       - name: Run the Job Object descendant cleanup journey
         shell: pwsh
         run: >-
           cargo test --locked --features navigation-test-support
           --test lsp_process_integration
           windows_job_cleanup_terminates_pipe_holding_descendant
-          -- --exact --nocapture
+          -- --ignored --exact --nocapture
       - name: Run the Ready-session exit-first descendant cleanup journey
         shell: pwsh
         run: >-
           cargo test --locked --features navigation-test-support
           --test lsp_process_integration
           windows_ready_session_cleanup_terminates_exit_first_descendant
-          -- --exact --nocapture
+          -- --ignored --exact --nocapture
       - name: Reject an incompatible position encoding and clean the process tree
         shell: pwsh
         run: >-
           cargo test --locked --features navigation-test-support
           --test lsp_process_integration
           windows_incompatible_position_encoding_forces_terminal_cleanup
-          -- --exact --nocapture
+          -- --ignored --exact --nocapture
       - name: Verify repeated crash backoff becomes terminal
         shell: pwsh
         run: >-
           cargo test --locked --features navigation-test-support
           --test lsp_process_integration
           repeated_real_crashes_back_off_and_fifth_failure_stops_spawning
-          -- --exact --nocapture
-      - name: Run unit and integration tests
+          -- --ignored --exact --nocapture
+      - name: Run unit and integration tests in parallel
         run: cargo test --all-targets --all-features --locked
       - name: Build the release binary
         run: cargo build --release --locked

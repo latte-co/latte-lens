@@ -7,6 +7,8 @@ Latte Lens 当前只维护中文版文档。文档按职责分层，不为尚未
 - [Code Agent 可观测性设计](design/code-agent-observability.md)：多 Code Agent 观测模型、协议边界、运行时与分阶段方案。
 - [代码跳转设计](design/code-navigation.md)：全平台显式 LSP 配置、UTF-16/URI、安全进程树、原子跳转与测试门禁。
 - [Preview Provider 扩展](design/preview-providers.md)：文件预览扩展点、内容安全契约与适用边界。
+- [常见文件预览 V1 实现设计](design/common-file-previews.md)：PNG/JPEG/GIF/WebP、全页 PDF、DOCX 的内置 Preview、安全预算、性能缓存与测试矩阵。
+- [统一文件激活与系统打开 V1 设计](design/external-file-open.md)：内部预览与系统打开的统一交互、跨平台 adapter、安全分级、性能边界与验收矩阵。
 
 ## 测试
 

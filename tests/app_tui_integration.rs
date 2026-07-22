@@ -2,6 +2,7 @@ mod support;
 
 use std::{
     fs,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -535,7 +536,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
 }
 
 #[test]
-fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
+fn enter_toggles_directories_and_requests_system_open_for_files() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -584,16 +585,22 @@ fn enter_toggles_only_directories_and_keeps_files_on_the_content_pane() {
     let rows_before_file_enter = visible_paths(&app);
 
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.focused_pane, FocusPane::Content);
+    settle(&mut app);
+    assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(visible_paths(&app), rows_before_file_enter);
     assert_eq!(
         app.selected_relative_path(),
         Some(PathBuf::from("src/file.txt"))
     );
+    let status = app.external_open_status_message();
+    assert!(
+        status.is_some_and(|message| message.contains("unavailable")),
+        "unexpected external-open status: {status:?}"
+    );
 }
 
 #[test]
-fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
+fn mouse_single_click_toggles_directories_and_double_click_opens_files() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -625,17 +632,20 @@ fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
         ]
     );
 
-    // A single second click on the same directory closes it again; no double
-    // click path is required to toggle state.
+    // Every directory-row click is the expand/collapse action; it does not
+    // wait for a double-click or require the disclosure glyph.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
-    app.handle_mouse(mouse_down(tree_x, tree_y));
+    // Clicking at the disclosure position has the same one-click row action.
+    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     let rows_before_file_click = visible_paths(&app);
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
+    app.handle_mouse(mouse_down(tree_x, tree_y + 1));
+    settle(&mut app);
 
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(
@@ -644,6 +654,41 @@ fn mouse_click_toggles_directories_once_and_leaves_file_expansion_alone() {
     );
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert_eq!(visible_paths(&app), rows_before_file_click);
+    let status = app.external_open_status_message();
+    assert!(
+        status.is_some_and(|message| message.contains("unavailable")),
+        "unexpected external-open status: {status:?}"
+    );
+}
+
+#[test]
+fn mouse_single_click_toggles_git_changes_containers() {
+    let fixture = TestRepo::new();
+    fixture.write("src/file.txt", "before\n");
+    fixture.commit_all("initial");
+    fixture.write("src/file.txt", "after\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("src/file.txt")]
+    );
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    let directory_row = tree_y + 1; // Repository group occupies the first Git Changes row.
+    app.handle_mouse(mouse_down(tree_x, directory_row));
+    assert_eq!(visible_paths(&app), [PathBuf::from("src")]);
+    app.handle_mouse(mouse_down(tree_x, directory_row));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("src/file.txt")]
+    );
 }
 
 #[test]
@@ -1272,7 +1317,7 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
     assert_eq!(app.visible_git_rows().len(), 1);
     assert_eq!(app.changed_count, 3);
     app.handle_mouse(mouse_down(
-        app.ui_regions.tree_inner.x,
+        app.ui_regions.tree_inner.x + 2,
         app.ui_regions.tree_inner.y,
     ));
     assert_eq!(app.visible_git_rows().len(), 5);
@@ -2041,6 +2086,176 @@ fn binary_file_explains_how_to_add_a_preview_provider() {
 }
 
 #[test]
+fn app_uses_metadata_and_explicit_actions_for_png() {
+    let fixture = TestRepo::new();
+    fixture.write("preview.png", common_preview_png_fixture());
+    fixture.commit_all("initial");
+
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
+    assert!(!app.content_show_line_numbers);
+    assert!(app.content_lines.iter().any(|line| line == "Format: PNG"));
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line == "Dimensions: 4 x 2")
+    );
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line.contains("Press o"))
+    );
+    assert!(app.content_lines.iter().all(|line| !line.contains('▀')));
+
+    let metadata = app.content_lines.clone();
+    app.handle_key(key(KeyCode::Char('i')));
+    assert_eq!(app.content_lines, metadata);
+}
+
+#[test]
+fn app_uses_the_builtin_common_file_provider_for_every_pdf_page() {
+    let fixture = TestRepo::new();
+    fixture.write(
+        "preview.pdf",
+        common_preview_pdf_fixture(&[Some("first page"), Some("second page")]),
+    );
+    fixture.commit_all("initial");
+
+    let app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
+    assert!(!app.content_show_line_numbers);
+    assert!(app.content_lines.iter().any(|line| line == "Pages: 2"));
+    assert!(app.content_lines.iter().any(|line| line == "Page 1 / 2"));
+    assert!(app.content_lines.iter().any(|line| line == "Page 2 / 2"));
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line.contains("second page"))
+    );
+}
+
+#[test]
+fn pdf_uses_the_same_o_and_clickable_open_action_without_image_fallback() {
+    let fixture = TestRepo::new();
+    fixture.write(
+        "preview.pdf",
+        common_preview_pdf_fixture(&[Some("system open")]),
+    );
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let original = app.content_lines.clone();
+    let backend = TestBackend::new(100, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("[Open]"));
+
+    let open = app.ui_regions.external_open_button;
+    app.handle_mouse(mouse_down(open.x, open.y));
+    settle(&mut app);
+
+    assert_eq!(app.content_lines, original);
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("unavailable"))
+    );
+}
+
+#[test]
+fn unknown_file_requires_o_confirmation_while_enter_cannot_confirm() {
+    let fixture = TestRepo::new();
+    fixture.write("payload.data", b"\x00\x01\x02\x03");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('o')));
+    settle(&mut app);
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("press o again"))
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("Press o"))
+    );
+    assert!(!app.is_external_open_loading());
+
+    app.handle_key(key(KeyCode::Char('o')));
+    settle(&mut app);
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("unavailable"))
+    );
+}
+
+#[test]
+fn script_activation_is_blocked_before_the_system_adapter() {
+    let fixture = TestRepo::new();
+    fixture.write("payload.sh", "#!/bin/sh\necho unsafe\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    app.handle_key(key(KeyCode::Char('o')));
+    settle(&mut app);
+
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("blocked") && message.contains("script"))
+    );
+}
+
+#[test]
+fn app_uses_the_builtin_common_file_provider_for_docx() {
+    let fixture = TestRepo::new();
+    fixture.write("preview.docx", common_preview_docx_fixture());
+    fixture.commit_all("initial");
+
+    let app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
+    assert!(!app.content_show_line_numbers);
+    assert!(app.content_lines.iter().any(|line| line == "Format: DOCX"));
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line == "Title: Integration preview")
+    );
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line == "# Document heading")
+    );
+}
+
+#[test]
+fn app_does_not_render_a_script_disguised_as_a_pdf() {
+    let fixture = TestRepo::new();
+    fixture.write("payload.pdf", "#!/bin/sh\necho should-not-render\n");
+    fixture.commit_all("initial");
+
+    let app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
+    assert!(!app.content_show_line_numbers);
+    assert!(
+        app.content_lines
+            .iter()
+            .any(|line| line.contains("Format mismatch"))
+    );
+    assert!(
+        app.content_lines
+            .iter()
+            .all(|line| !line.contains("should-not-render"))
+    );
+}
+
+#[test]
 fn app_accepts_a_custom_pdf_preview_provider() {
     struct FakePdfProvider;
 
@@ -2072,6 +2287,92 @@ fn app_accepts_a_custom_pdf_preview_provider() {
     assert_eq!(app.content_mode, ContentMode::Preview);
     assert_eq!(app.content_provider.as_deref(), Some("fake-pdf"));
     assert_eq!(app.content_lines, ["PDF page one"]);
+}
+
+fn common_preview_png_fixture() -> Vec<u8> {
+    let image = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_fn(4, 2, |x, _| {
+        if x < 2 {
+            image::Rgba([0, 0, 0, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    }));
+    let mut bytes = Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    bytes.into_inner()
+}
+
+fn common_preview_pdf_fixture(pages: &[Option<&str>]) -> Vec<u8> {
+    use lopdf::{Document, Object, Stream, content::Operation, dictionary};
+
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let font_id = document.add_object(lopdf::dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let resources_id = document.add_object(lopdf::dictionary! {
+        "Font" => lopdf::dictionary! { "F1" => font_id },
+    });
+    let mut page_ids = Vec::new();
+    for text in pages {
+        let operations = text.map_or_else(Vec::new, |text| {
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), 12.into()]),
+                Operation::new("Td", vec![48.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ]
+        });
+        let content = lopdf::content::Content { operations }.encode().unwrap();
+        let content_id = document.add_object(Stream::new(lopdf::dictionary! {}, content));
+        let page_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        });
+        page_ids.push(page_id);
+    }
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(lopdf::dictionary! {
+            "Type" => "Pages",
+            "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
+            "Count" => i64::try_from(page_ids.len()).unwrap(),
+        }),
+    );
+    let catalog_id = document.add_object(lopdf::dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn common_preview_docx_fixture() -> Vec<u8> {
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    writer.start_file("[Content_Types].xml", options).unwrap();
+    writer
+        .write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#)
+        .unwrap();
+    writer.start_file("docProps/core.xml", options).unwrap();
+    writer
+        .write_all(br#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="d"><dc:title>Integration preview</dc:title></cp:coreProperties>"#)
+        .unwrap();
+    writer.start_file("word/document.xml", options).unwrap();
+    writer
+        .write_all(br#"<?xml version="1.0"?><w:document xmlns:w="w"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Document heading</w:t></w:r></w:p></w:body></w:document>"#)
+        .unwrap();
+    writer.finish().unwrap().into_inner()
 }
 
 #[cfg(unix)]
@@ -3889,6 +4190,7 @@ fn production_spawner_runs_framed_definition_journey() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "run separately in Windows CI to isolate the real process journey"]
 #[cfg(feature = "navigation-test-support")]
 fn windows_production_spawner_runs_framed_definition_journey() {
     run_production_spawner_framed_journey();
@@ -4156,7 +4458,7 @@ fn settle(app: &mut App) {
 }
 
 fn ready_app(path: PathBuf) -> anyhow::Result<App> {
-    let mut app = App::new(path)?;
+    let mut app = App::with_system_open_disabled(path)?;
     settle(&mut app);
     Ok(app)
 }
@@ -4165,7 +4467,7 @@ fn ready_app_with_preview_registry(
     path: PathBuf,
     registry: PreviewRegistry,
 ) -> anyhow::Result<App> {
-    let mut app = App::with_preview_registry(path, registry)?;
+    let mut app = App::with_preview_registry_and_system_open_disabled(path, registry)?;
     settle(&mut app);
     Ok(app)
 }

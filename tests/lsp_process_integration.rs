@@ -25,6 +25,7 @@ fn unix_process_group_cleanup_terminates_pipe_holding_descendant() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "run separately in Windows CI to isolate the real process journey"]
 fn windows_job_cleanup_terminates_pipe_holding_descendant() {
     run_pipe_holding_descendant_cleanup("descendant", None);
 }
@@ -37,6 +38,7 @@ fn unix_ready_session_cleanup_terminates_exit_first_descendant() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "run separately in Windows CI to isolate the real process journey"]
 fn windows_ready_session_cleanup_terminates_exit_first_descendant() {
     run_pipe_holding_descendant_cleanup("ready-descendant", Some("ready-before-direct-exit"));
 }
@@ -49,11 +51,16 @@ fn unix_incompatible_position_encoding_forces_terminal_cleanup() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "run separately in Windows CI to isolate the real process journey"]
 fn windows_incompatible_position_encoding_forces_terminal_cleanup() {
     run_incompatible_position_encoding_cleanup();
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "run separately in Windows CI to isolate the real process journey"
+)]
 fn repeated_real_crashes_back_off_and_fifth_failure_stops_spawning() {
     let _environment = ENVIRONMENT_LOCK
         .get_or_init(|| Mutex::new(()))

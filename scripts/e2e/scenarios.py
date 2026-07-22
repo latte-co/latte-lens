@@ -23,6 +23,7 @@ from .fixtures import (
     create_disabled_product_config_fixture,
     create_fold_mouse_navigation_fixture,
     create_git_matrix_fixture,
+    create_image_preview_fixture,
     create_incompatible_lsp_fixture,
     create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
@@ -31,6 +32,7 @@ from .fixtures import (
     create_repository_relation_fixture,
     create_resilience_lsp_fixture,
     create_search_fixture,
+    create_system_open_fixture,
     create_symlink_preview_fixture,
     create_structure_fixture,
     create_timeout_lsp_fixture,
@@ -92,37 +94,22 @@ def wait_for_initial_files(session: PtySession) -> None:
     )
 
 
-def _click_disclosure(session: PtySession, marker: str) -> None:
-    session.drain()
-    divider = _interior_divider(session.screen) or session.screen.columns
-    for row, cells in enumerate(session.screen.cells):
-        line = "".join(cells[:divider])
-        marker_column = line.find(marker)
-        if marker_column < 0:
-            continue
-        disclosure = next(
-            (
-                column
-                for column in range(marker_column - 1, -1, -1)
-                if cells[column] in "▾▸"
-            ),
-            None,
-        )
-        if disclosure is not None:
-            session.click(disclosure, row)
-            return
-    raise E2EAssertionError("input_target", f"cannot find tree disclosure for: {marker}")
-
-
 def _click_tree_row(session: PtySession, marker: str) -> None:
+    session.click(*_tree_row_position(session, marker))
+
+
+def _double_click_tree_row(session: PtySession, marker: str) -> None:
+    session.double_click(*_tree_row_position(session, marker))
+
+
+def _tree_row_position(session: PtySession, marker: str) -> tuple[int, int]:
     session.drain()
     divider = _interior_divider(session.screen) or session.screen.columns
     for row, cells in enumerate(session.screen.cells):
         line = "".join(cells[:divider])
         column = line.find(marker)
         if column >= 0:
-            session.click(column, row)
-            return
+            return column, row
     raise E2EAssertionError("input_target", f"cannot find tree row for: {marker}")
 
 
@@ -205,13 +192,13 @@ def files_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("▾ a-dir", "nested"), "keyboard-opened collapsed All Files directory"
     )
-    _click_disclosure(session, "a-dir")
+    _click_tree_row(session, "a-dir")
     session.wait_screen(
         ("a-dir", "Tree"),
         "mouse-closed directory with one click",
         absent=("nested", "b-changed.rs"),
     )
-    _click_disclosure(session, "a-dir")
+    _click_tree_row(session, "a-dir")
     session.wait_screen(("a-dir", "nested"), "mouse-opened directory with one click")
     session.key(b"\r")
     session.wait_screen(
@@ -308,7 +295,7 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
     )
     # A directory symlink is expandable; opening it reveals the file inside the
     # target directory, which then previews normally.
-    _click_disclosure(session, "a-directory-link")
+    _click_tree_row(session, "a-directory-link")
     session.wait_screen(
         ("a-directory-link", "inside.txt"),
         "production binary expands a sandboxed directory symlink",
@@ -320,6 +307,130 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
         "production binary previews a file reached through a directory symlink",
         absent=("Preview unavailable",),
     )
+
+
+def image_preview_fallback(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    _click_tree_row(session, "sample.png")
+    session.wait_screen(
+        (
+            "Format: PNG",
+            "Dimensions: 2 x 2",
+            "Press o to open with the system default app.",
+        ),
+        "image preview defaults to bounded metadata",
+    )
+
+    session.key(b"o")
+    session.wait_screen(
+        (
+            "System default app unavailable:",
+            "Press i to preview in this terminal using TrueColor half-block pixels.",
+            "Press Esc to cancel.",
+        ),
+        "unavailable system app requires an explicit terminal-preview decision",
+    )
+    session.key(b"\x1b")
+    session.wait_screen(
+        ("Format: PNG", "Press o to open with the system default app."),
+        "Escape cancels terminal rendering and restores image metadata",
+    )
+
+    session.key(b"o")
+    session.wait_screen(
+        ("System default app unavailable:", "Press i to preview"),
+        "terminal image confirmation prompt can be opened again",
+    )
+    session.key(b"i")
+    session.wait_screen(
+        ("Terminal preview", "press o for the system default app", "▀"),
+        "confirmed terminal preview uses half-block pixels",
+    )
+
+
+def unified_system_open(context: ScenarioContext) -> None:
+    session = context.session
+    trace = Path(context.environment["LATTELENS_E2E_OPEN_TRACE"])
+    expected_pdf = str((context.repository / "a-preview.pdf").resolve())
+    expected_unknown = str((context.repository / "b-unknown.data").resolve())
+    expected_docx = str((context.repository / "d-passive.docx").resolve())
+    wait_for_initial_files(session)
+
+    _click_tree_row(session, "a-preview.pdf")
+    session.wait_screen(
+        ("Format: PDF", "Pages: 1", "Unified system open"),
+        "PDF keeps its internal bounded preview before external opening",
+    )
+    session.key(b"o")
+    session.wait_screen(
+        ("Opened a-preview.pdf with the system default app.",),
+        "PDF uses the unified default-app action",
+    )
+    session.wait_until(
+        lambda _screen: trace.is_file()
+        and trace.read_text(encoding="utf-8").splitlines()
+        == [expected_pdf],
+        "stub opener receives the verified PDF path exactly once",
+    )
+    _click_marker_on_line(session, "[Open]", alongside=("Preview", "a-preview.pdf"))
+    session.wait_screen(
+        ("a-preview.pdf was already handed to the system app.",),
+        "clickable Open shares the short duplicate-suppression window",
+    )
+
+    _click_tree_row(session, "b-unknown.data")
+    session.wait_screen(("b-unknown.data",), "unknown file is selected")
+    session.key(b"o")
+    session.wait_screen(
+        ("b-unknown.data is unknown regular file; press o again", "Open anyway"),
+        "unknown binary requires explicit confirmation",
+    )
+    session.key(b"\r")
+    session.wait_screen(
+        ("Unknown file type. Press o or click Open anyway to confirm.",),
+        "Enter cannot consume an unknown-file confirmation",
+    )
+    assert trace.read_text(encoding="utf-8").splitlines() == [expected_pdf]
+    session.key(b"o")
+    session.wait_screen(
+        ("Opened b-unknown.data with the system default app.",),
+        "second explicit o confirms the same unknown fingerprint",
+    )
+    session.wait_until(
+        lambda _screen: trace.read_text(encoding="utf-8").splitlines()
+        == [expected_pdf, expected_unknown],
+        "stub opener receives the confirmed unknown path exactly once",
+    )
+
+    session.key(b"G")
+    session.wait_screen(
+        ("Format: DOCX", "Passive OOXML document"),
+        "passive DOCX keeps its bounded internal preview",
+    )
+    _double_click_tree_row(session, "d-passive.docx")
+    session.wait_screen(
+        ("Opened d-passive.docx with the system default app.",),
+        "Tree double-click opens a passive DOCX classified from parsed OOXML content types",
+    )
+    session.wait_until(
+        lambda _screen: trace.read_text(encoding="utf-8").splitlines()
+        == [expected_pdf, expected_unknown, expected_docx],
+        "stub opener receives the parsed passive DOCX exactly once",
+    )
+
+    _click_tree_row(session, "c-danger.sh")
+    session.wait_screen(("c-danger.sh",), "script is selected")
+    session.key(b"o")
+    session.wait_screen(
+        ("System open blocked:", "script"),
+        "script activation is blocked before the platform adapter",
+    )
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        expected_pdf,
+        expected_unknown,
+        expected_docx,
+    ]
 
 
 def symlink_copy_path(context: ScenarioContext) -> None:
@@ -405,7 +516,7 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"g")
     session.key(b"\r")
     session.wait_screen(("▾ a-dir", "nested"), "tree Home and Enter expand the first directory")
-    _click_disclosure(session, "nested")
+    _click_tree_row(session, "nested")
     session.wait_screen(
         ("b-changed.rs",),
         "nested directory loading makes the changed file searchable",
@@ -526,13 +637,13 @@ def git_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("b-changed.rs", "nested-owned.txt"), "keyboard-reopened repository group"
     )
-    _click_disclosure(session, ".")
+    _click_tree_row(session, ".")
     session.wait_screen(
         ("Git changes",),
         "mouse-collapsed repository group",
         absent=("b-changed.rs", "nested-owned.txt"),
     )
-    _click_disclosure(session, ".")
+    _click_tree_row(session, ".")
     session.wait_screen(
         ("vendor/nested", "nested-owned.txt"), "mouse-reopened repository group"
     )
@@ -634,8 +745,9 @@ def git_review_state(context: ScenarioContext) -> None:
 
     _click_tree_row(session, "worktree.txt")
     session.wait_screen(
-        ("worktree.txt", "+worktree after", "Space review"),
+        ("worktree.txt", "+worktree after", "── WORKTREE ──"),
         "reviewable worktree diff is fully loaded",
+        absent=("LOADING",),
     )
     session.key(b" ")
     session.wait_until(
@@ -1877,6 +1989,18 @@ CASES = (
         "files",
         create_symlink_preview_fixture,
         symlink_preview_smoke,
+    ),
+    ScenarioCase(
+        "image-preview-fallback",
+        "files",
+        create_image_preview_fixture,
+        image_preview_fallback,
+    ),
+    ScenarioCase(
+        "unified-system-open",
+        "files",
+        create_system_open_fixture,
+        unified_system_open,
     ),
     ScenarioCase("keyboard-controls", "files", create_navigation_fixture, keyboard_controls),
     ScenarioCase(

@@ -37,8 +37,11 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+lopdf = { version = "0.44.0", default-features = false }
 lsp-types = "=0.97.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
+quick-xml = "0.41.0"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1.12"
 serde = { version = "=1.0.228", features = ["derive"] }
@@ -54,6 +57,7 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-f
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
 url = "=2.5.8"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -69,6 +73,8 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_Memory",
   "Win32_System_Pipes",
   "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

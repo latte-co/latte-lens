@@ -30,6 +30,7 @@ use crate::agent::{
 
 use crate::{
     clipboard,
+    content_safety::FileFingerprint,
     diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
     folding::{FoldAnchor, FoldRegion, FoldSource, StructureSnapshot, SymbolId},
     git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
@@ -43,18 +44,22 @@ use crate::{
         NavigationSource, NavigationTargetRange, SourcePosition, SourceRange,
         lsp_uri_to_navigation_target,
     },
-    preview::{HighlightKind, HighlightSpan, PreviewProvider, PreviewRegistry},
+    preview::{
+        HighlightKind, HighlightSpan, PreviewKind, PreviewProvider, PreviewRegistry,
+        TerminalImageSize,
+    },
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
         RepoRelationState, RepoSnapshot,
     },
     runtime::{
         ContentCompletion, ContentIdentity, ContentKind, ContentPurpose, ContentRequest,
-        ContentSnapshot, ContentTarget, DirectoryCompletion, DirectoryRequest, RefreshCompletion,
-        RefreshRequest, RefreshSnapshot, RequestGeneration, WorkerRuntime,
-        rebind_navigation_source,
+        ContentSnapshot, ContentTarget, DirectoryCompletion, DirectoryRequest,
+        ExternalOpenCompletion, ExternalOpenRequest, RefreshCompletion, RefreshRequest,
+        RefreshSnapshot, RequestGeneration, WorkerRuntime, rebind_navigation_source,
     },
     search::{SearchEvent, SearchMatch, SearchOptions, SearchRequest, SearchRuntime},
+    system_preview::{ExternalOpenOutcome, SystemOpenAdapter},
     text_layout::{expand_tabs, grapheme_width_at},
     tree::{self, FileEntry},
     ui,
@@ -267,6 +272,8 @@ struct SearchRestore {
     clipboard_status: Option<String>,
     content_mode: ContentMode,
     content_provider: Option<String>,
+    content_preview_kind: PreviewKind,
+    content_source_target: Option<ContentTarget>,
     content_show_line_numbers: bool,
     content_diff_lines: Vec<DiffLineAnnotation>,
     content_identity: Option<ContentIdentity>,
@@ -380,6 +387,9 @@ const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1_500);
 const NAVIGATION_HISTORY_LIMIT: usize = 128;
 const NAVIGATION_STATUS_INFO: Duration = Duration::from_secs(4);
 const NAVIGATION_STATUS_ERROR: Duration = Duration::from_secs(8);
+const TREE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+const EXTERNAL_OPEN_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
+const EXTERNAL_OPEN_DEDUP_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NavigationStatusLevel {
@@ -392,6 +402,32 @@ pub(crate) struct NavigationStatus {
     pub(crate) level: NavigationStatusLevel,
     pub(crate) message: String,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTerminalImagePreview {
+    target: ContentTarget,
+    label: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingExternalOpenConfirmation {
+    target: ContentTarget,
+    label: String,
+    fingerprint: FileFingerprint,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalOpenTrigger {
+    Activate,
+    ExplicitConfirm,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TreeClickIdentity {
+    AllFiles(PathBuf),
+    GitChanges(GitRowIdentity),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -584,6 +620,7 @@ pub struct UiRegions {
     pub preview_find_previous: Rect,
     pub preview_find_next: Rect,
     pub preview_find_close: Rect,
+    pub external_open_button: Rect,
     pub tree_body: Rect,
     pub tree_inner: Rect,
     pub divider: Rect,
@@ -658,6 +695,8 @@ pub struct App {
     pub clipboard_status: Option<String>,
     pub content_mode: ContentMode,
     pub content_provider: Option<String>,
+    content_preview_kind: PreviewKind,
+    content_source_target: Option<ContentTarget>,
     pub content_show_line_numbers: bool,
     pub(crate) content_diff_lines: Vec<DiffLineAnnotation>,
     content_identity: Option<ContentIdentity>,
@@ -705,6 +744,7 @@ pub struct App {
     runtime: WorkerRuntime,
     refresh_requests: RequestGeneration,
     content_requests: RequestGeneration,
+    external_open_requests: RequestGeneration,
     navigation_preview_requests: RequestGeneration,
     search_runtime: SearchRuntime,
     pub(crate) search: Option<SearchState>,
@@ -715,9 +755,14 @@ pub struct App {
     search_preview_target: Option<SearchPreviewTarget>,
     recent_files: Vec<PathBuf>,
     last_search_click: Option<(usize, Instant)>,
+    last_tree_click: Option<(TreeClickIdentity, Instant)>,
+    last_external_opened: Option<(ContentTarget, Instant)>,
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
     quit_confirmation: Option<QuitConfirmation>,
+    pending_terminal_image_preview: Option<PendingTerminalImagePreview>,
+    pending_external_open_confirmation: Option<PendingExternalOpenConfirmation>,
+    terminal_truecolor_supported: bool,
     should_quit: bool,
     #[cfg(feature = "agent-observability")]
     agent_runtime: Option<AgentRuntime>,
@@ -766,6 +811,33 @@ impl App {
             preview_registry,
             tree::DEFAULT_MAX_ENTRIES,
             options,
+            if cfg!(test) {
+                SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned())
+            } else {
+                SystemOpenAdapter::Host
+            },
+        )
+    }
+
+    /// Test-only construction surface that prevents a TUI test from starting
+    /// a real desktop application when it exercises Enter, double-click, or o.
+    #[doc(hidden)]
+    pub fn with_system_open_disabled(path: PathBuf) -> Result<Self> {
+        Self::with_preview_registry_and_system_open_disabled(path, PreviewRegistry::with_builtins())
+    }
+
+    /// Test-only variant for suites that install a custom preview registry.
+    #[doc(hidden)]
+    pub fn with_preview_registry_and_system_open_disabled(
+        path: PathBuf,
+        preview_registry: PreviewRegistry,
+    ) -> Result<Self> {
+        Self::with_preview_registry_scan_limit_and_options(
+            path,
+            preview_registry,
+            tree::DEFAULT_MAX_ENTRIES,
+            AppOptions::default(),
+            SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
         )
     }
 
@@ -780,6 +852,7 @@ impl App {
             preview_registry,
             scan_entry_limit,
             AppOptions::default(),
+            SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
         )
     }
 
@@ -788,6 +861,7 @@ impl App {
         preview_registry: PreviewRegistry,
         scan_entry_limit: usize,
         mut options: AppOptions,
+        system_open_adapter: SystemOpenAdapter,
     ) -> Result<Self> {
         let requested_root = path
             .canonicalize()
@@ -806,7 +880,8 @@ impl App {
             options.navigation_config_warning = Some(format!("{error:#}"));
         }
 
-        let runtime = WorkerRuntime::start(root.clone(), preview_registry.clone())?;
+        let runtime =
+            WorkerRuntime::start(root.clone(), preview_registry.clone(), system_open_adapter)?;
         let search_runtime = SearchRuntime::start(root.clone())?;
         let navigation_runtime =
             NavigationRuntime::start(root.clone(), options.navigation.clone())?;
@@ -834,6 +909,8 @@ impl App {
             clipboard_status: None,
             content_mode: ContentMode::Info,
             content_provider: None,
+            content_preview_kind: PreviewKind::Text,
+            content_source_target: None,
             content_show_line_numbers: false,
             content_diff_lines: Vec::new(),
             content_identity: None,
@@ -879,6 +956,7 @@ impl App {
             runtime,
             refresh_requests: RequestGeneration::default(),
             content_requests: RequestGeneration::default(),
+            external_open_requests: RequestGeneration::default(),
             navigation_preview_requests: RequestGeneration::default(),
             search_runtime,
             search: None,
@@ -889,9 +967,14 @@ impl App {
             search_preview_target: None,
             recent_files: Vec::new(),
             last_search_click: None,
+            last_tree_click: None,
+            last_external_opened: None,
             last_refresh_error: None,
             has_refresh_snapshot: false,
             quit_confirmation: None,
+            pending_terminal_image_preview: None,
+            pending_external_open_confirmation: None,
+            terminal_truecolor_supported: crate::system_preview::terminal_truecolor_supported(),
             should_quit: false,
             #[cfg(feature = "agent-observability")]
             agent_runtime: None,
@@ -1541,6 +1624,10 @@ impl App {
             return;
         }
         if key.code == KeyCode::Esc {
+            if self.pending_terminal_image_preview.take().is_some() {
+                self.load_selected_preview();
+                return;
+            }
             if self.navigation_invocation.is_some() || self.pending_navigation_stage.is_some() {
                 self.cancel_pending_navigation();
                 return;
@@ -1581,6 +1668,12 @@ impl App {
             }
             (KeyCode::Char('f' | 'F'), KeyModifiers::CONTROL) => {
                 self.open_preview_find();
+            }
+            (KeyCode::Char('o'), KeyModifiers::NONE) => {
+                self.request_external_open(ExternalOpenTrigger::ExplicitConfirm);
+            }
+            (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                self.confirm_terminal_image_preview();
             }
             (KeyCode::Tab, _) => self.set_tree_scope(self.tree_scope.next()),
             (KeyCode::BackTab, _) => self.set_tree_scope(self.tree_scope.previous()),
@@ -1662,6 +1755,7 @@ impl App {
             self.set_search_mode(mode);
             return;
         }
+        self.pending_terminal_image_preview = None;
         let restore = self.capture_search_restore();
         // Search previews temporarily replace ContentSnapshot state. Retire
         // any semantic request before that identity can change, while keeping
@@ -1698,6 +1792,8 @@ impl App {
             clipboard_status: self.clipboard_status.clone(),
             content_mode: self.content_mode,
             content_provider: self.content_provider.clone(),
+            content_preview_kind: self.content_preview_kind,
+            content_source_target: self.content_source_target.clone(),
             content_show_line_numbers: self.content_show_line_numbers,
             content_diff_lines: self.content_diff_lines.clone(),
             content_identity: self.content_identity.clone(),
@@ -2613,6 +2709,8 @@ impl App {
             self.clipboard_status = restore.clipboard_status;
             self.content_mode = restore.content_mode;
             self.content_provider = restore.content_provider;
+            self.content_preview_kind = restore.content_preview_kind;
+            self.content_source_target = restore.content_source_target;
             self.content_show_line_numbers = restore.content_show_line_numbers;
             self.content_diff_lines = restore.content_diff_lines;
             self.content_identity = restore.content_identity;
@@ -2751,9 +2849,24 @@ impl App {
                 if self.handle_search_mouse_down(mouse) {
                     return;
                 }
+                if self.preview_find.is_none()
+                    && contains(
+                        self.ui_regions.external_open_button,
+                        mouse.column,
+                        mouse.row,
+                    )
+                    && self.can_open_content_externally()
+                {
+                    self.clear_content_selection();
+                    self.focused_pane = FocusPane::Content;
+                    self.last_tree_click = None;
+                    self.request_external_open(ExternalOpenTrigger::ExplicitConfirm);
+                    return;
+                }
                 if self.ui_regions.refresh_at(mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
+                    self.last_tree_click = None;
                     self.request_refresh(self.tree_scope == TreeScope::GitChanges);
                     return;
                 }
@@ -2765,6 +2878,7 @@ impl App {
                 if let Some(scope) = self.ui_regions.scope_at(mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
+                    self.last_tree_click = None;
                     self.set_tree_scope(scope);
                     return;
                 }
@@ -2774,26 +2888,29 @@ impl App {
                     let visible_row = usize::from(mouse.row - self.ui_regions.tree_inner.y);
                     let index = self.tree_state.offset().saturating_add(visible_row);
                     if index < self.tree_row_count() {
+                        let identity = self.tree_click_identity(index);
+                        let container = self.tree_row_is_container(index);
+                        let double_click = !container
+                            && identity.as_ref().is_some_and(|identity| {
+                                self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
+                                    previous == identity
+                                        && Instant::now().saturating_duration_since(*at)
+                                            <= TREE_DOUBLE_CLICK_WINDOW
+                                })
+                            });
                         self.select(index);
-                        let is_container = match self.tree_scope {
-                            TreeScope::AllFiles => {
-                                self.selected_entry().is_some_and(|entry| entry.is_dir)
-                            }
-                            TreeScope::GitChanges => self
-                                .selected_git_row()
-                                .is_some_and(GitTreeRow::is_container),
-                            #[cfg(feature = "agent-observability")]
-                            TreeScope::Agents => false,
-                        };
-                        if is_container {
+                        if container {
+                            self.last_tree_click = None;
                             self.toggle_selected_directory();
-                        } else if self.tree_scope == TreeScope::GitChanges
-                            && self.selected_git_row().is_some_and(GitTreeRow::is_change)
-                        {
-                            self.focused_pane = FocusPane::Content;
+                        } else if double_click {
+                            self.last_tree_click = None;
+                            self.activate_selected_tree_entry();
+                        } else if let Some(identity) = identity {
+                            self.last_tree_click = Some((identity, Instant::now()));
                         }
                     }
                 } else if contains(self.ui_regions.content_inner, mouse.column, mouse.row) {
+                    self.last_tree_click = None;
                     self.focused_pane = FocusPane::Content;
                     if self.handle_fold_mouse_down(mouse) {
                         return;
@@ -2815,7 +2932,10 @@ impl App {
                     self.begin_content_selection(mouse);
                 } else if contains(self.ui_regions.content_body, mouse.column, mouse.row) {
                     self.clear_content_selection();
+                    self.last_tree_click = None;
                     self.focused_pane = FocusPane::Content;
+                } else {
+                    self.last_tree_click = None;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -2879,6 +2999,36 @@ impl App {
             return true;
         }
         false
+    }
+
+    fn tree_click_identity(&self, index: usize) -> Option<TreeClickIdentity> {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .map(|entry| TreeClickIdentity::AllFiles(entry.relative.clone())),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .map(|row| TreeClickIdentity::GitChanges(row.identity.clone())),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => None,
+        }
+    }
+
+    fn tree_row_is_container(&self, index: usize) -> bool {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .is_some_and(|entry| entry.is_dir),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .is_some_and(GitTreeRow::is_container),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => false,
+        }
     }
 
     fn handle_search_mouse_down(&mut self, mouse: MouseEvent) -> bool {
@@ -3266,6 +3416,8 @@ impl App {
     }
 
     pub fn set_tree_scope(&mut self, scope: TreeScope) {
+        self.last_tree_click = None;
+        self.pending_external_open_confirmation = None;
         // Git state is intentionally refreshed on every entry to this scope,
         // including a second click on its tab. A long-running TUI should not
         // show a stale changed-files tree after an agent updates the worktree.
@@ -3357,6 +3509,17 @@ impl App {
 
     pub const fn is_content_loading(&self) -> bool {
         self.content_requests.is_loading()
+    }
+
+    pub const fn is_external_open_loading(&self) -> bool {
+        self.external_open_requests.is_loading()
+    }
+
+    #[doc(hidden)]
+    pub fn external_open_status_message(&self) -> Option<&str> {
+        self.navigation_status
+            .as_ref()
+            .map(|status| status.message.as_str())
     }
 
     const fn is_navigation_preview_loading(&self) -> bool {
@@ -3524,15 +3687,14 @@ impl App {
             match self.selected_git_row() {
                 Some(row) if row.is_container() => self.toggle_selected_directory(),
                 Some(row) if row.is_change() => {
-                    self.focused_pane = FocusPane::Content;
-                    self.load_selected_diff();
+                    self.request_external_open(ExternalOpenTrigger::Activate);
                 }
                 _ => {}
             }
         } else {
             match self.selected_entry().map(|entry| entry.is_dir) {
                 Some(true) => self.toggle_selected_directory(),
-                Some(false) => self.focused_pane = FocusPane::Content,
+                Some(false) => self.request_external_open(ExternalOpenTrigger::Activate),
                 None => {}
             }
         }
@@ -3867,7 +4029,7 @@ impl App {
             self.navigation_status = None;
         }
         self.dispatch_search_if_due();
-        let (refresh, directories, content) = self.runtime.take_completions();
+        let (refresh, directories, content, external_open) = self.runtime.take_completions();
         if let Some(completion) = refresh {
             self.apply_refresh_completion(completion);
         }
@@ -3876,6 +4038,9 @@ impl App {
         }
         if let Some(completion) = content {
             self.apply_content_completion(completion);
+        }
+        if let Some(completion) = external_open {
+            self.apply_external_open_completion(completion);
         }
         for completion in self.navigation_runtime.take_completions() {
             self.apply_navigation_completion(completion);
@@ -4012,12 +4177,14 @@ impl App {
         while self.is_refreshing()
             || self.is_directory_loading()
             || self.is_content_loading()
+            || self.is_external_open_loading()
             || self.is_navigation_preview_loading()
             || self.is_searching()
         {
             if self.is_refreshing()
                 || self.is_directory_loading()
                 || self.is_content_loading()
+                || self.is_external_open_loading()
                 || self.is_navigation_preview_loading()
             {
                 if !self.runtime.wait_for_completion() {
@@ -5005,6 +5172,183 @@ impl App {
         );
     }
 
+    fn request_external_open(&mut self, trigger: ExternalOpenTrigger) {
+        let Some((target, label)) = self.current_external_open_target() else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Info,
+                "Select an existing regular file before using system open.",
+            );
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .last_external_opened
+            .as_ref()
+            .is_some_and(|(opened, at)| {
+                opened == &target
+                    && now.saturating_duration_since(*at) <= EXTERNAL_OPEN_DEDUP_WINDOW
+            })
+        {
+            self.set_navigation_status(
+                NavigationStatusLevel::Info,
+                format!("{label} was already handed to the system app."),
+            );
+            return;
+        }
+
+        let pending_matches = self
+            .pending_external_open_confirmation
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.target == target && pending.label == label && pending.expires_at > now
+            });
+        if trigger == ExternalOpenTrigger::Activate && pending_matches {
+            self.set_navigation_status(
+                NavigationStatusLevel::Info,
+                "Unknown file type. Press o or click Open anyway to confirm.",
+            );
+            return;
+        }
+        let confirmed_fingerprint = (trigger == ExternalOpenTrigger::ExplicitConfirm)
+            .then(|| {
+                self.pending_external_open_confirmation
+                    .as_ref()
+                    .filter(|pending| {
+                        pending.target == target
+                            && pending.label == label
+                            && pending.expires_at > now
+                    })
+                    .map(|pending| pending.fingerprint.clone())
+            })
+            .flatten();
+        self.pending_external_open_confirmation = None;
+        self.pending_terminal_image_preview = None;
+        let generation = self.external_open_requests.begin();
+        self.runtime.request_external_open(ExternalOpenRequest {
+            generation,
+            target,
+            label: label.clone(),
+            confirmed_fingerprint,
+        });
+        self.set_navigation_status(
+            NavigationStatusLevel::Info,
+            format!("Checking {label} before opening it with the system app…"),
+        );
+    }
+
+    fn current_external_open_target(&self) -> Option<(ContentTarget, String)> {
+        if self.focused_pane == FocusPane::Content
+            && let Some(target) = self.content_source_target.clone()
+            && self.content_successful
+        {
+            let label = self.content_identity.as_ref().map_or_else(
+                || self.selected_content_label(),
+                ContentIdentity::display_label,
+            );
+            return Some((target, label));
+        }
+        self.selected_tree_external_open_target()
+            .or_else(|| self.content_external_open_target())
+    }
+
+    fn selected_tree_external_open_target(&self) -> Option<(ContentTarget, String)> {
+        match self.tree_scope {
+            TreeScope::AllFiles => {
+                let entry = self.selected_entry()?;
+                (!entry.is_dir && entry.exists).then(|| {
+                    (
+                        ContentTarget::Workspace(entry.relative.clone()),
+                        entry.relative.display().to_string(),
+                    )
+                })
+            }
+            TreeScope::GitChanges => {
+                let row = self.selected_git_row()?;
+                let GitRowKind::Change(change) = &row.kind else {
+                    return None;
+                };
+                row.exists
+                    .then(|| (ContentTarget::Repository(change.clone()), row.label.clone()))
+            }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => None,
+        }
+    }
+
+    fn content_external_open_target(&self) -> Option<(ContentTarget, String)> {
+        let target = self.content_source_target.clone()?;
+        self.content_successful.then(|| {
+            let label = self.content_identity.as_ref().map_or_else(
+                || self.selected_content_label(),
+                ContentIdentity::display_label,
+            );
+            (target, label)
+        })
+    }
+
+    pub(crate) fn can_open_content_externally(&self) -> bool {
+        self.content_external_open_target().is_some()
+    }
+
+    pub(crate) fn external_open_confirmation_for_content(&self) -> bool {
+        let Some((target, label)) = self.content_external_open_target() else {
+            return false;
+        };
+        self.pending_external_open_confirmation
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.target == target
+                    && pending.label == label
+                    && pending.expires_at > Instant::now()
+            })
+    }
+
+    fn confirm_terminal_image_preview(&mut self) {
+        let Some(pending) = self.pending_terminal_image_preview.take() else {
+            if matches!(self.content_preview_kind, PreviewKind::Image(_)) {
+                self.set_navigation_status(
+                    NavigationStatusLevel::Info,
+                    "Press o first; terminal rendering is offered only when the system default app is unavailable.",
+                );
+            }
+            return;
+        };
+        if !self.terminal_truecolor_supported {
+            self.set_info(vec![
+                "Terminal image preview unavailable: TERM=dumb does not support TrueColor."
+                    .to_owned(),
+                "Select the image again to return to metadata.".to_owned(),
+            ]);
+            return;
+        }
+
+        let terminal_image_size = TerminalImageSize {
+            columns: self.ui_regions.content_inner.width.max(1),
+            rows: self
+                .ui_regions
+                .content_inner
+                .height
+                .saturating_sub(7)
+                .max(1),
+        };
+        self.cancel_pending_navigation();
+        self.navigation_picker = None;
+        self.navigation_target_highlight = None;
+        let generation = self.content_requests.begin();
+        self.cache_current_folds();
+        self.cancel_external_open();
+        self.reset_content(ContentMode::Preview);
+        self.pending_diff_path = None;
+        self.content_lines = vec![format!("Rendering {} for this terminal…", pending.label)];
+        self.runtime.request_content(ContentRequest {
+            generation,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            target: pending.target,
+            terminal_image_size: Some(terminal_image_size),
+        });
+    }
+
     fn request_content(&mut self, kind: ContentKind, label: String, target: ContentTarget) -> u64 {
         self.request_content_with_review_path(kind, label, target, None)
     }
@@ -5030,6 +5374,7 @@ impl App {
         self.navigation_target_highlight = None;
         let generation = self.content_requests.begin();
         self.cache_current_folds();
+        self.cancel_external_open();
         self.reset_content(match kind {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
@@ -5041,6 +5386,7 @@ impl App {
             kind,
             purpose: ContentPurpose::Display,
             target,
+            terminal_image_size: None,
         });
         generation
     }
@@ -5518,6 +5864,7 @@ impl App {
                 navigation_generation: invocation.generation,
             },
             target: content_target_for_navigation(&target.document),
+            terminal_image_size: None,
         });
         self.pending_navigation_stage = Some(PendingNavigationStage {
             invocation,
@@ -5605,12 +5952,15 @@ impl App {
 
     fn install_navigation_snapshot(&mut self, snapshot: ContentSnapshot) {
         self.cache_current_folds();
+        self.cancel_external_open();
         self.reset_content(ContentMode::Preview);
         let cached = snapshot
             .identity
             .as_ref()
             .map_or_else(HashSet::new, |identity| self.cached_folds(identity));
         self.content_provider = snapshot.provider;
+        self.content_preview_kind = snapshot.preview_kind;
+        self.content_source_target = snapshot.source_target;
         self.content_lines = snapshot.lines;
         self.content_highlights = snapshot.highlights;
         self.content_show_line_numbers = snapshot.show_line_numbers;
@@ -5884,6 +6234,7 @@ impl App {
                 navigation_generation,
             },
             target: content_target_for_navigation(&target.document),
+            terminal_image_size: None,
         });
     }
 
@@ -6029,6 +6380,8 @@ impl App {
                     .as_ref()
                     .map_or_else(HashSet::new, |identity| self.cached_folds(identity));
                 self.content_provider = snapshot.provider;
+                self.content_preview_kind = snapshot.preview_kind;
+                self.content_source_target = snapshot.source_target;
                 self.content_lines = snapshot.lines;
                 self.content_highlights = snapshot.highlights;
                 self.content_identity = snapshot.identity;
@@ -6113,6 +6466,81 @@ impl App {
         }
     }
 
+    fn apply_external_open_completion(&mut self, completion: ExternalOpenCompletion) {
+        let ExternalOpenCompletion {
+            generation,
+            target,
+            label,
+            result,
+        } = completion;
+        if !self.external_open_requests.accept(generation) {
+            return;
+        }
+        match result {
+            Ok(ExternalOpenOutcome::Opened) => {
+                self.last_external_opened = Some((target, Instant::now()));
+                self.pending_external_open_confirmation = None;
+                self.set_navigation_status(
+                    NavigationStatusLevel::Info,
+                    format!("Opened {label} with the system default app."),
+                );
+            }
+            Ok(ExternalOpenOutcome::ConfirmationRequired {
+                fingerprint,
+                detected,
+            }) => {
+                self.pending_external_open_confirmation = Some(PendingExternalOpenConfirmation {
+                    target,
+                    label: label.clone(),
+                    fingerprint,
+                    expires_at: Instant::now() + EXTERNAL_OPEN_CONFIRM_WINDOW,
+                });
+                self.set_navigation_status(
+                    NavigationStatusLevel::Info,
+                    format!(
+                        "{label} is {detected}; press o again or click Open anyway within 15s."
+                    ),
+                );
+            }
+            Ok(ExternalOpenOutcome::Unavailable {
+                reason,
+                image_fallback,
+            })
+            | Ok(ExternalOpenOutcome::Failed {
+                reason,
+                image_fallback,
+            }) if image_fallback => {
+                let reason = clean_navigation_message(&reason);
+                self.set_info(vec![
+                    format!("System default app unavailable: {reason}."),
+                    String::new(),
+                    "Press i to preview in this terminal using TrueColor half-block pixels."
+                        .to_owned(),
+                    "Rendering quality depends on the terminal. Press Esc to cancel.".to_owned(),
+                ]);
+                self.pending_terminal_image_preview =
+                    Some(PendingTerminalImagePreview { target, label });
+            }
+            Ok(ExternalOpenOutcome::Unavailable { reason, .. })
+            | Ok(ExternalOpenOutcome::Failed { reason, .. }) => {
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!(
+                        "System default app unavailable: {}",
+                        clean_navigation_message(&reason)
+                    ),
+                );
+            }
+            Err(error) => {
+                self.pending_external_open_confirmation = None;
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("System open blocked: {}", clean_navigation_message(&error)),
+                );
+            }
+        }
+    }
+
     fn reset_content(&mut self, mode: ContentMode) {
         self.preview_find = None;
         self.content_scroll = 0;
@@ -6121,6 +6549,8 @@ impl App {
         self.clipboard_status = None;
         self.content_mode = mode;
         self.content_provider = None;
+        self.content_preview_kind = PreviewKind::Text;
+        self.content_source_target = None;
         self.content_highlights.clear();
         self.content_show_line_numbers = false;
         self.content_diff_lines.clear();
@@ -6143,8 +6573,16 @@ impl App {
         self.runtime.cancel_pending_content();
         self.pending_diff_path = None;
         self.cache_current_folds();
+        self.cancel_external_open();
         self.reset_content(ContentMode::Info);
         self.content_lines = lines;
+    }
+
+    fn cancel_external_open(&mut self) {
+        self.external_open_requests.invalidate();
+        self.runtime.cancel_pending_external_open();
+        self.pending_terminal_image_preview = None;
+        self.pending_external_open_confirmation = None;
     }
 
     fn toggle_current_diff_review(&mut self) {
@@ -6953,7 +7391,7 @@ const fn freshness_label(value: ObservationFreshness) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::{fs, io::Cursor, process::Command};
 
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -7752,6 +8190,8 @@ mod tests {
             fold_regions: Vec::new(),
             structure: crate::folding::StructureSnapshot::unavailable(),
             navigation_source: None,
+            preview_kind: PreviewKind::Text,
+            source_target: None,
         }
     }
 
@@ -8431,6 +8871,8 @@ mod tests {
                 fold_regions: old_source.structure.folds.clone(),
                 structure: old_source.structure.as_ref().clone(),
                 navigation_source: Some(old_source.as_ref().clone()),
+                preview_kind: PreviewKind::Text,
+                source_target: None,
             }),
         });
         assert_eq!(
@@ -9297,6 +9739,100 @@ mod tests {
             app.last_error.as_deref(),
             Some("scan failed: permission denied"),
             "non-copy errors must not be cleared by a successful path copy"
+        );
+    }
+
+    fn image_preview_app() -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.keep();
+        let image = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_fn(4, 2, |x, y| {
+            image::Rgba([x as u8 * 60, y as u8 * 120, 80, 255])
+        }));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        fs::write(root.join("sample.png"), bytes.into_inner()).unwrap();
+        let mut app = App::new(root).unwrap();
+        app.wait_for_background();
+        app.ui_regions.content_inner = Rect::new(0, 0, 24, 12);
+        app.ui_regions.content_body = app.ui_regions.content_inner;
+        app
+    }
+
+    #[test]
+    fn terminal_image_requires_an_explicit_unavailable_viewer_prompt() {
+        let mut app = image_preview_app();
+        assert!(matches!(
+            app.content_preview_kind,
+            PreviewKind::Image(crate::preview::ImagePreviewFormat::Png)
+        ));
+        let original_lines = app.content_lines.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert_eq!(app.content_lines, original_lines);
+        assert!(app.pending_terminal_image_preview.is_none());
+        assert!(
+            app.navigation_status
+                .as_ref()
+                .is_some_and(|status| status.message.contains("Press o first"))
+        );
+    }
+
+    #[test]
+    fn unavailable_viewer_prompt_can_render_or_cancel_truecolor_preview() {
+        let mut app = image_preview_app();
+        app.terminal_truecolor_supported = true;
+        let target = app.content_source_target.clone().unwrap();
+        let generation = app.external_open_requests.begin();
+        app.apply_external_open_completion(ExternalOpenCompletion {
+            generation,
+            target: target.clone(),
+            label: "sample.png".to_owned(),
+            result: Ok(ExternalOpenOutcome::Unavailable {
+                reason: "no graphical session".to_owned(),
+                image_fallback: true,
+            }),
+        });
+        assert!(app.pending_terminal_image_preview.is_some());
+        assert!(
+            app.content_lines
+                .iter()
+                .any(|line| line.contains("Press i"))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.wait_for_background();
+        assert!(app.pending_terminal_image_preview.is_none());
+        assert!(
+            app.content_lines
+                .iter()
+                .any(|line| line.contains("Press o"))
+        );
+
+        let generation = app.external_open_requests.begin();
+        app.apply_external_open_completion(ExternalOpenCompletion {
+            generation,
+            target,
+            label: "sample.png".to_owned(),
+            result: Ok(ExternalOpenOutcome::Unavailable {
+                reason: "no graphical session".to_owned(),
+                image_fallback: true,
+            }),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.wait_for_background();
+
+        assert!(app.pending_terminal_image_preview.is_none());
+        assert!(
+            app.content_lines.iter().any(|line| line.contains('▀')),
+            "expected terminal image rows, got {:?}",
+            app.content_lines
+        );
+        assert!(
+            app.content_highlights
+                .iter()
+                .flatten()
+                .any(|highlight| { matches!(highlight.kind, HighlightKind::ImagePixel { .. }) })
         );
     }
 

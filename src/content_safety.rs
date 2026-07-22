@@ -9,6 +9,7 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, bail};
@@ -67,12 +68,84 @@ pub(crate) enum OpenRegular {
 /// A handle that passed the shared non-following regular-file policy.
 pub(crate) struct SafeFile {
     file: File,
-    len: u64,
+    metadata: Metadata,
 }
 
 impl SafeFile {
-    pub(crate) const fn len(&self) -> u64 {
-        self.len
+    pub(crate) fn len(&self) -> u64 {
+        self.metadata.len()
+    }
+
+    pub(crate) fn fingerprint(&self) -> Result<FileFingerprint> {
+        FileFingerprint::from_file(&self.file, &self.metadata)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_executable(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        self.metadata.mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) const fn is_executable(&self) -> bool {
+        false
+    }
+}
+
+/// Stable-enough identity captured from a safely opened regular-file handle.
+///
+/// This is used only to detect replacement between classification and an
+/// explicit system-open handoff. The external application still reopens a
+/// path, so this fingerprint narrows common races rather than claiming an
+/// atomic cross-process guarantee.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+impl FileFingerprint {
+    fn from_file(file: &File, metadata: &Metadata) -> Result<Self> {
+        #[cfg(not(windows))]
+        let _ = file;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let (volume_serial, file_index) = windows_file_identity(file)?;
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                volume_serial,
+                file_index,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
     }
 }
 
@@ -195,8 +268,8 @@ pub(crate) fn open_regular(content_root: Option<&Path>, path: &Path) -> Result<O
     }
 
     Ok(OpenRegular::Opened(SafeFile {
-        len: opened_metadata.len(),
         file,
+        metadata: opened_metadata,
     }))
 }
 
