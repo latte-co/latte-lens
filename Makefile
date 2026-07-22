@@ -1,5 +1,11 @@
 SHELL := /bin/bash
 
+# Auto-enable sccache if installed; CI/dev environments without it are unaffected
+SCCACHE := $(shell command -v sccache 2>/dev/null)
+ifneq ($(SCCACHE),)
+export RUSTC_WRAPPER := sccache
+endif
+
 CARGO ?= cargo
 PYTHON ?= python3
 TRAEX_BIN ?=
@@ -30,8 +36,8 @@ fmt: ## Format Rust sources
 fmt-check: ## Check Rust formatting without changing files
 	$(CARGO) fmt --all --check
 
-check: ## Type-check every target
-	$(CARGO) check --all-targets --all-features --locked
+check: ## Type-check the default feature set without compiling tests or benches
+	$(CARGO) check --locked
 
 lint: ## Run Clippy with warnings denied
 	$(CARGO) clippy --all-targets --all-features --locked -- -D warnings
@@ -127,10 +133,10 @@ agent-package-negative: ## Prove the default build does not expose the synthetic
 agent-ci: agent-ut agent-contract agent-harness-self-test agent-e2e-hook agent-e2e agent-e2e-tui agent-package-negative ## Run all synthetic Agent observability gates
 
 coverage: coverage-unit coverage-e2e coverage-agent ## Enforce UT, production PTY E2E, and Agent Core coverage floors
+	rm -rf target/llvm-cov-target target/llvm-cov-e2e coverage lcov.info
 
 coverage-unit: ## Enforce 93% line coverage for the direct unit-test responsibility surface
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "cargo-llvm-cov is missing; run 'make setup'"; exit 1; }
-	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --workspace --all-features --lib --bins --locked \
 		--ignore-filename-regex '$(UT_COVERAGE_IGNORE_REGEX)' \
 		--fail-under-lines $(UT_COVERAGE_MIN)
@@ -145,7 +151,6 @@ coverage-e2e: e2e-self-test ## Enforce 85% line coverage for the production PTY 
 
 coverage-agent: ## Enforce 80% line coverage across the complete synthetic Agent Core
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "cargo-llvm-cov is missing; run 'make setup'"; exit 1; }
-	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --workspace --all-targets --all-features --locked \
 		--ignore-filename-regex '$(AGENT_COVERAGE_IGNORE_REGEX)' \
 		--fail-under-lines $(AGENT_COVERAGE_MIN)

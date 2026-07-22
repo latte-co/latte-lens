@@ -8,10 +8,15 @@ license = "Apache-2.0"
 repository = "https://github.com/latte-co/latte-lens"
 
 [features]
-default = ["agent-observability"]
+default = ["agent-observability", "tree-sitter-go", "tree-sitter-javascript", "tree-sitter-python", "tree-sitter-rust", "tree-sitter-typescript"]
 agent-observability = []
 agent-observability-harness = ["agent-observability"]
 navigation-test-support = []
+tree-sitter-go = ["dep:tree-sitter-go"]
+tree-sitter-javascript = ["dep:tree-sitter-javascript"]
+tree-sitter-python = ["dep:tree-sitter-python"]
+tree-sitter-rust = ["dep:tree-sitter-rust"]
+tree-sitter-typescript = ["dep:tree-sitter-typescript"]
 
 [[bin]]
 name = "latte-lens"
@@ -40,11 +45,11 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
 syntect = { version = "5.3", default-features = false, features = ["regex-fancy"] }
 tree-sitter = "0.25.10"
-tree-sitter-go = "0.25.0"
-tree-sitter-javascript = "0.25.0"
-tree-sitter-python = "0.25.0"
-tree-sitter-rust = "0.24.2"
-tree-sitter-typescript = "0.23.2"
+tree-sitter-go = { version = "0.25.0", optional = true }
+tree-sitter-javascript = { version = "0.25.0", optional = true }
+tree-sitter-python = { version = "0.25.0", optional = true }
+tree-sitter-rust = { version = "0.24.2", optional = true }
+tree-sitter-typescript = { version = "0.23.2", optional = true }
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
@@ -73,3 +78,18 @@ tempfile = "3.20"
 [[bench]]
 name = "tree_scan"
 harness = false
+
+[profile.dev]
+debug = 1
+codegen-units = 256
+
+[profile.test]
+debug = 1
+codegen-units = 256
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
