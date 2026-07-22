@@ -690,6 +690,7 @@ fn graphical_session_present(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
 enum LaunchAttempt {
     Missing,
     Outcome(PlatformOpenOutcome),
@@ -697,6 +698,15 @@ enum LaunchAttempt {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn launch_command(command: &mut Command, name: &str) -> LaunchAttempt {
+    launch_command_with_window(command, name, QUICK_FAILURE_WINDOW)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn launch_command_with_window(
+    command: &mut Command,
+    name: &str,
+    quick_failure_window: Duration,
+) -> LaunchAttempt {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -711,7 +721,7 @@ fn launch_command(command: &mut Command, name: &str) -> LaunchAttempt {
         }
     };
 
-    let deadline = Instant::now() + QUICK_FAILURE_WINDOW;
+    let deadline = Instant::now() + quick_failure_window;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return LaunchAttempt::Outcome(outcome_from_status(name, status)),
@@ -1030,19 +1040,18 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn quickly_failing_opener_process_is_not_misreported_as_opened() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let opener = directory.path().join("opener");
-        fs::write(&opener, "#!/bin/sh\nexit 23\n").unwrap();
-        let mut permissions = fs::metadata(&opener).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&opener, permissions).unwrap();
-
-        assert!(matches!(
-            launch_command(&mut Command::new(opener), "fixture"),
-            LaunchAttempt::Outcome(PlatformOpenOutcome::Failed(message)) if message.contains("fixture")
-        ));
+        let outcome = launch_command_with_window(
+            &mut Command::new("false"),
+            "fixture",
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(
+                &outcome,
+                LaunchAttempt::Outcome(PlatformOpenOutcome::Failed(message)) if message.contains("fixture")
+            ),
+            "unexpected opener outcome: {outcome:?}"
+        );
     }
 
     #[test]
