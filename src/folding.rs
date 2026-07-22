@@ -237,6 +237,7 @@ pub(crate) fn fold_regions_with_limits(
             limits.max_markdown_events,
             &mut budget,
         ),
+        #[cfg(feature = "tree-sitter-rust")]
         "rs" => code_regions(
             &source,
             &line_starts,
@@ -245,6 +246,7 @@ pub(crate) fn fold_regions_with_limits(
             limits.max_nodes,
             &mut budget,
         ),
+        #[cfg(feature = "tree-sitter-typescript")]
         "ts" | "mts" | "cts" => code_regions(
             &source,
             &line_starts,
@@ -253,6 +255,7 @@ pub(crate) fn fold_regions_with_limits(
             limits.max_nodes,
             &mut budget,
         ),
+        #[cfg(feature = "tree-sitter-typescript")]
         "tsx" => code_regions(
             &source,
             &line_starts,
@@ -261,6 +264,7 @@ pub(crate) fn fold_regions_with_limits(
             limits.max_nodes,
             &mut budget,
         ),
+        #[cfg(feature = "tree-sitter-javascript")]
         "js" | "mjs" | "cjs" | "jsx" => code_regions(
             &source,
             &line_starts,
@@ -269,6 +273,7 @@ pub(crate) fn fold_regions_with_limits(
             limits.max_nodes,
             &mut budget,
         ),
+        #[cfg(feature = "tree-sitter-python")]
         "py" | "pyi" => code_regions(
             &source,
             &line_starts,
@@ -277,6 +282,7 @@ pub(crate) fn fold_regions_with_limits(
             limits.max_nodes,
             &mut budget,
         ),
+        #[cfg(feature = "tree-sitter-go")]
         "go" => code_regions(
             &source,
             &line_starts,
@@ -316,6 +322,7 @@ pub(crate) fn structure_snapshot_with_limits(
 
     match extension.as_str() {
         "md" | "markdown" => markdown_structure_snapshot(&source, &starts, lines, limits),
+        #[cfg(feature = "tree-sitter-rust")]
         "rs" => code_structure_snapshot(
             &source,
             &starts,
@@ -324,6 +331,7 @@ pub(crate) fn structure_snapshot_with_limits(
             CodeLanguage::Rust,
             limits,
         ),
+        #[cfg(feature = "tree-sitter-typescript")]
         "ts" | "mts" | "cts" => code_structure_snapshot(
             &source,
             &starts,
@@ -332,6 +340,7 @@ pub(crate) fn structure_snapshot_with_limits(
             CodeLanguage::TypeScript,
             limits,
         ),
+        #[cfg(feature = "tree-sitter-typescript")]
         "tsx" => code_structure_snapshot(
             &source,
             &starts,
@@ -340,6 +349,7 @@ pub(crate) fn structure_snapshot_with_limits(
             CodeLanguage::TypeScript,
             limits,
         ),
+        #[cfg(feature = "tree-sitter-javascript")]
         "js" | "mjs" | "cjs" | "jsx" => code_structure_snapshot(
             &source,
             &starts,
@@ -348,6 +358,7 @@ pub(crate) fn structure_snapshot_with_limits(
             CodeLanguage::JavaScript,
             limits,
         ),
+        #[cfg(feature = "tree-sitter-python")]
         "py" | "pyi" => code_structure_snapshot(
             &source,
             &starts,
@@ -356,6 +367,7 @@ pub(crate) fn structure_snapshot_with_limits(
             CodeLanguage::Python,
             limits,
         ),
+        #[cfg(feature = "tree-sitter-go")]
         "go" => code_structure_snapshot(
             &source,
             &starts,
@@ -598,6 +610,7 @@ const fn heading_rank(level: HeadingLevel) -> u8 {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Variants are only constructed when their grammar feature is enabled.
 enum CodeLanguage {
     Rust,
     TypeScript,
