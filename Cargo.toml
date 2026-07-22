@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/latte-co/latte-lens"
 
 [features]
-default = ["agent-observability", "tree-sitter-rust", "tree-sitter-typescript"]
+default = ["agent-observability", "tree-sitter-go", "tree-sitter-javascript", "tree-sitter-python", "tree-sitter-rust", "tree-sitter-typescript"]
 agent-observability = []
 agent-observability-harness = ["agent-observability"]
 navigation-test-support = []
