@@ -15,5 +15,6 @@ mod runtime;
 mod search;
 mod system_preview;
 mod text_layout;
+pub mod theme;
 pub mod tree;
 pub mod ui;

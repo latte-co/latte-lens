@@ -23,16 +23,128 @@ use crate::{
     git::FileStatus,
     preview::{HighlightKind, HighlightSpan},
     text_layout::expand_tabs,
+    theme::Theme,
     tree::FileEntry,
 };
 
-const MUTED: Color = Color::Rgb(168, 162, 158);
-const SUBTLE: Color = Color::Rgb(104, 100, 98);
-const LAVENDER: Color = Color::Rgb(200, 184, 224);
-const MINT: Color = Color::Rgb(167, 229, 211);
-const PEACH: Color = Color::Rgb(244, 197, 168);
-const ROSE: Color = Color::Rgb(232, 184, 196);
-const TREE_CHANGE_HINT: Color = Color::Rgb(196, 151, 126);
+// Foreground-only palette accessors. Each maps a legacy color role onto the
+// active [`Theme`] semantic token so the render layer never reads a raw color.
+// Region layering stays modifier/glyph driven; these only supply foregrounds.
+//
+// The legacy names are retained where a role is genuinely single-purpose so the
+// ~200 existing call sites keep reading naturally. Overloaded sites are rebound
+// to the correct semantic token individually rather than through these.
+
+/// The primary interactive accent (former `LAVENDER`): headings, focus, search
+/// chrome, and picker borders all key off the active pane's content accent.
+#[inline]
+fn accent() -> Color {
+    Theme::current().content_accent
+}
+
+/// Muted secondary text (former `MUTED`): details, gutters, help lines.
+#[inline]
+fn muted() -> Color {
+    Theme::current().text_muted
+}
+
+/// The quietest structural tone (former `SUBTLE`): dividers and idle markers.
+#[inline]
+fn subtle() -> Color {
+    Theme::current().text_subtle
+}
+
+/// Primary body text (former `Color::Reset` in content): preview/diff context.
+#[inline]
+fn text_primary() -> Color {
+    Theme::current().text_primary
+}
+
+/// The quiet "directory contains changes" hint (former `TREE_CHANGE_HINT`).
+#[inline]
+fn change_hint() -> Color {
+    Theme::current().tree_change_hint
+}
+
+/// Apply `Modifier::DIM` to a style when its owning pane is not focused, so an
+/// out-of-focus region reads as recessive without any background paint.
+#[inline]
+fn dim_when_unfocused(style: Style, focused: bool) -> Style {
+    if focused {
+        style
+    } else {
+        style.add_modifier(Modifier::DIM)
+    }
+}
+
+/// Foreground color for a file entry by kind, so type is legible before the
+/// name is read. Directories, executables, links, and missing files also carry
+/// a distinct glyph elsewhere, keeping the cue redundant under `NO_COLOR`.
+fn file_entry_color(entry: &FileEntry) -> Color {
+    let theme = Theme::current();
+    if entry.symlink_target.is_some() {
+        return theme.symlink;
+    }
+    if entry.is_dir {
+        return theme.dir;
+    }
+    match file_category(&entry.relative) {
+        FileCategory::Config => theme.file_config,
+        FileCategory::Doc => theme.file_doc,
+        FileCategory::Media => theme.file_media,
+        FileCategory::Binary => theme.file_binary,
+        FileCategory::Executable => theme.file_exec,
+        FileCategory::Plain => theme.file,
+    }
+}
+
+/// Coarse file classification used only for foreground coloring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileCategory {
+    Config,
+    Doc,
+    Media,
+    Binary,
+    Executable,
+    Plain,
+}
+
+fn file_category(path: &Path) -> FileCategory {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    const CONFIG_NAMES: &[&str] = &[
+        "makefile",
+        "dockerfile",
+        "cmakelists.txt",
+        ".gitignore",
+        ".gitattributes",
+        ".editorconfig",
+        ".env",
+    ];
+    if CONFIG_NAMES.contains(&name.as_str()) {
+        return FileCategory::Config;
+    }
+
+    match extension.as_str() {
+        "toml" | "yaml" | "yml" | "json" | "jsonc" | "ini" | "cfg" | "conf" | "config" | "lock"
+        | "properties" | "env" => FileCategory::Config,
+        "md" | "markdown" | "rst" | "txt" | "adoc" | "org" | "tex" | "pdf" => FileCategory::Doc,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "mp4" | "mov" | "mp3"
+        | "wav" | "flac" | "ogg" => FileCategory::Media,
+        "exe" | "dll" | "so" | "dylib" | "a" | "o" | "bin" | "class" | "wasm" | "zip" | "gz"
+        | "tar" | "7z" | "rlib" => FileCategory::Binary,
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => FileCategory::Executable,
+        _ => FileCategory::Plain,
+    }
+}
+
 pub(crate) const MIN_TREE_WIDTH: u16 = 28;
 const MIN_CONTENT_WIDTH: u16 = 24;
 const DEFAULT_MAX_TREE_WIDTH: u16 = 44;
@@ -289,12 +401,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(refresh_width)]).areas(area);
     let mut title = vec![Span::styled(
         " LATTE LENS ",
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
     )];
     if app.is_initial_loading() {
         title.push(Span::styled(
             "  loading workspace",
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         ));
     } else if app.total_repository_count > 0 {
         let change_count = format_change_count(app.changed_count);
@@ -316,7 +428,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         title.push(Span::raw("  "));
         if let Some(branch) = app.branch.as_deref() {
-            title.push(Span::styled(branch, Style::default().fg(MINT)));
+            title.push(Span::styled(branch, Style::default().fg(Theme::current().git_accent)));
             title.push(Span::raw("  ·  "));
         }
         title.push(Span::styled(
@@ -340,14 +452,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                     ""
                 }
             ),
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         ));
     } else {
-        title.push(Span::styled("  directory", Style::default().fg(MUTED)));
+        title.push(Span::styled("  directory", Style::default().fg(muted())));
     }
     let subtitle = Line::from(Span::styled(
         display_path(&app.root),
-        Style::default().fg(MUTED),
+        Style::default().fg(muted()),
     ));
     frame.render_widget(
         Paragraph::new(vec![Line::from(title), subtitle]),
@@ -361,7 +473,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     " r  "
                 },
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             ),
             Span::styled(
                 if app.is_refreshing() {
@@ -369,7 +481,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     "Refresh "
                 },
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
         ])),
         refresh,
@@ -397,10 +509,10 @@ fn draw_scope_tabs(frame: &mut Frame, app: &App, area: Rect) {
         let focused_active = app.focused_pane == FocusPane::ScopeTabs && active;
         let style = if active {
             Style::default()
-                .fg(LAVENDER)
+                .fg(accent())
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default().fg(MUTED)
+            Style::default().fg(muted())
         };
         // Replace one fixed leading space rather than adding a new cell:
         // tab labels and their mouse hit boxes stay the same width.
@@ -416,9 +528,9 @@ fn draw_scope_tabs(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
     let (glyph, color) = if resizing {
-        ("┃", LAVENDER)
+        ("┃", accent())
     } else {
-        ("│", SUBTLE)
+        ("│", subtle())
     };
     let lines: Vec<Line> = (0..area.height)
         .map(|_| Line::from(Span::styled(glyph, Style::default().fg(color))))
@@ -436,10 +548,10 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
         .unwrap_or((SearchMode::Files, false));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(LAVENDER))
+        .border_style(Style::default().fg(accent()))
         .title(Span::styled(
             format!(" {} ", mode.label()),
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         ));
     let block_inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -487,20 +599,20 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
     let mut input_spans = vec![
         Span::styled(
             "> ",
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(before, Style::default().fg(Color::Reset)),
+        Span::styled(before, Style::default().fg(text_primary())),
     ];
     input_spans.push(Span::styled(
         "│",
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
     ));
-    input_spans.push(Span::styled(after, Style::default().fg(Color::Reset)));
+    input_spans.push(Span::styled(after, Style::default().fg(text_primary())));
     frame.render_widget(Paragraph::new(Line::from(input_spans)), input);
     frame.render_widget(
         Paragraph::new(Span::styled(
             " Esc × ",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            Style::default().fg(muted()).add_modifier(Modifier::BOLD),
         )),
         close,
     );
@@ -508,7 +620,7 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 " Clear ×",
-                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
             )),
             clear,
         );
@@ -564,7 +676,7 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             detail,
-            Style::default().fg(if search.error.is_some() { ROSE } else { MUTED }),
+            Style::default().fg(if search.error.is_some() { Theme::current().missing } else { muted() }),
         )),
         detail_area,
     );
@@ -589,7 +701,7 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
             "No matches"
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(empty, Style::default().fg(MUTED))),
+            Paragraph::new(Span::styled(empty, Style::default().fg(muted()))),
             results,
         );
     } else {
@@ -598,7 +710,7 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             "↑↓ select · Enter open · Ctrl+U clear · Esc close",
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         )),
         help,
     );
@@ -615,10 +727,10 @@ fn draw_navigation_picker(frame: &mut Frame, app: &mut App) {
         });
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(LAVENDER))
+        .border_style(Style::default().fg(accent()))
         .title(Span::styled(
             format!(" {title} ({count}) "),
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         ));
     let inner = inset_horizontal(block.inner(popup), 1);
     frame.render_widget(block, popup);
@@ -636,7 +748,7 @@ fn draw_navigation_picker(frame: &mut Frame, app: &mut App) {
                 std::iter::repeat_n(Line::from("│"), usize::from(divider.height))
                     .collect::<Vec<_>>(),
             ))
-            .style(Style::default().fg(SUBTLE)),
+            .style(Style::default().fg(subtle())),
             divider,
         );
         (preview, results)
@@ -662,7 +774,7 @@ fn draw_navigation_picker(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             "↑↓ select · Enter open/collapse · click location open · Esc close",
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         )),
         help,
     );
@@ -674,13 +786,13 @@ fn navigation_picker_item(
     selected: bool,
 ) -> ListItem<'static> {
     let selected_style = Style::default()
-        .fg(Color::Reset)
+        .fg(text_primary())
         .bg(Color::Rgb(54, 51, 58))
         .add_modifier(Modifier::BOLD);
     let style = if selected {
         selected_style
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(muted())
     };
     match row {
         NavigationPickerRow::Group(group_index) => {
@@ -705,7 +817,7 @@ fn navigation_picker_item(
                     if selected {
                         selected_style
                     } else {
-                        Style::default().fg(SUBTLE)
+                        Style::default().fg(subtle())
                     },
                 ),
                 Span::styled(
@@ -713,7 +825,7 @@ fn navigation_picker_item(
                     if selected {
                         selected_style
                     } else {
-                        Style::default().fg(SUBTLE)
+                        Style::default().fg(subtle())
                     },
                 ),
             ]))
@@ -746,7 +858,7 @@ fn navigation_picker_item(
                     if selected {
                         selected_style
                     } else {
-                        Style::default().fg(SUBTLE)
+                        Style::default().fg(subtle())
                     },
                 ));
             }
@@ -764,20 +876,20 @@ fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPic
     frame.render_widget(
         Paragraph::new(Span::styled(
             header_text,
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )),
         header,
     );
     if picker.preview_loading {
         frame.render_widget(
-            Paragraph::new(Span::styled("Loading preview…", Style::default().fg(MUTED))),
+            Paragraph::new(Span::styled("Loading preview…", Style::default().fg(muted()))),
             body,
         );
         return;
     }
     if let Some(error) = picker.preview_error.as_deref() {
         frame.render_widget(
-            Paragraph::new(Span::styled(error.to_owned(), Style::default().fg(ROSE))),
+            Paragraph::new(Span::styled(error.to_owned(), Style::default().fg(Theme::current().missing))),
             body,
         );
         return;
@@ -786,7 +898,7 @@ fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPic
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "Select a result to preview it.",
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             )),
             body,
         );
@@ -831,14 +943,14 @@ fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPic
             }
             let mut spans = vec![Span::styled(
                 format!("{:>number_width$} │ ", line_index.saturating_add(1)),
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             )];
             spans.extend(preview_content_spans(
                 line,
                 0,
                 &highlights,
                 None,
-                Style::default().fg(Color::Reset),
+                Style::default().fg(text_primary()),
             ));
             Line::from(spans)
         })
@@ -906,10 +1018,10 @@ fn draw_search_toggle(frame: &mut Frame, area: Rect, label: &str, active: bool) 
             label.to_owned(),
             if active {
                 Style::default()
-                    .fg(LAVENDER)
+                    .fg(accent())
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
-                Style::default().fg(MUTED)
+                Style::default().fg(muted())
             },
         )),
         area,
@@ -918,9 +1030,9 @@ fn draw_search_toggle(frame: &mut Frame, area: Rect, label: &str, active: bool) 
 
 fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> ListItem<'static> {
     let selection_style = if selected {
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Reset)
+        Style::default().fg(text_primary())
     };
     let icon = if result.is_dir { "▸ " } else { "· " };
     let location = result.line_number.map_or_else(
@@ -930,11 +1042,11 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
     let mut spans = vec![
         Span::styled(
             if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected { LAVENDER } else { SUBTLE }),
+            Style::default().fg(if selected { accent() } else { subtle() }),
         ),
         Span::styled(
             icon,
-            Style::default().fg(if result.is_dir { LAVENDER } else { MUTED }),
+            Style::default().fg(if result.is_dir { accent() } else { muted() }),
         ),
     ];
     let leading_width = spans_width(&spans);
@@ -951,22 +1063,22 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
         {
             snippet.push(Span::styled(
                 line[..range.start].to_owned(),
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             ));
             snippet.push(Span::styled(
                 line[range.clone()].to_owned(),
                 Style::default()
-                    .fg(LAVENDER)
+                    .fg(accent())
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
             snippet.push(Span::styled(
                 line[range.end..].to_owned(),
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             ));
         } else {
             snippet.push(Span::styled(
                 truncate_to_width(line, usize::from(width).saturating_sub(4)),
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             ));
         }
         ListItem::new(Text::from(vec![location_line, Line::from(snippet)]))
@@ -981,7 +1093,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     let items: Vec<ListItem> = if app.is_initial_loading() && !is_agents_scope(app) {
         vec![ListItem::new(Line::from(Span::styled(
             "  Scanning files…",
-            Style::default().fg(MINT),
+            Style::default().fg(Theme::current().success),
         )))]
     } else {
         match app.tree_scope {
@@ -1092,12 +1204,18 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         "Files"
     };
+    let tree_accent = if app.tree_scope == TreeScope::GitChanges {
+        Theme::current().git_accent
+    } else {
+        Theme::current().tree_accent
+    };
     draw_panel_heading(
         frame,
         Rect::new(header.x, header.y, heading_width, header.height),
         heading,
         &detail,
         focused,
+        tree_accent,
     );
     let full_labels = file_button.width >= 7;
     frame.render_widget(
@@ -1107,7 +1225,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             } else {
                 " / "
             },
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )),
         file_button,
     );
@@ -1118,7 +1236,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             } else {
                 "^⇧F "
             },
-            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )),
         text_button,
     );
@@ -1166,15 +1284,15 @@ fn agent_session_line(
     );
     let label = truncate_to_width(&label, usize::from(width));
     let style = if selected && focused {
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
     } else if selected {
         Style::default()
-            .fg(Color::Reset)
+            .fg(text_primary())
             .add_modifier(Modifier::BOLD)
     } else if session.activity == ActivityState::Working {
-        Style::default().fg(MINT)
+        Style::default().fg(Theme::current().success)
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(muted())
     };
     Line::from(Span::styled(label, style))
 }
@@ -1214,43 +1332,46 @@ fn git_tree_line(
             (None, GitRowKind::Repository { .. } | GitRowKind::Directory) => unreachable!(),
         }
     };
+    let theme = Theme::current();
     let review_color = match review_state {
-        Some(DiffReviewState::Reviewed) => Some(MINT),
-        Some(DiffReviewState::ChangedAfterReview) => Some(PEACH),
+        Some(DiffReviewState::Reviewed) => Some(theme.reviewed),
+        Some(DiffReviewState::ChangedAfterReview) => Some(theme.changed_after_review),
         Some(DiffReviewState::Unreviewed) | None => None,
     };
     let selection_style = if selected && focused {
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.git_accent)
+            .add_modifier(Modifier::BOLD)
     } else if selected {
         Style::default()
-            .fg(Color::Reset)
+            .fg(theme.text_subtle)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Reset)
+        dim_when_unfocused(Style::default().fg(theme.text_primary), focused)
     };
     let icon_color = if selected && focused || row.is_container() {
-        LAVENDER
+        theme.git_accent
     } else if matches!(row.kind, GitRowKind::Issue(_)) {
-        ROSE
+        theme.missing
     } else {
-        review_color.unwrap_or(MUTED)
+        review_color.unwrap_or(theme.text_muted)
     };
     let spans = vec![
         Span::styled(
             if selected { "▌ " } else { "  " },
             Style::default().fg(if selected && focused {
-                LAVENDER
+                theme.git_accent
             } else {
-                SUBTLE
+                theme.text_subtle
             }),
         ),
         Span::raw(indent),
         Span::styled(icon, Style::default().fg(icon_color)),
     ];
     let label_style = if !row.exists && !selected {
-        Style::default().fg(ROSE)
+        dim_when_unfocused(Style::default().fg(theme.missing), focused)
     } else if repository_has_changes && !selected {
-        Style::default().fg(TREE_CHANGE_HINT)
+        dim_when_unfocused(Style::default().fg(theme.tree_change_hint), focused)
     } else {
         selection_style
     };
@@ -1258,16 +1379,16 @@ fn git_tree_line(
         let mut hint = Vec::new();
         if let Some(stat) = app.git_row_diff_stat(row) {
             if stat.binary {
-                hint.push(Span::styled("binary", Style::default().fg(MUTED)));
+                hint.push(Span::styled("binary", Style::default().fg(theme.text_muted)));
             } else {
                 hint.push(Span::styled(
                     format!("+{}", stat.added),
-                    Style::default().fg(MINT),
+                    Style::default().fg(theme.diff_add),
                 ));
                 hint.push(Span::raw(" "));
                 hint.push(Span::styled(
                     format!("-{}", stat.deleted),
-                    Style::default().fg(ROSE),
+                    Style::default().fg(theme.diff_del),
                 ));
             }
             hint.push(Span::raw(" "));
@@ -1286,16 +1407,22 @@ fn git_tree_line(
         let mut content = vec![Span::styled(row.label.clone(), label_style)];
         if repository_has_changes {
             content.push(Span::raw(" "));
-            content.push(Span::styled("•", Style::default().fg(TREE_CHANGE_HINT)));
+            content.push(Span::styled(
+                "•",
+                Style::default().fg(theme.tree_change_hint),
+            ));
         }
         content.push(Span::raw("  "));
-        content.push(Span::styled(row.detail.clone(), Style::default().fg(MUTED)));
+        content.push(Span::styled(
+            row.detail.clone(),
+            Style::default().fg(theme.text_muted),
+        ));
         if let Some(change_count) = repository_change_count.filter(|count| *count > 0) {
             tree_row_with_styled_hint(
                 spans,
                 content,
                 change_count.to_string(),
-                Style::default().fg(TREE_CHANGE_HINT),
+                Style::default().fg(theme.tree_change_hint),
                 width,
             )
         } else {
@@ -1329,37 +1456,46 @@ fn tree_line(
     } else {
         "  "
     };
+    let theme = Theme::current();
+    // Files carry their type color; directories use the tree region accent. The
+    // selected/focused row promotes to the accent + BOLD, and every unfocused
+    // row is dimmed so the type hue stays but recedes.
+    let type_color = file_entry_color(entry);
     let selection_style = if selected && focused {
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.tree_accent)
+            .add_modifier(Modifier::BOLD)
     } else if selected {
         Style::default()
-            .fg(Color::Reset)
+            .fg(theme.text_subtle)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Reset)
+        dim_when_unfocused(Style::default().fg(type_color), focused)
     };
-    let icon_color = if selected && focused || entry.is_dir {
-        LAVENDER
+    let icon_color = if selected && focused {
+        theme.tree_accent
+    } else if entry.is_dir {
+        theme.dir
     } else {
-        MUTED
+        theme.text_muted
     };
     let spans = vec![
         Span::styled(
             if selected { "▌ " } else { "  " },
             Style::default().fg(if selected && focused {
-                LAVENDER
+                theme.tree_accent
             } else {
-                SUBTLE
+                theme.text_subtle
             }),
         ),
         Span::raw(indent),
         Span::styled(disclosure, Style::default().fg(icon_color)),
     ];
     let label = entry.name();
-    let label_style = if entry.exists || selected {
-        selection_style
+    let label_style = if !entry.exists && !selected {
+        dim_when_unfocused(Style::default().fg(theme.missing), focused)
     } else {
-        Style::default().fg(ROSE)
+        selection_style
     };
 
     // A symbolic link shows a muted "⇢ target" suffix after its name so the
@@ -1369,7 +1505,7 @@ fn tree_line(
     if let Some(target) = entry.symlink_target.as_ref() {
         content.push(Span::styled(
             format!("  ⇢ {}", target.display()),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme.text_muted),
         ));
     }
 
@@ -1386,7 +1522,7 @@ fn tree_line(
             spans,
             content,
             "•".to_owned(),
-            Style::default().fg(TREE_CHANGE_HINT),
+            Style::default().fg(theme.tree_change_hint),
             width,
         )
     } else if entry.symlink_target.is_some() {
@@ -1553,6 +1689,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             app.selected_content_title(),
             &detail,
             app.content_is_focused(),
+            Theme::current().content_accent,
         );
         if app.can_open_content_externally() {
             let label = if app.external_open_confirmation_for_content() {
@@ -1565,7 +1702,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     label,
-                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 ))),
                 app.ui_regions.external_open_button,
             );
@@ -1626,14 +1763,20 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
                 ContentMode::Info => Line::from(content_selection_spans(
                     segment,
                     selection,
-                    Style::default().fg(MUTED),
+                    Style::default().fg(muted()),
                     visual_row.tab_origin,
                 )),
             })
         })
         .collect();
-    let paragraph = Paragraph::new(Text::from(lines))
+    let mut paragraph = Paragraph::new(Text::from(lines))
         .scroll((0, app.effective_content_horizontal_scroll() as u16));
+    // Dim the whole content body when the pane is not focused, so the active
+    // region reads forward without any background paint. Selection REVERSED and
+    // syntax hues are preserved; only overall intensity recedes.
+    if !app.content_is_focused() {
+        paragraph = paragraph.style(Style::default().add_modifier(Modifier::DIM));
+    }
     frame.render_widget(paragraph, render_area);
 }
 
@@ -1648,14 +1791,14 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 " Find ",
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(before, Style::default().fg(Color::Reset)),
+            Span::styled(before, Style::default().fg(text_primary())),
             Span::styled(
                 "│",
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(after, Style::default().fg(Color::Reset)),
+            Span::styled(after, Style::default().fg(text_primary())),
         ])),
         input,
     );
@@ -1665,7 +1808,7 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
             Paragraph::new(Span::styled(
                 " Aa ",
                 Style::default()
-                    .fg(if find.case_sensitive { LAVENDER } else { MUTED })
+                    .fg(if find.case_sensitive { accent() } else { muted() })
                     .add_modifier(if find.case_sensitive {
                         Modifier::BOLD
                     } else {
@@ -1679,22 +1822,22 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             format!(" {current}/{count} "),
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         )),
         app.ui_regions.preview_find_position,
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(" ↑ ", Style::default().fg(LAVENDER))),
+        Paragraph::new(Span::styled(" ↑ ", Style::default().fg(accent()))),
         app.ui_regions.preview_find_previous,
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(" ↓ ", Style::default().fg(LAVENDER))),
+        Paragraph::new(Span::styled(" ↓ ", Style::default().fg(accent()))),
         app.ui_regions.preview_find_next,
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
             " [x]",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            Style::default().fg(muted()).add_modifier(Modifier::BOLD),
         )),
         app.ui_regions.preview_find_close,
     );
@@ -1706,11 +1849,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     " Navigate ",
-                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     "  ↑↓ select  Enter open/collapse  click location open  Esc close",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(muted()),
                 ),
             ])),
             area,
@@ -1727,9 +1870,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     " Find ",
-                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(help, Style::default().fg(MUTED)),
+                Span::styled(help, Style::default().fg(muted())),
             ])),
             area,
         );
@@ -1747,9 +1890,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     " Search ",
-                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(help, Style::default().fg(MUTED)),
+                Span::styled(help, Style::default().fg(muted())),
             ])),
             area,
         );
@@ -1798,22 +1941,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
             Span::styled(
                 message,
-                Style::default().fg(PEACH).add_modifier(Modifier::BOLD),
+                Style::default().fg(change_hint()).add_modifier(Modifier::BOLD),
             ),
         ])
     } else if let Some(error) = &app.last_error {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(error.to_owned(), Style::default().fg(ROSE)),
+            Span::styled(error.to_owned(), Style::default().fg(Theme::current().missing)),
         ])
     } else if app.is_refreshing() || app.is_directory_loading() || app.is_content_loading() {
         let status = match (
@@ -1836,23 +1979,23 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(status, Style::default().fg(MINT)),
+            Span::styled(status, Style::default().fg(Theme::current().success)),
         ])
     } else if let Some(status) = &app.navigation_status {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
             Span::styled(
                 status.message.clone(),
                 Style::default().fg(match status.level {
-                    super::app::NavigationStatusLevel::Info => MINT,
-                    super::app::NavigationStatusLevel::Error => ROSE,
+                    super::app::NavigationStatusLevel::Info => Theme::current().success,
+                    super::app::NavigationStatusLevel::Error => Theme::current().missing,
                 }),
             ),
         ])
@@ -1860,22 +2003,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("Configuration: {warning}"),
-                Style::default().fg(ROSE),
+                Style::default().fg(Theme::current().missing),
             ),
         ])
     } else if let Some(status) = &app.clipboard_status {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(status.to_owned(), Style::default().fg(MINT)),
+            Span::styled(status.to_owned(), Style::default().fg(Theme::current().success)),
         ])
     } else if app.repository_graph_truncated || app.repository_error_count > 0 {
         let status = match (app.repository_graph_truncated, app.repository_error_count) {
@@ -1886,51 +2029,64 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(status, Style::default().fg(PEACH)),
+            Span::styled(status, Style::default().fg(change_hint())),
         ])
     } else {
         Line::from(vec![
             Span::styled(
                 format!(" {focus} "),
-                Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(help, Style::default().fg(MUTED)),
+            Span::styled(help, Style::default().fg(muted())),
         ])
     };
     frame.render_widget(Paragraph::new(content), area);
 }
 
-fn draw_panel_heading(frame: &mut Frame, area: Rect, title: &str, detail: &str, focused: bool) {
+fn draw_panel_heading(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    detail: &str,
+    focused: bool,
+    accent: Color,
+) {
+    let theme = Theme::current();
     let title_style = if focused {
-        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Reset)
+            .fg(theme.text_subtle)
             .add_modifier(Modifier::BOLD)
     };
     let mut spans = vec![
         Span::styled(
             if focused { "● " } else { "  " },
-            Style::default().fg(if focused { LAVENDER } else { SUBTLE }),
+            Style::default().fg(if focused { accent } else { theme.text_subtle }),
         ),
         Span::styled(title.to_owned(), title_style),
     ];
     if !detail.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(detail.to_owned(), Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            detail.to_owned(),
+            Style::default().fg(theme.text_muted),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn status_color(status: FileStatus) -> Color {
+    let theme = Theme::current();
     match (status.index, status.worktree) {
-        ('?', '?') => MINT,
-        ('A', _) | (_, 'A') => MINT,
-        ('D', _) | (_, 'D') => ROSE,
-        _ => TREE_CHANGE_HINT,
+        ('?', '?') => theme.status_add,
+        ('A', _) | (_, 'A') => theme.status_add,
+        ('D', _) | (_, 'D') => theme.status_del,
+        ('R', _) | (_, 'R') => theme.status_renamed,
+        _ => theme.status_mod,
     }
 }
 
@@ -1942,26 +2098,33 @@ fn diff_line(
     tab_origin: usize,
     selection: Option<Range<usize>>,
 ) -> Line<'static> {
+    let theme = Theme::current();
     let kind = annotation.map_or(DiffLineKind::Metadata, |annotation| annotation.kind);
     let style = match kind {
         DiffLineKind::Addition => Style::default()
-            .fg(Color::LightGreen)
+            .fg(theme.diff_add)
             .add_modifier(Modifier::BOLD),
         DiffLineKind::Deletion => Style::default()
-            .fg(Color::LightRed)
+            .fg(theme.diff_del)
             .add_modifier(Modifier::BOLD),
-        DiffLineKind::Hunk => Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
-        DiffLineKind::NoNewline => Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        DiffLineKind::Context => Style::default().fg(Color::Reset),
+        DiffLineKind::Hunk => Style::default()
+            .fg(theme.diff_hunk)
+            .add_modifier(Modifier::BOLD),
+        DiffLineKind::NoNewline => Style::default()
+            .fg(theme.diff_meta)
+            .add_modifier(Modifier::ITALIC),
+        DiffLineKind::Context => Style::default().fg(theme.diff_context),
         DiffLineKind::Metadata if line.starts_with("+++") || line.starts_with("---") => {
-            Style::default().fg(MUTED)
+            Style::default().fg(theme.diff_meta)
         }
         DiffLineKind::Metadata
             if line.starts_with("diff ") || line.starts_with("index ") || line.starts_with('─') =>
         {
-            Style::default().fg(PEACH).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.diff_file_header)
+                .add_modifier(Modifier::BOLD)
         }
-        DiffLineKind::Metadata => Style::default().fg(Color::Reset),
+        DiffLineKind::Metadata => Style::default().fg(theme.diff_context),
     };
     let annotation = annotation.filter(|_| !continuation);
     let old_line = annotation
@@ -1974,13 +2137,13 @@ fn diff_line(
         .unwrap_or_default();
     let gutter_style = match kind {
         DiffLineKind::Addition => Style::default()
-            .fg(Color::LightGreen)
+            .fg(theme.diff_add)
             .add_modifier(Modifier::BOLD),
         DiffLineKind::Deletion => Style::default()
-            .fg(Color::LightRed)
+            .fg(theme.diff_del)
             .add_modifier(Modifier::BOLD),
-        DiffLineKind::Hunk => Style::default().fg(LAVENDER),
-        _ => Style::default().fg(MUTED),
+        DiffLineKind::Hunk => Style::default().fg(theme.diff_hunk),
+        _ => Style::default().fg(theme.text_muted),
     };
     let mut spans = vec![Span::styled(
         format!("{old_line:>number_width$} {new_line:>number_width$} │ "),
@@ -2000,9 +2163,9 @@ fn preview_line(
     visual_row: &ContentVisualRow,
 ) -> Line<'static> {
     let text_style = if truncated {
-        Style::default().fg(PEACH)
+        Style::default().fg(change_hint())
     } else {
-        Style::default().fg(Color::Reset)
+        Style::default().fg(text_primary())
     };
     let number = number.map(|number| number.to_string()).unwrap_or_default();
     let marker = match visual_row.fold_marker {
@@ -2012,7 +2175,7 @@ fn preview_line(
     };
     let mut spans = vec![Span::styled(
         format!("{number:>width$} {marker} "),
-        Style::default().fg(MUTED),
+        Style::default().fg(muted()),
     )];
     spans.extend(preview_content_spans(
         line,
@@ -2022,7 +2185,7 @@ fn preview_line(
         text_style,
     ));
     if let Some(summary) = visual_row.summary.as_deref() {
-        spans.push(Span::styled(summary.to_owned(), Style::default().fg(MUTED)));
+        spans.push(Span::styled(summary.to_owned(), Style::default().fg(muted())));
     }
     Line::from(spans)
 }
@@ -2051,7 +2214,7 @@ fn preview_text_line(
         segment_start,
         highlights,
         selection,
-        Style::default().fg(Color::Reset),
+        Style::default().fg(text_primary()),
     ))
 }
 
@@ -2122,24 +2285,29 @@ fn preview_content_spans(
 }
 
 fn highlight_style(kind: HighlightKind) -> Style {
+    let theme = Theme::current();
     match kind {
-        HighlightKind::Comment => Style::default().fg(SUBTLE).add_modifier(Modifier::ITALIC),
-        HighlightKind::String => Style::default().fg(PEACH),
-        HighlightKind::Keyword => Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
-        HighlightKind::Function => Style::default().fg(MINT),
-        HighlightKind::Type => Style::default().fg(ROSE),
-        HighlightKind::Number => Style::default().fg(PEACH),
-        HighlightKind::Constant => Style::default().fg(MINT),
-        HighlightKind::Attribute => Style::default().fg(LAVENDER),
+        HighlightKind::Comment => Style::default()
+            .fg(theme.syn_comment)
+            .add_modifier(Modifier::ITALIC),
+        HighlightKind::String => Style::default().fg(theme.syn_string),
+        HighlightKind::Keyword => Style::default()
+            .fg(theme.syn_keyword)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::Function => Style::default().fg(theme.syn_function),
+        HighlightKind::Type => Style::default().fg(theme.syn_type),
+        HighlightKind::Number => Style::default().fg(theme.syn_number),
+        HighlightKind::Constant => Style::default().fg(theme.syn_constant),
+        HighlightKind::Attribute => Style::default().fg(theme.syn_attribute),
         HighlightKind::SearchMatch => Style::default()
-            .fg(LAVENDER)
+            .fg(theme.search_match)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         HighlightKind::Search => Style::default()
-            .fg(LAVENDER)
+            .fg(theme.search_match)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         HighlightKind::NavigationTarget => Style::default()
             .fg(Color::Black)
-            .bg(MINT)
+            .bg(theme.nav_target)
             .add_modifier(Modifier::BOLD),
         HighlightKind::NavigationHover => Style::default().add_modifier(Modifier::UNDERLINED),
         HighlightKind::ImagePixel {
@@ -2295,14 +2463,14 @@ mod tests {
         let leading = vec![
             Span::raw("  "),
             Span::raw("    "),
-            Span::styled("· ", Style::default().fg(MUTED)),
+            Span::styled("· ", Style::default().fg(muted())),
         ];
         let directory_line = tree_row_with_hint(
             leading.clone(),
             "a-very-long-directory-name".to_owned(),
             Style::default().fg(Color::Reset),
             "•".to_owned(),
-            Style::default().fg(TREE_CHANGE_HINT),
+            Style::default().fg(change_hint()),
             24,
         );
         let file_line = tree_row_with_hint(
@@ -2313,7 +2481,7 @@ mod tests {
                 index: ' ',
                 worktree: 'M',
             }),
-            Style::default().fg(TREE_CHANGE_HINT),
+            Style::default().fg(change_hint()),
             24,
         );
 
@@ -2322,7 +2490,7 @@ mod tests {
             assert_eq!(line.width(), 24);
             assert_eq!(hint.content.as_ref(), expected_hint);
             assert_eq!(UnicodeWidthStr::width(hint.content.as_ref()), 1);
-            assert_eq!(hint.style.fg, Some(TREE_CHANGE_HINT));
+            assert_eq!(hint.style.fg, Some(change_hint()));
             assert_eq!(hint.style.bg.unwrap_or(Color::Reset), Color::Reset);
             assert_eq!(line.spans.last().unwrap().content.as_ref(), " ");
             assert!(
@@ -2405,10 +2573,10 @@ mod tests {
                 .collect::<String>(),
             "n mai"
         );
-        assert_eq!(spans[0].style.fg, Some(LAVENDER));
-        assert_eq!(spans[2].style.fg, Some(MINT));
+        assert_eq!(spans[0].style.fg, Some(Theme::current().syn_keyword));
+        assert_eq!(spans[2].style.fg, Some(Theme::current().syn_function));
         assert!(spans[2].style.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(spans[3].style.fg, Some(MINT));
+        assert_eq!(spans[3].style.fg, Some(Theme::current().syn_function));
         assert!(!spans[3].style.add_modifier.contains(Modifier::REVERSED));
         assert!(
             spans
@@ -2437,7 +2605,7 @@ mod tests {
         );
 
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].style.fg, Some(MINT));
+        assert_eq!(spans[0].style.fg, Some(Theme::current().syn_function));
         assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
@@ -2493,7 +2661,7 @@ mod tests {
                 .collect::<String>(),
             "    Field   string"
         );
-        assert_eq!(preview[1].style.fg, Some(ROSE));
+        assert_eq!(preview[1].style.fg, Some(Theme::current().syn_type));
 
         let diff = content_selection_spans(
             "+\tfield",

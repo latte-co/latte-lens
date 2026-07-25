@@ -1060,7 +1060,7 @@ fn non_git_workspace_lists_clean_and_dirty_descendant_repositories() {
             .find(|cell| cell.symbol() == "•");
         if should_be_dirty {
             let marker = marker.expect("dirty repository marker");
-            assert_eq!(marker.fg, Color::Rgb(196, 151, 126));
+            assert_eq!(marker.fg, Color::Rgb(250, 179, 135));
         } else {
             assert!(marker.is_none(), "clean repository must stay quiet");
         }
@@ -2647,7 +2647,7 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
         .cell((app.ui_regions.tree_body.x, app.ui_regions.tree_body.y))
         .unwrap();
     assert_eq!(tree_heading.symbol(), "●");
-    assert_eq!(tree_heading.fg, Color::Rgb(200, 184, 224));
+    assert_eq!(tree_heading.fg, Color::Rgb(137, 180, 250));
     assert!(!tree_heading.modifier.contains(Modifier::REVERSED));
     assert!(!tree_heading.modifier.contains(Modifier::UNDERLINED));
     assert_eq!(tree_heading.bg, Color::Reset);
@@ -2676,7 +2676,7 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
         ))
         .unwrap();
     assert_eq!(content_heading.symbol(), "●");
-    assert_eq!(content_heading.fg, Color::Rgb(200, 184, 224));
+    assert_eq!(content_heading.fg, Color::Rgb(180, 190, 254));
     assert!(!content_heading.modifier.contains(Modifier::REVERSED));
     assert!(!content_heading.modifier.contains(Modifier::UNDERLINED));
     let unfocused_tree_heading = terminal
@@ -2828,7 +2828,7 @@ fn all_files_uses_a_small_aligned_change_gutter() {
         .unwrap();
     assert_eq!(directory_hint.symbol(), "•");
     assert_eq!(UnicodeWidthStr::width(directory_hint.symbol()), 1);
-    assert_eq!(directory_hint.fg, Color::Rgb(196, 151, 126));
+    assert_eq!(directory_hint.fg, Color::Rgb(250, 179, 135));
     assert!(!directory_hint.modifier.contains(Modifier::BOLD));
     assert_eq!(directory_hint.bg, Color::Reset);
 
@@ -2839,7 +2839,7 @@ fn all_files_uses_a_small_aligned_change_gutter() {
         .unwrap();
     assert_eq!(file_hint.symbol(), "ᴍ");
     assert_eq!(UnicodeWidthStr::width(file_hint.symbol()), 1);
-    assert_eq!(file_hint.fg, Color::Rgb(196, 151, 126));
+    assert_eq!(file_hint.fg, Color::Rgb(250, 179, 135));
     assert!(!file_hint.modifier.contains(Modifier::BOLD));
     assert_eq!(file_hint.bg, Color::Reset);
 
@@ -2925,7 +2925,7 @@ fn git_repository_change_count_stays_fixed_right_when_details_are_truncated() {
     for column in count_x..=count_x + 1 {
         assert_eq!(
             buffer.cell((column, row_y)).unwrap().fg,
-            Color::Rgb(196, 151, 126)
+            Color::Rgb(250, 179, 135)
         );
     }
     let rendered_row = (app.ui_regions.tree_inner.x..app.ui_regions.tree_inner.right())
@@ -3234,7 +3234,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
         .cell((column, deleted_row))
         .unwrap();
     assert_eq!(deleted_number.symbol(), "1");
-    assert_eq!(deleted_number.fg, Color::LightRed);
+    assert_eq!(deleted_number.fg, Color::Rgb(243, 139, 168));
     assert!(deleted_number.modifier.contains(Modifier::BOLD));
     let added_number = terminal
         .backend()
@@ -3242,7 +3242,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
         .cell((column + 2, added_row))
         .unwrap();
     assert_eq!(added_number.symbol(), "1");
-    assert_eq!(added_number.fg, Color::LightGreen);
+    assert_eq!(added_number.fg, Color::Rgb(166, 227, 161));
     assert!(added_number.modifier.contains(Modifier::BOLD));
     let added_marker = terminal
         .backend()
@@ -3250,7 +3250,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
         .cell((column + 6, added_row))
         .unwrap();
     assert_eq!(added_marker.symbol(), "+");
-    assert_eq!(added_marker.fg, Color::LightGreen);
+    assert_eq!(added_marker.fg, Color::Rgb(166, 227, 161));
     assert!(added_marker.modifier.contains(Modifier::BOLD));
 
     app.handle_mouse(mouse_down(column + 7, added_row));
