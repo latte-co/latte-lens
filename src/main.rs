@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use latte_lens::agent::*;
 use latte_lens::{
     app::App,
-    navigation::{AppOptions, NavigationSettings},
+    navigation::{AppOptions, load_user_configuration},
     preview::PreviewRegistry,
 };
 #[cfg(not(windows))]
@@ -156,13 +156,11 @@ fn run_tui(path: PathBuf) -> Result<()> {
     if !workspace.is_dir() {
         bail!("{} is not a directory", workspace.display());
     }
-    // Resolve and install the terminal theme once, before any rendering. All
-    // environment and config reads for appearance happen here, keeping the
-    // render layer free of I/O.
-    let loaded_theme = latte_lens::navigation::load_user_theme();
-    latte_lens::theme::install(loaded_theme.theme);
-    let loaded = NavigationSettings::load_user_config(&workspace);
-    let navigation_config_warning = match (loaded.warning, loaded_theme.warning) {
+    // Resolve startup configuration once before rendering; theme and navigation
+    // failures remain isolated in the returned warnings.
+    let loaded = load_user_configuration(&workspace);
+    latte_lens::theme::install(loaded.theme.theme);
+    let navigation_config_warning = match (loaded.navigation.warning, loaded.theme.warning) {
         (Some(navigation), Some(theme)) => Some(format!("{navigation} · {theme}")),
         (Some(navigation), None) => Some(navigation),
         (None, Some(theme)) => Some(theme),
@@ -172,7 +170,7 @@ fn run_tui(path: PathBuf) -> Result<()> {
         workspace.clone(),
         PreviewRegistry::with_builtins(),
         AppOptions {
-            navigation: loaded.settings,
+            navigation: loaded.navigation.settings,
             navigation_config_warning,
         },
     )?;

@@ -450,16 +450,8 @@ impl NavigationSettings {
     /// An explicit path that is missing or invalid disables navigation and
     /// returns a warning; it never prevents the viewer from starting.
     pub fn load_user_config(workspace_root: &Path) -> LoadedNavigationSettings {
-        match load_user_config(workspace_root) {
-            Ok(settings) => LoadedNavigationSettings {
-                settings,
-                warning: None,
-            },
-            Err(error) => LoadedNavigationSettings {
-                settings: Self::disabled(),
-                warning: Some(clean_warning(&format!("{error:#}"))),
-            },
-        }
+        let raw = read_user_config_file();
+        load_navigation_from_config_result(workspace_root, &raw)
     }
 
     /// Revalidate already-resolved settings after the App root is canonical.
@@ -491,6 +483,38 @@ pub struct LoadedNavigationSettings {
     pub warning: Option<String>,
 }
 
+/// Complete user-level startup configuration, loaded from disk once during
+/// construction. Theme and navigation still fail independently: a broken theme
+/// falls back to color defaults, while a broken navigation block disables only
+/// code navigation.
+#[derive(Clone, Debug)]
+pub struct LoadedUserConfiguration {
+    pub navigation: LoadedNavigationSettings,
+    pub theme: LoadedTheme,
+}
+
+pub fn load_user_configuration(workspace_root: &Path) -> LoadedUserConfiguration {
+    let raw = match read_user_config_file() {
+        Ok(raw) => raw,
+        Err(error) => {
+            let theme = theme_from_result(resolve_appearance(None));
+            return LoadedUserConfiguration {
+                navigation: LoadedNavigationSettings {
+                    settings: NavigationSettings::disabled(),
+                    warning: Some(clean_warning(&format!("{error:#}"))),
+                },
+                theme,
+            };
+        }
+    };
+    LoadedUserConfiguration {
+        navigation: load_navigation_from_raw(workspace_root, raw.as_ref()),
+        theme: theme_from_result(resolve_appearance(
+            raw.as_ref().and_then(|config| config.appearance.as_ref()),
+        )),
+    }
+}
+
 /// Resolve the terminal [`crate::theme::Theme`] from the user configuration's
 /// `appearance` block, reading the environment and config file exactly once.
 ///
@@ -499,9 +523,16 @@ pub struct LoadedNavigationSettings {
 /// disable navigation. Any error degrades to a detected built-in theme with a
 /// startup warning; it never blocks the TUI. Call this during construction only.
 pub fn load_user_theme() -> LoadedTheme {
-    let appearance = read_appearance_config();
-    let (theme, warning) = resolve_appearance(appearance.as_ref());
-    LoadedTheme { theme, warning }
+    match read_user_config_file() {
+        Ok(raw) => theme_from_result(resolve_appearance(
+            raw.as_ref().and_then(|config| config.appearance.as_ref()),
+        )),
+        Err(error) => {
+            let mut theme = theme_from_result(resolve_appearance(None));
+            theme.warning = Some(clean_warning(&format!("{error:#}")));
+            theme
+        }
+    }
 }
 
 /// A resolved theme plus any non-fatal warning gathered while loading it.
@@ -511,16 +542,23 @@ pub struct LoadedTheme {
     pub warning: Option<String>,
 }
 
-/// Read only the `appearance` subtree of the user config, tolerating every
-/// failure by returning `None` (the resolver then uses detected defaults).
-fn read_appearance_config() -> Option<RawAppearance> {
-    let (path, _) = user_config_path().ok()?;
+fn read_user_config_file() -> Result<Option<RawConfig>> {
+    let (path, explicit) = user_config_path()?;
     if !path.exists() {
-        return None;
+        if explicit {
+            bail!(
+                "explicit Latte Lens config does not exist: {}",
+                path.display()
+            );
+        }
+        return Ok(None);
     }
-    let normalized = read_jsonc_file(&path, MAX_CONFIG_BYTES, "Latte Lens config").ok()?;
-    let raw: RawConfig = serde_json::from_slice(&normalized).ok()?;
-    raw.appearance
+    let normalized = read_jsonc_file(&path, MAX_CONFIG_BYTES, "Latte Lens config")?;
+    parse_normalized_config(&normalized).map(Some)
+}
+
+fn theme_from_result((theme, warning): (crate::theme::Theme, Option<String>)) -> LoadedTheme {
+    LoadedTheme { theme, warning }
 }
 
 #[derive(Clone, Debug)]
@@ -575,9 +613,9 @@ pub(crate) enum ExecutableIdentity {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     code_navigation: Option<RawCodeNavigation>,
-    /// Theme selection. Unknown fields inside `appearance` are ignored (warn,
-    /// not fail) so a theme typo never blocks startup; `code_navigation`
-    /// deliberately keeps its strict schema.
+    /// Theme selection. Unknown fields inside `appearance` are ignored so a
+    /// future theme key never blocks startup; `code_navigation` deliberately
+    /// keeps its strict schema.
     appearance: Option<RawAppearance>,
 }
 
@@ -633,8 +671,8 @@ enum RawNavigationEngineKind {
 // Appearance / theme configuration
 // ---------------------------------------------------------------------------
 
-/// External theme file schema. Unknown top-level keys are ignored so a stray or
-/// misspelled field warns rather than failing the whole theme.
+/// External theme file schema. Unknown top-level keys are ignored so future
+/// fields never fail the whole theme.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawThemeFile {
@@ -683,30 +721,43 @@ impl ThemeDiagnostics {
     }
 }
 
-fn load_user_config(workspace_root: &Path) -> Result<NavigationSettings> {
+fn load_navigation_from_config_result(
+    workspace_root: &Path,
+    raw: &Result<Option<RawConfig>>,
+) -> LoadedNavigationSettings {
+    match raw {
+        Ok(raw) => load_navigation_from_raw(workspace_root, raw.as_ref()),
+        Err(error) => LoadedNavigationSettings {
+            settings: NavigationSettings::disabled(),
+            warning: Some(clean_warning(&format!("{error:#}"))),
+        },
+    }
+}
+
+fn load_navigation_from_raw(
+    workspace_root: &Path,
+    raw: Option<&RawConfig>,
+) -> LoadedNavigationSettings {
+    match navigation_settings_from_raw(workspace_root, raw) {
+        Ok(settings) => LoadedNavigationSettings {
+            settings,
+            warning: None,
+        },
+        Err(error) => LoadedNavigationSettings {
+            settings: NavigationSettings::disabled(),
+            warning: Some(clean_warning(&format!("{error:#}"))),
+        },
+    }
+}
+
+fn navigation_settings_from_raw(
+    workspace_root: &Path,
+    raw: Option<&RawConfig>,
+) -> Result<NavigationSettings> {
     let workspace_root = workspace_root
         .canonicalize()
         .with_context(|| format!("cannot resolve workspace {}", workspace_root.display()))?;
-    let (path, explicit) = user_config_path()?;
-    let raw = if !path.exists() {
-        if explicit {
-            bail!(
-                "explicit Latte Lens config does not exist: {}",
-                path.display()
-            );
-        }
-        None
-    } else {
-        let normalized = read_jsonc_file(&path, MAX_CONFIG_BYTES, "Latte Lens config")?;
-        Some(
-            serde_json::from_slice::<RawConfig>(&normalized)
-                .context("invalid Latte Lens config")?,
-        )
-    };
-
-    let raw_navigation = raw
-        .as_ref()
-        .and_then(|config| config.code_navigation.as_ref());
+    let raw_navigation = raw.and_then(|config| config.code_navigation.as_ref());
     if raw_navigation.and_then(|navigation| navigation.enabled) == Some(false) {
         return Ok(NavigationSettings::disabled());
     }
@@ -783,16 +834,8 @@ fn trusted_server_from_command(
     })
 }
 
-fn parse_raw_config(bytes: &[u8]) -> Result<RawConfig> {
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        bail!("Latte Lens config exceeds 64 KiB");
-    }
-    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        bail!("Latte Lens config must not contain a UTF-8 BOM");
-    }
-    std::str::from_utf8(bytes).context("Latte Lens config is not strict UTF-8")?;
-    let normalized = normalize_jsonc(bytes)?;
-    serde_json::from_slice(&normalized).context("invalid Latte Lens config")
+fn parse_normalized_config(normalized: &[u8]) -> Result<RawConfig> {
+    serde_json::from_slice(normalized).context("invalid Latte Lens config")
 }
 
 /// Read a JSONC file through the exact same safety pipeline the main config
@@ -925,7 +968,7 @@ fn load_theme_source(
             Ok((palette, crate::theme::Semantics::from_palette(&palette)))
         }
         ThemeSource::File(path) => {
-            if depth > MAX_EXTENDS_DEPTH {
+            if depth >= MAX_EXTENDS_DEPTH {
                 bail!("theme extends chain exceeds depth {MAX_EXTENDS_DEPTH}");
             }
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -1001,7 +1044,7 @@ fn load_theme_source(
 /// file reverts to the matching built-in preset, and the whole thing degrades to
 /// the detected built-in flavor if nothing resolves. Never panics or blocks.
 fn resolve_appearance(appearance: Option<&RawAppearance>) -> (crate::theme::Theme, Option<String>) {
-    use crate::theme::{self, ColorMode, Flavor};
+    use crate::theme::{self, Flavor};
 
     let mut diagnostics = ThemeDiagnostics::default();
     let (detected_mode, detected_flavor) = theme::detect();
@@ -1062,12 +1105,7 @@ fn resolve_appearance(appearance: Option<&RawAppearance>) -> (crate::theme::Them
         _ => fallback_semantics(default_preset),
     };
 
-    let mode = if detected_mode == ColorMode::None {
-        ColorMode::None
-    } else {
-        detected_mode
-    };
-    (semantics.resolve(mode), diagnostics.into_warning())
+    (semantics.resolve(detected_mode), diagnostics.into_warning())
 }
 
 fn fallback_semantics(preset_name: &str) -> crate::theme::Semantics {
@@ -1660,6 +1698,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn parse_raw_config(bytes: &[u8]) -> Result<RawConfig> {
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            bail!("Latte Lens config exceeds 64 KiB");
+        }
+        if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+            bail!("Latte Lens config must not contain a UTF-8 BOM");
+        }
+        std::str::from_utf8(bytes).context("Latte Lens config is not strict UTF-8")?;
+        let normalized = normalize_jsonc(bytes)?;
+        parse_normalized_config(&normalized)
     }
 
     #[test]
@@ -2470,6 +2520,102 @@ mod tests {
         assert_eq!(
             loaded.theme.syn_string,
             ratatui::style::Color::Rgb(0x0a, 0x0b, 0x0c)
+        );
+    }
+
+    #[test]
+    fn startup_configuration_loads_navigation_and_theme_from_one_file() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let tools = root.join("tools");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let server = tools.join("rust-analyzer");
+            fs::write(&server, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let theme_path = root.join("startup-theme.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{ "semantic": { "syn_keyword": "#112233" } }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "startup-theme.jsonc" }, "code_navigation": { "enabled": true } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("PATH", Some(std::env::join_paths([tools]).unwrap())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_configuration(&workspace);
+
+        assert!(
+            loaded.navigation.warning.is_none(),
+            "{:?}",
+            loaded.navigation.warning
+        );
+        #[cfg(unix)]
+        assert!(loaded.navigation.settings.is_enabled());
+        assert!(loaded.theme.warning.is_none(), "{:?}", loaded.theme.warning);
+        assert_eq!(
+            loaded.theme.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn external_theme_extends_chain_is_capped_at_four_files() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..5 {
+            let body = if index == 4 {
+                r##"{ "semantic": { "syn_keyword": "#112233" } }"##.to_owned()
+            } else {
+                format!(r##"{{ "extends": "theme-{}.jsonc" }}"##, index + 1)
+            };
+            fs::write(root.join(format!("theme-{index}.jsonc")), body).unwrap();
+        }
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "theme-0.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_theme();
+
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("exceeds depth 4")),
+            "warning: {:?}",
+            loaded.warning
+        );
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0xcb, 0xa6, 0xf7)
         );
     }
 

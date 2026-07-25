@@ -7173,6 +7173,7 @@ fn append_change_rows(
         let depth = repo_ancestors.len() + display.components().count();
         if let Some(change) = change {
             let entry = FileEntry {
+                category: crate::tree::FileCategory::from_path(&display),
                 relative: display.clone(),
                 is_dir: false,
                 depth: depth.saturating_sub(1),
@@ -7201,6 +7202,7 @@ fn append_change_rows(
                 relative: display.clone(),
             });
             let entry = FileEntry {
+                category: crate::tree::FileCategory::Plain,
                 relative: display.clone(),
                 is_dir: true,
                 depth: depth.saturating_sub(1),

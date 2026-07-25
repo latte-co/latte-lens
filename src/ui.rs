@@ -23,8 +23,8 @@ use crate::{
     git::FileStatus,
     preview::{HighlightKind, HighlightSpan},
     text_layout::expand_tabs,
-    theme::Theme,
-    tree::FileEntry,
+    theme::{ColorMode, Theme},
+    tree::{FileCategory, FileEntry},
 };
 
 // Foreground-only palette accessors. Each maps a legacy color role onto the
@@ -88,60 +88,13 @@ fn file_entry_color(entry: &FileEntry) -> Color {
     if entry.is_dir {
         return theme.dir;
     }
-    match file_category(&entry.relative) {
+    match entry.category {
         FileCategory::Config => theme.file_config,
         FileCategory::Doc => theme.file_doc,
         FileCategory::Media => theme.file_media,
         FileCategory::Binary => theme.file_binary,
         FileCategory::Executable => theme.file_exec,
         FileCategory::Plain => theme.file,
-    }
-}
-
-/// Coarse file classification used only for foreground coloring.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileCategory {
-    Config,
-    Doc,
-    Media,
-    Binary,
-    Executable,
-    Plain,
-}
-
-fn file_category(path: &Path) -> FileCategory {
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    let extension = path
-        .extension()
-        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-
-    const CONFIG_NAMES: &[&str] = &[
-        "makefile",
-        "dockerfile",
-        "cmakelists.txt",
-        ".gitignore",
-        ".gitattributes",
-        ".editorconfig",
-        ".env",
-    ];
-    if CONFIG_NAMES.contains(&name.as_str()) {
-        return FileCategory::Config;
-    }
-
-    match extension.as_str() {
-        "toml" | "yaml" | "yml" | "json" | "jsonc" | "ini" | "cfg" | "conf" | "config" | "lock"
-        | "properties" | "env" => FileCategory::Config,
-        "md" | "markdown" | "rst" | "txt" | "adoc" | "org" | "tex" | "pdf" => FileCategory::Doc,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "mp4" | "mov" | "mp3"
-        | "wav" | "flac" | "ogg" => FileCategory::Media,
-        "exe" | "dll" | "so" | "dylib" | "a" | "o" | "bin" | "class" | "wasm" | "zip" | "gz"
-        | "tar" | "7z" | "rlib" => FileCategory::Binary,
-        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => FileCategory::Executable,
-        _ => FileCategory::Plain,
     }
 }
 
@@ -2316,7 +2269,10 @@ fn preview_content_spans(
 }
 
 fn highlight_style(kind: HighlightKind) -> Style {
-    let theme = Theme::current();
+    highlight_style_with_theme(kind, Theme::current())
+}
+
+fn highlight_style_with_theme(kind: HighlightKind, theme: &Theme) -> Style {
     match kind {
         HighlightKind::Comment => Style::default()
             .fg(theme.syn_comment)
@@ -2336,6 +2292,9 @@ fn highlight_style(kind: HighlightKind) -> Style {
         HighlightKind::Search => Style::default()
             .fg(theme.search_match)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        HighlightKind::NavigationTarget if theme.mode == ColorMode::None => {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        }
         HighlightKind::NavigationTarget => Style::default()
             .fg(Color::Black)
             .bg(theme.nav_target)
@@ -2638,6 +2597,17 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].style.fg, Some(Theme::current().syn_function));
         assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn navigation_target_uses_modifier_only_cue_without_color() {
+        let no_color = Theme::from_parts(ColorMode::None, crate::theme::Flavor::Mocha);
+        let style = highlight_style_with_theme(HighlightKind::NavigationTarget, &no_color);
+
+        assert_eq!(style.fg, None);
+        assert_eq!(style.bg, None);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

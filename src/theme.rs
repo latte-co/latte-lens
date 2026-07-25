@@ -735,8 +735,8 @@ fn parse_named_color(value: &str) -> Option<RawColor> {
         "blue" => Color::Blue,
         "magenta" => Color::Magenta,
         "cyan" => Color::Cyan,
-        "gray" | "grey" | "white" if key == "white" => Color::White,
         "gray" | "grey" => Color::Gray,
+        "white" => Color::White,
         "darkgray" | "darkgrey" => Color::DarkGray,
         "lightred" => Color::LightRed,
         "lightgreen" => Color::LightGreen,
@@ -744,7 +744,6 @@ fn parse_named_color(value: &str) -> Option<RawColor> {
         "lightblue" => Color::LightBlue,
         "lightmagenta" => Color::LightMagenta,
         "lightcyan" => Color::LightCyan,
-        "white" => Color::White,
         _ => return None,
     };
     // A named color has no faithful hex; approximate one so true-color terminals
