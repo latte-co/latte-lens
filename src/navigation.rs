@@ -812,7 +812,10 @@ fn read_jsonc_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> 
     let mut file = match open_regular(None, path)? {
         OpenRegular::Opened(file) => file,
         OpenRegular::Declined(inspected) => {
-            bail!("{label} is a {}, not a regular file", inspected.kind.label())
+            bail!(
+                "{label} is a {}, not a regular file",
+                inspected.kind.label()
+            )
         }
     };
     let mut bytes = Vec::with_capacity(max_bytes as usize + 1);
@@ -864,7 +867,10 @@ fn classify_theme_value(value: &str, base_dir: Option<&Path>) -> Result<ThemeSou
         return Ok(ThemeSource::Preset(rest.trim().to_owned()));
     }
     if let Some(rest) = value.strip_prefix("file:") {
-        return Ok(ThemeSource::File(resolve_theme_path(rest.trim(), base_dir)?));
+        return Ok(ThemeSource::File(resolve_theme_path(
+            rest.trim(),
+            base_dir,
+        )?));
     }
     if crate::theme::is_preset(value) {
         return Ok(ThemeSource::Preset(value.to_owned()));
@@ -907,6 +913,7 @@ fn resolve_theme_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
 /// cyclic `extends` chains; `visited` blocks direct cycles.
 fn load_theme_source(
     source: &ThemeSource,
+    default_preset: &str,
     depth: usize,
     visited: &mut Vec<PathBuf>,
     diagnostics: &mut ThemeDiagnostics,
@@ -932,13 +939,19 @@ fn load_theme_source(
                 serde_json::from_slice(&normalized).context("invalid theme file")?;
 
             // Establish the base: an `extends` target (preset, or another file
-            // relative to this file's directory) or the default Mocha preset.
+            // relative to this file's directory) or the active variant default.
             let (base_palette, base_semantics) = if let Some(extends) = file.extends.as_deref() {
                 let base_dir = path.parent();
                 let base_source = classify_theme_value(extends, base_dir)?;
-                load_theme_source(&base_source, depth + 1, visited, diagnostics)?
+                load_theme_source(
+                    &base_source,
+                    default_preset,
+                    depth + 1,
+                    visited,
+                    diagnostics,
+                )?
             } else {
-                let palette = crate::theme::MOCHA;
+                let palette = crate::theme::preset(default_preset).unwrap_or(crate::theme::MOCHA);
                 (palette, crate::theme::Semantics::from_palette(&palette))
             };
 
@@ -950,8 +963,9 @@ fn load_theme_source(
                     match crate::theme::parse_color_value(value, &palette) {
                         Some(color) if palette.set(name, color) => {}
                         Some(_) => diagnostics.warn(format!("unknown palette color '{name}'")),
-                        None => diagnostics
-                            .warn(format!("invalid palette color '{name}' = '{value}'")),
+                        None => {
+                            diagnostics.warn(format!("invalid palette color '{name}' = '{value}'"))
+                        }
                     }
                 }
             }
@@ -971,8 +985,9 @@ fn load_theme_source(
                     match crate::theme::parse_color_value(value, &palette) {
                         Some(color) if semantics.set(name, color) => {}
                         Some(_) => diagnostics.warn(format!("unknown semantic token '{name}'")),
-                        None => diagnostics
-                            .warn(format!("invalid semantic color '{name}' = '{value}'")),
+                        None => {
+                            diagnostics.warn(format!("invalid semantic color '{name}' = '{value}'"))
+                        }
                     }
                 }
             }
@@ -1022,7 +1037,13 @@ fn resolve_appearance(appearance: Option<&RawAppearance>) -> (crate::theme::Them
             match classify_theme_value(value, base_dir.as_deref()) {
                 Ok(source) => {
                     let mut visited = Vec::new();
-                    match load_theme_source(&source, 0, &mut visited, &mut diagnostics) {
+                    match load_theme_source(
+                        &source,
+                        default_preset,
+                        0,
+                        &mut visited,
+                        &mut diagnostics,
+                    ) {
                         Ok((_, semantics)) => semantics,
                         Err(error) => {
                             diagnostics.warn(format!(
@@ -2392,11 +2413,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = root.join("latte-lens.jsonc");
-        fs::write(
-            &config,
-            r#"{ "appearance": { "prefer": "light" } }"#,
-        )
-        .unwrap();
+        fs::write(&config, r#"{ "appearance": { "prefer": "light" } }"#).unwrap();
         let _variables = EnvironmentGuard::apply(&[
             ("LATTELENS_CONFIG", Some(config.into_os_string())),
             ("NO_COLOR", None),
@@ -2445,11 +2462,53 @@ mod tests {
         let loaded = load_user_theme();
         assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
         // Palette override propagates to dir/tree_accent and the $blue reference.
-        assert_eq!(loaded.theme.syn_keyword, ratatui::style::Color::Rgb(1, 2, 3));
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
         assert_eq!(loaded.theme.dir, ratatui::style::Color::Rgb(1, 2, 3));
         assert_eq!(
             loaded.theme.syn_string,
             ratatui::style::Color::Rgb(0x0a, 0x0b, 0x0c)
+        );
+    }
+
+    #[test]
+    fn partial_light_theme_without_extends_uses_latte_defaults() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("partial-light.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "name": "partial-light",
+                "semantic": { "syn_string": "#112233" }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "light", "light": "partial-light.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0x88, 0x39, 0xef)
+        );
+        assert_eq!(
+            loaded.theme.syn_string,
+            ratatui::style::Color::Rgb(0x11, 0x22, 0x33)
         );
     }
 
@@ -2559,10 +2618,8 @@ mod tests {
         // `appearance` must be lenient about unknown keys (warn-and-ignore),
         // unlike the strict `code_navigation` subtree.
         let raw: RawConfig = serde_json::from_slice(
-            &normalize_jsonc(
-                br#"{ "appearance": { "prefer": "dark", "unexpected": 1 } }"#,
-            )
-            .unwrap(),
+            &normalize_jsonc(br#"{ "appearance": { "prefer": "dark", "unexpected": 1 } }"#)
+                .unwrap(),
         )
         .expect("appearance tolerates unknown fields");
         assert!(raw.appearance.is_some());

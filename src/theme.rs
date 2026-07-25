@@ -882,7 +882,10 @@ mod tests {
     #[test]
     fn resolve_degrades_through_every_fidelity_level() {
         let color = rc((0x12, 0x34, 0x56), 99, Color::LightBlue);
-        assert_eq!(color.resolve(ColorMode::TrueColor), Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(
+            color.resolve(ColorMode::TrueColor),
+            Color::Rgb(0x12, 0x34, 0x56)
+        );
         assert_eq!(color.resolve(ColorMode::Ansi256), Color::Indexed(99));
         assert_eq!(color.resolve(ColorMode::Ansi16), Color::LightBlue);
         // NO_COLOR drops only the foreground.
@@ -916,6 +919,23 @@ mod tests {
         assert_eq!(MOCHA.get("blue"), Some(MOCHA.blue));
         assert_eq!(MOCHA.get("lavender"), Some(MOCHA.lavender));
         assert_eq!(MOCHA.get("nope"), None);
+    }
+
+    #[test]
+    fn palette_override_updates_every_named_slot() {
+        let custom = rc((1, 2, 3), 4, Color::Red);
+        for name in [
+            "base", "text", "subtext0", "overlay1", "surface2", "mauve", "blue", "green", "red",
+            "peach", "yellow", "teal", "sky", "lavender",
+        ] {
+            let mut palette = MOCHA;
+            assert!(palette.set(name, custom), "{name}");
+            assert_eq!(palette.get(name), Some(custom), "{name}");
+        }
+
+        let mut palette = MOCHA;
+        assert!(!palette.set("unknown", custom));
+        assert_eq!(preset_flavor("unknown"), None);
     }
 
     #[test]
@@ -956,7 +976,10 @@ mod tests {
             Some(Color::LightGreen)
         );
         // Bare integer becomes an ANSI-256 index.
-        assert_eq!(parse_color_value("196", &MOCHA).map(|c| c.idx256), Some(196));
+        assert_eq!(
+            parse_color_value("196", &MOCHA).map(|c| c.idx256),
+            Some(196)
+        );
     }
 
     #[test]
@@ -971,9 +994,15 @@ mod tests {
     #[test]
     fn custom_color_uses_same_degrade_chain() {
         let custom = parse_color_value("#1e66f5", &LATTE).unwrap();
-        assert_eq!(custom.resolve(ColorMode::TrueColor), Color::Rgb(0x1e, 0x66, 0xf5));
+        assert_eq!(
+            custom.resolve(ColorMode::TrueColor),
+            Color::Rgb(0x1e, 0x66, 0xf5)
+        );
         // Degrades without panicking on lower-fidelity terminals.
-        assert!(matches!(custom.resolve(ColorMode::Ansi256), Color::Indexed(_)));
+        assert!(matches!(
+            custom.resolve(ColorMode::Ansi256),
+            Color::Indexed(_)
+        ));
         assert_eq!(custom.resolve(ColorMode::None), Color::Reset);
     }
 }

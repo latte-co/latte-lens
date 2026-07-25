@@ -32,9 +32,11 @@ from .fixtures import (
     create_repository_relation_fixture,
     create_resilience_lsp_fixture,
     create_search_fixture,
+    create_structure_fixture,
     create_system_open_fixture,
     create_symlink_preview_fixture,
-    create_structure_fixture,
+    create_theme_config_fixture,
+    create_theme_matrix_config_fixture,
     create_timeout_lsp_fixture,
 )
 from .terminal import E2EAssertionError, PtySession, TerminalScreen
@@ -1629,6 +1631,7 @@ def crashing_lsp(context: ScenarioContext) -> None:
         absent=("LOADING", "Loading content"),
     )
     session.key(b"l")
+    session.wait_screen(("Content",), "crashing-LSP fixture focuses Preview")
     session.key(b"\x04")
     _wait_trace(
         context,
@@ -1657,8 +1660,13 @@ def crashing_lsp(context: ScenarioContext) -> None:
 
 def incompatible_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("role-caller.rs", "caller!"), "UTF-8 LSP fixture Preview loads")
+    session.wait_screen(
+        ("role-caller.rs", "caller!"),
+        "UTF-8 LSP fixture Preview loads",
+        absent=("LOADING", "Loading content"),
+    )
     session.key(b"l")
+    session.wait_screen(("Content",), "UTF-8 LSP fixture focuses Preview")
     session.key(b"\x04")
     _wait_trace(context, ("utf8-initialize-sent",), "server selects an incompatible encoding")
     session.wait_screen(
@@ -1675,8 +1683,13 @@ def incompatible_lsp(context: ScenarioContext) -> None:
 
 def descendant_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("role-caller.rs", "caller!"), "descendant LSP fixture Preview loads")
+    session.wait_screen(
+        ("role-caller.rs", "caller!"),
+        "descendant LSP fixture Preview loads",
+        absent=("LOADING", "Loading content"),
+    )
     session.key(b"l")
+    session.wait_screen(("Content",), "descendant LSP fixture focuses Preview")
     session.key(b"\x04")
     trace = _wait_trace(
         context,
@@ -1695,8 +1708,13 @@ def descendant_lsp(context: ScenarioContext) -> None:
 
 def timeout_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("role-caller.rs", "caller!"), "timeout LSP fixture Preview loads")
+    session.wait_screen(
+        ("role-caller.rs", "caller!"),
+        "timeout LSP fixture Preview loads",
+        absent=("LOADING", "Loading content"),
+    )
     session.key(b"l")
+    session.wait_screen(("Content",), "timeout LSP fixture focuses Preview")
     session.key(b"\x04")
     _wait_trace(context, ("timeout-definition-held",), "definition request is held by the server")
     session.wait_screen(
@@ -1951,6 +1969,24 @@ def disabled_product_config(context: ScenarioContext) -> None:
     )
 
 
+def theme_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("LATTE LENS", "themed-config.rs", "caller!"),
+        "partial light external theme starts with a normal Preview",
+        absent=("Configuration:", "theme file", "catppuccin-mocha"),
+    )
+
+
+def theme_matrix_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("LATTE LENS", "theme-matrix.rs", "caller!"),
+        "external theme matrix starts with a normal Preview",
+        absent=("Configuration:", "theme file", "catppuccin-mocha"),
+    )
+
+
 def code_navigation_without_lsp(context: ScenarioContext) -> None:
     session = context.session
     session.wait_raw((b"?1000h",), "no-LSP terminal enables mouse capture")
@@ -2112,6 +2148,18 @@ CASES = (
         "code-navigation",
         create_disabled_product_config_fixture,
         disabled_product_config,
+    ),
+    ScenarioCase(
+        "theme-product-config",
+        "code-navigation",
+        create_theme_config_fixture,
+        theme_config,
+    ),
+    ScenarioCase(
+        "theme-matrix-product-config",
+        "code-navigation",
+        create_theme_matrix_config_fixture,
+        theme_matrix_config,
     ),
 )
 

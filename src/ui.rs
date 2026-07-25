@@ -428,7 +428,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         title.push(Span::raw("  "));
         if let Some(branch) = app.branch.as_deref() {
-            title.push(Span::styled(branch, Style::default().fg(Theme::current().git_accent)));
+            title.push(Span::styled(
+                branch,
+                Style::default().fg(Theme::current().git_accent),
+            ));
             title.push(Span::raw("  ·  "));
         }
         title.push(Span::styled(
@@ -676,7 +679,11 @@ fn draw_search_popup(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             detail,
-            Style::default().fg(if search.error.is_some() { Theme::current().missing } else { muted() }),
+            Style::default().fg(if search.error.is_some() {
+                Theme::current().missing
+            } else {
+                muted()
+            }),
         )),
         detail_area,
     );
@@ -882,14 +889,20 @@ fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPic
     );
     if picker.preview_loading {
         frame.render_widget(
-            Paragraph::new(Span::styled("Loading preview…", Style::default().fg(muted()))),
+            Paragraph::new(Span::styled(
+                "Loading preview…",
+                Style::default().fg(muted()),
+            )),
             body,
         );
         return;
     }
     if let Some(error) = picker.preview_error.as_deref() {
         frame.render_widget(
-            Paragraph::new(Span::styled(error.to_owned(), Style::default().fg(Theme::current().missing))),
+            Paragraph::new(Span::styled(
+                error.to_owned(),
+                Style::default().fg(Theme::current().missing),
+            )),
             body,
         );
         return;
@@ -1379,7 +1392,10 @@ fn git_tree_line(
         let mut hint = Vec::new();
         if let Some(stat) = app.git_row_diff_stat(row) {
             if stat.binary {
-                hint.push(Span::styled("binary", Style::default().fg(theme.text_muted)));
+                hint.push(Span::styled(
+                    "binary",
+                    Style::default().fg(theme.text_muted),
+                ));
             } else {
                 hint.push(Span::styled(
                     format!("+{}", stat.added),
@@ -1808,7 +1824,11 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
             Paragraph::new(Span::styled(
                 " Aa ",
                 Style::default()
-                    .fg(if find.case_sensitive { accent() } else { muted() })
+                    .fg(if find.case_sensitive {
+                        accent()
+                    } else {
+                        muted()
+                    })
                     .add_modifier(if find.case_sensitive {
                         Modifier::BOLD
                     } else {
@@ -1946,7 +1966,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("  ", Style::default()),
             Span::styled(
                 message,
-                Style::default().fg(change_hint()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(change_hint())
+                    .add_modifier(Modifier::BOLD),
             ),
         ])
     } else if let Some(error) = &app.last_error {
@@ -1956,7 +1978,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(error.to_owned(), Style::default().fg(Theme::current().missing)),
+            Span::styled(
+                error.to_owned(),
+                Style::default().fg(Theme::current().missing),
+            ),
         ])
     } else if app.is_refreshing() || app.is_directory_loading() || app.is_content_loading() {
         let status = match (
@@ -2018,7 +2043,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(status.to_owned(), Style::default().fg(Theme::current().success)),
+            Span::styled(
+                status.to_owned(),
+                Style::default().fg(Theme::current().success),
+            ),
         ])
     } else if app.repository_graph_truncated || app.repository_error_count > 0 {
         let status = match (app.repository_graph_truncated, app.repository_error_count) {
@@ -2185,7 +2213,10 @@ fn preview_line(
         text_style,
     ));
     if let Some(summary) = visual_row.summary.as_deref() {
-        spans.push(Span::styled(summary.to_owned(), Style::default().fg(muted())));
+        spans.push(Span::styled(
+            summary.to_owned(),
+            Style::default().fg(muted()),
+        ));
     }
     Line::from(spans)
 }
