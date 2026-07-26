@@ -982,6 +982,59 @@ mod tests {
     }
 
     #[test]
+    fn named_and_indexed_colors_cover_degrade_boundaries() {
+        for (name, ansi16) in [
+            ("black", Color::Black),
+            ("red", Color::Red),
+            ("green", Color::Green),
+            ("yellow", Color::Yellow),
+            ("blue", Color::Blue),
+            ("magenta", Color::Magenta),
+            ("cyan", Color::Cyan),
+            ("gray", Color::Gray),
+            ("grey", Color::Gray),
+            ("white", Color::White),
+            ("dark-gray", Color::DarkGray),
+            ("light red", Color::LightRed),
+            ("light-green", Color::LightGreen),
+            ("light yellow", Color::LightYellow),
+            ("bright_blue", Color::LightBlue),
+            ("light magenta", Color::LightMagenta),
+            ("light-cyan", Color::LightCyan),
+        ] {
+            assert_eq!(
+                parse_color_value(name, &MOCHA).map(|c| c.ansi16),
+                Some(ansi16)
+            );
+        }
+
+        assert_eq!(
+            parse_color_value("0", &MOCHA).map(|c| c.hex),
+            Some((0, 0, 0))
+        );
+        assert_eq!(
+            parse_color_value("15", &MOCHA).map(|c| c.hex),
+            Some((0xff, 0xff, 0xff))
+        );
+        assert_eq!(
+            parse_color_value("16", &MOCHA).map(|c| c.hex),
+            Some((0, 0, 0))
+        );
+        assert_eq!(
+            parse_color_value("231", &MOCHA).map(|c| c.hex),
+            Some((0xff, 0xff, 0xff))
+        );
+        assert_eq!(
+            parse_color_value("232", &MOCHA).map(|c| c.hex),
+            Some((8, 8, 8))
+        );
+        assert_eq!(
+            parse_color_value("255", &MOCHA).map(|c| c.hex),
+            Some((0xee, 0xee, 0xee))
+        );
+    }
+
+    #[test]
     fn rejects_bad_color_values_and_missing_references() {
         assert!(parse_color_value("", &MOCHA).is_none());
         assert!(parse_color_value("#12", &MOCHA).is_none());
