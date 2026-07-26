@@ -685,6 +685,15 @@ struct RawThemeFile {
     palette: Option<BTreeMap<String, String>>,
     /// Semantic token overrides (`{ "syn_keyword": "$mauve" }`).
     semantic: Option<BTreeMap<String, String>>,
+    /// File color overrides by coarse category and exact extension.
+    files: Option<RawThemeFiles>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawThemeFiles {
+    categories: Option<BTreeMap<String, String>>,
+    extensions: Option<BTreeMap<String, String>>,
 }
 
 /// Bound on `extends` chains between external files, plus cycle protection.
@@ -1030,6 +1039,31 @@ fn load_theme_source(
                         Some(_) => diagnostics.warn(format!("unknown semantic token '{name}'")),
                         None => {
                             diagnostics.warn(format!("invalid semantic color '{name}' = '{value}'"))
+                        }
+                    }
+                }
+            }
+            if let Some(files) = file.files.as_ref() {
+                if let Some(entries) = files.categories.as_ref() {
+                    for (name, value) in entries {
+                        match crate::theme::parse_color_value(value, &palette) {
+                            Some(color) if semantics.set_file_category(name, color) => {}
+                            Some(_) => diagnostics.warn(format!("unknown file category '{name}'")),
+                            None => diagnostics
+                                .warn(format!("invalid file category color '{name}' = '{value}'")),
+                        }
+                    }
+                }
+                if let Some(entries) = files.extensions.as_ref() {
+                    for (extension, value) in entries {
+                        match crate::theme::parse_color_value(value, &palette) {
+                            Some(color) if semantics.file_types.set_extension(extension, color) => {
+                            }
+                            Some(_) => diagnostics
+                                .warn(format!("invalid file extension override '{extension}'")),
+                            None => diagnostics.warn(format!(
+                                "invalid file extension color '{extension}' = '{value}'"
+                            )),
                         }
                     }
                 }
@@ -2450,10 +2484,10 @@ mod tests {
         ]);
         let loaded = load_user_theme();
         assert!(loaded.warning.is_none());
-        // Mocha keyword is mauve.
+        // Mocha keyword is the stronger dark IDE mauve.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xcb, 0xa6, 0xf7)
+            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
         );
     }
 
@@ -2473,10 +2507,10 @@ mod tests {
         ]);
         let loaded = load_user_theme();
         assert!(loaded.warning.is_none());
-        // Latte keyword is a darker mauve.
+        // Latte keyword uses the stronger light IDE purple.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0x88, 0x39, 0xef)
+            ratatui::style::Color::Rgb(0x82, 0x50, 0xdf)
         );
     }
 
@@ -2577,6 +2611,142 @@ mod tests {
     }
 
     #[test]
+    fn external_theme_overrides_file_categories_and_extensions() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("file-colors.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "extends": "catppuccin-mocha",
+                "palette": { "peach": "#010203" },
+                "files": {
+                    "categories": {
+                        "config": "#00ffff",
+                        "docs": "$peach",
+                        "executable": "light-green"
+                    },
+                    "extensions": {
+                        "rs": "#ff8800",
+                        ".jsonc": "$teal"
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "file-colors.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_theme();
+
+        assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
+        assert_eq!(
+            loaded.theme.file_config,
+            ratatui::style::Color::Rgb(0x00, 0xff, 0xff)
+        );
+        assert_eq!(
+            loaded.theme.file_doc,
+            ratatui::style::Color::Rgb(0x01, 0x02, 0x03)
+        );
+        assert_eq!(
+            loaded.theme.file_exec,
+            ratatui::style::Color::Rgb(0x54, 0xff, 0x54)
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("src/main.rs")),
+            Some(ratatui::style::Color::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("settings.JSONC")),
+            Some(ratatui::style::Color::Rgb(0x56, 0xb6, 0xc2))
+        );
+    }
+
+    #[test]
+    fn invalid_file_color_entries_warn_and_keep_valid_entries() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("partial-file-colors.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "extends": "catppuccin-mocha",
+                "files": {
+                    "categories": {
+                        "config": "#00ffff",
+                        "unknown": "#112233",
+                        "media": "not-a-color"
+                    },
+                    "extensions": {
+                        "rs": "#ff8800",
+                        "bad/slash": "#112233",
+                        "json": "not-a-color"
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "partial-file-colors.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_theme();
+        let warning = loaded.warning.as_deref().unwrap_or_default();
+
+        assert!(warning.contains("unknown file category 'unknown'"));
+        assert!(warning.contains("invalid file category color 'media'"));
+        assert!(warning.contains("invalid file extension override 'bad/slash'"));
+        assert!(warning.contains("invalid file extension color 'json'"));
+        assert_eq!(
+            loaded.theme.file_config,
+            ratatui::style::Color::Rgb(0x00, 0xff, 0xff)
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("src/main.rs")),
+            Some(ratatui::style::Color::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("package.json")),
+            None
+        );
+    }
+
+    #[test]
     fn external_theme_extends_chain_is_capped_at_four_files() {
         let _environment = lock_navigation_environment();
         let temp = tempfile::tempdir().unwrap();
@@ -2615,7 +2785,7 @@ mod tests {
         );
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xcb, 0xa6, 0xf7)
+            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
         );
     }
 
@@ -2650,7 +2820,7 @@ mod tests {
         assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0x88, 0x39, 0xef)
+            ratatui::style::Color::Rgb(0x82, 0x50, 0xdf)
         );
         assert_eq!(
             loaded.theme.syn_string,
@@ -2688,7 +2858,7 @@ mod tests {
         // Falls back to the built-in Mocha preset rather than losing all color.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xcb, 0xa6, 0xf7)
+            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
         );
     }
 
@@ -2731,7 +2901,7 @@ mod tests {
         // The bad token keeps the preset default; the valid one applies.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xcb, 0xa6, 0xf7)
+            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
         );
         assert_eq!(
             loaded.theme.syn_string,

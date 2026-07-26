@@ -264,6 +264,54 @@ absolute native executable or a basename:
 }
 ```
 
+`appearance` chooses the built-in foreground-only theme or an external JSONC
+theme file. The built-in identifiers are `catppuccin-mocha` and
+`catppuccin-latte`; both are tuned for terminal contrast while keeping the
+Catppuccin-inspired roles. Relative theme paths resolve from the directory that
+contains `latte-lens.jsonc`, and theme files may inherit a preset or another
+theme with `extends`:
+
+```jsonc
+{
+  "appearance": {
+    "prefer": "dark",
+    "dark": "themes/my-mocha.jsonc",
+    "light": "catppuccin-latte"
+  }
+}
+```
+
+Theme files can override palette names, semantic tokens, coarse file
+categories, and exact file extensions. File-extension colors take precedence
+over the coarse category color; directories and symlinks keep their own cues.
+
+```jsonc
+{
+  "extends": "catppuccin-mocha",
+  "palette": {
+    "blue": "#61afef"
+  },
+  "semantic": {
+    "dir": "$blue",
+    "tree_accent": "$blue"
+  },
+  "files": {
+    "categories": {
+      "config": "#00ffff",
+      "doc": "$subtext0",
+      "media": "$mauve",
+      "binary": "$peach",
+      "executable": "$green",
+      "plain": "$text"
+    },
+    "extensions": {
+      "rs": "#ff8800",
+      ".jsonc": "$teal"
+    }
+  }
+}
+```
+
 The file accepts JSONC line/block comments and trailing commas. Configuration is
 user-level only. Workspace commands, Windows shell wrappers, broken or cyclic
 links, and executables whose canonical target is inside the opened workspace

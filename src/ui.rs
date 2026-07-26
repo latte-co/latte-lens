@@ -81,12 +81,18 @@ fn dim_when_unfocused(style: Style, focused: bool) -> Style {
 /// name is read. Directories, executables, links, and missing files also carry
 /// a distinct glyph elsewhere, keeping the cue redundant under `NO_COLOR`.
 fn file_entry_color(entry: &FileEntry) -> Color {
-    let theme = Theme::current();
+    file_entry_color_with_theme(entry, Theme::current())
+}
+
+fn file_entry_color_with_theme(entry: &FileEntry, theme: &Theme) -> Color {
     if entry.symlink_target.is_some() {
         return theme.symlink;
     }
     if entry.is_dir {
         return theme.dir;
+    }
+    if let Some(color) = theme.file_types.color_for_path(&entry.relative) {
+        return color;
     }
     match entry.category {
         FileCategory::Config => theme.file_config,
@@ -2419,6 +2425,30 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::preview::RgbColor;
+
+    #[test]
+    fn file_entry_color_prefers_extension_over_coarse_category() {
+        let mut semantics = crate::theme::Semantics::from_palette(&crate::theme::MOCHA);
+        semantics
+            .file_types
+            .set_extension("jsonc", crate::theme::raw_from_rgb(0, 255, 255));
+        let theme = semantics.resolve(ColorMode::TrueColor);
+        let entry = FileEntry {
+            relative: "settings.jsonc".into(),
+            is_dir: false,
+            category: FileCategory::Config,
+            depth: 0,
+            status: None,
+            contains_changes: false,
+            exists: true,
+            symlink_target: None,
+        };
+
+        assert_eq!(
+            file_entry_color_with_theme(&entry, &theme),
+            Color::Rgb(0, 255, 255)
+        );
+    }
 
     #[test]
     fn long_search_queries_keep_the_cursor_end_visible() {

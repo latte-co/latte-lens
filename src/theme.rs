@@ -11,7 +11,7 @@
 //! [`detect`]. Rendering code only ever calls [`Theme::current`], which is a
 //! pure lookup against an already-resolved, process-global [`Theme`].
 
-use std::sync::OnceLock;
+use std::{collections::BTreeMap, path::Path, sync::OnceLock};
 
 use ratatui::style::Color;
 
@@ -29,12 +29,12 @@ pub enum ColorMode {
     None,
 }
 
-/// Which built-in Catppuccin flavor to use.
+/// Which built-in Latte Lens flavor to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Flavor {
-    /// Dark. Catppuccin Mocha.
+    /// Dark. Inspired by Catppuccin Mocha and common dark IDE defaults.
     Mocha,
-    /// Light. Catppuccin Latte.
+    /// Light. Inspired by Catppuccin Latte and common light IDE defaults.
     Latte,
 }
 
@@ -73,8 +73,8 @@ const fn rc(hex: (u8, u8, u8), idx256: u8, ansi16: Color) -> RawColor {
     }
 }
 
-/// Catppuccin named colors for one flavor. Custom themes build a `Palette`
-/// (optionally by extending a preset) and everything downstream stays uniform.
+/// Named colors for one flavor. Custom themes build a `Palette` (optionally by
+/// extending a preset) and everything downstream stays uniform.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Palette {
     pub base: RawColor,
@@ -141,40 +141,42 @@ impl Palette {
     }
 }
 
-/// Catppuccin Mocha (dark). Official hex; ANSI-256/16 are close approximations.
+/// Latte Lens Mocha (dark). Tuned for TUI/IDE contrast while retaining a
+/// Catppuccin-inspired shape; ANSI-256/16 are close approximations.
 pub const MOCHA: Palette = Palette {
-    base: rc((0x1e, 0x1e, 0x2e), 235, Color::Black),
-    text: rc((0xcd, 0xd6, 0xf4), 189, Color::White),
-    subtext0: rc((0xa6, 0xad, 0xc8), 146, Color::Gray),
-    overlay1: rc((0x7f, 0x84, 0x9c), 103, Color::DarkGray),
-    surface2: rc((0x58, 0x5b, 0x70), 60, Color::DarkGray),
-    mauve: rc((0xcb, 0xa6, 0xf7), 183, Color::LightMagenta),
-    blue: rc((0x89, 0xb4, 0xfa), 111, Color::LightBlue),
-    green: rc((0xa6, 0xe3, 0xa1), 151, Color::LightGreen),
-    red: rc((0xf3, 0x8b, 0xa8), 211, Color::LightRed),
-    peach: rc((0xfa, 0xb3, 0x87), 216, Color::LightRed),
-    yellow: rc((0xf9, 0xe2, 0xaf), 223, Color::LightYellow),
-    teal: rc((0x94, 0xe2, 0xd5), 116, Color::LightCyan),
-    sky: rc((0x89, 0xdc, 0xeb), 117, Color::LightCyan),
-    lavender: rc((0xb4, 0xbe, 0xfe), 147, Color::LightBlue),
+    base: rc((0x1f, 0x29, 0x33), 235, Color::Black),
+    text: rc((0xd6, 0xde, 0xe8), 188, Color::White),
+    subtext0: rc((0x9a, 0xa7, 0xb2), 145, Color::Gray),
+    overlay1: rc((0x5e, 0x6a, 0x75), 66, Color::DarkGray),
+    surface2: rc((0x46, 0x51, 0x5c), 60, Color::DarkGray),
+    mauve: rc((0xc6, 0x78, 0xdd), 176, Color::LightMagenta),
+    blue: rc((0x61, 0xaf, 0xef), 75, Color::LightBlue),
+    green: rc((0x98, 0xc3, 0x79), 114, Color::LightGreen),
+    red: rc((0xe0, 0x6c, 0x75), 168, Color::LightRed),
+    peach: rc((0xd1, 0x9a, 0x66), 173, Color::LightRed),
+    yellow: rc((0xe5, 0xc0, 0x7b), 180, Color::LightYellow),
+    teal: rc((0x56, 0xb6, 0xc2), 73, Color::LightCyan),
+    sky: rc((0x7d, 0xcf, 0xff), 117, Color::LightCyan),
+    lavender: rc((0xa0, 0x89, 0xff), 141, Color::LightBlue),
 };
 
-/// Catppuccin Latte (light). Official hex; ANSI-256/16 are close approximations.
+/// Latte Lens Latte (light). Tuned for TUI/IDE contrast while retaining a
+/// Catppuccin-inspired shape; ANSI-256/16 are close approximations.
 pub const LATTE: Palette = Palette {
-    base: rc((0xef, 0xf1, 0xf5), 255, Color::White),
-    text: rc((0x4c, 0x4f, 0x69), 60, Color::Black),
-    subtext0: rc((0x6c, 0x6f, 0x85), 66, Color::DarkGray),
-    overlay1: rc((0x8c, 0x8f, 0xa1), 103, Color::DarkGray),
-    surface2: rc((0xac, 0xb0, 0xbe), 145, Color::Gray),
-    mauve: rc((0x88, 0x39, 0xef), 92, Color::Magenta),
-    blue: rc((0x1e, 0x66, 0xf5), 33, Color::Blue),
-    green: rc((0x40, 0xa0, 0x2b), 64, Color::Green),
-    red: rc((0xd2, 0x0f, 0x39), 160, Color::Red),
-    peach: rc((0xfe, 0x64, 0x0b), 202, Color::Red),
-    yellow: rc((0xdf, 0x8e, 0x1d), 172, Color::Yellow),
-    teal: rc((0x17, 0x92, 0x99), 30, Color::Cyan),
-    sky: rc((0x04, 0xa5, 0xe5), 38, Color::Cyan),
-    lavender: rc((0x72, 0x87, 0xfd), 63, Color::Blue),
+    base: rc((0xff, 0xff, 0xff), 255, Color::White),
+    text: rc((0x24, 0x29, 0x2f), 236, Color::Black),
+    subtext0: rc((0x57, 0x60, 0x6a), 59, Color::DarkGray),
+    overlay1: rc((0x6e, 0x77, 0x81), 66, Color::DarkGray),
+    surface2: rc((0xd0, 0xd7, 0xde), 188, Color::Gray),
+    mauve: rc((0x82, 0x50, 0xdf), 98, Color::Magenta),
+    blue: rc((0x09, 0x69, 0xda), 26, Color::Blue),
+    green: rc((0x1a, 0x7f, 0x37), 28, Color::Green),
+    red: rc((0xcf, 0x22, 0x2e), 160, Color::Red),
+    peach: rc((0xbc, 0x4c, 0x00), 130, Color::Red),
+    yellow: rc((0x9a, 0x67, 0x00), 136, Color::Yellow),
+    teal: rc((0x0a, 0x7f, 0x8f), 30, Color::Cyan),
+    sky: rc((0x0a, 0x96, 0xc4), 31, Color::Cyan),
+    lavender: rc((0x82, 0x50, 0xdf), 98, Color::Blue),
 };
 
 /// Return the built-in palette registered under `name`, if any. Preset names are
@@ -201,11 +203,88 @@ pub fn preset_flavor(name: &str) -> Option<Flavor> {
     }
 }
 
+/// User-configurable file colors that are more specific than the coarse
+/// [`FileCategory`](crate::tree::FileCategory) semantic tokens.
+///
+/// Keys are normalized extension names without a leading dot (`rs`, `jsonc`,
+/// `d.ts` is intentionally not special-cased). Resolution happens once during
+/// startup, so render code only performs a bounded map lookup per visible row.
+#[derive(Clone, Debug, Default)]
+pub struct FileTypeColors {
+    pub extensions: BTreeMap<String, RawColor>,
+}
+
+impl FileTypeColors {
+    /// Resolve a raw extension override for `path`, if one exists.
+    pub fn color_for_path(&self, path: &Path, mode: ColorMode) -> Option<Color> {
+        let extension = path.extension()?.to_str()?;
+        self.extensions
+            .get(&extension.to_ascii_lowercase())
+            .map(|color| color.resolve(mode))
+    }
+
+    /// Store an extension override. Returns `false` for names that are empty,
+    /// very large, or contain characters outside the portable extension set.
+    pub fn set_extension(&mut self, extension: &str, color: RawColor) -> bool {
+        let key = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if key.is_empty()
+            || key.len() > 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+'))
+        {
+            return false;
+        }
+        self.extensions.insert(key, color);
+        true
+    }
+
+    /// Carry extension overrides inherited through an external theme `extends`
+    /// chain. The caller applies the child theme's own overrides afterwards.
+    pub fn carry_customizations(&mut self, base: &Self) {
+        self.extensions.extend(
+            base.extensions
+                .iter()
+                .map(|(key, value)| (key.clone(), *value)),
+        );
+    }
+
+    /// Resolve every override to the terminal's active color fidelity.
+    pub fn resolve(&self, mode: ColorMode) -> ResolvedFileTypeColors {
+        ResolvedFileTypeColors {
+            extensions: self
+                .extensions
+                .iter()
+                .map(|(key, value)| (key.clone(), value.resolve(mode)))
+                .collect(),
+        }
+    }
+}
+
+/// Extension colors after terminal-fidelity degradation.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedFileTypeColors {
+    extensions: BTreeMap<String, Color>,
+}
+
+impl ResolvedFileTypeColors {
+    /// Return the resolved color for `path`'s extension, if configured.
+    pub fn color_for_path(&self, path: &Path) -> Option<Color> {
+        let extension = path.extension()?.to_str()?;
+        self.extensions
+            .get(&extension.to_ascii_lowercase())
+            .copied()
+    }
+}
+
 /// Every semantic token, still in `RawColor` form. A custom theme overrides
 /// individual entries here; resolution to the final `Theme` runs once, through
 /// the same [`RawColor::resolve`] degrade chain, so custom and built-in colors
 /// share one code path.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Semantics {
     // Region identity.
     pub tree_accent: RawColor,
@@ -255,6 +334,7 @@ pub struct Semantics {
     pub search_match: RawColor,
     pub nav_target: RawColor,
     pub success: RawColor,
+    pub file_types: FileTypeColors,
 }
 
 /// All semantic token names, used for name-keyed iteration.
@@ -348,6 +428,7 @@ impl Semantics {
             search_match: p.lavender,
             nav_target: p.green,
             success: p.green,
+            file_types: FileTypeColors::default(),
         }
     }
 
@@ -396,6 +477,24 @@ impl Semantics {
             "search_match" => &mut self.search_match,
             "nav_target" => &mut self.nav_target,
             "success" => &mut self.success,
+            _ => return false,
+        };
+        *slot = color;
+        true
+    }
+
+    pub fn set_file_category(&mut self, name: &str, color: RawColor) -> bool {
+        let normalized = name
+            .trim()
+            .replace(['-', '_', ' '], "")
+            .to_ascii_lowercase();
+        let slot = match normalized.as_str() {
+            "config" => &mut self.file_config,
+            "doc" | "docs" | "document" | "documents" => &mut self.file_doc,
+            "media" => &mut self.file_media,
+            "binary" => &mut self.file_binary,
+            "exec" | "executable" => &mut self.file_exec,
+            "plain" | "file" | "default" => &mut self.file,
             _ => return false,
         };
         *slot = color;
@@ -463,6 +562,7 @@ impl Semantics {
                 self.set(name, base_value);
             }
         }
+        self.file_types.carry_customizations(&base.file_types);
     }
 
     /// Resolve every token to a final `Color` at the given fidelity.
@@ -511,13 +611,14 @@ impl Semantics {
             search_match: c(&self.search_match),
             nav_target: c(&self.nav_target),
             success: c(&self.success),
+            file_types: self.file_types.resolve(mode),
         }
     }
 }
 
 /// Fully resolved, foreground-only theme. Every field is a ready-to-use
 /// `Color`. Rendering code reads these directly and never touches the palette.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Theme {
     pub mode: ColorMode,
     pub tree_accent: Color,
@@ -561,6 +662,7 @@ pub struct Theme {
     pub search_match: Color,
     pub nav_target: Color,
     pub success: Color,
+    pub file_types: ResolvedFileTypeColors,
 }
 
 impl Theme {
@@ -905,11 +1007,11 @@ mod tests {
     #[test]
     fn both_builtin_flavors_build_in_truecolor() {
         let mocha = Theme::from_parts(ColorMode::TrueColor, Flavor::Mocha);
-        assert_eq!(mocha.syn_keyword, Color::Rgb(0xcb, 0xa6, 0xf7));
-        assert_eq!(mocha.tree_accent, Color::Rgb(0x89, 0xb4, 0xfa));
-        assert_eq!(mocha.content_accent, Color::Rgb(0xb4, 0xbe, 0xfe));
+        assert_eq!(mocha.syn_keyword, Color::Rgb(0xc6, 0x78, 0xdd));
+        assert_eq!(mocha.tree_accent, Color::Rgb(0x61, 0xaf, 0xef));
+        assert_eq!(mocha.content_accent, Color::Rgb(0xa0, 0x89, 0xff));
         let latte = Theme::from_parts(ColorMode::TrueColor, Flavor::Latte);
-        assert_eq!(latte.syn_keyword, Color::Rgb(0x88, 0x39, 0xef));
+        assert_eq!(latte.syn_keyword, Color::Rgb(0x82, 0x50, 0xdf));
         assert_ne!(mocha.text_primary, latte.text_primary);
     }
 
@@ -943,9 +1045,54 @@ mod tests {
         assert!(semantics.set("syn_keyword", MOCHA.red));
         assert!(!semantics.set("not_a_token", MOCHA.red));
         let theme = semantics.resolve(ColorMode::TrueColor);
-        assert_eq!(theme.syn_keyword, Color::Rgb(0xf3, 0x8b, 0xa8));
+        assert_eq!(theme.syn_keyword, Color::Rgb(0xe0, 0x6c, 0x75));
         // Untouched tokens keep the built-in mapping.
-        assert_eq!(theme.syn_function, Color::Rgb(0x89, 0xb4, 0xfa));
+        assert_eq!(theme.syn_function, Color::Rgb(0x61, 0xaf, 0xef));
+    }
+
+    #[test]
+    fn file_category_aliases_override_coarse_file_tokens() {
+        let mut semantics = Semantics::from_palette(&MOCHA);
+        let custom = raw_from_rgb(1, 2, 3);
+
+        for name in ["config", "docs", "media", "binary", "executable", "plain"] {
+            assert!(semantics.set_file_category(name, custom), "{name}");
+        }
+        assert!(!semantics.set_file_category("unknown", custom));
+
+        let theme = semantics.resolve(ColorMode::TrueColor);
+        assert_eq!(theme.file_config, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.file_doc, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.file_media, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.file_binary, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.file_exec, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.file, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn file_extension_overrides_normalize_and_degrade_like_semantics() {
+        let mut colors = FileTypeColors::default();
+        let rust = raw_from_rgb(0xff, 0x88, 0x00);
+
+        assert!(colors.set_extension(".RS", rust));
+        assert!(!colors.set_extension("", rust));
+        assert!(!colors.set_extension("bad/slash", rust));
+        assert!(!colors.set_extension(&"x".repeat(65), rust));
+
+        assert_eq!(
+            colors.color_for_path(Path::new("src/main.rs"), ColorMode::TrueColor),
+            Some(Color::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            colors.color_for_path(Path::new("src/main.RS"), ColorMode::None),
+            Some(Color::Reset)
+        );
+        assert_eq!(
+            colors
+                .resolve(ColorMode::TrueColor)
+                .color_for_path(Path::new("README.md")),
+            None
+        );
     }
 
     #[test]
