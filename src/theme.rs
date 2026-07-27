@@ -807,6 +807,9 @@ pub fn parse_color_value(value: &str, palette: &Palette) -> Option<RawColor> {
 
 fn parse_hex(hex: &str) -> Option<RawColor> {
     let hex = hex.trim();
+    if !hex.is_ascii() {
+        return None;
+    }
     let (r, g, b) = match hex.len() {
         6 => (
             u8::from_str_radix(&hex[0..2], 16).ok()?,
@@ -1199,6 +1202,8 @@ mod tests {
         assert!(parse_color_value("", &LATTE_DARK).is_none());
         assert!(parse_color_value("#12", &LATTE_DARK).is_none());
         assert!(parse_color_value("#zzzzzz", &LATTE_DARK).is_none());
+        assert!(parse_color_value("#aé", &LATTE_DARK).is_none());
+        assert!(parse_color_value("#aébcd", &LATTE_DARK).is_none());
         assert!(parse_color_value("not-a-color", &LATTE_DARK).is_none());
         assert!(parse_color_value("$nope", &LATTE_DARK).is_none());
     }
