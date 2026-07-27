@@ -146,18 +146,18 @@ impl Palette {
 pub const LATTE_DARK: Palette = Palette {
     base: rc((0x1e, 0x1e, 0x1e), 234, Color::Black),
     text: rc((0xd4, 0xd4, 0xd4), 188, Color::White),
-    subtext0: rc((0xa0, 0xa0, 0xa0), 145, Color::Gray),
+    subtext0: rc((0xa8, 0xa8, 0xa8), 248, Color::Gray),
     overlay1: rc((0x6f, 0x6f, 0x6f), 242, Color::DarkGray),
     surface2: rc((0x4b, 0x4b, 0x4b), 238, Color::DarkGray),
-    mauve: rc((0xc5, 0x86, 0xc0), 176, Color::LightMagenta),
-    blue: rc((0x9a, 0xa7, 0xb2), 145, Color::Gray),
-    green: rc((0x6a, 0x99, 0x55), 71, Color::Green),
-    red: rc((0xc4, 0x6a, 0x6a), 167, Color::LightRed),
-    peach: rc((0xb4, 0x8b, 0x62), 137, Color::Yellow),
+    mauve: rc((0xc7, 0x92, 0xea), 177, Color::LightMagenta),
+    blue: rc((0x7f, 0xb7, 0xd7), 110, Color::LightBlue),
+    green: rc((0x86, 0xb8, 0x6f), 107, Color::Green),
+    red: rc((0xd7, 0x6d, 0x77), 167, Color::LightRed),
+    peach: rc((0xd0, 0x9a, 0x69), 173, Color::Yellow),
     yellow: rc((0xd7, 0xba, 0x7d), 180, Color::LightYellow),
-    teal: rc((0x8a, 0xb4, 0xb8), 109, Color::Cyan),
-    sky: rc((0x8a, 0xb4, 0xb8), 109, Color::LightCyan),
-    lavender: rc((0xb7, 0xa7, 0xd9), 146, Color::LightMagenta),
+    teal: rc((0x72, 0xb7, 0xc2), 109, Color::Cyan),
+    sky: rc((0x7f, 0xc7, 0xd8), 116, Color::LightCyan),
+    lavender: rc((0xb6, 0xa6, 0xe8), 146, Color::LightMagenta),
 };
 
 /// Latte Light. A plain light default with low-saturation structural accents.
@@ -167,15 +167,15 @@ pub const LATTE_LIGHT: Palette = Palette {
     subtext0: rc((0x57, 0x60, 0x6a), 59, Color::DarkGray),
     overlay1: rc((0x8c, 0x95, 0x9f), 102, Color::DarkGray),
     surface2: rc((0xd0, 0xd7, 0xde), 188, Color::Gray),
-    mauve: rc((0x7a, 0x5c, 0xa7), 97, Color::Magenta),
-    blue: rc((0x57, 0x60, 0x6a), 59, Color::DarkGray),
-    green: rc((0x4f, 0x7d, 0x45), 65, Color::Green),
-    red: rc((0xa0, 0x47, 0x47), 131, Color::Red),
-    peach: rc((0x8a, 0x6a, 0x4b), 95, Color::Yellow),
-    yellow: rc((0x7d, 0x6a, 0x43), 101, Color::Yellow),
-    teal: rc((0x4b, 0x7f, 0x85), 66, Color::Cyan),
-    sky: rc((0x5f, 0x7f, 0x92), 67, Color::Cyan),
-    lavender: rc((0x6f, 0x5f, 0xa8), 97, Color::Magenta),
+    mauve: rc((0x7f, 0x4f, 0xb5), 97, Color::Magenta),
+    blue: rc((0x2f, 0x6f, 0x9f), 67, Color::Blue),
+    green: rc((0x3f, 0x7f, 0x45), 65, Color::Green),
+    red: rc((0xb0, 0x42, 0x46), 131, Color::Red),
+    peach: rc((0xa0, 0x66, 0x2d), 130, Color::Yellow),
+    yellow: rc((0x8f, 0x6f, 0x1f), 136, Color::Yellow),
+    teal: rc((0x2f, 0x7f, 0x88), 30, Color::Cyan),
+    sky: rc((0x3f, 0x86, 0xa8), 67, Color::Cyan),
+    lavender: rc((0x6b, 0x5f, 0xb5), 61, Color::Magenta),
 };
 
 /// Compatibility alias for the earlier Catppuccin-inspired dark preset name.
@@ -1012,11 +1012,11 @@ mod tests {
     #[test]
     fn both_builtin_flavors_build_in_truecolor() {
         let mocha = Theme::from_parts(ColorMode::TrueColor, Flavor::Mocha);
-        assert_eq!(mocha.syn_keyword, Color::Rgb(0xc5, 0x86, 0xc0));
-        assert_eq!(mocha.tree_accent, Color::Rgb(0x9a, 0xa7, 0xb2));
-        assert_eq!(mocha.content_accent, Color::Rgb(0xb7, 0xa7, 0xd9));
+        assert_eq!(mocha.syn_keyword, Color::Rgb(0xc7, 0x92, 0xea));
+        assert_eq!(mocha.tree_accent, Color::Rgb(0x7f, 0xb7, 0xd7));
+        assert_eq!(mocha.content_accent, Color::Rgb(0xb6, 0xa6, 0xe8));
         let latte = Theme::from_parts(ColorMode::TrueColor, Flavor::Latte);
-        assert_eq!(latte.syn_keyword, Color::Rgb(0x7a, 0x5c, 0xa7));
+        assert_eq!(latte.syn_keyword, Color::Rgb(0x7f, 0x4f, 0xb5));
         assert_ne!(mocha.text_primary, latte.text_primary);
     }
 
@@ -1050,9 +1050,9 @@ mod tests {
         assert!(semantics.set("syn_keyword", LATTE_DARK.red));
         assert!(!semantics.set("not_a_token", LATTE_DARK.red));
         let theme = semantics.resolve(ColorMode::TrueColor);
-        assert_eq!(theme.syn_keyword, Color::Rgb(0xc4, 0x6a, 0x6a));
+        assert_eq!(theme.syn_keyword, Color::Rgb(0xd7, 0x6d, 0x77));
         // Untouched tokens keep the built-in mapping.
-        assert_eq!(theme.syn_function, Color::Rgb(0x9a, 0xa7, 0xb2));
+        assert_eq!(theme.syn_function, Color::Rgb(0x7f, 0xb7, 0xd7));
     }
 
     #[test]

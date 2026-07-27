@@ -2487,7 +2487,7 @@ mod tests {
         // Latte Dark keyword is a muted editor purple.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
         );
     }
 
@@ -2510,7 +2510,7 @@ mod tests {
         // Latte Light keyword is a muted editor purple.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0x7a, 0x5c, 0xa7)
+            ratatui::style::Color::Rgb(0x7f, 0x4f, 0xb5)
         );
     }
 
@@ -2676,7 +2676,7 @@ mod tests {
                 .theme
                 .file_types
                 .color_for_path(Path::new("settings.JSONC")),
-            Some(ratatui::style::Color::Rgb(0x8a, 0xb4, 0xb8))
+            Some(ratatui::style::Color::Rgb(0x72, 0xb7, 0xc2))
         );
     }
 
@@ -2785,7 +2785,7 @@ mod tests {
         );
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
         );
     }
 
@@ -2820,7 +2820,7 @@ mod tests {
         assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0x7a, 0x5c, 0xa7)
+            ratatui::style::Color::Rgb(0x7f, 0x4f, 0xb5)
         );
         assert_eq!(
             loaded.theme.syn_string,
@@ -2858,7 +2858,7 @@ mod tests {
         // Falls back to the built-in Latte Dark preset rather than losing all color.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
         );
     }
 
@@ -2901,7 +2901,7 @@ mod tests {
         // The bad token keeps the preset default; the valid one applies.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
         );
         assert_eq!(
             loaded.theme.syn_string,
