@@ -390,20 +390,13 @@ def unified_system_open(context: ScenarioContext) -> None:
     )
     session.key(b"\r")
     session.wait_screen(
-        ("Unknown file type. Press o or click Open anyway to confirm.",),
-        "Enter cannot consume an unknown-file confirmation",
+        (
+            "No preview provider accepted b-unknown.data.",
+            "Register a PreviewProvider to support this file type.",
+        ),
+        "Enter opens an unknown file only in the internal Lens preview",
     )
     assert trace.read_text(encoding="utf-8").splitlines() == [expected_pdf]
-    session.key(b"o")
-    session.wait_screen(
-        ("Opened b-unknown.data with the system default app.",),
-        "second explicit o confirms the same unknown fingerprint",
-    )
-    session.wait_until(
-        lambda _screen: trace.read_text(encoding="utf-8").splitlines()
-        == [expected_pdf, expected_unknown],
-        "stub opener receives the confirmed unknown path exactly once",
-    )
 
     session.key(b"G")
     session.wait_screen(
@@ -412,12 +405,20 @@ def unified_system_open(context: ScenarioContext) -> None:
     )
     _double_click_tree_row(session, "d-passive.docx")
     session.wait_screen(
+        ("Format: DOCX", "Passive OOXML document"),
+        "Tree double-click keeps a passive DOCX in the internal Lens preview",
+    )
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        expected_pdf,
+    ]
+    session.key(b"o")
+    session.wait_screen(
         ("Opened d-passive.docx with the system default app.",),
-        "Tree double-click opens a passive DOCX classified from parsed OOXML content types",
+        "explicit o opens a passive DOCX classified from parsed OOXML content types",
     )
     session.wait_until(
         lambda _screen: trace.read_text(encoding="utf-8").splitlines()
-        == [expected_pdf, expected_unknown, expected_docx],
+        == [expected_pdf, expected_docx],
         "stub opener receives the parsed passive DOCX exactly once",
     )
 
@@ -430,7 +431,6 @@ def unified_system_open(context: ScenarioContext) -> None:
     )
     assert trace.read_text(encoding="utf-8").splitlines() == [
         expected_pdf,
-        expected_unknown,
         expected_docx,
     ]
 

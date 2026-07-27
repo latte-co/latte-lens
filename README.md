@@ -119,7 +119,7 @@ Inside the TUI:
 | `1` / `2` | Show all files, or refresh and show only Git changes, while retaining focus |
 | `tab` / `shift-tab` | Switch the left tree scope while retaining focus |
 | `h` / `l` | Focus the tree or content pane |
-| `enter` | With Tree focused, expand/collapse a directory or safely open an existing file with the system default app; with Preview focused, retain the fold action below |
+| `enter` | With Tree focused, expand/collapse a directory or open the selected file in Lens Preview; with Preview focused, retain the fold action below |
 | `/` / `ctrl-p` | Open the file popup |
 | `ctrl-f` | Find in the current Preview or Diff |
 | `ctrl-d` | In focused Preview content, go to the definition; one result jumps directly and multiple results open the navigation popup |
@@ -146,7 +146,7 @@ Mouse controls:
 
 - Click `Files` or `Git changes` to switch the left tree dataset; entering Git Changes refreshes it first.
 - Click `Refresh` in the header (or press `r`) to re-scan the repository without leaving the current view.
-- Clicking a directory row anywhere, including its `▸`/`▾` disclosure, immediately expands or collapses it. A file-row click selects and internally previews it; double-click a file row to request the same safe system-open action as `Enter`/`o`.
+- Clicking a directory row anywhere, including its `▸`/`▾` disclosure, immediately expands or collapses it. A file-row click selects and internally previews it; double-click a file row focuses the same Lens Preview action as `Enter`.
 - Click `[Open]` in the Content heading to use the same system-open action. Unknown non-executable files change it to `[Open anyway]`; only that explicit button or a second `o` confirms, never `Enter`, double-click, or key repeat.
 - Click `Open` or `Text` in the Files heading to open file or workspace text search. Search uses a centered popup whose width is independent of the Files pane; text matches show their path and source line separately.
 - In the popup, type directly, use `↑`/`↓` to preview results, and press `Enter` to open one. `Esc`, the close button, and opening a result hide the popup without clearing its query, results, selection, or scroll position. Reopening File or Text search restores that mode's previous session.
@@ -154,7 +154,7 @@ Mouse controls:
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
 - In a supported built-in source Preview, hold `Alt` while moving the mouse to underline a complete navigable token, then `Alt`-click to request its definition. Keyboard navigation uses the same `Ctrl` + mnemonic style as search: `Ctrl+D` definition, `Ctrl+R` references, `Ctrl+O` implementations, and `Ctrl+S` document symbols. References and implementations always open a file-grouped results popup; on wide terminals it previews the selected location without replacing the main Content pane. Press `Enter` or click a location to commit its jump; file-group headers only expand or collapse their locations. A safe external result inside a recognized dependency package (`go.mod`, `Cargo.toml`, `package.json`, `pyproject.toml`, or `setup.py`) opens a read-only `Dependency Source` view without adding it to the workspace Tree or Git scopes; use `Alt`+`←` to return. Other external results are rejected. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
-- In Git Changes, selecting a file keeps its owning-repository diff in Content. Click a container row once to expand/collapse it, and use `Right`/`l` to focus the diff; `Enter`, file double-click, `o`, or `[Open]` requests the system default app only for an existing regular file.
+- In Git Changes, selecting a file keeps its owning-repository diff in Content. Click a container row once to expand/collapse it, use `Enter` or file double-click to open the working-tree file in Lens Preview, and use `o` or `[Open]` when you explicitly want the system default app.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
 
@@ -371,9 +371,9 @@ bounded target-path text without opening the target. Every read still declines
 FIFOs, sockets, devices, and Windows reparse points, and applies the same
 non-blocking, byte-and-line-bounded I/O to a link's target.
 
-PNG, JPEG, GIF, and WebP files initially show verified metadata only. Press `o`,
-use Tree `Enter`/double-click, or click `[Open]` to explicitly open the image in
-the host system's default viewer. When a Linux
+PNG, JPEG, GIF, and WebP files initially show verified metadata only. Press `o`
+or click `[Open]` to explicitly open the image in the host system's default
+viewer. When a Linux
 session has no graphical display, or an opener is unavailable or fails, Lens
 does not silently substitute a lossy rendering: it asks whether to press `i`
 for a bounded TrueColor half-block preview sized to the current Content pane,

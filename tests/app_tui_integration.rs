@@ -536,7 +536,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
 }
 
 #[test]
-fn enter_toggles_directories_and_requests_system_open_for_files() {
+fn enter_toggles_directories_and_previews_files_in_lens() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -592,15 +592,13 @@ fn enter_toggles_directories_and_requests_system_open_for_files() {
         app.selected_relative_path(),
         Some(PathBuf::from("src/file.txt"))
     );
-    let status = app.external_open_status_message();
-    assert!(
-        status.is_some_and(|message| message.contains("unavailable")),
-        "unexpected external-open status: {status:?}"
-    );
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_lines, ["fixture"]);
+    assert!(!app.is_external_open_loading());
 }
 
 #[test]
-fn mouse_single_click_toggles_directories_and_double_click_opens_files() {
+fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_lens() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -653,12 +651,9 @@ fn mouse_single_click_toggles_directories_and_double_click_opens_files() {
         Some(PathBuf::from("src/file.txt"))
     );
     assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_lines, ["fixture"]);
     assert_eq!(visible_paths(&app), rows_before_file_click);
-    let status = app.external_open_status_message();
-    assert!(
-        status.is_some_and(|message| message.contains("unavailable")),
-        "unexpected external-open status: {status:?}"
-    );
+    assert!(!app.is_external_open_loading());
 }
 
 #[test]
@@ -2169,7 +2164,7 @@ fn pdf_uses_the_same_o_and_clickable_open_action_without_image_fallback() {
 }
 
 #[test]
-fn unknown_file_requires_o_confirmation_while_enter_cannot_confirm() {
+fn unknown_file_requires_o_confirmation_while_enter_previews_internally() {
     let fixture = TestRepo::new();
     fixture.write("payload.data", b"\x00\x01\x02\x03");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
@@ -2182,13 +2177,24 @@ fn unknown_file_requires_o_confirmation_while_enter_cannot_confirm() {
     );
 
     app.handle_key(key(KeyCode::Enter));
-    assert!(
-        app.external_open_status_message()
-            .is_some_and(|message| message.contains("Press o"))
-    );
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Preview);
     assert!(!app.is_external_open_loading());
 
     app.handle_key(key(KeyCode::Char('o')));
+    settle(&mut app);
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("press o again"))
+    );
+    let backend = TestBackend::new(100, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("[Open anyway]"));
+
+    let open = app.ui_regions.external_open_button;
+    app.handle_mouse(mouse_down(open.x, open.y));
     settle(&mut app);
     assert!(
         app.external_open_status_message()
