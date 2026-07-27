@@ -265,9 +265,9 @@ absolute native executable or a basename:
 ```
 
 `appearance` chooses the built-in foreground-only theme or an external JSONC
-theme file. The built-in identifiers are `catppuccin-mocha` and
-`catppuccin-latte`; both are tuned for terminal contrast while keeping the
-Catppuccin-inspired roles. Relative theme paths resolve from the directory that
+theme file. The built-in identifiers are `latte-dark` and
+`latte-light`; both are tuned for terminal contrast while keeping the
+Latte roles. Relative theme paths resolve from the directory that
 contains `latte-lens.jsonc`, and theme files may inherit a preset or another
 theme with `extends`:
 
@@ -275,8 +275,8 @@ theme with `extends`:
 {
   "appearance": {
     "prefer": "dark",
-    "dark": "themes/my-mocha.jsonc",
-    "light": "catppuccin-latte"
+    "dark": "themes/my-dark.jsonc",
+    "light": "latte-light"
   }
 }
 ```
@@ -287,7 +287,7 @@ over the coarse category color; directories and symlinks keep their own cues.
 
 ```jsonc
 {
-  "extends": "catppuccin-mocha",
+  "extends": "latte-dark",
   "palette": {
     "blue": "#61afef"
   },

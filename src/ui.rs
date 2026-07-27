@@ -2428,7 +2428,7 @@ mod tests {
 
     #[test]
     fn file_entry_color_prefers_extension_over_coarse_category() {
-        let mut semantics = crate::theme::Semantics::from_palette(&crate::theme::MOCHA);
+        let mut semantics = crate::theme::Semantics::from_palette(&crate::theme::LATTE_DARK);
         semantics
             .file_types
             .set_extension("jsonc", crate::theme::raw_from_rgb(0, 255, 255));

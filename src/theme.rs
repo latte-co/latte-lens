@@ -32,9 +32,9 @@ pub enum ColorMode {
 /// Which built-in Latte Lens flavor to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Flavor {
-    /// Dark. Inspired by Catppuccin Mocha and common dark IDE defaults.
+    /// Dark. Latte Dark.
     Mocha,
-    /// Light. Inspired by Catppuccin Latte and common light IDE defaults.
+    /// Light. Latte Light.
     Latte,
 }
 
@@ -141,50 +141,55 @@ impl Palette {
     }
 }
 
-/// Latte Lens Mocha (dark). Tuned for TUI/IDE contrast while retaining a
-/// Catppuccin-inspired shape; ANSI-256/16 are close approximations.
-pub const MOCHA: Palette = Palette {
-    base: rc((0x1f, 0x29, 0x33), 235, Color::Black),
-    text: rc((0xd6, 0xde, 0xe8), 188, Color::White),
-    subtext0: rc((0x9a, 0xa7, 0xb2), 145, Color::Gray),
-    overlay1: rc((0x5e, 0x6a, 0x75), 66, Color::DarkGray),
-    surface2: rc((0x46, 0x51, 0x5c), 60, Color::DarkGray),
-    mauve: rc((0xc6, 0x78, 0xdd), 176, Color::LightMagenta),
-    blue: rc((0x61, 0xaf, 0xef), 75, Color::LightBlue),
-    green: rc((0x98, 0xc3, 0x79), 114, Color::LightGreen),
-    red: rc((0xe0, 0x6c, 0x75), 168, Color::LightRed),
-    peach: rc((0xd1, 0x9a, 0x66), 173, Color::LightRed),
-    yellow: rc((0xe5, 0xc0, 0x7b), 180, Color::LightYellow),
-    teal: rc((0x56, 0xb6, 0xc2), 73, Color::LightCyan),
-    sky: rc((0x7d, 0xcf, 0xff), 117, Color::LightCyan),
-    lavender: rc((0xa0, 0x89, 0xff), 141, Color::LightBlue),
+/// Latte Dark. A plain, editor-like dark default: mostly neutral foregrounds,
+/// with muted accents for structure and stronger colors reserved for status.
+pub const LATTE_DARK: Palette = Palette {
+    base: rc((0x1e, 0x1e, 0x1e), 234, Color::Black),
+    text: rc((0xd4, 0xd4, 0xd4), 188, Color::White),
+    subtext0: rc((0xa0, 0xa0, 0xa0), 145, Color::Gray),
+    overlay1: rc((0x6f, 0x6f, 0x6f), 242, Color::DarkGray),
+    surface2: rc((0x4b, 0x4b, 0x4b), 238, Color::DarkGray),
+    mauve: rc((0xc5, 0x86, 0xc0), 176, Color::LightMagenta),
+    blue: rc((0x9a, 0xa7, 0xb2), 145, Color::Gray),
+    green: rc((0x6a, 0x99, 0x55), 71, Color::Green),
+    red: rc((0xc4, 0x6a, 0x6a), 167, Color::LightRed),
+    peach: rc((0xb4, 0x8b, 0x62), 137, Color::Yellow),
+    yellow: rc((0xd7, 0xba, 0x7d), 180, Color::LightYellow),
+    teal: rc((0x8a, 0xb4, 0xb8), 109, Color::Cyan),
+    sky: rc((0x8a, 0xb4, 0xb8), 109, Color::LightCyan),
+    lavender: rc((0xb7, 0xa7, 0xd9), 146, Color::LightMagenta),
 };
 
-/// Latte Lens Latte (light). Tuned for TUI/IDE contrast while retaining a
-/// Catppuccin-inspired shape; ANSI-256/16 are close approximations.
-pub const LATTE: Palette = Palette {
+/// Latte Light. A plain light default with low-saturation structural accents.
+pub const LATTE_LIGHT: Palette = Palette {
     base: rc((0xff, 0xff, 0xff), 255, Color::White),
     text: rc((0x24, 0x29, 0x2f), 236, Color::Black),
     subtext0: rc((0x57, 0x60, 0x6a), 59, Color::DarkGray),
-    overlay1: rc((0x6e, 0x77, 0x81), 66, Color::DarkGray),
+    overlay1: rc((0x8c, 0x95, 0x9f), 102, Color::DarkGray),
     surface2: rc((0xd0, 0xd7, 0xde), 188, Color::Gray),
-    mauve: rc((0x82, 0x50, 0xdf), 98, Color::Magenta),
-    blue: rc((0x09, 0x69, 0xda), 26, Color::Blue),
-    green: rc((0x1a, 0x7f, 0x37), 28, Color::Green),
-    red: rc((0xcf, 0x22, 0x2e), 160, Color::Red),
-    peach: rc((0xbc, 0x4c, 0x00), 130, Color::Red),
-    yellow: rc((0x9a, 0x67, 0x00), 136, Color::Yellow),
-    teal: rc((0x0a, 0x7f, 0x8f), 30, Color::Cyan),
-    sky: rc((0x0a, 0x96, 0xc4), 31, Color::Cyan),
-    lavender: rc((0x82, 0x50, 0xdf), 98, Color::Blue),
+    mauve: rc((0x7a, 0x5c, 0xa7), 97, Color::Magenta),
+    blue: rc((0x57, 0x60, 0x6a), 59, Color::DarkGray),
+    green: rc((0x4f, 0x7d, 0x45), 65, Color::Green),
+    red: rc((0xa0, 0x47, 0x47), 131, Color::Red),
+    peach: rc((0x8a, 0x6a, 0x4b), 95, Color::Yellow),
+    yellow: rc((0x7d, 0x6a, 0x43), 101, Color::Yellow),
+    teal: rc((0x4b, 0x7f, 0x85), 66, Color::Cyan),
+    sky: rc((0x5f, 0x7f, 0x92), 67, Color::Cyan),
+    lavender: rc((0x6f, 0x5f, 0xa8), 97, Color::Magenta),
 };
+
+/// Compatibility alias for the earlier Catppuccin-inspired dark preset name.
+pub const MOCHA: Palette = LATTE_DARK;
+
+/// Compatibility alias for the earlier Catppuccin-inspired light preset name.
+pub const LATTE: Palette = LATTE_LIGHT;
 
 /// Return the built-in palette registered under `name`, if any. Preset names are
 /// the stable identifiers accepted by external `extends` and `appearance` keys.
 pub fn preset(name: &str) -> Option<Palette> {
     match name {
-        "catppuccin-mocha" => Some(MOCHA),
-        "catppuccin-latte" => Some(LATTE),
+        "latte-dark" | "catppuccin-mocha" => Some(LATTE_DARK),
+        "latte-light" | "catppuccin-latte" => Some(LATTE_LIGHT),
         _ => None,
     }
 }
@@ -197,8 +202,8 @@ pub fn is_preset(name: &str) -> bool {
 /// The default flavor for a preset name, used to pick a `ColorMode` companion.
 pub fn preset_flavor(name: &str) -> Option<Flavor> {
     match name {
-        "catppuccin-mocha" => Some(Flavor::Mocha),
-        "catppuccin-latte" => Some(Flavor::Latte),
+        "latte-dark" | "catppuccin-mocha" => Some(Flavor::Mocha),
+        "latte-light" | "catppuccin-latte" => Some(Flavor::Latte),
         _ => None,
     }
 }
@@ -669,15 +674,15 @@ impl Theme {
     /// Build a built-in theme from a fidelity level and flavor.
     pub fn from_parts(mode: ColorMode, flavor: Flavor) -> Self {
         let palette = match flavor {
-            Flavor::Mocha => MOCHA,
-            Flavor::Latte => LATTE,
+            Flavor::Mocha => LATTE_DARK,
+            Flavor::Latte => LATTE_LIGHT,
         };
         Semantics::from_palette(&palette).resolve(mode)
     }
 
-    /// The process-global theme. Defaults to a deterministic TrueColor Mocha the
-    /// first time it is read; production installs a detected theme before the
-    /// first render via [`install`]. This method performs no I/O.
+    /// The process-global theme. Defaults to a deterministic TrueColor Latte
+    /// Dark the first time it is read; production installs a detected theme
+    /// before the first render via [`install`]. This method performs no I/O.
     pub fn current() -> &'static Theme {
         THEME.get_or_init(|| Theme::from_parts(ColorMode::TrueColor, Flavor::Mocha))
     }
@@ -700,7 +705,7 @@ pub fn install(theme: Theme) {
 ///   {truecolor,24bit}` → `TrueColor`; else `TERM` contains `256color` →
 ///   `Ansi256`; else `Ansi16`.
 /// - `Flavor`: `LATTE_LENS_THEME` = `light`/`dark` wins; else a large trailing
-///   `COLORFGBG` field (light background) → `Latte`; else `Mocha`.
+///   `COLORFGBG` field (light background) → Latte Light; else Latte Dark.
 pub fn detect() -> (ColorMode, Flavor) {
     (detect_color_mode(), detect_flavor())
 }
@@ -1007,19 +1012,19 @@ mod tests {
     #[test]
     fn both_builtin_flavors_build_in_truecolor() {
         let mocha = Theme::from_parts(ColorMode::TrueColor, Flavor::Mocha);
-        assert_eq!(mocha.syn_keyword, Color::Rgb(0xc6, 0x78, 0xdd));
-        assert_eq!(mocha.tree_accent, Color::Rgb(0x61, 0xaf, 0xef));
-        assert_eq!(mocha.content_accent, Color::Rgb(0xa0, 0x89, 0xff));
+        assert_eq!(mocha.syn_keyword, Color::Rgb(0xc5, 0x86, 0xc0));
+        assert_eq!(mocha.tree_accent, Color::Rgb(0x9a, 0xa7, 0xb2));
+        assert_eq!(mocha.content_accent, Color::Rgb(0xb7, 0xa7, 0xd9));
         let latte = Theme::from_parts(ColorMode::TrueColor, Flavor::Latte);
-        assert_eq!(latte.syn_keyword, Color::Rgb(0x82, 0x50, 0xdf));
+        assert_eq!(latte.syn_keyword, Color::Rgb(0x7a, 0x5c, 0xa7));
         assert_ne!(mocha.text_primary, latte.text_primary);
     }
 
     #[test]
     fn palette_reference_lookup_covers_named_colors() {
-        assert_eq!(MOCHA.get("blue"), Some(MOCHA.blue));
-        assert_eq!(MOCHA.get("lavender"), Some(MOCHA.lavender));
-        assert_eq!(MOCHA.get("nope"), None);
+        assert_eq!(LATTE_DARK.get("blue"), Some(LATTE_DARK.blue));
+        assert_eq!(LATTE_DARK.get("lavender"), Some(LATTE_DARK.lavender));
+        assert_eq!(LATTE_DARK.get("nope"), None);
     }
 
     #[test]
@@ -1029,30 +1034,30 @@ mod tests {
             "base", "text", "subtext0", "overlay1", "surface2", "mauve", "blue", "green", "red",
             "peach", "yellow", "teal", "sky", "lavender",
         ] {
-            let mut palette = MOCHA;
+            let mut palette = LATTE_DARK;
             assert!(palette.set(name, custom), "{name}");
             assert_eq!(palette.get(name), Some(custom), "{name}");
         }
 
-        let mut palette = MOCHA;
+        let mut palette = LATTE_DARK;
         assert!(!palette.set("unknown", custom));
         assert_eq!(preset_flavor("unknown"), None);
     }
 
     #[test]
     fn semantic_override_by_name_is_scoped_to_one_token() {
-        let mut semantics = Semantics::from_palette(&MOCHA);
-        assert!(semantics.set("syn_keyword", MOCHA.red));
-        assert!(!semantics.set("not_a_token", MOCHA.red));
+        let mut semantics = Semantics::from_palette(&LATTE_DARK);
+        assert!(semantics.set("syn_keyword", LATTE_DARK.red));
+        assert!(!semantics.set("not_a_token", LATTE_DARK.red));
         let theme = semantics.resolve(ColorMode::TrueColor);
-        assert_eq!(theme.syn_keyword, Color::Rgb(0xe0, 0x6c, 0x75));
+        assert_eq!(theme.syn_keyword, Color::Rgb(0xc4, 0x6a, 0x6a));
         // Untouched tokens keep the built-in mapping.
-        assert_eq!(theme.syn_function, Color::Rgb(0x61, 0xaf, 0xef));
+        assert_eq!(theme.syn_function, Color::Rgb(0x9a, 0xa7, 0xb2));
     }
 
     #[test]
     fn file_category_aliases_override_coarse_file_tokens() {
-        let mut semantics = Semantics::from_palette(&MOCHA);
+        let mut semantics = Semantics::from_palette(&LATTE_DARK);
         let custom = raw_from_rgb(1, 2, 3);
 
         for name in ["config", "docs", "media", "binary", "executable", "plain"] {
@@ -1097,10 +1102,15 @@ mod tests {
 
     #[test]
     fn preset_registry_matches_flavors() {
+        assert!(is_preset("latte-dark"));
+        assert!(is_preset("latte-light"));
+        assert_eq!(preset_flavor("latte-dark"), Some(Flavor::Mocha));
+        assert_eq!(preset_flavor("latte-light"), Some(Flavor::Latte));
+        // Keep the old preset identifiers as aliases for existing configs.
         assert!(is_preset("catppuccin-mocha"));
         assert!(is_preset("catppuccin-latte"));
-        assert!(!is_preset("dracula"));
         assert_eq!(preset_flavor("catppuccin-latte"), Some(Flavor::Latte));
+        assert!(!is_preset("dracula"));
     }
 
     #[test]
@@ -1115,15 +1125,18 @@ mod tests {
             Some((0xff, 0x00, 0xaa))
         );
         // Palette reference resolves to the same RawColor.
-        assert_eq!(parse_color_value("$blue", &MOCHA), Some(MOCHA.blue));
+        assert_eq!(
+            parse_color_value("$blue", &LATTE_DARK),
+            Some(LATTE_DARK.blue)
+        );
         // Named color keeps an exact ansi16 while approximating hex.
         assert_eq!(
-            parse_color_value("light-green", &MOCHA).map(|c| c.ansi16),
+            parse_color_value("light-green", &LATTE_DARK).map(|c| c.ansi16),
             Some(Color::LightGreen)
         );
         // Bare integer becomes an ANSI-256 index.
         assert_eq!(
-            parse_color_value("196", &MOCHA).map(|c| c.idx256),
+            parse_color_value("196", &LATTE_DARK).map(|c| c.idx256),
             Some(196)
         );
     }
@@ -1150,49 +1163,49 @@ mod tests {
             ("light-cyan", Color::LightCyan),
         ] {
             assert_eq!(
-                parse_color_value(name, &MOCHA).map(|c| c.ansi16),
+                parse_color_value(name, &LATTE_DARK).map(|c| c.ansi16),
                 Some(ansi16)
             );
         }
 
         assert_eq!(
-            parse_color_value("0", &MOCHA).map(|c| c.hex),
+            parse_color_value("0", &LATTE_DARK).map(|c| c.hex),
             Some((0, 0, 0))
         );
         assert_eq!(
-            parse_color_value("15", &MOCHA).map(|c| c.hex),
+            parse_color_value("15", &LATTE_DARK).map(|c| c.hex),
             Some((0xff, 0xff, 0xff))
         );
         assert_eq!(
-            parse_color_value("16", &MOCHA).map(|c| c.hex),
+            parse_color_value("16", &LATTE_DARK).map(|c| c.hex),
             Some((0, 0, 0))
         );
         assert_eq!(
-            parse_color_value("231", &MOCHA).map(|c| c.hex),
+            parse_color_value("231", &LATTE_DARK).map(|c| c.hex),
             Some((0xff, 0xff, 0xff))
         );
         assert_eq!(
-            parse_color_value("232", &MOCHA).map(|c| c.hex),
+            parse_color_value("232", &LATTE_DARK).map(|c| c.hex),
             Some((8, 8, 8))
         );
         assert_eq!(
-            parse_color_value("255", &MOCHA).map(|c| c.hex),
+            parse_color_value("255", &LATTE_DARK).map(|c| c.hex),
             Some((0xee, 0xee, 0xee))
         );
     }
 
     #[test]
     fn rejects_bad_color_values_and_missing_references() {
-        assert!(parse_color_value("", &MOCHA).is_none());
-        assert!(parse_color_value("#12", &MOCHA).is_none());
-        assert!(parse_color_value("#zzzzzz", &MOCHA).is_none());
-        assert!(parse_color_value("not-a-color", &MOCHA).is_none());
-        assert!(parse_color_value("$nope", &MOCHA).is_none());
+        assert!(parse_color_value("", &LATTE_DARK).is_none());
+        assert!(parse_color_value("#12", &LATTE_DARK).is_none());
+        assert!(parse_color_value("#zzzzzz", &LATTE_DARK).is_none());
+        assert!(parse_color_value("not-a-color", &LATTE_DARK).is_none());
+        assert!(parse_color_value("$nope", &LATTE_DARK).is_none());
     }
 
     #[test]
     fn custom_color_uses_same_degrade_chain() {
-        let custom = parse_color_value("#1e66f5", &LATTE).unwrap();
+        let custom = parse_color_value("#1e66f5", &LATTE_LIGHT).unwrap();
         assert_eq!(
             custom.resolve(ColorMode::TrueColor),
             Color::Rgb(0x1e, 0x66, 0xf5)

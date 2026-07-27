@@ -1105,8 +1105,8 @@ fn resolve_appearance(appearance: Option<&RawAppearance>) -> (crate::theme::Them
 
     let base_dir = config_base_dir();
     let default_preset = match flavor {
-        Flavor::Latte => "catppuccin-latte",
-        Flavor::Mocha => "catppuccin-mocha",
+        Flavor::Latte => "latte-light",
+        Flavor::Mocha => "latte-dark",
     };
 
     let semantics = match variant {
@@ -2484,10 +2484,10 @@ mod tests {
         ]);
         let loaded = load_user_theme();
         assert!(loaded.warning.is_none());
-        // Mocha keyword is the stronger dark IDE mauve.
+        // Latte Dark keyword is a muted editor purple.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
+            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
         );
     }
 
@@ -2507,10 +2507,10 @@ mod tests {
         ]);
         let loaded = load_user_theme();
         assert!(loaded.warning.is_none());
-        // Latte keyword uses the stronger light IDE purple.
+        // Latte Light keyword is a muted editor purple.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0x82, 0x50, 0xdf)
+            ratatui::style::Color::Rgb(0x7a, 0x5c, 0xa7)
         );
     }
 
@@ -2524,7 +2524,7 @@ mod tests {
             &theme_path,
             r##"{
                 "name": "custom",
-                "extends": "catppuccin-mocha",
+                "extends": "latte-dark",
                 "palette": { "blue": "#010203" },
                 "semantic": { "syn_keyword": "$blue", "syn_string": "#0a0b0c" }
             }"##,
@@ -2619,7 +2619,7 @@ mod tests {
         fs::write(
             &theme_path,
             r##"{
-                "extends": "catppuccin-mocha",
+                "extends": "latte-dark",
                 "palette": { "peach": "#010203" },
                 "files": {
                     "categories": {
@@ -2676,7 +2676,7 @@ mod tests {
                 .theme
                 .file_types
                 .color_for_path(Path::new("settings.JSONC")),
-            Some(ratatui::style::Color::Rgb(0x56, 0xb6, 0xc2))
+            Some(ratatui::style::Color::Rgb(0x8a, 0xb4, 0xb8))
         );
     }
 
@@ -2689,7 +2689,7 @@ mod tests {
         fs::write(
             &theme_path,
             r##"{
-                "extends": "catppuccin-mocha",
+                "extends": "latte-dark",
                 "files": {
                     "categories": {
                         "config": "#00ffff",
@@ -2785,7 +2785,7 @@ mod tests {
         );
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
+            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
         );
     }
 
@@ -2820,7 +2820,7 @@ mod tests {
         assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0x82, 0x50, 0xdf)
+            ratatui::style::Color::Rgb(0x7a, 0x5c, 0xa7)
         );
         assert_eq!(
             loaded.theme.syn_string,
@@ -2855,10 +2855,10 @@ mod tests {
             "warning: {:?}",
             loaded.warning
         );
-        // Falls back to the built-in Mocha preset rather than losing all color.
+        // Falls back to the built-in Latte Dark preset rather than losing all color.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
+            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
         );
     }
 
@@ -2871,7 +2871,7 @@ mod tests {
         fs::write(
             &theme_path,
             r##"{
-                "extends": "catppuccin-mocha",
+                "extends": "latte-dark",
                 "semantic": { "syn_keyword": "not-a-color", "syn_string": "#112233" }
             }"##,
         )
@@ -2901,7 +2901,7 @@ mod tests {
         // The bad token keeps the preset default; the valid one applies.
         assert_eq!(
             loaded.theme.syn_keyword,
-            ratatui::style::Color::Rgb(0xc6, 0x78, 0xdd)
+            ratatui::style::Color::Rgb(0xc5, 0x86, 0xc0)
         );
         assert_eq!(
             loaded.theme.syn_string,
