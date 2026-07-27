@@ -3687,14 +3687,16 @@ impl App {
             match self.selected_git_row() {
                 Some(row) if row.is_container() => self.toggle_selected_directory(),
                 Some(row) if row.is_change() => {
-                    self.request_external_open(ExternalOpenTrigger::Activate);
+                    self.load_selected_preview();
                 }
                 _ => {}
             }
         } else {
             match self.selected_entry().map(|entry| entry.is_dir) {
                 Some(true) => self.toggle_selected_directory(),
-                Some(false) => self.request_external_open(ExternalOpenTrigger::Activate),
+                Some(false) => {
+                    self.load_selected_preview();
+                }
                 None => {}
             }
         }
@@ -5287,11 +5289,11 @@ impl App {
     }
 
     pub(crate) fn can_open_content_externally(&self) -> bool {
-        self.content_external_open_target().is_some()
+        self.current_external_open_target().is_some()
     }
 
     pub(crate) fn external_open_confirmation_for_content(&self) -> bool {
-        let Some((target, label)) = self.content_external_open_target() else {
+        let Some((target, label)) = self.current_external_open_target() else {
             return false;
         };
         self.pending_external_open_confirmation
@@ -7173,6 +7175,7 @@ fn append_change_rows(
         let depth = repo_ancestors.len() + display.components().count();
         if let Some(change) = change {
             let entry = FileEntry {
+                category: crate::tree::FileCategory::from_path(&display),
                 relative: display.clone(),
                 is_dir: false,
                 depth: depth.saturating_sub(1),
@@ -7201,6 +7204,7 @@ fn append_change_rows(
                 relative: display.clone(),
             });
             let entry = FileEntry {
+                category: crate::tree::FileCategory::Plain,
                 relative: display.clone(),
                 is_dir: true,
                 depth: depth.saturating_sub(1),

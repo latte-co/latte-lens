@@ -23,6 +23,7 @@ pub const DEFAULT_INITIAL_SCAN_DEPTH: usize = 2;
 pub struct FileEntry {
     pub relative: PathBuf,
     pub is_dir: bool,
+    pub category: FileCategory,
     pub depth: usize,
     pub status: Option<FileStatus>,
     pub contains_changes: bool,
@@ -33,6 +34,100 @@ pub struct FileEntry {
     /// what `ln -s` recorded. `is_dir` still reflects the resolved kind, so a
     /// directory symlink stays expandable while surfacing its link nature here.
     pub symlink_target: Option<PathBuf>,
+}
+
+/// Coarse file classification used only for foreground coloring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileCategory {
+    Config,
+    Doc,
+    Media,
+    Binary,
+    Executable,
+    Plain,
+}
+
+impl FileCategory {
+    pub fn from_path(path: &Path) -> Self {
+        const CONFIG_NAMES: &[&str] = &[
+            "makefile",
+            "dockerfile",
+            "cmakelists.txt",
+            ".gitignore",
+            ".gitattributes",
+            ".editorconfig",
+            ".env",
+        ];
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                CONFIG_NAMES
+                    .iter()
+                    .any(|config| name.eq_ignore_ascii_case(config))
+            })
+        {
+            return Self::Config;
+        }
+
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension)
+                if [
+                    "toml",
+                    "yaml",
+                    "yml",
+                    "json",
+                    "jsonc",
+                    "ini",
+                    "cfg",
+                    "conf",
+                    "config",
+                    "lock",
+                    "properties",
+                    "env",
+                ]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Config
+            }
+            Some(extension)
+                if ["md", "markdown", "rst", "txt", "adoc", "org", "tex", "pdf"]
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Doc
+            }
+            Some(extension)
+                if [
+                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "mp4", "mov", "mp3",
+                    "wav", "flac", "ogg",
+                ]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Media
+            }
+            Some(extension)
+                if [
+                    "exe", "dll", "so", "dylib", "a", "o", "bin", "class", "wasm", "zip", "gz",
+                    "tar", "7z", "rlib",
+                ]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Binary
+            }
+            Some(extension)
+                if ["sh", "bash", "zsh", "fish", "ps1", "bat", "cmd"]
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Executable
+            }
+            _ => Self::Plain,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,6 +432,7 @@ fn make_entry(
     let depth = relative.components().count().saturating_sub(1);
 
     FileEntry {
+        category: FileCategory::from_path(&relative),
         relative,
         is_dir,
         depth,
@@ -358,6 +454,34 @@ mod tests {
             .iter()
             .map(|entry| entry.relative.clone())
             .collect()
+    }
+
+    #[test]
+    fn file_category_is_computed_case_insensitively_once() {
+        assert_eq!(
+            FileCategory::from_path(Path::new("Makefile")),
+            FileCategory::Config
+        );
+        assert_eq!(
+            FileCategory::from_path(Path::new("README.MD")),
+            FileCategory::Doc
+        );
+        assert_eq!(
+            FileCategory::from_path(Path::new("assets/LOGO.PNG")),
+            FileCategory::Media
+        );
+        assert_eq!(
+            FileCategory::from_path(Path::new("target/app.WASM")),
+            FileCategory::Binary
+        );
+        assert_eq!(
+            FileCategory::from_path(Path::new("scripts/run.SH")),
+            FileCategory::Executable
+        );
+        assert_eq!(
+            FileCategory::from_path(Path::new("src/lib.rs")),
+            FileCategory::Plain
+        );
     }
 
     fn fixture_with_files_in_order(names: &[&str]) -> tempfile::TempDir {

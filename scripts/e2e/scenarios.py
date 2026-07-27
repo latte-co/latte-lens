@@ -25,6 +25,7 @@ from .fixtures import (
     create_git_matrix_fixture,
     create_image_preview_fixture,
     create_incompatible_lsp_fixture,
+    create_invalid_theme_config_fixture,
     create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
     create_missing_product_config_fixture,
@@ -32,9 +33,11 @@ from .fixtures import (
     create_repository_relation_fixture,
     create_resilience_lsp_fixture,
     create_search_fixture,
+    create_structure_fixture,
     create_system_open_fixture,
     create_symlink_preview_fixture,
-    create_structure_fixture,
+    create_theme_config_fixture,
+    create_theme_matrix_config_fixture,
     create_timeout_lsp_fixture,
 )
 from .terminal import E2EAssertionError, PtySession, TerminalScreen
@@ -388,20 +391,13 @@ def unified_system_open(context: ScenarioContext) -> None:
     )
     session.key(b"\r")
     session.wait_screen(
-        ("Unknown file type. Press o or click Open anyway to confirm.",),
-        "Enter cannot consume an unknown-file confirmation",
+        (
+            "No preview provider accepted b-unknown.data.",
+            "Register a PreviewProvider to support this file type.",
+        ),
+        "Enter opens an unknown file only in the internal Lens preview",
     )
     assert trace.read_text(encoding="utf-8").splitlines() == [expected_pdf]
-    session.key(b"o")
-    session.wait_screen(
-        ("Opened b-unknown.data with the system default app.",),
-        "second explicit o confirms the same unknown fingerprint",
-    )
-    session.wait_until(
-        lambda _screen: trace.read_text(encoding="utf-8").splitlines()
-        == [expected_pdf, expected_unknown],
-        "stub opener receives the confirmed unknown path exactly once",
-    )
 
     session.key(b"G")
     session.wait_screen(
@@ -410,12 +406,20 @@ def unified_system_open(context: ScenarioContext) -> None:
     )
     _double_click_tree_row(session, "d-passive.docx")
     session.wait_screen(
+        ("Format: DOCX", "Passive OOXML document"),
+        "Tree double-click keeps a passive DOCX in the internal Lens preview",
+    )
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        expected_pdf,
+    ]
+    session.key(b"o")
+    session.wait_screen(
         ("Opened d-passive.docx with the system default app.",),
-        "Tree double-click opens a passive DOCX classified from parsed OOXML content types",
+        "explicit o opens a passive DOCX classified from parsed OOXML content types",
     )
     session.wait_until(
         lambda _screen: trace.read_text(encoding="utf-8").splitlines()
-        == [expected_pdf, expected_unknown, expected_docx],
+        == [expected_pdf, expected_docx],
         "stub opener receives the parsed passive DOCX exactly once",
     )
 
@@ -428,7 +432,6 @@ def unified_system_open(context: ScenarioContext) -> None:
     )
     assert trace.read_text(encoding="utf-8").splitlines() == [
         expected_pdf,
-        expected_unknown,
         expected_docx,
     ]
 
@@ -1629,6 +1632,7 @@ def crashing_lsp(context: ScenarioContext) -> None:
         absent=("LOADING", "Loading content"),
     )
     session.key(b"l")
+    session.wait_screen(("Content",), "crashing-LSP fixture focuses Preview")
     session.key(b"\x04")
     _wait_trace(
         context,
@@ -1657,8 +1661,13 @@ def crashing_lsp(context: ScenarioContext) -> None:
 
 def incompatible_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("role-caller.rs", "caller!"), "UTF-8 LSP fixture Preview loads")
+    session.wait_screen(
+        ("role-caller.rs", "caller!"),
+        "UTF-8 LSP fixture Preview loads",
+        absent=("LOADING", "Loading content"),
+    )
     session.key(b"l")
+    session.wait_screen(("Content",), "UTF-8 LSP fixture focuses Preview")
     session.key(b"\x04")
     _wait_trace(context, ("utf8-initialize-sent",), "server selects an incompatible encoding")
     session.wait_screen(
@@ -1675,8 +1684,13 @@ def incompatible_lsp(context: ScenarioContext) -> None:
 
 def descendant_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("role-caller.rs", "caller!"), "descendant LSP fixture Preview loads")
+    session.wait_screen(
+        ("role-caller.rs", "caller!"),
+        "descendant LSP fixture Preview loads",
+        absent=("LOADING", "Loading content"),
+    )
     session.key(b"l")
+    session.wait_screen(("Content",), "descendant LSP fixture focuses Preview")
     session.key(b"\x04")
     trace = _wait_trace(
         context,
@@ -1695,8 +1709,13 @@ def descendant_lsp(context: ScenarioContext) -> None:
 
 def timeout_lsp(context: ScenarioContext) -> None:
     session = context.session
-    session.wait_screen(("role-caller.rs", "caller!"), "timeout LSP fixture Preview loads")
+    session.wait_screen(
+        ("role-caller.rs", "caller!"),
+        "timeout LSP fixture Preview loads",
+        absent=("LOADING", "Loading content"),
+    )
     session.key(b"l")
+    session.wait_screen(("Content",), "timeout LSP fixture focuses Preview")
     session.key(b"\x04")
     _wait_trace(context, ("timeout-definition-held",), "definition request is held by the server")
     session.wait_screen(
@@ -1951,6 +1970,32 @@ def disabled_product_config(context: ScenarioContext) -> None:
     )
 
 
+def theme_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("LATTE LENS", "themed-config.rs", "caller!"),
+        "partial light external theme starts with a normal Preview",
+        absent=("Configuration:", "theme file", "catppuccin-mocha"),
+    )
+
+
+def invalid_theme_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("invalid-theme.rs", "caller!", "Configuration:", "syn_keyword"),
+        "invalid external theme colors warn without blocking startup",
+    )
+
+
+def theme_matrix_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("LATTE LENS", "theme-matrix.rs", "caller!"),
+        "external theme matrix starts with a normal Preview",
+        absent=("Configuration:", "theme file", "catppuccin-mocha"),
+    )
+
+
 def code_navigation_without_lsp(context: ScenarioContext) -> None:
     session = context.session
     session.wait_raw((b"?1000h",), "no-LSP terminal enables mouse capture")
@@ -2112,6 +2157,24 @@ CASES = (
         "code-navigation",
         create_disabled_product_config_fixture,
         disabled_product_config,
+    ),
+    ScenarioCase(
+        "theme-product-config",
+        "code-navigation",
+        create_theme_config_fixture,
+        theme_config,
+    ),
+    ScenarioCase(
+        "invalid-theme-product-config",
+        "code-navigation",
+        create_invalid_theme_config_fixture,
+        invalid_theme_config,
+    ),
+    ScenarioCase(
+        "theme-matrix-product-config",
+        "code-navigation",
+        create_theme_matrix_config_fixture,
+        theme_matrix_config,
     ),
 )
 

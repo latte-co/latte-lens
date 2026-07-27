@@ -536,7 +536,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
 }
 
 #[test]
-fn enter_toggles_directories_and_requests_system_open_for_files() {
+fn enter_toggles_directories_and_previews_files_in_lens() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -592,15 +592,13 @@ fn enter_toggles_directories_and_requests_system_open_for_files() {
         app.selected_relative_path(),
         Some(PathBuf::from("src/file.txt"))
     );
-    let status = app.external_open_status_message();
-    assert!(
-        status.is_some_and(|message| message.contains("unavailable")),
-        "unexpected external-open status: {status:?}"
-    );
+    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_lines, ["fixture"]);
+    assert!(!app.is_external_open_loading());
 }
 
 #[test]
-fn mouse_single_click_toggles_directories_and_double_click_opens_files() {
+fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_lens() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -653,12 +651,9 @@ fn mouse_single_click_toggles_directories_and_double_click_opens_files() {
         Some(PathBuf::from("src/file.txt"))
     );
     assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content_lines, ["fixture"]);
     assert_eq!(visible_paths(&app), rows_before_file_click);
-    let status = app.external_open_status_message();
-    assert!(
-        status.is_some_and(|message| message.contains("unavailable")),
-        "unexpected external-open status: {status:?}"
-    );
+    assert!(!app.is_external_open_loading());
 }
 
 #[test]
@@ -1060,7 +1055,7 @@ fn non_git_workspace_lists_clean_and_dirty_descendant_repositories() {
             .find(|cell| cell.symbol() == "•");
         if should_be_dirty {
             let marker = marker.expect("dirty repository marker");
-            assert_eq!(marker.fg, Color::Rgb(196, 151, 126));
+            assert_eq!(marker.fg, Color::Rgb(208, 154, 105));
         } else {
             assert!(marker.is_none(), "clean repository must stay quiet");
         }
@@ -2169,7 +2164,7 @@ fn pdf_uses_the_same_o_and_clickable_open_action_without_image_fallback() {
 }
 
 #[test]
-fn unknown_file_requires_o_confirmation_while_enter_cannot_confirm() {
+fn unknown_file_requires_o_confirmation_while_enter_previews_internally() {
     let fixture = TestRepo::new();
     fixture.write("payload.data", b"\x00\x01\x02\x03");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
@@ -2182,13 +2177,24 @@ fn unknown_file_requires_o_confirmation_while_enter_cannot_confirm() {
     );
 
     app.handle_key(key(KeyCode::Enter));
-    assert!(
-        app.external_open_status_message()
-            .is_some_and(|message| message.contains("Press o"))
-    );
+    settle(&mut app);
+    assert_eq!(app.content_mode, ContentMode::Preview);
     assert!(!app.is_external_open_loading());
 
     app.handle_key(key(KeyCode::Char('o')));
+    settle(&mut app);
+    assert!(
+        app.external_open_status_message()
+            .is_some_and(|message| message.contains("press o again"))
+    );
+    let backend = TestBackend::new(100, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("[Open anyway]"));
+
+    let open = app.ui_regions.external_open_button;
+    app.handle_mouse(mouse_down(open.x, open.y));
     settle(&mut app);
     assert!(
         app.external_open_status_message()
@@ -2647,7 +2653,7 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
         .cell((app.ui_regions.tree_body.x, app.ui_regions.tree_body.y))
         .unwrap();
     assert_eq!(tree_heading.symbol(), "●");
-    assert_eq!(tree_heading.fg, Color::Rgb(200, 184, 224));
+    assert_eq!(tree_heading.fg, Color::Rgb(127, 183, 215));
     assert!(!tree_heading.modifier.contains(Modifier::REVERSED));
     assert!(!tree_heading.modifier.contains(Modifier::UNDERLINED));
     assert_eq!(tree_heading.bg, Color::Reset);
@@ -2676,7 +2682,7 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
         ))
         .unwrap();
     assert_eq!(content_heading.symbol(), "●");
-    assert_eq!(content_heading.fg, Color::Rgb(200, 184, 224));
+    assert_eq!(content_heading.fg, Color::Rgb(182, 166, 232));
     assert!(!content_heading.modifier.contains(Modifier::REVERSED));
     assert!(!content_heading.modifier.contains(Modifier::UNDERLINED));
     let unfocused_tree_heading = terminal
@@ -2828,7 +2834,7 @@ fn all_files_uses_a_small_aligned_change_gutter() {
         .unwrap();
     assert_eq!(directory_hint.symbol(), "•");
     assert_eq!(UnicodeWidthStr::width(directory_hint.symbol()), 1);
-    assert_eq!(directory_hint.fg, Color::Rgb(196, 151, 126));
+    assert_eq!(directory_hint.fg, Color::Rgb(208, 154, 105));
     assert!(!directory_hint.modifier.contains(Modifier::BOLD));
     assert_eq!(directory_hint.bg, Color::Reset);
 
@@ -2839,7 +2845,7 @@ fn all_files_uses_a_small_aligned_change_gutter() {
         .unwrap();
     assert_eq!(file_hint.symbol(), "ᴍ");
     assert_eq!(UnicodeWidthStr::width(file_hint.symbol()), 1);
-    assert_eq!(file_hint.fg, Color::Rgb(196, 151, 126));
+    assert_eq!(file_hint.fg, Color::Rgb(208, 154, 105));
     assert!(!file_hint.modifier.contains(Modifier::BOLD));
     assert_eq!(file_hint.bg, Color::Reset);
 
@@ -2925,7 +2931,7 @@ fn git_repository_change_count_stays_fixed_right_when_details_are_truncated() {
     for column in count_x..=count_x + 1 {
         assert_eq!(
             buffer.cell((column, row_y)).unwrap().fg,
-            Color::Rgb(196, 151, 126)
+            Color::Rgb(208, 154, 105)
         );
     }
     let rendered_row = (app.ui_regions.tree_inner.x..app.ui_regions.tree_inner.right())
@@ -3234,7 +3240,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
         .cell((column, deleted_row))
         .unwrap();
     assert_eq!(deleted_number.symbol(), "1");
-    assert_eq!(deleted_number.fg, Color::LightRed);
+    assert_eq!(deleted_number.fg, Color::Rgb(215, 109, 119));
     assert!(deleted_number.modifier.contains(Modifier::BOLD));
     let added_number = terminal
         .backend()
@@ -3242,7 +3248,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
         .cell((column + 2, added_row))
         .unwrap();
     assert_eq!(added_number.symbol(), "1");
-    assert_eq!(added_number.fg, Color::LightGreen);
+    assert_eq!(added_number.fg, Color::Rgb(134, 184, 111));
     assert!(added_number.modifier.contains(Modifier::BOLD));
     let added_marker = terminal
         .backend()
@@ -3250,7 +3256,7 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
         .cell((column + 6, added_row))
         .unwrap();
     assert_eq!(added_marker.symbol(), "+");
-    assert_eq!(added_marker.fg, Color::LightGreen);
+    assert_eq!(added_marker.fg, Color::Rgb(134, 184, 111));
     assert!(added_marker.modifier.contains(Modifier::BOLD));
 
     app.handle_mouse(mouse_down(column + 7, added_row));

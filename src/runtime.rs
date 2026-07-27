@@ -1239,7 +1239,7 @@ mod tests {
 
         let parent = tempfile::tempdir().unwrap();
         init_test_repo(parent.path());
-        let output = Command::new("git")
+        let output = test_git_command(parent.path())
             .args([
                 "-c",
                 "protocol.file.allow=always",
@@ -1249,7 +1249,6 @@ mod tests {
             ])
             .arg(source.path())
             .arg("child")
-            .current_dir(parent.path())
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -1280,6 +1279,15 @@ mod tests {
         assert_eq!(snapshot.projected_change_count, 1);
     }
 
+    fn git_binary() -> &'static str {
+        for candidate in ["/usr/bin/git", "/opt/homebrew/bin/git"] {
+            if Path::new(candidate).exists() {
+                return candidate;
+            }
+        }
+        "git"
+    }
+
     fn init_test_repo(root: &Path) {
         test_git(root, &["-c", "init.defaultBranch=main", "init", "--quiet"]);
         test_git(root, &["config", "user.name", "Latte Lens Tests"]);
@@ -1289,12 +1297,20 @@ mod tests {
         );
     }
 
+    fn test_git_command(root: &Path) -> Command {
+        let mut command = Command::new(git_binary());
+        command
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_SYSTEM")
+            .env_remove("GIT_TEMPLATE_DIR")
+            .current_dir(root);
+        command
+    }
+
     fn test_git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
+        let output = test_git_command(root).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {} failed: {}",

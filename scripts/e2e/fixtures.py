@@ -157,19 +157,11 @@ def create_image_preview_fixture(root: Path, environment: dict[str, str]) -> Non
     run("git", "add", "sample.png", cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "image fixture", cwd=root, environment=environment)
 
-    # Never hand an E2E fixture to a real desktop application. macOS reaches
-    # the prompt through this deterministic failing opener; headless Linux
-    # reaches it before xdg-open because both display variables are absent.
+    # Never hand an E2E fixture to a real desktop application. Keep the opener
+    # commands absent so every platform reaches the unavailable-viewer prompt
+    # deterministically instead of racing a short-lived stub process.
     viewer_bin = root.parent / "viewer-bin"
     viewer_bin.mkdir(mode=0o700)
-    environment["LATTELENS_E2E_VIEWER_MARKER"] = str(root.parent / "viewer-invoked")
-    for name in ("open", "xdg-open"):
-        opener = viewer_bin / name
-        opener.write_text(
-            '#!/bin/sh\n: > "$LATTELENS_E2E_VIEWER_MARKER"\nexit 23\n',
-            encoding="utf-8",
-        )
-        opener.chmod(0o700)
     git = shutil.which("git", path=environment["PATH"])
     if git is None:
         raise RuntimeError("git is required for the image preview fixture")
@@ -606,6 +598,234 @@ def create_disabled_product_config_fixture(root: Path, environment: dict[str, st
         encoding="utf-8",
     )
     environment["LATTELENS_CONFIG"] = str(config)
+
+
+def create_theme_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "themed-config.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "theme config fixture", cwd=root, environment=environment)
+
+    config = (root.parent / "themed-latte-lens.jsonc").resolve()
+    theme = (root.parent / "partial-light.jsonc").resolve()
+    theme.write_text(
+        """{
+  "name": "partial-light",
+  "palette": { "blue": "#112233" },
+  "semantic": { "syn_string": "$blue" },
+}
+""",
+        encoding="utf-8",
+    )
+    config.write_text(
+        """{
+  "appearance": {
+    "prefer": "light",
+    "light": "partial-light.jsonc",
+  },
+}
+""",
+        encoding="utf-8",
+    )
+    environment["LATTELENS_CONFIG"] = str(config)
+    environment["COLORTERM"] = "truecolor"
+    environment.pop("NO_COLOR", None)
+    environment.pop("LATTE_LENS_THEME", None)
+    environment.pop("COLORFGBG", None)
+
+
+def create_invalid_theme_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "invalid-theme.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "invalid theme fixture", cwd=root, environment=environment)
+
+    config = (root.parent / "invalid-theme-latte-lens.jsonc").resolve()
+    theme = (root.parent / "invalid-theme.jsonc").resolve()
+    theme.write_text(
+        """{
+  "extends": "latte-dark",
+  "semantic": {
+    "syn_keyword": "#aé",
+    "syn_string": "#112233",
+  },
+  "files": {
+    "categories": {
+      "config": "#00ffff",
+      "unknown": "#112233",
+      "media": "not-a-color",
+    },
+    "extensions": {
+      "rs": "#ff8800",
+      "bad/slash": "#112233",
+      "json": "not-a-color",
+    },
+  },
+}
+""",
+        encoding="utf-8",
+    )
+    config.write_text(
+        """{
+  "appearance": {
+    "prefer": "dark",
+    "dark": "invalid-theme.jsonc",
+  },
+}
+""",
+        encoding="utf-8",
+    )
+    environment["LATTELENS_CONFIG"] = str(config)
+    environment["COLORTERM"] = "truecolor"
+    environment.pop("NO_COLOR", None)
+    environment.pop("LATTE_LENS_THEME", None)
+    environment.pop("COLORFGBG", None)
+
+
+def create_theme_matrix_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "theme-matrix.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "theme matrix fixture", cwd=root, environment=environment)
+
+    tokens = (
+        "tree_accent",
+        "content_accent",
+        "git_accent",
+        "text_primary",
+        "text_muted",
+        "text_subtle",
+        "divider",
+        "dir",
+        "file",
+        "file_config",
+        "file_doc",
+        "file_media",
+        "file_binary",
+        "file_exec",
+        "symlink",
+        "missing",
+        "tree_change_hint",
+        "status_add",
+        "status_del",
+        "status_mod",
+        "status_renamed",
+        "reviewed",
+        "changed_after_review",
+        "unreviewed",
+        "diff_add",
+        "diff_del",
+        "diff_hunk",
+        "diff_file_header",
+        "diff_context",
+        "diff_meta",
+        "syn_comment",
+        "syn_string",
+        "syn_keyword",
+        "syn_function",
+        "syn_type",
+        "syn_number",
+        "syn_constant",
+        "syn_attribute",
+        "search_match",
+        "nav_target",
+        "success",
+    )
+    palette = {
+        "base": "#040404",
+        "text": "#ffffff",
+        "subtext0": "0",
+        "overlay1": "1",
+        "surface2": "2",
+        "mauve": "3",
+        "blue": "4",
+        "green": "5",
+        "red": "6",
+        "peach": "7",
+        "yellow": "8",
+        "teal": "9",
+        "sky": "10",
+        "lavender": "11",
+    }
+    semantic_values = [
+        "$blue",
+        "$green",
+        "$red",
+        "$yellow",
+        "$teal",
+        "$sky",
+        "$lavender",
+        "12",
+        "13",
+        "14",
+        "15",
+        "240",
+        "white",
+        "grey",
+        "dark-grey",
+        "light red",
+        "bright_blue",
+    ]
+    semantic = {
+        token: semantic_values[index % len(semantic_values)]
+        for index, token in enumerate(tokens)
+    }
+
+    base_theme = (root.parent / "theme-matrix-base.jsonc").resolve()
+    child_theme = (root.parent / "theme-matrix-child.jsonc").resolve()
+    base_theme.write_text(
+        json.dumps(
+            {
+                "name": "theme-matrix-base",
+                "extends": "preset:catppuccin-latte",
+                "palette": palette,
+                "semantic": semantic,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    child_theme.write_text(
+        json.dumps(
+            {
+                "name": "theme-matrix-child",
+                "extends": "theme-matrix-base.jsonc",
+                "palette": {
+                    "blue": "light-green",
+                    "green": "#123",
+                    "red": "#abcdef",
+                    "yellow": "231",
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = (root.parent / "theme-matrix-latte-lens.jsonc").resolve()
+    config.write_text(
+        json.dumps(
+            {
+                "appearance": {
+                    "prefer": "dark",
+                    "dark": "file:theme-matrix-child.jsonc",
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    environment["LATTELENS_CONFIG"] = str(config)
+    environment["TERM"] = "xterm-256color"
+    environment.pop("COLORTERM", None)
+    environment.pop("NO_COLOR", None)
+    environment.pop("LATTE_LENS_THEME", None)
+    environment.pop("COLORFGBG", None)
 
 
 def create_code_navigation_without_lsp_fixture(

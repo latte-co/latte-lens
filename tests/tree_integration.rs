@@ -242,6 +242,7 @@ fn scan_reports_a_missing_root() {
 #[test]
 fn file_entry_name_uses_the_final_path_component() {
     let entry = FileEntry {
+        category: latte_lens::tree::FileCategory::from_path(Path::new("src/latte.rs")),
         relative: "src/latte.rs".into(),
         is_dir: false,
         depth: 1,

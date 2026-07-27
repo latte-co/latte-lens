@@ -450,16 +450,8 @@ impl NavigationSettings {
     /// An explicit path that is missing or invalid disables navigation and
     /// returns a warning; it never prevents the viewer from starting.
     pub fn load_user_config(workspace_root: &Path) -> LoadedNavigationSettings {
-        match load_user_config(workspace_root) {
-            Ok(settings) => LoadedNavigationSettings {
-                settings,
-                warning: None,
-            },
-            Err(error) => LoadedNavigationSettings {
-                settings: Self::disabled(),
-                warning: Some(clean_warning(&format!("{error:#}"))),
-            },
-        }
+        let raw = read_user_config_file();
+        load_navigation_from_config_result(workspace_root, &raw)
     }
 
     /// Revalidate already-resolved settings after the App root is canonical.
@@ -489,6 +481,84 @@ pub struct AppOptions {
 pub struct LoadedNavigationSettings {
     pub settings: NavigationSettings,
     pub warning: Option<String>,
+}
+
+/// Complete user-level startup configuration, loaded from disk once during
+/// construction. Theme and navigation still fail independently: a broken theme
+/// falls back to color defaults, while a broken navigation block disables only
+/// code navigation.
+#[derive(Clone, Debug)]
+pub struct LoadedUserConfiguration {
+    pub navigation: LoadedNavigationSettings,
+    pub theme: LoadedTheme,
+}
+
+pub fn load_user_configuration(workspace_root: &Path) -> LoadedUserConfiguration {
+    let raw = match read_user_config_file() {
+        Ok(raw) => raw,
+        Err(error) => {
+            let theme = theme_from_result(resolve_appearance(None));
+            return LoadedUserConfiguration {
+                navigation: LoadedNavigationSettings {
+                    settings: NavigationSettings::disabled(),
+                    warning: Some(clean_warning(&format!("{error:#}"))),
+                },
+                theme,
+            };
+        }
+    };
+    LoadedUserConfiguration {
+        navigation: load_navigation_from_raw(workspace_root, raw.as_ref()),
+        theme: theme_from_result(resolve_appearance(
+            raw.as_ref().and_then(|config| config.appearance.as_ref()),
+        )),
+    }
+}
+
+/// Resolve the terminal [`crate::theme::Theme`] from the user configuration's
+/// `appearance` block, reading the environment and config file exactly once.
+///
+/// This is intentionally independent of [`NavigationSettings::load_user_config`]:
+/// a navigation failure must not lose the theme and a theme failure must not
+/// disable navigation. Any error degrades to a detected built-in theme with a
+/// startup warning; it never blocks the TUI. Call this during construction only.
+pub fn load_user_theme() -> LoadedTheme {
+    match read_user_config_file() {
+        Ok(raw) => theme_from_result(resolve_appearance(
+            raw.as_ref().and_then(|config| config.appearance.as_ref()),
+        )),
+        Err(error) => {
+            let mut theme = theme_from_result(resolve_appearance(None));
+            theme.warning = Some(clean_warning(&format!("{error:#}")));
+            theme
+        }
+    }
+}
+
+/// A resolved theme plus any non-fatal warning gathered while loading it.
+#[derive(Clone, Debug)]
+pub struct LoadedTheme {
+    pub theme: crate::theme::Theme,
+    pub warning: Option<String>,
+}
+
+fn read_user_config_file() -> Result<Option<RawConfig>> {
+    let (path, explicit) = user_config_path()?;
+    if !path.exists() {
+        if explicit {
+            bail!(
+                "explicit Latte Lens config does not exist: {}",
+                path.display()
+            );
+        }
+        return Ok(None);
+    }
+    let normalized = read_jsonc_file(&path, MAX_CONFIG_BYTES, "Latte Lens config")?;
+    parse_normalized_config(&normalized).map(Some)
+}
+
+fn theme_from_result((theme, warning): (crate::theme::Theme, Option<String>)) -> LoadedTheme {
+    LoadedTheme { theme, warning }
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +613,21 @@ pub(crate) enum ExecutableIdentity {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     code_navigation: Option<RawCodeNavigation>,
+    /// Theme selection. Unknown fields inside `appearance` are ignored so a
+    /// future theme key never blocks startup; `code_navigation` deliberately
+    /// keeps its strict schema.
+    appearance: Option<RawAppearance>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawAppearance {
+    /// `auto` (default), `dark`, or `light`.
+    prefer: Option<String>,
+    /// Preset name or external theme file path used for the dark variant.
+    dark: Option<String>,
+    /// Preset name or external theme file path used for the light variant.
+    light: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -582,47 +667,106 @@ enum RawNavigationEngineKind {
     LanguageServer,
 }
 
-fn load_user_config(workspace_root: &Path) -> Result<NavigationSettings> {
+// ---------------------------------------------------------------------------
+// Appearance / theme configuration
+// ---------------------------------------------------------------------------
+
+/// External theme file schema. Unknown top-level keys are ignored so future
+/// fields never fail the whole theme.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawThemeFile {
+    name: Option<String>,
+    author: Option<String>,
+    /// A built-in preset name to inherit from before applying this file's
+    /// overrides. External file chains are followed up to [`MAX_EXTENDS_DEPTH`].
+    extends: Option<String>,
+    /// Named palette color overrides (`{ "blue": "#..." }`).
+    palette: Option<BTreeMap<String, String>>,
+    /// Semantic token overrides (`{ "syn_keyword": "$mauve" }`).
+    semantic: Option<BTreeMap<String, String>>,
+    /// File color overrides by coarse category and exact extension.
+    files: Option<RawThemeFiles>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawThemeFiles {
+    categories: Option<BTreeMap<String, String>>,
+    extensions: Option<BTreeMap<String, String>>,
+}
+
+/// Bound on `extends` chains between external files, plus cycle protection.
+const MAX_EXTENDS_DEPTH: usize = 4;
+/// External theme files share the config size ceiling.
+const MAX_THEME_BYTES: u64 = MAX_CONFIG_BYTES;
+
+/// How a `dark`/`light` appearance value was interpreted.
+enum ThemeSource {
+    /// A built-in preset registered under this name.
+    Preset(String),
+    /// An external theme file at this resolved absolute path.
+    File(PathBuf),
+}
+
+/// Warnings accumulated while resolving appearance, surfaced in the startup
+/// diagnostic without ever blocking the TUI.
+#[derive(Default)]
+struct ThemeDiagnostics {
+    warnings: Vec<String>,
+}
+
+impl ThemeDiagnostics {
+    fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
+    }
+
+    fn into_warning(self) -> Option<String> {
+        if self.warnings.is_empty() {
+            None
+        } else {
+            Some(clean_warning(&self.warnings.join(" · ")))
+        }
+    }
+}
+
+fn load_navigation_from_config_result(
+    workspace_root: &Path,
+    raw: &Result<Option<RawConfig>>,
+) -> LoadedNavigationSettings {
+    match raw {
+        Ok(raw) => load_navigation_from_raw(workspace_root, raw.as_ref()),
+        Err(error) => LoadedNavigationSettings {
+            settings: NavigationSettings::disabled(),
+            warning: Some(clean_warning(&format!("{error:#}"))),
+        },
+    }
+}
+
+fn load_navigation_from_raw(
+    workspace_root: &Path,
+    raw: Option<&RawConfig>,
+) -> LoadedNavigationSettings {
+    match navigation_settings_from_raw(workspace_root, raw) {
+        Ok(settings) => LoadedNavigationSettings {
+            settings,
+            warning: None,
+        },
+        Err(error) => LoadedNavigationSettings {
+            settings: NavigationSettings::disabled(),
+            warning: Some(clean_warning(&format!("{error:#}"))),
+        },
+    }
+}
+
+fn navigation_settings_from_raw(
+    workspace_root: &Path,
+    raw: Option<&RawConfig>,
+) -> Result<NavigationSettings> {
     let workspace_root = workspace_root
         .canonicalize()
         .with_context(|| format!("cannot resolve workspace {}", workspace_root.display()))?;
-    let (path, explicit) = user_config_path()?;
-    let raw = if !path.exists() {
-        if explicit {
-            bail!(
-                "explicit Latte Lens config does not exist: {}",
-                path.display()
-            );
-        }
-        None
-    } else {
-        ensure_absolute_no_links(&path)?;
-        let mut file = match open_regular(None, &path)? {
-            OpenRegular::Opened(file) => file,
-            OpenRegular::Declined(inspected) => {
-                bail!(
-                    "Latte Lens config is a {}, not a regular file",
-                    inspected.kind.label()
-                )
-            }
-        };
-        let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES as usize + 1);
-        file.by_ref()
-            .take(MAX_CONFIG_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("cannot read Latte Lens config")?;
-        if bytes.len() as u64 > MAX_CONFIG_BYTES {
-            bail!("Latte Lens config exceeds 64 KiB");
-        }
-        if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-            bail!("Latte Lens config must not contain a UTF-8 BOM");
-        }
-        Some(parse_raw_config(&bytes)?)
-    };
-
-    let raw_navigation = raw
-        .as_ref()
-        .and_then(|config| config.code_navigation.as_ref());
+    let raw_navigation = raw.and_then(|config| config.code_navigation.as_ref());
     if raw_navigation.and_then(|navigation| navigation.enabled) == Some(false) {
         return Ok(NavigationSettings::disabled());
     }
@@ -699,16 +843,46 @@ fn trusted_server_from_command(
     })
 }
 
-fn parse_raw_config(bytes: &[u8]) -> Result<RawConfig> {
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        bail!("Latte Lens config exceeds 64 KiB");
+fn parse_normalized_config(normalized: &[u8]) -> Result<RawConfig> {
+    serde_json::from_slice(normalized).context("invalid Latte Lens config")
+}
+
+/// Read a JSONC file through the exact same safety pipeline the main config
+/// uses, returning comment-stripped bytes ready for `serde_json`.
+///
+/// The pipeline is: absolute + no-symlink path → regular-file open → bounded
+/// read → size / BOM / strict-UTF-8 checks → JSONC normalization. `label`
+/// personalizes the diagnostics so both the product config and external theme
+/// files produce clear, self-describing warnings. Every failure is an `Err`;
+/// callers decide whether that means disabling navigation or falling back to a
+/// built-in theme. This function never reads during rendering.
+fn read_jsonc_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    if !path.exists() {
+        bail!("{label} does not exist: {}", path.display());
+    }
+    ensure_absolute_no_links(path)?;
+    let mut file = match open_regular(None, path)? {
+        OpenRegular::Opened(file) => file,
+        OpenRegular::Declined(inspected) => {
+            bail!(
+                "{label} is a {}, not a regular file",
+                inspected.kind.label()
+            )
+        }
+    };
+    let mut bytes = Vec::with_capacity(max_bytes as usize + 1);
+    file.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {label}"))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("{label} exceeds 64 KiB");
     }
     if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        bail!("Latte Lens config must not contain a UTF-8 BOM");
+        bail!("{label} must not contain a UTF-8 BOM");
     }
-    std::str::from_utf8(bytes).context("Latte Lens config is not strict UTF-8")?;
-    let normalized = normalize_jsonc(bytes)?;
-    serde_json::from_slice(&normalized).context("invalid Latte Lens config")
+    std::str::from_utf8(&bytes).with_context(|| format!("{label} is not strict UTF-8"))?;
+    normalize_jsonc(&bytes)
 }
 
 fn user_config_path() -> Result<(PathBuf, bool)> {
@@ -724,6 +898,253 @@ fn user_config_path() -> Result<(PathBuf, bool)> {
     #[cfg(windows)]
     let home = absolute_env_path("USERPROFILE")?;
     Ok((home.join(".latte/latte-lens.jsonc"), false))
+}
+
+/// Directory that relative theme paths resolve against: the folder holding the
+/// active config file (default `~/.latte/`).
+fn config_base_dir() -> Option<PathBuf> {
+    let (path, _) = user_config_path().ok()?;
+    path.parent().map(Path::to_path_buf)
+}
+
+/// Decide whether `value` names a built-in preset or points at a theme file.
+///
+/// Rules: an explicit `preset:` / `file:` prefix wins; a bare name matching the
+/// preset registry is a preset; anything containing a path separator or ending
+/// in `.json`/`.jsonc` is a file; otherwise it is treated as a (possibly
+/// unknown) preset name so the caller can warn and fall back.
+fn classify_theme_value(value: &str, base_dir: Option<&Path>) -> Result<ThemeSource> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix("preset:") {
+        return Ok(ThemeSource::Preset(rest.trim().to_owned()));
+    }
+    if let Some(rest) = value.strip_prefix("file:") {
+        return Ok(ThemeSource::File(resolve_theme_path(
+            rest.trim(),
+            base_dir,
+        )?));
+    }
+    if crate::theme::is_preset(value) {
+        return Ok(ThemeSource::Preset(value.to_owned()));
+    }
+    let looks_like_path = value.contains('/')
+        || value.contains('\\')
+        || value.ends_with(".json")
+        || value.ends_with(".jsonc");
+    if looks_like_path {
+        Ok(ThemeSource::File(resolve_theme_path(value, base_dir)?))
+    } else {
+        // Unknown bare name: defer to preset lookup, which will miss and warn.
+        Ok(ThemeSource::Preset(value.to_owned()))
+    }
+}
+
+/// Resolve a theme path: `~/` expands to HOME, relative paths join the config
+/// base directory, absolute paths are used directly. The result is not yet
+/// symlink-checked; the reader does that.
+fn resolve_theme_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(rest) = value.strip_prefix("~/") {
+        #[cfg(not(windows))]
+        let home = absolute_env_path("HOME")?;
+        #[cfg(windows)]
+        let home = absolute_env_path("USERPROFILE")?;
+        return Ok(home.join(rest));
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    match base_dir {
+        Some(base) => Ok(base.join(path)),
+        None => bail!("cannot resolve relative theme path without a config directory"),
+    }
+}
+
+/// Load a semantics table for one theme source, applying `extends` and this
+/// file's palette/semantic overrides. `depth` guards against overly long or
+/// cyclic `extends` chains; `visited` blocks direct cycles.
+fn load_theme_source(
+    source: &ThemeSource,
+    default_preset: &str,
+    depth: usize,
+    visited: &mut Vec<PathBuf>,
+    diagnostics: &mut ThemeDiagnostics,
+) -> Result<(crate::theme::Palette, crate::theme::Semantics)> {
+    match source {
+        ThemeSource::Preset(name) => {
+            let palette = crate::theme::preset(name)
+                .ok_or_else(|| anyhow!("unknown built-in theme preset: {name}"))?;
+            Ok((palette, crate::theme::Semantics::from_palette(&palette)))
+        }
+        ThemeSource::File(path) => {
+            if depth >= MAX_EXTENDS_DEPTH {
+                bail!("theme extends chain exceeds depth {MAX_EXTENDS_DEPTH}");
+            }
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if visited.contains(&canonical) {
+                bail!("theme extends chain contains a cycle at {}", path.display());
+            }
+            visited.push(canonical);
+
+            let normalized = read_jsonc_file(path, MAX_THEME_BYTES, "theme file")?;
+            let file: RawThemeFile =
+                serde_json::from_slice(&normalized).context("invalid theme file")?;
+
+            // Establish the base: an `extends` target (preset, or another file
+            // relative to this file's directory) or the active variant default.
+            let (base_palette, base_semantics) = if let Some(extends) = file.extends.as_deref() {
+                let base_dir = path.parent();
+                let base_source = classify_theme_value(extends, base_dir)?;
+                load_theme_source(
+                    &base_source,
+                    default_preset,
+                    depth + 1,
+                    visited,
+                    diagnostics,
+                )?
+            } else {
+                let palette = crate::theme::preset(default_preset).unwrap_or(crate::theme::MOCHA);
+                (palette, crate::theme::Semantics::from_palette(&palette))
+            };
+
+            let mut palette = base_palette;
+            // Palette overrides first, so `$name` semantic references and the
+            // palette-derived semantic defaults below both see the new colors.
+            if let Some(entries) = file.palette.as_ref() {
+                for (name, value) in entries {
+                    match crate::theme::parse_color_value(value, &palette) {
+                        Some(color) if palette.set(name, color) => {}
+                        Some(_) => diagnostics.warn(format!("unknown palette color '{name}'")),
+                        None => {
+                            diagnostics.warn(format!("invalid palette color '{name}' = '{value}'"))
+                        }
+                    }
+                }
+            }
+
+            // Re-derive semantics from the merged palette so a palette override
+            // (e.g. `blue`) propagates to every token that keys off it (`dir`,
+            // `tree_accent`, ...). Then carry over any semantic customizations
+            // the base already applied (tokens diverging from a clean mapping of
+            // the base palette), and finally this file's own overrides.
+            let mut semantics = crate::theme::Semantics::from_palette(&palette);
+            semantics.carry_customizations(
+                &base_semantics,
+                &crate::theme::Semantics::from_palette(&base_palette),
+            );
+            if let Some(entries) = file.semantic.as_ref() {
+                for (name, value) in entries {
+                    match crate::theme::parse_color_value(value, &palette) {
+                        Some(color) if semantics.set(name, color) => {}
+                        Some(_) => diagnostics.warn(format!("unknown semantic token '{name}'")),
+                        None => {
+                            diagnostics.warn(format!("invalid semantic color '{name}' = '{value}'"))
+                        }
+                    }
+                }
+            }
+            if let Some(files) = file.files.as_ref() {
+                if let Some(entries) = files.categories.as_ref() {
+                    for (name, value) in entries {
+                        match crate::theme::parse_color_value(value, &palette) {
+                            Some(color) if semantics.set_file_category(name, color) => {}
+                            Some(_) => diagnostics.warn(format!("unknown file category '{name}'")),
+                            None => diagnostics
+                                .warn(format!("invalid file category color '{name}' = '{value}'")),
+                        }
+                    }
+                }
+                if let Some(entries) = files.extensions.as_ref() {
+                    for (extension, value) in entries {
+                        match crate::theme::parse_color_value(value, &palette) {
+                            Some(color) if semantics.file_types.set_extension(extension, color) => {
+                            }
+                            Some(_) => diagnostics
+                                .warn(format!("invalid file extension override '{extension}'")),
+                            None => diagnostics.warn(format!(
+                                "invalid file extension color '{extension}' = '{value}'"
+                            )),
+                        }
+                    }
+                }
+            }
+            Ok((palette, semantics))
+        }
+    }
+}
+
+/// Resolve the effective [`crate::theme::Theme`] from an optional appearance
+/// block. Any file- or token-level failure warns and falls back: a broken theme
+/// file reverts to the matching built-in preset, and the whole thing degrades to
+/// the detected built-in flavor if nothing resolves. Never panics or blocks.
+fn resolve_appearance(appearance: Option<&RawAppearance>) -> (crate::theme::Theme, Option<String>) {
+    use crate::theme::{self, Flavor};
+
+    let mut diagnostics = ThemeDiagnostics::default();
+    let (detected_mode, detected_flavor) = theme::detect();
+
+    // Determine the effective flavor: config `prefer` overrides detection.
+    let flavor = match appearance.and_then(|value| value.prefer.as_deref()) {
+        Some(prefer) => match prefer.trim().to_ascii_lowercase().as_str() {
+            "light" => Flavor::Latte,
+            "dark" => Flavor::Mocha,
+            "auto" => detected_flavor,
+            other => {
+                diagnostics.warn(format!("unknown appearance.prefer '{other}', using auto"));
+                detected_flavor
+            }
+        },
+        None => detected_flavor,
+    };
+
+    // Pick which variant string applies for the chosen flavor.
+    let variant = appearance.and_then(|value| match flavor {
+        Flavor::Latte => value.light.as_deref(),
+        Flavor::Mocha => value.dark.as_deref(),
+    });
+
+    let base_dir = config_base_dir();
+    let default_preset = match flavor {
+        Flavor::Latte => "latte-light",
+        Flavor::Mocha => "latte-dark",
+    };
+
+    let semantics = match variant {
+        Some(value) if !value.trim().is_empty() => {
+            match classify_theme_value(value, base_dir.as_deref()) {
+                Ok(source) => {
+                    let mut visited = Vec::new();
+                    match load_theme_source(
+                        &source,
+                        default_preset,
+                        0,
+                        &mut visited,
+                        &mut diagnostics,
+                    ) {
+                        Ok((_, semantics)) => semantics,
+                        Err(error) => {
+                            diagnostics.warn(format!(
+                                "theme '{value}' failed to load ({error:#}); using {default_preset}"
+                            ));
+                            fallback_semantics(default_preset)
+                        }
+                    }
+                }
+                Err(error) => {
+                    diagnostics.warn(format!("theme '{value}' is invalid ({error:#})"));
+                    fallback_semantics(default_preset)
+                }
+            }
+        }
+        _ => fallback_semantics(default_preset),
+    };
+
+    (semantics.resolve(detected_mode), diagnostics.into_warning())
+}
+
+fn fallback_semantics(preset_name: &str) -> crate::theme::Semantics {
+    let palette = crate::theme::preset(preset_name).unwrap_or(crate::theme::MOCHA);
+    crate::theme::Semantics::from_palette(&palette)
 }
 
 fn normalize_jsonc(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -1311,6 +1732,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn parse_raw_config(bytes: &[u8]) -> Result<RawConfig> {
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            bail!("Latte Lens config exceeds 64 KiB");
+        }
+        if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+            bail!("Latte Lens config must not contain a UTF-8 BOM");
+        }
+        std::str::from_utf8(bytes).context("Latte Lens config is not strict UTF-8")?;
+        let normalized = normalize_jsonc(bytes)?;
+        parse_normalized_config(&normalized)
     }
 
     #[test]
@@ -2030,5 +2463,481 @@ mod tests {
         assert!(range.contains(SourcePosition { line: 1, byte: 2 }));
         assert!(!range.contains(SourcePosition { line: 1, byte: 5 }));
         assert!(!range.is_empty());
+    }
+
+    // ----- Appearance / theme resolution -----
+
+    #[test]
+    fn appearance_defaults_to_detected_builtin_without_config() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", None),
+            ("HOME", Some(home.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", Some(OsString::from("dark"))),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(loaded.warning.is_none());
+        // Latte Dark keyword is a muted editor purple.
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
+        );
+    }
+
+    #[test]
+    fn prefer_light_selects_latte_variant() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(&config, r#"{ "appearance": { "prefer": "light" } }"#).unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(loaded.warning.is_none());
+        // Latte Light keyword is a muted editor purple.
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0x7f, 0x4f, 0xb5)
+        );
+    }
+
+    #[test]
+    fn extends_builtin_preset_with_overrides_stays_on_degrade_chain() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("custom.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "name": "custom",
+                "extends": "latte-dark",
+                "palette": { "blue": "#010203" },
+                "semantic": { "syn_keyword": "$blue", "syn_string": "#0a0b0c" }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "custom.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
+        // Palette override propagates to dir/tree_accent and the $blue reference.
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(loaded.theme.dir, ratatui::style::Color::Rgb(1, 2, 3));
+        assert_eq!(
+            loaded.theme.syn_string,
+            ratatui::style::Color::Rgb(0x0a, 0x0b, 0x0c)
+        );
+    }
+
+    #[test]
+    fn startup_configuration_loads_navigation_and_theme_from_one_file() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let tools = root.join("tools");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let server = tools.join("rust-analyzer");
+            fs::write(&server, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let theme_path = root.join("startup-theme.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{ "semantic": { "syn_keyword": "#112233" } }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "startup-theme.jsonc" }, "code_navigation": { "enabled": true } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("PATH", Some(std::env::join_paths([tools]).unwrap())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_configuration(&workspace);
+
+        assert!(
+            loaded.navigation.warning.is_none(),
+            "{:?}",
+            loaded.navigation.warning
+        );
+        #[cfg(unix)]
+        assert!(loaded.navigation.settings.is_enabled());
+        assert!(loaded.theme.warning.is_none(), "{:?}", loaded.theme.warning);
+        assert_eq!(
+            loaded.theme.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn external_theme_overrides_file_categories_and_extensions() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("file-colors.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "extends": "latte-dark",
+                "palette": { "peach": "#010203" },
+                "files": {
+                    "categories": {
+                        "config": "#00ffff",
+                        "docs": "$peach",
+                        "executable": "light-green"
+                    },
+                    "extensions": {
+                        "rs": "#ff8800",
+                        ".jsonc": "$teal"
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "file-colors.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_theme();
+
+        assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
+        assert_eq!(
+            loaded.theme.file_config,
+            ratatui::style::Color::Rgb(0x00, 0xff, 0xff)
+        );
+        assert_eq!(
+            loaded.theme.file_doc,
+            ratatui::style::Color::Rgb(0x01, 0x02, 0x03)
+        );
+        assert_eq!(
+            loaded.theme.file_exec,
+            ratatui::style::Color::Rgb(0x54, 0xff, 0x54)
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("src/main.rs")),
+            Some(ratatui::style::Color::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("settings.JSONC")),
+            Some(ratatui::style::Color::Rgb(0x72, 0xb7, 0xc2))
+        );
+    }
+
+    #[test]
+    fn invalid_file_color_entries_warn_and_keep_valid_entries() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("partial-file-colors.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "extends": "latte-dark",
+                "files": {
+                    "categories": {
+                        "config": "#00ffff",
+                        "unknown": "#112233",
+                        "media": "not-a-color"
+                    },
+                    "extensions": {
+                        "rs": "#ff8800",
+                        "bad/slash": "#112233",
+                        "json": "not-a-color"
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "partial-file-colors.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_theme();
+        let warning = loaded.warning.as_deref().unwrap_or_default();
+
+        assert!(warning.contains("unknown file category 'unknown'"));
+        assert!(warning.contains("invalid file category color 'media'"));
+        assert!(warning.contains("invalid file extension override 'bad/slash'"));
+        assert!(warning.contains("invalid file extension color 'json'"));
+        assert_eq!(
+            loaded.theme.file_config,
+            ratatui::style::Color::Rgb(0x00, 0xff, 0xff)
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("src/main.rs")),
+            Some(ratatui::style::Color::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            loaded
+                .theme
+                .file_types
+                .color_for_path(Path::new("package.json")),
+            None
+        );
+    }
+
+    #[test]
+    fn external_theme_extends_chain_is_capped_at_four_files() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..5 {
+            let body = if index == 4 {
+                r##"{ "semantic": { "syn_keyword": "#112233" } }"##.to_owned()
+            } else {
+                format!(r##"{{ "extends": "theme-{}.jsonc" }}"##, index + 1)
+            };
+            fs::write(root.join(format!("theme-{index}.jsonc")), body).unwrap();
+        }
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "theme-0.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+
+        let loaded = load_user_theme();
+
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("exceeds depth 4")),
+            "warning: {:?}",
+            loaded.warning
+        );
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
+        );
+    }
+
+    #[test]
+    fn partial_light_theme_without_extends_uses_latte_defaults() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("partial-light.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "name": "partial-light",
+                "semantic": { "syn_string": "#112233" }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "light", "light": "partial-light.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(loaded.warning.is_none(), "warning: {:?}", loaded.warning);
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0x7f, 0x4f, 0xb5)
+        );
+        assert_eq!(
+            loaded.theme.syn_string,
+            ratatui::style::Color::Rgb(0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn missing_theme_file_falls_back_to_preset_with_warning() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "prefer": "dark", "dark": "does-not-exist.jsonc" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("does not exist")),
+            "warning: {:?}",
+            loaded.warning
+        );
+        // Falls back to the built-in Latte Dark preset rather than losing all color.
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
+        );
+    }
+
+    #[test]
+    fn bad_color_token_warns_and_keeps_other_tokens() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let theme_path = root.join("partial.jsonc");
+        fs::write(
+            &theme_path,
+            r##"{
+                "extends": "latte-dark",
+                "semantic": { "syn_keyword": "not-a-color", "syn_string": "#112233" }
+            }"##,
+        )
+        .unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(
+            &config,
+            r#"{ "appearance": { "dark": "partial.jsonc", "prefer": "dark" } }"#,
+        )
+        .unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", None),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("syn_keyword")),
+            "warning: {:?}",
+            loaded.warning
+        );
+        // The bad token keeps the preset default; the valid one applies.
+        assert_eq!(
+            loaded.theme.syn_keyword,
+            ratatui::style::Color::Rgb(0xc7, 0x92, 0xea)
+        );
+        assert_eq!(
+            loaded.theme.syn_string,
+            ratatui::style::Color::Rgb(0x11, 0x22, 0x33)
+        );
+    }
+
+    #[test]
+    fn no_color_environment_resets_theme_without_panicking() {
+        let _environment = lock_navigation_environment();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = root.join("latte-lens.jsonc");
+        fs::write(&config, r#"{ "appearance": { "prefer": "dark" } }"#).unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", Some(config.into_os_string())),
+            ("NO_COLOR", Some(OsString::from("1"))),
+            ("COLORTERM", Some(OsString::from("truecolor"))),
+            ("LATTE_LENS_THEME", None),
+            ("COLORFGBG", None),
+        ]);
+        let loaded = load_user_theme();
+        assert_eq!(loaded.theme.syn_keyword, ratatui::style::Color::Reset);
+        assert_eq!(loaded.theme.diff_add, ratatui::style::Color::Reset);
+        assert_eq!(loaded.theme.text_primary, ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn unknown_appearance_field_is_ignored_not_fatal() {
+        // `appearance` must be lenient about unknown keys (warn-and-ignore),
+        // unlike the strict `code_navigation` subtree.
+        let raw: RawConfig = serde_json::from_slice(
+            &normalize_jsonc(br#"{ "appearance": { "prefer": "dark", "unexpected": 1 } }"#)
+                .unwrap(),
+        )
+        .expect("appearance tolerates unknown fields");
+        assert!(raw.appearance.is_some());
     }
 }
