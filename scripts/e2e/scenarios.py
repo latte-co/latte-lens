@@ -25,6 +25,7 @@ from .fixtures import (
     create_git_matrix_fixture,
     create_image_preview_fixture,
     create_incompatible_lsp_fixture,
+    create_invalid_theme_config_fixture,
     create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
     create_missing_product_config_fixture,
@@ -1978,6 +1979,14 @@ def theme_config(context: ScenarioContext) -> None:
     )
 
 
+def invalid_theme_config(context: ScenarioContext) -> None:
+    session = context.session
+    session.wait_screen(
+        ("invalid-theme.rs", "caller!", "Configuration:", "syn_keyword"),
+        "invalid external theme colors warn without blocking startup",
+    )
+
+
 def theme_matrix_config(context: ScenarioContext) -> None:
     session = context.session
     session.wait_screen(
@@ -2154,6 +2163,12 @@ CASES = (
         "code-navigation",
         create_theme_config_fixture,
         theme_config,
+    ),
+    ScenarioCase(
+        "invalid-theme-product-config",
+        "code-navigation",
+        create_invalid_theme_config_fixture,
+        invalid_theme_config,
     ),
     ScenarioCase(
         "theme-matrix-product-config",

@@ -157,19 +157,11 @@ def create_image_preview_fixture(root: Path, environment: dict[str, str]) -> Non
     run("git", "add", "sample.png", cwd=root, environment=environment)
     run("git", "commit", "-q", "-m", "image fixture", cwd=root, environment=environment)
 
-    # Never hand an E2E fixture to a real desktop application. macOS reaches
-    # the prompt through this deterministic failing opener; headless Linux
-    # reaches it before xdg-open because both display variables are absent.
+    # Never hand an E2E fixture to a real desktop application. Keep the opener
+    # commands absent so every platform reaches the unavailable-viewer prompt
+    # deterministically instead of racing a short-lived stub process.
     viewer_bin = root.parent / "viewer-bin"
     viewer_bin.mkdir(mode=0o700)
-    environment["LATTELENS_E2E_VIEWER_MARKER"] = str(root.parent / "viewer-invoked")
-    for name in ("open", "xdg-open"):
-        opener = viewer_bin / name
-        opener.write_text(
-            '#!/bin/sh\n: > "$LATTELENS_E2E_VIEWER_MARKER"\nexit 23\n',
-            encoding="utf-8",
-        )
-        opener.chmod(0o700)
     git = shutil.which("git", path=environment["PATH"])
     if git is None:
         raise RuntimeError("git is required for the image preview fixture")
@@ -631,6 +623,55 @@ def create_theme_config_fixture(root: Path, environment: dict[str, str]) -> None
   "appearance": {
     "prefer": "light",
     "light": "partial-light.jsonc",
+  },
+}
+""",
+        encoding="utf-8",
+    )
+    environment["LATTELENS_CONFIG"] = str(config)
+    environment["COLORTERM"] = "truecolor"
+    environment.pop("NO_COLOR", None)
+    environment.pop("LATTE_LENS_THEME", None)
+    environment.pop("COLORFGBG", None)
+
+
+def create_invalid_theme_config_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    caller = root / "invalid-theme.rs"
+    caller.write_text("caller!();\n", encoding="utf-8")
+    run("git", "add", caller.name, cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "invalid theme fixture", cwd=root, environment=environment)
+
+    config = (root.parent / "invalid-theme-latte-lens.jsonc").resolve()
+    theme = (root.parent / "invalid-theme.jsonc").resolve()
+    theme.write_text(
+        """{
+  "extends": "latte-dark",
+  "semantic": {
+    "syn_keyword": "#aé",
+    "syn_string": "#112233",
+  },
+  "files": {
+    "categories": {
+      "config": "#00ffff",
+      "unknown": "#112233",
+      "media": "not-a-color",
+    },
+    "extensions": {
+      "rs": "#ff8800",
+      "bad/slash": "#112233",
+      "json": "not-a-color",
+    },
+  },
+}
+""",
+        encoding="utf-8",
+    )
+    config.write_text(
+        """{
+  "appearance": {
+    "prefer": "dark",
+    "dark": "invalid-theme.jsonc",
   },
 }
 """,
