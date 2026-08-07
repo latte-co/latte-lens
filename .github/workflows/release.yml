@@ -83,6 +83,9 @@ jobs:
         run: |
           pip install ziglang
           cargo install cargo-zigbuild
+      - name: Enable zigbuild for cross-compilation
+        if: matrix.use_zigbuild
+        run: echo "USE_ZIGBUILD=1" >> "$GITHUB_ENV"
       - name: Run the quality gate
         if: matrix.run_full_quality_gate
         run: make ci
@@ -92,7 +95,6 @@ jobs:
       - name: Build and verify the native package
         env:
           BUILD_TARGET: ${{ matrix.target }}
-          USE_ZIGBUILD: ${{ matrix.use_zigbuild && '1' || '' }}
         run: make package-smoke
       - uses: actions/upload-artifact@v7
         with:
