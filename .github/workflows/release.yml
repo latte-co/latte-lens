@@ -56,9 +56,6 @@ jobs:
             install_cross_musl: false
             linker: ""
     runs-on: ${{ matrix.os }}
-    env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target == 'x86_64-unknown-linux-musl' && matrix.linker || '' }}
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-musl' && matrix.linker || '' }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -86,6 +83,11 @@ jobs:
       - name: Enable zigbuild for cross-compilation
         if: matrix.use_zigbuild
         run: echo "USE_ZIGBUILD=1" >> "$GITHUB_ENV"
+      - name: Configure musl linker
+        if: matrix.linker != ''
+        run: |
+          target_upper=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${target_upper}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
       - name: Run the quality gate
         if: matrix.run_full_quality_gate
         run: make ci
