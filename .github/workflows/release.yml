@@ -36,8 +36,9 @@ jobs:
             run_full_quality_gate: false
             run_native_e2e: false
             install_musl: false
-            install_cross_musl: true
-            linker: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
+            install_cross_musl: false
+            use_zigbuild: true
+            linker: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: latte-lens-macos-aarch64
@@ -77,6 +78,11 @@ jobs:
         run: |
           curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      - name: Install Zig and cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild
       - name: Run the quality gate
         if: matrix.run_full_quality_gate
         run: make ci
@@ -86,6 +92,7 @@ jobs:
       - name: Build and verify the native package
         env:
           BUILD_TARGET: ${{ matrix.target }}
+          USE_ZIGBUILD: ${{ matrix.use_zigbuild && '1' || '' }}
         run: make package-smoke
       - uses: actions/upload-artifact@v7
         with:

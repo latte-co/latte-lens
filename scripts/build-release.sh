@@ -22,7 +22,9 @@ if [[ "$build_target" == *windows* ]]; then
   binary_path+="$binary_suffix"
 fi
 
-if [[ -n "${BUILD_TARGET:-}" ]]; then
+if [[ -n "${USE_ZIGBUILD:-}" ]]; then
+  cargo zigbuild --release --locked --target "$BUILD_TARGET"
+elif [[ -n "${BUILD_TARGET:-}" ]]; then
   cargo build --release --locked --target "$BUILD_TARGET"
 else
   cargo build --release --locked
