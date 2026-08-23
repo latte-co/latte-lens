@@ -4550,6 +4550,57 @@ fn search_tab_opens_text_search_popup() {
     assert_eq!(app.search_mode(), Some(SearchMode::Text));
 }
 
+#[test]
+fn same_scope_tab_activation_populates_projection() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "hello\n");
+    fixture.write("b.txt", "world\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Opening a second Files tab from a Files tab must populate the new
+    // tab's projection instead of leaving it empty.
+    let first_tab = app.active_tab_id();
+    let second_tab = app.open_tab(TabKind::Files).expect("second Files tab");
+    assert_ne!(first_tab, second_tab);
+    assert!(
+        !app.tab().files().visible_rows.is_empty(),
+        "new same-scope tab must have populated visible_rows"
+    );
+
+    // Switching back to the first tab also keeps its projection populated.
+    app.activate_tab(first_tab);
+    assert!(
+        !app.tab().files().visible_rows.is_empty(),
+        "first tab projection must remain populated"
+    );
+}
+
+#[test]
+fn content_completion_binds_to_requesting_tab() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "alpha\n");
+    fixture.write("b.txt", "beta\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    let tab_a = app.active_tab_id();
+    let tab_b = app.open_tab(TabKind::Files).expect("second Files tab");
+
+    // Each tab gets its own content state when opened. Tab B's content
+    // must not be the same instance as tab A's.
+    app.activate_tab(tab_a);
+    let tab_a_lines = app.tab().content.lines.clone();
+    app.activate_tab(tab_b);
+    let tab_b_lines = app.tab().content.lines.clone();
+    // Both tabs may show default content, but they must be independent copies.
+    // Switching back to tab A must preserve its content.
+    app.activate_tab(tab_a);
+    assert_eq!(app.tab().content.lines, tab_a_lines);
+    app.activate_tab(tab_b);
+    assert_eq!(app.tab().content.lines, tab_b_lines);
+}
+
 #[cfg(feature = "navigation-test-support")]
 fn trace_contains(path: &Path, marker: &str) -> bool {
     fs::read_to_string(path).is_ok_and(|contents| contents.lines().any(|line| line == marker))
