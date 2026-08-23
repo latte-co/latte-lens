@@ -1181,7 +1181,7 @@ def _assert_process_gone(session: PtySession, pid: int, label: str) -> None:
 
 
 def tab_shell(context: ScenarioContext) -> None:
-    """Exercise the tab shell: open/switch/close tabs."""
+    """Exercise the tab shell: open/switch/close tabs, palette, and same-scope."""
     session = context.session
     wait_for_initial_files(session)
 
@@ -1207,6 +1207,28 @@ def tab_shell(context: ScenarioContext) -> None:
     session.key(b"\x17")  # Ctrl+W
     session.wait_screen(
         ("Files",), "Ctrl+W closes Review tab", absent=("Git changes",)
+    )
+
+    # Open a second Files tab (same scope) — projection must be populated.
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu reopens")
+    session.key(b"\r")  # Enter → Files (first item)
+    session.wait_screen(("Files",), "second Files tab has populated projection")
+
+    # Digit key 1 switches to the first tab.
+    session.key(b"1")
+    session.wait_screen(("Files",), "digit 1 switches to first tab")
+
+    # Ctrl+P opens the tab palette; Enter selects the highlighted tab.
+    session.key(b"\x10")  # Ctrl+P
+    session.wait_screen((">",), "⌘P palette opens")
+    session.key(b"\r")  # Enter → select first tab
+    session.wait_screen(("Files",), "palette Enter switches tab")
+
+    # Ctrl+W closes the second Files tab.
+    session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(
+        ("Files",), "Ctrl+W closes second Files tab", absent=("Git changes",)
     )
 
 

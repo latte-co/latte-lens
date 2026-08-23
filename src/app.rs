@@ -475,6 +475,7 @@ struct PendingNavigationStage {
     invocation: NavigationInvocation,
     content_generation: u64,
     target: NavigationTarget,
+    tab_id: TabId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6288,6 +6289,7 @@ impl App {
             invocation,
             content_generation,
             target,
+            tab_id: self.active_tab,
         });
         self.navigation_picker = None;
         self.set_navigation_status(NavigationStatusLevel::Info, "Loading navigation target…");
@@ -6322,6 +6324,10 @@ impl App {
             || stage.content_generation != content_generation
             || self.navigation_generation != navigation_generation
         {
+            return;
+        }
+        // If the requesting tab was closed, discard the completion.
+        if !self.tabs.iter().any(|tab| tab.id == stage.tab_id) {
             return;
         }
         let mut snapshot = match result {
@@ -6364,8 +6370,14 @@ impl App {
             );
             return;
         };
+        // Bind the navigation stage completion to the tab that initiated it.
+        let original_tab = self.active_tab;
+        if stage.tab_id != original_tab && self.tabs.iter().any(|tab| tab.id == stage.tab_id) {
+            self.active_tab = stage.tab_id;
+        }
         self.install_navigation_snapshot(snapshot);
         self.commit_navigation_reveal(&stage.invocation, stage.target.document, range);
+        self.active_tab = original_tab;
     }
 
     fn install_navigation_snapshot(&mut self, snapshot: ContentSnapshot) {
