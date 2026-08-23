@@ -16,8 +16,8 @@ use crate::agent::{ActivityState, AgentViewSession, ObservationMode};
 use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
-        GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, SearchMode,
-        SearchResult, TreeScope, UiRegions, display_workspace_path,
+        GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, NewTabMenuState,
+        SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -173,7 +173,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
-    if app.navigation_picker.is_some() {
+    if app.new_tab_menu.is_some() {
+        dim_underlay(frame);
+        draw_new_tab_menu(frame, app, app.ui_regions.new_tab_button);
+    } else if app.navigation_picker.is_some() {
         dim_underlay(frame);
         draw_navigation_picker(frame, app);
     } else if app.search_is_active() {
@@ -227,6 +230,13 @@ fn regions(areas: DrawAreas) -> UiRegions {
         new_tab_width,
         tab_bar.height,
     );
+    let menu_height = (NewTabMenuState::items().len() as u16) + 2;
+    let new_tab_menu = Rect::new(
+        new_tab_button.x,
+        new_tab_button.y.saturating_add(1),
+        20,
+        menu_height,
+    );
     let all_files_width = (ALL_FILES_TAB_LABEL.len() as u16).min(scope_tabs.width);
     let scope_end = scope_tabs.x.saturating_add(scope_tabs.width);
     let git_changes_x = scope_tabs
@@ -269,6 +279,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
     UiRegions {
         tab_bar,
         new_tab_button,
+        new_tab_menu,
         all_files_tab: Rect::new(
             scope_tabs.x,
             scope_tabs.y,
@@ -371,18 +382,28 @@ fn active_search_controls(area: Rect) -> (Rect, Rect, [Rect; 4]) {
 }
 
 fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let [tabs, plus] = Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(area);
-    let tab = app.tab();
-    let title = format!(" {} ", tab.title);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            title,
+    let tabs = app.tabs();
+    let plus_width = 3u16;
+    let tabs_width = area.width.saturating_sub(plus_width);
+    let [tabs_area, plus] = Layout::horizontal([
+        Constraint::Length(tabs_width),
+        Constraint::Length(plus_width),
+    ])
+    .areas(area);
+    let active_id = app.active_tab_id();
+    let mut spans = Vec::new();
+    for tab in tabs {
+        let label = format!(" {} ", tab.title);
+        let style = if tab.id == active_id {
             Style::default()
                 .fg(accent())
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        ))),
-        tabs,
-    );
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(muted())
+        };
+        spans.push(Span::styled(label, style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " + ",
@@ -529,6 +550,42 @@ fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
         .map(|_| Line::from(Span::styled(glyph, Style::default().fg(color))))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_new_tab_menu(frame: &mut Frame, app: &App, anchor: Rect) {
+    let Some(menu_state) = app.new_tab_menu.as_ref() else {
+        return;
+    };
+    let items = NewTabMenuState::items();
+    let menu_width = 20u16.min(frame.area().width.saturating_sub(anchor.x));
+    let menu_height = (items.len() as u16) + 2;
+    let menu = Rect::new(
+        anchor.x,
+        anchor.y.saturating_add(1),
+        menu_width,
+        menu_height,
+    );
+    frame.render_widget(Clear, menu);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent())),
+        menu,
+    );
+    let inner = Rect::new(menu.x + 1, menu.y + 1, menu.width - 2, menu.height - 2);
+    let mut lines = Vec::new();
+    for (index, kind) in items.iter().enumerate() {
+        let label = format!("  {}  ", kind.label());
+        let style = if index == menu_state.selected {
+            Style::default()
+                .fg(accent())
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(text_primary())
+        };
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_search_popup(frame: &mut Frame, app: &mut App) {

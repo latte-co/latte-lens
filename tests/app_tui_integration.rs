@@ -12,7 +12,7 @@ use latte_lens::agent::*;
 #[cfg(feature = "navigation-test-support")]
 use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
-    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TreeScope},
+    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeScope},
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
 };
@@ -366,7 +366,8 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.focused_pane, FocusPane::Content);
 
-    app.handle_key(key(KeyCode::Tab));
+    // Opening a Review tab switches to the GitChanges projection.
+    app.open_tab(TabKind::Review);
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::GitChanges);
     assert_eq!(app.focused_pane, FocusPane::Content);
@@ -377,22 +378,24 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
     assert!(app.tab().content.lines.iter().any(|line| line == "+after"));
 
-    app.handle_key(key(KeyCode::BackTab));
+    // Tab cycles back to the Files tab. Each tab keeps its own selection.
+    app.handle_key(key(KeyCode::Tab));
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::AllFiles);
     assert_eq!(app.focused_pane, FocusPane::Content);
     assert_eq!(
         app.selected_relative_path(),
-        Some(PathBuf::from("b-changed.txt"))
+        Some(PathBuf::from("a-clean.txt"))
     );
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
-    app.handle_key(key(KeyCode::Char('2')));
-    settle(&mut app);
-    app.handle_key(key(KeyCode::Char('p')));
+    // BackTab cycles forward to the Review tab.
+    app.handle_key(key(KeyCode::BackTab));
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::GitChanges);
     assert_eq!(app.focused_pane, FocusPane::Content);
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
@@ -939,7 +942,7 @@ fn entering_git_changes_refreshes_and_excludes_clean_files() {
 
     // Simulate an agent changing the worktree after Latte Lens has started.
     fixture.write("z-new-change.txt", "new\n");
-    app.handle_key(key(KeyCode::Char('2')));
+    app.open_tab(TabKind::Review);
     settle(&mut app);
 
     assert_eq!(app.tree_scope, TreeScope::GitChanges);

@@ -525,6 +525,29 @@ pub(crate) struct PreviewFindState {
     pub case_sensitive: bool,
 }
 
+/// The 「+」new-tab menu: a small popup listing the tab kinds that can be
+/// opened. Selection is a row index into [`NewTabMenuState::items`].
+#[derive(Clone, Debug)]
+pub(crate) struct NewTabMenuState {
+    pub selected: usize,
+}
+
+impl NewTabMenuState {
+    pub fn new() -> Self {
+        Self { selected: 0 }
+    }
+
+    /// The tab kinds offered by the menu, in display order.
+    pub fn items() -> &'static [TabKind] {
+        &[
+            TabKind::Files,
+            TabKind::Review,
+            #[cfg(feature = "agent-observability")]
+            TabKind::Chat,
+        ]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentMode {
     Info,
@@ -598,6 +621,7 @@ impl ContentSelection {
 pub struct UiRegions {
     pub tab_bar: Rect,
     pub new_tab_button: Rect,
+    pub new_tab_menu: Rect,
     pub all_files_tab: Rect,
     pub git_changes_tab: Rect,
     #[cfg(feature = "agent-observability")]
@@ -775,14 +799,6 @@ pub enum ProjectionState {
     Files(FilesProjection),
 }
 
-impl ProjectionState {
-    const fn kind(&self) -> TabKind {
-        match self {
-            Self::Files(_) => TabKind::Files,
-        }
-    }
-}
-
 /// [`TabKind::Files`] projection: the bounded workspace tree.
 pub struct FilesProjection {
     pub selection: Option<PathBuf>,
@@ -809,6 +825,7 @@ impl FilesProjection {
 /// on [`App`]; a tab owns only what differs between parallel contexts.
 pub struct Tab {
     pub id: TabId,
+    pub kind: TabKind,
     pub title: String,
     pub tree_state: ListState,
     pub panel_width: Option<u16>,
@@ -820,23 +837,17 @@ impl Tab {
     fn new(id: TabId, kind: TabKind) -> Self {
         Self {
             id,
+            kind,
             title: kind.label().to_owned(),
             tree_state: ListState::default(),
             panel_width: None,
-            projection: match kind {
-                TabKind::Files => ProjectionState::Files(FilesProjection::new()),
-                TabKind::Review | TabKind::Search => {
-                    unreachable!("Review/Search tabs arrive in Phase 2")
-                }
-                #[cfg(feature = "agent-observability")]
-                TabKind::Chat => unreachable!("Chat tab arrives in Phase 2"),
-            },
+            projection: ProjectionState::Files(FilesProjection::new()),
             content: ContentState::default(),
         }
     }
 
     pub fn kind(&self) -> TabKind {
-        self.projection.kind()
+        self.kind
     }
 
     pub fn files(&self) -> &FilesProjection {
@@ -860,8 +871,6 @@ pub struct App {
     pub git_changes_truncated: bool,
     tabs: Vec<Tab>,
     active_tab: TabId,
-    /// Monotonic id source for [`TabId`]. Read when Phase 2 adds tab creation.
-    #[allow(dead_code)]
     next_tab_id: u64,
     pub tree_scope: TreeScope,
     pub focused_pane: FocusPane,
@@ -937,6 +946,7 @@ pub struct App {
     navigation_invocation: Option<NavigationInvocation>,
     pending_navigation_stage: Option<PendingNavigationStage>,
     pub(crate) navigation_picker: Option<NavigationPickerState>,
+    pub(crate) new_tab_menu: Option<NewTabMenuState>,
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
@@ -959,6 +969,93 @@ impl App {
             .iter_mut()
             .find(|tab| tab.id == id)
             .expect("active tab exists")
+    }
+
+    /// All open tabs, in display order.
+    pub fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    /// The active tab id.
+    pub fn active_tab_id(&self) -> TabId {
+        self.active_tab
+    }
+
+    /// Open a new tab of the given kind and activate it. The tab's projection
+    /// kind is synced with the legacy `tree_scope` so the existing scope
+    /// machinery (selection restore, refresh-on-review) keeps working.
+    pub fn open_tab(&mut self, kind: TabKind) -> TabId {
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id = self.next_tab_id.saturating_add(1);
+        let mut tab = Tab::new(id, kind);
+        if kind == TabKind::Files {
+            tab.title = self
+                .root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| kind.label().to_owned());
+        }
+        self.tabs.push(tab);
+        self.activate_tab(id);
+        id
+    }
+
+    /// Activate the tab with the given id, syncing `tree_scope`.
+    pub fn activate_tab(&mut self, id: TabId) {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
+            return;
+        }
+        self.active_tab = id;
+        let kind = self.tab().kind();
+        let scope = match kind {
+            TabKind::Files => TreeScope::AllFiles,
+            TabKind::Review => TreeScope::GitChanges,
+            TabKind::Search => TreeScope::AllFiles,
+            #[cfg(feature = "agent-observability")]
+            TabKind::Chat => TreeScope::Agents,
+        };
+        if self.tree_scope != scope {
+            self.set_tree_scope(scope);
+        }
+    }
+
+    /// Close the tab with the given id. The last tab cannot be closed.
+    /// Returns true if the tab was closed.
+    pub fn close_tab(&mut self, id: TabId) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        self.tabs.remove(index);
+        if self.active_tab == id {
+            let new_index = index.min(self.tabs.len() - 1);
+            let new_id = self.tabs[new_index].id;
+            self.activate_tab(new_id);
+        }
+        true
+    }
+
+    /// Cycle to the next (forward) or previous tab.
+    pub fn cycle_tab(&mut self, forward: bool) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let current = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == self.active_tab)
+            .unwrap_or(0);
+        let len = self.tabs.len();
+        let next = if forward {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        let id = self.tabs[next].id;
+        self.activate_tab(id);
     }
 
     pub fn new(path: PathBuf) -> Result<Self> {
@@ -1146,6 +1243,7 @@ impl App {
             navigation_invocation: None,
             pending_navigation_stage: None,
             navigation_picker: None,
+            new_tab_menu: None,
             navigation_status: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
@@ -1754,6 +1852,11 @@ impl App {
     /// Apply one terminal key event to the same path used by the interactive loop.
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.tab_mut().content.navigation_hover_highlight = None;
+        if self.new_tab_menu.is_some() {
+            self.quit_confirmation = None;
+            self.handle_new_tab_menu_key(key);
+            return;
+        }
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
@@ -1841,17 +1944,21 @@ impl App {
             (KeyCode::Char('i'), KeyModifiers::NONE) => {
                 self.confirm_terminal_image_preview();
             }
-            (KeyCode::Tab, _) => self.set_tree_scope(self.tree_scope.next()),
-            (KeyCode::BackTab, _) => self.set_tree_scope(self.tree_scope.previous()),
-            (KeyCode::Char('1'), KeyModifiers::NONE) => {
-                self.set_tree_scope(TreeScope::AllFiles);
+            (KeyCode::Tab, _) => self.cycle_tab(true),
+            (KeyCode::BackTab, _) => self.cycle_tab(false),
+            (KeyCode::Char(c @ '1'..='9'), KeyModifiers::NONE) => {
+                let index = (c as u8 - b'1') as usize;
+                if index < self.tabs.len() {
+                    let id = self.tabs[index].id;
+                    self.activate_tab(id);
+                }
             }
-            (KeyCode::Char('2'), KeyModifiers::NONE) => {
-                self.set_tree_scope(TreeScope::GitChanges);
+            (KeyCode::Char('w' | 'W'), KeyModifiers::CONTROL) => {
+                let id = self.active_tab;
+                self.close_tab(id);
             }
-            #[cfg(feature = "agent-observability")]
-            (KeyCode::Char('3'), KeyModifiers::NONE) => {
-                self.set_tree_scope(TreeScope::Agents);
+            (KeyCode::Char('n' | 'N'), KeyModifiers::CONTROL) => {
+                self.new_tab_menu = Some(NewTabMenuState::new());
             }
             (KeyCode::Char('h'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             (KeyCode::Char('l'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
@@ -3015,10 +3122,33 @@ impl App {
             }
             return;
         }
+        if self.new_tab_menu.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                if contains(self.ui_regions.new_tab_menu, mouse.column, mouse.row) {
+                    let row = usize::from(mouse.row - self.ui_regions.new_tab_menu.y - 1);
+                    let items = NewTabMenuState::items();
+                    if row < items.len() {
+                        let kind = items[row];
+                        self.new_tab_menu = None;
+                        self.open_tab(kind);
+                    }
+                } else {
+                    self.new_tab_menu = None;
+                }
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.clipboard_status = None;
                 self.tree_resize_dragging = false;
+                if contains(self.ui_regions.new_tab_button, mouse.column, mouse.row) {
+                    self.new_tab_menu = Some(NewTabMenuState::new());
+                    return;
+                }
+                if self.handle_tab_bar_mouse_down(mouse) {
+                    return;
+                }
                 if self.handle_preview_find_mouse_down(mouse) {
                     return;
                 }
@@ -3137,6 +3267,24 @@ impl App {
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(mouse, 3),
             _ => {}
         }
+    }
+
+    fn handle_tab_bar_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !contains(self.ui_regions.tab_bar, mouse.column, mouse.row) {
+            return false;
+        }
+        let mut x = self.ui_regions.tab_bar.x;
+        for tab in self.tabs() {
+            let label = format!(" {} ", tab.title);
+            let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+            let rect = Rect::new(x, self.ui_regions.tab_bar.y, width, 1);
+            if contains(rect, mouse.column, mouse.row) && tab.id != self.active_tab {
+                self.activate_tab(tab.id);
+                return true;
+            }
+            x = x.saturating_add(width);
+        }
+        false
     }
 
     fn handle_preview_find_mouse_down(&mut self, mouse: MouseEvent) -> bool {
@@ -6315,6 +6463,30 @@ impl App {
             (KeyCode::PageDown, _) => self.move_navigation_picker(10),
             (KeyCode::PageUp, _) => self.move_navigation_picker(-10),
             (KeyCode::Enter, _) => self.accept_navigation_picker_selection(),
+            _ => {}
+        }
+    }
+
+    fn handle_new_tab_menu_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.new_tab_menu.as_mut() else {
+            return;
+        };
+        let item_count = NewTabMenuState::items().len();
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.new_tab_menu = None;
+            }
+            (KeyCode::Down, _) => {
+                menu.selected = (menu.selected + 1).min(item_count - 1);
+            }
+            (KeyCode::Up, _) => {
+                menu.selected = menu.selected.saturating_sub(1);
+            }
+            (KeyCode::Enter, _) => {
+                let kind = NewTabMenuState::items()[menu.selected];
+                self.new_tab_menu = None;
+                self.open_tab(kind);
+            }
             _ => {}
         }
     }
