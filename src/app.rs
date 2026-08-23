@@ -542,6 +542,7 @@ impl NewTabMenuState {
         &[
             TabKind::Files,
             TabKind::Review,
+            TabKind::Search,
             #[cfg(feature = "agent-observability")]
             TabKind::Chat,
         ]
@@ -1062,6 +1063,11 @@ impl App {
         }
         self.tabs.push(tab);
         self.activate_tab(id);
+        // Bridge: Search tab opens the text search popup. Phase 2 follow-up
+        // moves search results into the tab projection.
+        if kind == TabKind::Search {
+            self.open_search(SearchMode::Text);
+        }
         id
     }
 
