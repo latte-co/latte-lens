@@ -1180,6 +1180,36 @@ def _assert_process_gone(session: PtySession, pid: int, label: str) -> None:
     raise E2EAssertionError("helper_receipt", f"helper pid {pid} was not killed and reaped")
 
 
+def tab_shell(context: ScenarioContext) -> None:
+    """Exercise the tab shell: open/switch/close tabs."""
+    session = context.session
+    wait_for_initial_files(session)
+
+    # The tab bar shows the workspace name and "+" button.
+    session.wait_screen(("+",), "tab bar shows new tab button")
+
+    # Open a Review tab through the "+" menu (Ctrl+N → Down → Enter).
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu lists templates")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\r")  # Enter
+    session.wait_screen(("Git changes",), "Review tab activates Git changes scope")
+
+    # Shift+Tab cycles back to the Files tab.
+    session.key(b"\x1b[Z")  # Shift+Tab
+    session.wait_screen(("Files",), "Shift+Tab returns to Files tab")
+
+    # Tab cycles forward to the Review tab.
+    session.key(b"\t")
+    session.wait_screen(("Git changes",), "Tab cycles to Review tab")
+
+    # Ctrl+W closes the Review tab, leaving only the Files tab.
+    session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(
+        ("Files",), "Ctrl+W closes Review tab", absent=("Git changes",)
+    )
+
+
 def code_navigation(context: ScenarioContext) -> None:
     session = context.session
     session.wait_raw((b"?1000h",), "navigation terminal enables mouse capture")
@@ -2183,6 +2213,12 @@ CASES = (
         "code-navigation",
         create_theme_matrix_config_fixture,
         theme_matrix_config,
+    ),
+    ScenarioCase(
+        "tab-shell",
+        "tab-shell",
+        create_navigation_fixture,
+        tab_shell,
     ),
 )
 

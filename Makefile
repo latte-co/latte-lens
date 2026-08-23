@@ -21,7 +21,7 @@ E2E_ARTIFACT_DIR ?= target/e2e-artifacts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup fmt fmt-check check lint test test-navigation-real installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e-navigation e2e agent-ut agent-contract agent-harness-self-test agent-e2e-hook codex-hooks-canary claude-hooks-canary opencode-plugin-canary traex-hooks-canary agent-e2e agent-e2e-tui agent-package-negative agent-ci coverage coverage-unit coverage-e2e coverage-agent coverage-html bench ci build release package package-smoke install clean
+.PHONY: help setup fmt fmt-check check lint test test-navigation-real installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e-navigation e2e-tab-shell e2e agent-ut agent-contract agent-harness-self-test agent-e2e-hook codex-hooks-canary claude-hooks-canary opencode-plugin-canary traex-hooks-canary agent-e2e agent-e2e-tui agent-package-negative agent-ci coverage coverage-unit coverage-e2e coverage-agent coverage-html bench ci build release package package-smoke install clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Latte Lens engineering commands:\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -79,6 +79,10 @@ e2e-navigation: e2e-self-test ## Exercise configured and unavailable code naviga
 	$(CARGO) build --locked
 	$(CARGO) build --locked --features navigation-test-support --bin latte-lens-lsp-test-helper
 	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY) --scenario code-navigation --artifact-dir $(E2E_ARTIFACT_DIR)
+
+e2e-tab-shell: e2e-self-test ## Exercise tab open/switch/close and ⌘P palette
+	$(CARGO) build --locked
+	$(PYTHON) scripts/e2e_tui.py target/debug/$(BINARY) --scenario tab-shell --artifact-dir $(E2E_ARTIFACT_DIR)
 
 e2e: e2e-self-test ## Build and run every production TUI scenario
 	$(CARGO) build --locked
