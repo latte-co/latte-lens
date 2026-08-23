@@ -739,17 +739,130 @@ impl Default for ContentState {
     }
 }
 
+/// Stable identity for an open tab. Assigned monotonically by [`App`] and
+/// never reused within a process.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct TabId(u64);
+
+/// What a tab shows. Determines the projection (left pane) kind and the
+/// default content (right pane) behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabKind {
+    Files,
+    Review,
+    Search,
+    #[cfg(feature = "agent-observability")]
+    Chat,
+}
+
+impl TabKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Files => "Files",
+            Self::Review => "Review",
+            Self::Search => "Search",
+            #[cfg(feature = "agent-observability")]
+            Self::Chat => "Chat",
+        }
+    }
+}
+
+/// Per-tab left-pane projection state. Each variant owns the selectable
+/// dataset and the selection/expansion memory that produces it.
+pub enum ProjectionState {
+    Files(FilesProjection),
+}
+
+impl ProjectionState {
+    const fn kind(&self) -> TabKind {
+        match self {
+            Self::Files(_) => TabKind::Files,
+        }
+    }
+}
+
+/// [`TabKind::Files`] projection: the bounded workspace tree.
+pub struct FilesProjection {
+    pub selection: Option<PathBuf>,
+    pub expansion: HashMap<PathBuf, bool>,
+    pub visible_rows: Vec<FileEntry>,
+    pub visible_changed_entries: Vec<FileEntry>,
+    pub truncated: bool,
+}
+
+impl FilesProjection {
+    fn new() -> Self {
+        Self {
+            selection: None,
+            expansion: HashMap::new(),
+            visible_rows: Vec::new(),
+            visible_changed_entries: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+/// One open tab: a projection (left pane) paired with an independent content
+/// view (right pane). Global scan data, runtimes, and navigation history stay
+/// on [`App`]; a tab owns only what differs between parallel contexts.
+pub struct Tab {
+    pub id: TabId,
+    pub title: String,
+    pub tree_state: ListState,
+    pub panel_width: Option<u16>,
+    pub projection: ProjectionState,
+    pub content: ContentState,
+}
+
+impl Tab {
+    fn new(id: TabId, kind: TabKind) -> Self {
+        Self {
+            id,
+            title: kind.label().to_owned(),
+            tree_state: ListState::default(),
+            panel_width: None,
+            projection: match kind {
+                TabKind::Files => ProjectionState::Files(FilesProjection::new()),
+                TabKind::Review | TabKind::Search => {
+                    unreachable!("Review/Search tabs arrive in Phase 2")
+                }
+                #[cfg(feature = "agent-observability")]
+                TabKind::Chat => unreachable!("Chat tab arrives in Phase 2"),
+            },
+            content: ContentState::default(),
+        }
+    }
+
+    pub fn kind(&self) -> TabKind {
+        self.projection.kind()
+    }
+
+    pub fn files(&self) -> &FilesProjection {
+        match &self.projection {
+            ProjectionState::Files(files) => files,
+        }
+    }
+
+    pub fn files_mut(&mut self) -> &mut FilesProjection {
+        match &mut self.projection {
+            ProjectionState::Files(files) => files,
+        }
+    }
+}
+
 pub struct App {
     pub root: PathBuf,
     pub repo: Option<GitRepo>,
     pub all_entries: Vec<FileEntry>,
     pub changed_entries: Vec<FileEntry>,
-    pub all_files_truncated: bool,
     pub git_changes_truncated: bool,
-    pub tree_state: ListState,
+    tabs: Vec<Tab>,
+    active_tab: TabId,
+    /// Monotonic id source for [`TabId`]. Read when Phase 2 adds tab creation.
+    #[allow(dead_code)]
+    next_tab_id: u64,
     pub tree_scope: TreeScope,
     pub focused_pane: FocusPane,
-    pub content: ContentState,
     pending_clipboard_text: Option<String>,
     pub clipboard_status: Option<String>,
     fold_cache: VecDeque<(ContentIdentity, HashSet<FoldAnchor>)>,
@@ -761,17 +874,14 @@ pub struct App {
     pub repository_graph_truncated: bool,
     pub last_error: Option<String>,
     pub ui_regions: UiRegions,
-    tree_panel_width: Option<u16>,
     tree_resize_dragging: bool,
     preview_registry: PreviewRegistry,
     repo_graph: Option<RepoGraph>,
-    all_files_selection: Option<PathBuf>,
     git_changes_selection: Option<GitRowIdentity>,
     pending_all_scope_path: Option<PathBuf>,
     pending_all_scope_navigation: bool,
     pending_git_scope_path: Option<PathBuf>,
     pending_git_scope_fallback: Option<GitRowIdentity>,
-    all_files_expansion: HashMap<PathBuf, bool>,
     unloaded_directories: HashSet<PathBuf>,
     loading_directories: HashSet<PathBuf>,
     tree_epoch: u64,
@@ -779,10 +889,6 @@ pub struct App {
     reviewed_change_versions: HashMap<RepoPath, ChangeVersion>,
     current_diff_path: Option<RepoPath>,
     pending_diff_path: Option<(u64, RepoPath)>,
-    // This is the single selectable/renderable tree dataset. The raw vectors
-    // above remain canonical scan results for their respective scopes.
-    visible_rows: Vec<FileEntry>,
-    visible_changed_entries: Vec<FileEntry>,
     git_rows: Vec<GitTreeRow>,
     visible_git_rows: Vec<GitTreeRow>,
     scan_entry_limit: usize,
@@ -835,6 +941,24 @@ pub struct App {
 }
 
 impl App {
+    /// The active tab. Panics only if the tab set is internally inconsistent
+    /// (every `active_tab` is kept valid by construction).
+    pub fn tab(&self) -> &Tab {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == self.active_tab)
+            .expect("active tab exists")
+    }
+
+    /// Mutable access to the active tab. See [`App::tab`].
+    pub fn tab_mut(&mut self) -> &mut Tab {
+        let id = self.active_tab;
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .expect("active tab exists")
+    }
+
     pub fn new(path: PathBuf) -> Result<Self> {
         Self::with_preview_registry(path, PreviewRegistry::with_builtins())
     }
@@ -927,25 +1051,23 @@ impl App {
         let search_runtime = SearchRuntime::start(root.clone())?;
         let navigation_runtime =
             NavigationRuntime::start(root.clone(), options.navigation.clone())?;
+        let mut initial_tab = Tab::new(TabId(0), TabKind::Files);
+        initial_tab.content.lines = vec![
+            "Loading workspace…".to_owned(),
+            String::new(),
+            "The file tree and repository state are being scanned in the background.".to_owned(),
+        ];
         let mut app = Self {
             root,
             repo: None,
             all_entries: Vec::new(),
             changed_entries: Vec::new(),
-            all_files_truncated: false,
             git_changes_truncated: false,
-            tree_state: ListState::default(),
+            tabs: vec![initial_tab],
+            active_tab: TabId(0),
+            next_tab_id: 1,
             tree_scope: TreeScope::AllFiles,
             focused_pane: FocusPane::Tree,
-            content: ContentState {
-                lines: vec![
-                    "Loading workspace…".to_owned(),
-                    String::new(),
-                    "The file tree and repository state are being scanned in the background."
-                        .to_owned(),
-                ],
-                ..ContentState::default()
-            },
             pending_clipboard_text: None,
             clipboard_status: None,
             fold_cache: VecDeque::new(),
@@ -957,17 +1079,14 @@ impl App {
             repository_graph_truncated: false,
             last_error: None,
             ui_regions: UiRegions::default(),
-            tree_panel_width: None,
             tree_resize_dragging: false,
             preview_registry,
             repo_graph: None,
-            all_files_selection: None,
             git_changes_selection: None,
             pending_all_scope_path: None,
             pending_all_scope_navigation: false,
             pending_git_scope_path: None,
             pending_git_scope_fallback: None,
-            all_files_expansion: HashMap::new(),
             unloaded_directories: HashSet::new(),
             loading_directories: HashSet::new(),
             tree_epoch: 0,
@@ -975,8 +1094,6 @@ impl App {
             reviewed_change_versions: HashMap::new(),
             current_diff_path: None,
             pending_diff_path: None,
-            visible_rows: Vec::new(),
-            visible_changed_entries: Vec::new(),
             git_rows: Vec::new(),
             visible_git_rows: Vec::new(),
             scan_entry_limit,
@@ -1060,7 +1177,8 @@ impl App {
 
     #[cfg(feature = "agent-observability")]
     pub fn selected_agent_session(&self) -> Option<&AgentViewSession> {
-        self.tree_state
+        self.tab()
+            .tree_state
             .selected()
             .and_then(|index| self.agent_view.sessions.get(index))
     }
@@ -1072,7 +1190,7 @@ impl App {
         self.preview_registry.register(provider);
         self.runtime
             .update_preview_registry(self.preview_registry.clone());
-        if self.content.mode == ContentMode::Preview {
+        if self.tab_mut().content.mode == ContentMode::Preview {
             self.load_selected_preview();
         }
     }
@@ -1110,8 +1228,8 @@ impl App {
 
     pub fn visible_entries(&self) -> &[FileEntry] {
         match self.tree_scope {
-            TreeScope::AllFiles => &self.visible_rows,
-            TreeScope::GitChanges => &self.visible_changed_entries,
+            TreeScope::AllFiles => &self.tab().files().visible_rows,
+            TreeScope::GitChanges => &self.tab().files().visible_changed_entries,
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => &[],
         }
@@ -1123,7 +1241,7 @@ impl App {
 
     pub fn tree_row_count(&self) -> usize {
         match self.tree_scope {
-            TreeScope::AllFiles => self.visible_rows.len(),
+            TreeScope::AllFiles => self.tab().files().visible_rows.len(),
             TreeScope::GitChanges => self.visible_git_rows.len(),
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => self.agent_view.sessions.len(),
@@ -1131,7 +1249,7 @@ impl App {
     }
 
     pub(crate) fn tree_panel_width(&self, total_width: u16) -> u16 {
-        ui::tree_panel_width(total_width, self.tree_panel_width)
+        ui::tree_panel_width(total_width, self.tab().panel_width)
     }
 
     pub(crate) const fn tree_resize_dragging(&self) -> bool {
@@ -1147,9 +1265,9 @@ impl App {
         }
     }
 
-    pub const fn scope_is_truncated(&self) -> bool {
+    pub fn scope_is_truncated(&self) -> bool {
         match self.tree_scope {
-            TreeScope::AllFiles => self.all_files_truncated,
+            TreeScope::AllFiles => self.tab().files().truncated,
             TreeScope::GitChanges => self.git_changes_truncated,
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => self.agent_view.truncated,
@@ -1161,9 +1279,9 @@ impl App {
     }
 
     pub fn selected_entry(&self) -> Option<&FileEntry> {
-        let index = self.tree_state.selected()?;
+        let index = self.tab().tree_state.selected()?;
         match self.tree_scope {
-            TreeScope::AllFiles => self.visible_rows.get(index),
+            TreeScope::AllFiles => self.tab().files().visible_rows.get(index),
             TreeScope::GitChanges => self.visible_git_rows.get(index)?.file_entry(),
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => None,
@@ -1172,7 +1290,7 @@ impl App {
 
     pub fn selected_git_row(&self) -> Option<&GitTreeRow> {
         (self.tree_scope == TreeScope::GitChanges)
-            .then(|| self.tree_state.selected())
+            .then(|| self.tab().tree_state.selected())
             .flatten()
             .and_then(|index| self.visible_git_rows.get(index))
     }
@@ -1183,7 +1301,9 @@ impl App {
         }
         match self.tree_scope {
             TreeScope::AllFiles => self
-                .all_files_expansion
+                .tab()
+                .files()
+                .expansion
                 .get(&entry.relative)
                 .copied()
                 .unwrap_or(false),
@@ -1276,6 +1396,7 @@ impl App {
 
     pub fn selected_content_label(&self) -> String {
         if let Some(identity) = self
+            .tab()
             .content
             .identity
             .as_ref()
@@ -1352,6 +1473,7 @@ impl App {
 
     pub fn selected_content_title(&self) -> &'static str {
         if self
+            .tab()
             .content
             .identity
             .as_ref()
@@ -1374,7 +1496,7 @@ impl App {
             return if self.selected_entry().is_some_and(|entry| entry.is_dir) {
                 "Directory"
             } else {
-                self.content.mode.title()
+                self.tab().content.mode.title()
             };
         };
         match row.kind {
@@ -1382,7 +1504,7 @@ impl App {
             GitRowKind::Directory => "Directory",
             GitRowKind::Pointer(_) => "Submodule pointer",
             GitRowKind::Issue(_) => "Repository error",
-            GitRowKind::Change(_) => self.content.mode.title(),
+            GitRowKind::Change(_) => self.tab().content.mode.title(),
         }
     }
 
@@ -1391,12 +1513,12 @@ impl App {
     }
 
     pub fn content_selection_range(&self, line: usize) -> Option<Range<usize>> {
-        let selection = self.content.selection?;
+        let selection = self.tab().content.selection?;
         let (start, end) = selection.normalized();
         if start == end || line < start.line || line > end.line {
             return None;
         }
-        let content = self.content.lines.get(line)?;
+        let content = self.tab().content.lines.get(line)?;
         let start_byte = if line == start.line { start.byte } else { 0 };
         let end_byte = if line == end.line {
             end.byte
@@ -1413,8 +1535,9 @@ impl App {
         let mut rows = Vec::new();
         let mut line_index = 0usize;
         let mut region_index = 0usize;
-        while line_index < self.content.lines.len() {
+        while line_index < self.tab().content.lines.len() {
             while self
+                .tab()
                 .content
                 .fold_regions
                 .get(region_index)
@@ -1423,18 +1546,19 @@ impl App {
                 region_index += 1;
             }
             let region = self
+                .tab()
                 .content
                 .fold_regions
                 .get(region_index)
                 .filter(|region| region.start_line == line_index);
-            let collapsed =
-                region.is_some_and(|region| self.content.collapsed_folds.contains(&region.anchor));
+            let collapsed = region
+                .is_some_and(|region| self.tab().content.collapsed_folds.contains(&region.anchor));
             let marker = match (region.is_some(), collapsed) {
                 (true, true) => FoldVisualMarker::Collapsed,
                 (true, false) => FoldVisualMarker::Expanded,
                 (false, _) => FoldVisualMarker::None,
             };
-            let line = &self.content.lines[line_index];
+            let line = &self.tab().content.lines[line_index];
             let tab_origin = self.content_tab_origin(line_index);
             let ranges = if wrap_content {
                 wrap_line_ranges(line, text_width, tab_origin)
@@ -1493,28 +1617,29 @@ impl App {
     }
 
     pub(crate) fn effective_content_scroll(&self, row_count: usize) -> usize {
-        self.content.scroll.min(row_count.saturating_sub(1))
+        self.tab().content.scroll.min(row_count.saturating_sub(1))
     }
 
     pub(crate) fn prepare_content_width(&mut self, width: u16) {
         let width = width.max(1);
-        if self.content.projection_width == 0 {
-            self.content.projection_width = width;
+        let current = self.tab().content.projection_width;
+        if current == 0 {
+            self.tab_mut().content.projection_width = width;
             return;
         }
-        if self.content.projection_width == width {
+        if current == width {
             return;
         }
-        let old_rows = self.content_visual_rows(self.content.projection_width);
+        let old_rows = self.content_visual_rows(current);
         let effective_scroll = self.effective_content_scroll(old_rows.len());
         let top = old_rows
             .get(effective_scroll)
             .map(|row| (row.line_index, row.byte_range.start, row.synthetic));
-        self.content.projection_width = width;
+        self.tab_mut().content.projection_width = width;
         if let Some((line, byte, synthetic)) = top {
             let rows = self.content_visual_rows(width);
-            let line_len = self.content.lines.get(line).map_or(0, String::len);
-            self.content.scroll = rows
+            let line_len = self.tab().content.lines.get(line).map_or(0, String::len);
+            let new_scroll = rows
                 .iter()
                 .position(|row| viewport_row_matches(row, line, byte, synthetic, line_len))
                 .or_else(|| {
@@ -1527,37 +1652,41 @@ impl App {
                 })
                 .or_else(|| rows.iter().position(|row| row.line_index == line))
                 .unwrap_or(effective_scroll.min(rows.len().saturating_sub(1)));
+            self.tab_mut().content.scroll = new_scroll;
         }
         let row_count = self.content_visual_rows(width).len();
-        self.content.scroll = self.effective_content_scroll(row_count);
+        self.tab_mut().content.scroll = self.effective_content_scroll(row_count);
     }
 
-    pub(crate) const fn content_wraps_lines(&self) -> bool {
-        matches!(self.content.mode, ContentMode::Diff | ContentMode::Preview)
+    pub(crate) fn content_wraps_lines(&self) -> bool {
+        matches!(
+            self.tab().content.mode,
+            ContentMode::Diff | ContentMode::Preview
+        )
     }
 
     pub(crate) fn effective_content_horizontal_scroll(&self) -> usize {
         if self.content_wraps_lines() {
             0
         } else {
-            self.content.horizontal_scroll.min(u16::MAX as usize)
+            self.tab().content.horizontal_scroll.min(u16::MAX as usize)
         }
     }
 
     pub(crate) fn content_line_number_width(&self) -> usize {
-        if self.content.mode == ContentMode::Diff {
-            line_number_width(&self.content.diff_lines)
+        if self.tab().content.mode == ContentMode::Diff {
+            line_number_width(&self.tab().content.diff_lines)
         } else {
-            self.content.lines.len().max(1).to_string().len()
+            self.tab().content.lines.len().max(1).to_string().len()
         }
     }
 
     pub(crate) fn content_gutter_width(&self) -> usize {
-        if !self.content.show_line_numbers {
+        if !self.tab().content.show_line_numbers {
             return 0;
         }
         let number_width = self.content_line_number_width();
-        if self.content.mode == ContentMode::Diff {
+        if self.tab().content.mode == ContentMode::Diff {
             number_width.saturating_mul(2).saturating_add(4)
         } else {
             number_width.saturating_add(3)
@@ -1566,24 +1695,29 @@ impl App {
 
     fn content_tab_origin(&self, line_index: usize) -> usize {
         usize::from(
-            self.content.mode == ContentMode::Diff
-                && self.content.diff_lines.get(line_index).is_some_and(|line| {
-                    matches!(
-                        line.kind,
-                        DiffLineKind::Addition | DiffLineKind::Deletion | DiffLineKind::Context
-                    )
-                }),
+            self.tab().content.mode == ContentMode::Diff
+                && self
+                    .tab()
+                    .content
+                    .diff_lines
+                    .get(line_index)
+                    .is_some_and(|line| {
+                        matches!(
+                            line.kind,
+                            DiffLineKind::Addition | DiffLineKind::Deletion | DiffLineKind::Context
+                        )
+                    }),
         )
     }
 
     pub fn selected_preview_text(&self) -> Option<String> {
-        (self.content.mode == ContentMode::Preview)
+        (self.tab().content.mode == ContentMode::Preview)
             .then(|| self.selected_content_text())
             .flatten()
     }
 
     pub fn selected_content_text(&self) -> Option<String> {
-        let selection = self.content.selection?;
+        let selection = self.tab().content.selection?;
         let (start, end) = selection.normalized();
         if start == end {
             return None;
@@ -1591,7 +1725,7 @@ impl App {
 
         let mut selected = String::new();
         for line_index in start.line..=end.line {
-            let line = self.content.lines.get(line_index)?;
+            let line = self.tab().content.lines.get(line_index)?;
             let start_byte = if line_index == start.line {
                 start.byte.min(line.len())
             } else {
@@ -1612,7 +1746,7 @@ impl App {
 
     /// Apply one terminal key event to the same path used by the interactive loop.
     pub fn handle_key(&mut self, key: KeyEvent) {
-        self.content.navigation_hover_highlight = None;
+        self.tab_mut().content.navigation_hover_highlight = None;
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
@@ -1726,13 +1860,17 @@ impl App {
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
             (KeyCode::Char('d'), KeyModifiers::NONE) => self.load_selected_diff(),
-            (KeyCode::Char(' '), KeyModifiers::NONE) if self.content.mode == ContentMode::Diff => {
+            (KeyCode::Char(' '), KeyModifiers::NONE)
+                if self.tab_mut().content.mode == ContentMode::Diff =>
+            {
                 self.toggle_current_diff_review();
             }
-            (KeyCode::Char('n'), KeyModifiers::NONE) if self.content.mode == ContentMode::Diff => {
+            (KeyCode::Char('n'), KeyModifiers::NONE)
+                if self.tab_mut().content.mode == ContentMode::Diff =>
+            {
                 self.select_changed(1);
             }
-            (KeyCode::Char('N'), _) if self.content.mode == ContentMode::Diff => {
+            (KeyCode::Char('N'), _) if self.tab_mut().content.mode == ContentMode::Diff => {
                 self.select_changed(-1);
             }
             (KeyCode::Char('y'), KeyModifiers::NONE) => {
@@ -1797,43 +1935,43 @@ impl App {
         SearchRestore {
             focused_pane: self.focused_pane,
             tree_scope: self.tree_scope,
-            tree_state: self.tree_state,
-            all_files_selection: self.all_files_selection.clone(),
+            tree_state: self.tab().tree_state,
+            all_files_selection: self.tab().files().selection.clone(),
             git_changes_selection: self.git_changes_selection.clone(),
             pending_all_scope_path: self.pending_all_scope_path.clone(),
             pending_all_scope_navigation: self.pending_all_scope_navigation,
             pending_git_scope_path: self.pending_git_scope_path.clone(),
             pending_git_scope_fallback: self.pending_git_scope_fallback.clone(),
-            content_lines: self.content.lines.clone(),
-            content_highlights: self.content.highlights.clone(),
+            content_lines: self.tab().content.lines.clone(),
+            content_highlights: self.tab().content.highlights.clone(),
             content_viewport: ContentViewportRestore {
                 line: top.map(|row| row.line_index),
                 byte_start: top.map_or(0, |row| row.byte_range.start),
                 synthetic: top.is_some_and(|row| row.synthetic),
                 effective_scroll,
             },
-            content_horizontal_scroll: self.content.horizontal_scroll,
-            content_selection: self.content.selection,
+            content_horizontal_scroll: self.tab().content.horizontal_scroll,
+            content_selection: self.tab().content.selection,
             clipboard_status: self.clipboard_status.clone(),
-            content_mode: self.content.mode,
-            content_provider: self.content.provider.clone(),
-            content_preview_kind: self.content.preview_kind,
-            content_source_target: self.content.source_target.clone(),
-            content_show_line_numbers: self.content.show_line_numbers,
-            content_diff_lines: self.content.diff_lines.clone(),
-            content_identity: self.content.identity.clone(),
-            content_fold_source: self.content.fold_source,
-            content_fold_regions: self.content.fold_regions.clone(),
-            content_structure: self.content.structure.clone(),
-            content_collapsed_folds: self.content.collapsed_folds.clone(),
-            content_cursor_line: self.content.cursor_line,
-            content_successful: self.content.successful,
+            content_mode: self.tab().content.mode,
+            content_provider: self.tab().content.provider.clone(),
+            content_preview_kind: self.tab().content.preview_kind,
+            content_source_target: self.tab().content.source_target.clone(),
+            content_show_line_numbers: self.tab().content.show_line_numbers,
+            content_diff_lines: self.tab().content.diff_lines.clone(),
+            content_identity: self.tab().content.identity.clone(),
+            content_fold_source: self.tab().content.fold_source,
+            content_fold_regions: self.tab().content.fold_regions.clone(),
+            content_structure: self.tab().content.structure.clone(),
+            content_collapsed_folds: self.tab().content.collapsed_folds.clone(),
+            content_cursor_line: self.tab().content.cursor_line,
+            content_successful: self.tab().content.successful,
             content_was_loading: self.is_content_loading(),
             last_error: self.last_error.clone(),
             navigation_source: self.navigation_source.clone(),
             navigation_document_version: self.navigation_document_version,
-            navigation_caret: self.content.navigation_caret,
-            navigation_target_highlight: self.content.navigation_target_highlight,
+            navigation_caret: self.tab().content.navigation_caret,
+            navigation_target_highlight: self.tab().content.navigation_target_highlight,
             navigation_status: self.navigation_status.clone(),
             navigation_back: self.navigation_back.clone(),
             navigation_forward: self.navigation_forward.clone(),
@@ -1946,7 +2084,10 @@ impl App {
     }
 
     pub fn open_preview_find(&mut self) {
-        if !matches!(self.content.mode, ContentMode::Preview | ContentMode::Diff) {
+        if !matches!(
+            self.tab_mut().content.mode,
+            ContentMode::Preview | ContentMode::Diff
+        ) {
             self.clipboard_status =
                 Some("Open a file preview or diff before using Ctrl+F".to_owned());
             return;
@@ -1997,10 +2138,10 @@ impl App {
 
     pub(crate) fn navigation_highlights(&self, line: usize) -> Vec<HighlightSpan> {
         let mut highlights = Vec::with_capacity(2);
-        if let Some(range) = self.content.navigation_target_highlight
+        if let Some(range) = self.tab().content.navigation_target_highlight
             && range.start.line <= line
             && line <= range.end.line
-            && let Some(text) = self.content.lines.get(line)
+            && let Some(text) = self.tab().content.lines.get(line)
         {
             let start = if line == range.start.line {
                 range.start.byte
@@ -2019,10 +2160,10 @@ impl App {
                 });
             }
         }
-        if let Some(range) = self.content.navigation_hover_highlight
+        if let Some(range) = self.tab().content.navigation_hover_highlight
             && range.start.line <= line
             && line <= range.end.line
-            && let Some(text) = self.content.lines.get(line)
+            && let Some(text) = self.tab().content.lines.get(line)
         {
             let start = if line == range.start.line {
                 range.start.byte
@@ -2128,7 +2269,8 @@ impl App {
                 .case_insensitive(!case_sensitive)
                 .build()
                 .expect("an escaped literal is always a valid regex");
-            self.content
+            self.tab_mut()
+                .content
                 .lines
                 .iter()
                 .enumerate()
@@ -2719,38 +2861,39 @@ impl App {
             let restored_tree_state = restore.tree_state;
             self.focused_pane = restore.focused_pane;
             self.tree_scope = restore.tree_scope;
-            self.all_files_selection = restore.all_files_selection;
+            self.tab_mut().files_mut().selection = restore.all_files_selection;
             self.git_changes_selection = restore.git_changes_selection;
             self.pending_all_scope_path = restore.pending_all_scope_path;
             self.pending_all_scope_navigation = restore.pending_all_scope_navigation;
             self.pending_git_scope_path = restore.pending_git_scope_path;
             self.pending_git_scope_fallback = restore.pending_git_scope_fallback;
             self.rebuild_visible_rows();
-            self.tree_state = restored_tree_state;
+            self.tab_mut().tree_state = restored_tree_state;
             self.normalize_tree_state();
-            self.content.lines = restore.content_lines;
-            self.content.highlights = restore.content_highlights;
-            self.content.horizontal_scroll = restore.content_horizontal_scroll;
-            self.content.selection = restore.content_selection;
+            self.tab_mut().content.lines = restore.content_lines;
+            self.tab_mut().content.highlights = restore.content_highlights;
+            self.tab_mut().content.horizontal_scroll = restore.content_horizontal_scroll;
+            self.tab_mut().content.selection = restore.content_selection;
             self.clipboard_status = restore.clipboard_status;
-            self.content.mode = restore.content_mode;
-            self.content.provider = restore.content_provider;
-            self.content.preview_kind = restore.content_preview_kind;
-            self.content.source_target = restore.content_source_target;
-            self.content.show_line_numbers = restore.content_show_line_numbers;
-            self.content.diff_lines = restore.content_diff_lines;
-            self.content.identity = restore.content_identity;
-            self.content.fold_source = restore.content_fold_source;
-            self.content.fold_regions = restore.content_fold_regions;
-            self.content.structure = restore.content_structure;
-            self.content.collapsed_folds = restore.content_collapsed_folds;
-            self.content.cursor_line = restore.content_cursor_line;
-            self.content.successful = restore.content_successful;
+            self.tab_mut().content.mode = restore.content_mode;
+            self.tab_mut().content.provider = restore.content_provider;
+            self.tab_mut().content.preview_kind = restore.content_preview_kind;
+            self.tab_mut().content.source_target = restore.content_source_target;
+            self.tab_mut().content.show_line_numbers = restore.content_show_line_numbers;
+            self.tab_mut().content.diff_lines = restore.content_diff_lines;
+            self.tab_mut().content.identity = restore.content_identity;
+            self.tab_mut().content.fold_source = restore.content_fold_source;
+            self.tab_mut().content.fold_regions = restore.content_fold_regions;
+            self.tab_mut().content.structure = restore.content_structure;
+            self.tab_mut().content.collapsed_folds = restore.content_collapsed_folds;
+            self.tab_mut().content.cursor_line = restore.content_cursor_line;
+            self.tab_mut().content.successful = restore.content_successful;
             self.last_error = restore.last_error;
             self.navigation_source = restore.navigation_source;
             self.navigation_document_version = restore.navigation_document_version;
-            self.content.navigation_caret = restore.navigation_caret;
-            self.content.navigation_target_highlight = restore.navigation_target_highlight;
+            self.tab_mut().content.navigation_caret = restore.navigation_caret;
+            self.tab_mut().content.navigation_target_highlight =
+                restore.navigation_target_highlight;
             self.navigation_status = restore.navigation_status;
             self.navigation_back = restore.navigation_back;
             self.navigation_forward = restore.navigation_forward;
@@ -2829,16 +2972,16 @@ impl App {
     /// Apply a mouse event using hit boxes captured during the latest draw.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.quit_confirmation = None;
-        self.content.navigation_hover_highlight = None;
+        self.tab_mut().content.navigation_hover_highlight = None;
         if mouse.kind == MouseEventKind::Moved {
             if mouse.modifiers == KeyModifiers::ALT
                 && self.navigation_picker.is_none()
                 && self.search.is_none()
                 && self.preview_find.is_none()
-                && self.content.mode == ContentMode::Preview
+                && self.tab_mut().content.mode == ContentMode::Preview
                 && let Some((_, token)) = self.navigation_token_at_mouse(mouse)
             {
-                self.content.navigation_hover_highlight = Some(token);
+                self.tab_mut().content.navigation_hover_highlight = Some(token);
             }
             return;
         }
@@ -2912,7 +3055,11 @@ impl App {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
                     let visible_row = usize::from(mouse.row - self.ui_regions.tree_inner.y);
-                    let index = self.tree_state.offset().saturating_add(visible_row);
+                    let index = self
+                        .tab_mut()
+                        .tree_state
+                        .offset()
+                        .saturating_add(visible_row);
                     if index < self.tree_row_count() {
                         let identity = self.tree_click_identity(index);
                         let container = self.tree_row_is_container(index);
@@ -2941,17 +3088,17 @@ impl App {
                     if self.handle_fold_mouse_down(mouse) {
                         return;
                     }
-                    if self.content.mode == ContentMode::Preview
+                    if self.tab_mut().content.mode == ContentMode::Preview
                         && mouse.modifiers == KeyModifiers::ALT
                         && let Some((point, token)) = self.navigation_token_at_mouse(mouse)
                     {
                         self.clear_content_selection();
-                        self.content.navigation_caret = NavigationCaret {
+                        self.tab_mut().content.navigation_caret = NavigationCaret {
                             point,
                             preferred_display_column: 0,
                         };
-                        self.content.navigation_hover_highlight = Some(token);
-                        self.content.navigation_target_highlight = None;
+                        self.tab_mut().content.navigation_hover_highlight = Some(token);
+                        self.tab_mut().content.navigation_target_highlight = None;
                         self.request_semantic_navigation(NavigationOperation::Definition);
                         return;
                     }
@@ -3157,7 +3304,7 @@ impl App {
             .saturating_add(self.ui_regions.divider.width)
             .saturating_add(self.ui_regions.content_body.width);
         let requested = column.saturating_sub(self.ui_regions.tree_body.x);
-        self.tree_panel_width = Some(ui::tree_panel_width(total_width, Some(requested)));
+        self.tab_mut().panel_width = Some(ui::tree_panel_width(total_width, Some(requested)));
     }
 
     fn begin_content_selection(&mut self, mouse: MouseEvent) {
@@ -3170,15 +3317,15 @@ impl App {
             return;
         };
         self.pending_clipboard_text = None;
-        self.content.navigation_caret = NavigationCaret {
+        self.tab_mut().content.navigation_caret = NavigationCaret {
             point: SourcePosition {
                 line: before.line,
                 byte: before.byte,
             },
             preferred_display_column: 0,
         };
-        self.content.navigation_target_highlight = None;
-        self.content.selection = Some(ContentSelection {
+        self.tab_mut().content.navigation_target_highlight = None;
+        self.tab_mut().content.selection = Some(ContentSelection {
             anchor_before: before,
             anchor_after: after,
             head: before,
@@ -3188,7 +3335,9 @@ impl App {
     }
 
     fn handle_fold_mouse_down(&mut self, mouse: MouseEvent) -> bool {
-        if self.content.mode != ContentMode::Preview || !self.content.show_line_numbers {
+        if self.tab_mut().content.mode != ContentMode::Preview
+            || !self.tab_mut().content.show_line_numbers
+        {
             return false;
         }
         let rows_area = self.content_text_rows();
@@ -3211,20 +3360,22 @@ impl App {
         if row.fold_marker == FoldVisualMarker::None {
             return false;
         }
-        self.content.cursor_line = row.line_index;
+        self.tab_mut().content.cursor_line = row.line_index;
         self.toggle_cursor_fold();
         let new_rows = self.content_visual_rows(rows_area.width);
         if let Some(index) = new_rows.iter().position(|row| {
-            row.line_index == self.content.cursor_line && row.fold_marker != FoldVisualMarker::None
+            row.line_index == self.tab_mut().content.cursor_line
+                && row.fold_marker != FoldVisualMarker::None
         }) {
-            self.content.scroll = index.saturating_sub(visible);
-            self.content.scroll = self.effective_content_scroll(new_rows.len());
+            self.tab_mut().content.scroll = index.saturating_sub(visible);
+            self.tab_mut().content.scroll = self.effective_content_scroll(new_rows.len());
         }
         true
     }
 
     fn drag_content_selection(&mut self, mouse: MouseEvent) {
         let Some(selection) = self
+            .tab_mut()
             .content
             .selection
             .filter(|selection| selection.dragging)
@@ -3239,7 +3390,7 @@ impl App {
         } else {
             before
         };
-        self.content.selection = Some(ContentSelection {
+        self.tab_mut().content.selection = Some(ContentSelection {
             head,
             dragged: true,
             ..selection
@@ -3248,6 +3399,7 @@ impl App {
 
     fn finish_content_selection(&mut self, mouse: MouseEvent) {
         let Some(selection) = self
+            .tab_mut()
             .content
             .selection
             .filter(|selection| selection.dragging)
@@ -3257,7 +3409,7 @@ impl App {
         if selection.dragged {
             self.drag_content_selection(mouse);
         }
-        if let Some(selection) = &mut self.content.selection {
+        if let Some(selection) = &mut self.tab_mut().content.selection {
             selection.dragging = false;
         }
         if selection.dragged {
@@ -3270,7 +3422,7 @@ impl App {
     }
 
     fn content_point_bounds(&self, mouse: MouseEvent) -> Option<(ContentPoint, ContentPoint)> {
-        if self.content.lines.is_empty() {
+        if self.tab().content.lines.is_empty() {
             return None;
         }
 
@@ -3289,7 +3441,7 @@ impl App {
             .saturating_add(visible_column);
         let gutter_width = self.content_gutter_width();
         let text_column = rendered_column.saturating_sub(gutter_width);
-        let line = self.content.lines.get(visual_row.line_index)?;
+        let line = self.tab().content.lines.get(visual_row.line_index)?;
         let segment = line.get(visual_row.byte_range.clone())?;
         let (before, after) =
             grapheme_bounds_at_column(segment, text_column, visual_row.tab_origin);
@@ -3338,7 +3490,7 @@ impl App {
 
     fn content_text_rows(&self) -> Rect {
         let rows = self.ui_regions.content_inner;
-        if self.content.mode == ContentMode::Info {
+        if self.tab().content.mode == ContentMode::Info {
             Rect::new(
                 rows.x,
                 rows.y.saturating_add(1),
@@ -3351,7 +3503,7 @@ impl App {
     }
 
     fn clear_content_selection(&mut self) {
-        self.content.selection = None;
+        self.tab_mut().content.selection = None;
         self.pending_clipboard_text = None;
     }
 
@@ -3487,7 +3639,7 @@ impl App {
         // keep the established changed-file-first default. Explicit and
         // previously saved Git selections remain stable across refreshes.
         if first_git_entry_without_sync {
-            self.tree_state.select(None);
+            self.tab_mut().tree_state.select(None);
         }
     }
 
@@ -3499,14 +3651,15 @@ impl App {
         let synchronized_file = self.selected_file_path_for_scope_sync();
         self.remember_current_selection();
         self.tree_scope = scope;
-        self.tree_state = ListState::default();
+        self.tab_mut().tree_state = ListState::default();
         self.rebuild_visible_rows();
         match scope {
             TreeScope::AllFiles => {
                 if let Some(path) = synchronized_file {
                     self.reveal_all_files_selection(path);
                 } else {
-                    self.restore_visible_selection(self.all_files_selection.clone());
+                    let selection = self.tab().files().selection.clone();
+                    self.restore_visible_selection(selection);
                 }
             }
             TreeScope::GitChanges => {
@@ -3598,27 +3751,27 @@ impl App {
     fn handle_content_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Char('['), KeyModifiers::NONE)
-                if self.content.mode == ContentMode::Preview =>
+                if self.tab_mut().content.mode == ContentMode::Preview =>
             {
                 self.jump_visible_fold(-1);
             }
             (KeyCode::Char(']'), KeyModifiers::NONE)
-                if self.content.mode == ContentMode::Preview =>
+                if self.tab_mut().content.mode == ContentMode::Preview =>
             {
                 self.jump_visible_fold(1);
             }
             (KeyCode::Enter | KeyCode::Char(' '), KeyModifiers::NONE)
-                if self.content.mode == ContentMode::Preview =>
+                if self.tab_mut().content.mode == ContentMode::Preview =>
             {
                 self.toggle_cursor_fold();
             }
             (KeyCode::Char('{'), KeyModifiers::NONE | KeyModifiers::SHIFT)
-                if self.content.mode == ContentMode::Preview =>
+                if self.tab_mut().content.mode == ContentMode::Preview =>
             {
                 self.collapse_all_folds();
             }
             (KeyCode::Char('}'), KeyModifiers::NONE | KeyModifiers::SHIFT)
-                if self.content.mode == ContentMode::Preview =>
+                if self.tab_mut().content.mode == ContentMode::Preview =>
             {
                 self.expand_all_folds();
             }
@@ -3631,11 +3784,11 @@ impl App {
             (KeyCode::Left, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             (KeyCode::Right, KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
             (KeyCode::Home | KeyCode::Char('g'), _) => {
-                self.content.scroll = 0;
+                self.tab_mut().content.scroll = 0;
                 self.sync_content_cursor_to_scroll();
             }
             (KeyCode::End | KeyCode::Char('G'), _) => {
-                self.content.scroll = self
+                self.tab_mut().content.scroll = self
                     .content_visual_rows(self.ui_regions.content_inner.width)
                     .len()
                     .saturating_sub(1);
@@ -3668,7 +3821,7 @@ impl App {
     }
 
     fn tree_is_at_first_row_or_empty(&self) -> bool {
-        self.tree_row_count() == 0 || self.tree_state.selected().unwrap_or(0) == 0
+        self.tree_row_count() == 0 || self.tab().tree_state.selected().unwrap_or(0) == 0
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -3676,7 +3829,7 @@ impl App {
             return;
         }
 
-        let current = self.tree_state.selected().unwrap_or(0);
+        let current = self.tab_mut().tree_state.selected().unwrap_or(0);
         let next = current
             .saturating_add_signed(delta)
             .min(self.tree_row_count().saturating_sub(1));
@@ -3696,7 +3849,7 @@ impl App {
     }
 
     fn select_optional(&mut self, index: Option<usize>) {
-        self.tree_state.select(index);
+        self.tab_mut().tree_state.select(index);
         self.normalize_tree_state();
         self.remember_current_selection();
         self.load_scope_default_content();
@@ -3763,11 +3916,16 @@ impl App {
         };
 
         let expanded = self
-            .all_files_expansion
+            .tab_mut()
+            .files_mut()
+            .expansion
             .get(&relative)
             .copied()
             .unwrap_or(false);
-        self.all_files_expansion.insert(relative.clone(), !expanded);
+        self.tab_mut()
+            .files_mut()
+            .expansion
+            .insert(relative.clone(), !expanded);
         if !expanded {
             self.request_directory_load(relative.clone());
         }
@@ -3793,7 +3951,7 @@ impl App {
         if len == 0 {
             return;
         }
-        let start = self.tree_state.selected().unwrap_or(0);
+        let start = self.tab_mut().tree_state.selected().unwrap_or(0);
         let target = (1..=len).find_map(|distance| {
             let distance = distance % len;
             let index = if delta.is_negative() {
@@ -3803,6 +3961,8 @@ impl App {
             };
             match self.tree_scope {
                 TreeScope::AllFiles => self
+                    .tab_mut()
+                    .files_mut()
                     .visible_rows
                     .get(index)
                     .is_some_and(|entry| !entry.is_dir && entry.status.is_some())
@@ -3823,15 +3983,18 @@ impl App {
     }
 
     fn sync_content_cursor_to_scroll(&mut self) {
-        if self.content.mode != ContentMode::Preview {
+        if self.tab_mut().content.mode != ContentMode::Preview {
             return;
         }
         let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
-        self.content.scroll = self.effective_content_scroll(rows.len());
-        if let Some(row) = rows.get(self.content.scroll) {
-            self.content.cursor_line = row.line_index;
-            self.content.navigation_caret = NavigationCaret {
-                point: first_navigation_point_on_line(&self.content.lines, row.line_index),
+        self.tab_mut().content.scroll = self.effective_content_scroll(rows.len());
+        if let Some(row) = rows.get(self.tab_mut().content.scroll) {
+            self.tab_mut().content.cursor_line = row.line_index;
+            self.tab_mut().content.navigation_caret = NavigationCaret {
+                point: first_navigation_point_on_line(
+                    &self.tab_mut().content.lines,
+                    row.line_index,
+                ),
                 preferred_display_column: 0,
             };
         }
@@ -3852,89 +4015,104 @@ impl App {
         let position = if delta >= 0 {
             markers
                 .iter()
-                .position(|(_, line)| *line > self.content.cursor_line)
+                .position(|(_, line)| *line > self.tab_mut().content.cursor_line)
                 .unwrap_or(0)
         } else {
             markers
                 .iter()
-                .rposition(|(_, line)| *line < self.content.cursor_line)
+                .rposition(|(_, line)| *line < self.tab_mut().content.cursor_line)
                 .unwrap_or(markers.len() - 1)
         };
-        self.content.scroll = markers[position].0;
-        self.content.cursor_line = markers[position].1;
+        self.tab_mut().content.scroll = markers[position].0;
+        self.tab_mut().content.cursor_line = markers[position].1;
         self.clear_content_selection();
     }
 
     fn toggle_cursor_fold(&mut self) {
-        let Some(region) = self
+        let cursor_line = self.tab().content.cursor_line;
+        let Some(anchor) = self
+            .tab()
             .content
             .fold_regions
             .iter()
-            .find(|region| region.start_line == self.content.cursor_line)
+            .find_map(|region| (region.start_line == cursor_line).then_some(region.anchor))
         else {
             return;
         };
-        let anchor = region.anchor;
-        if !self.content.collapsed_folds.remove(&anchor) {
-            self.content.collapsed_folds.insert(anchor);
+        if !self.tab_mut().content.collapsed_folds.remove(&anchor) {
+            self.tab_mut().content.collapsed_folds.insert(anchor);
         }
         self.clear_content_selection();
-        self.scroll_to_logical_line(self.content.cursor_line, 0);
+        let line = self.tab().content.cursor_line;
+        self.scroll_to_logical_line(line, 0);
     }
 
     fn collapse_all_folds(&mut self) {
-        self.content
-            .collapsed_folds
-            .extend(self.content.fold_regions.iter().map(|region| region.anchor));
+        let anchors: Vec<FoldAnchor> = self
+            .tab()
+            .content
+            .fold_regions
+            .iter()
+            .map(|region| region.anchor)
+            .collect();
+        self.tab_mut().content.collapsed_folds.extend(anchors);
         self.clear_content_selection();
         self.ensure_cursor_visible();
     }
 
     fn expand_all_folds(&mut self) {
-        self.content.collapsed_folds.clear();
+        self.tab_mut().content.collapsed_folds.clear();
         self.clear_content_selection();
-        self.scroll_to_logical_line(self.content.cursor_line, 0);
+        let line = self.tab().content.cursor_line;
+        self.scroll_to_logical_line(line, 0);
     }
 
     fn ensure_cursor_visible(&mut self) {
-        if let Some(outer) = self
+        let cursor_line = self.tab().content.cursor_line;
+        let collapsed = self.tab().content.collapsed_folds.clone();
+        let outer_start = self
+            .tab()
             .content
             .fold_regions
             .iter()
             .filter(|region| {
-                self.content.collapsed_folds.contains(&region.anchor)
-                    && region.start_line < self.content.cursor_line
-                    && self.content.cursor_line <= region.end_line
+                collapsed.contains(&region.anchor)
+                    && region.start_line < cursor_line
+                    && cursor_line <= region.end_line
             })
             .min_by_key(|region| region.start_line)
-        {
-            self.content.cursor_line = outer.start_line;
+            .map(|region| region.start_line);
+        if let Some(start) = outer_start {
+            self.tab_mut().content.cursor_line = start;
         }
-        self.scroll_to_logical_line(self.content.cursor_line, 0);
+        let line = self.tab().content.cursor_line;
+        self.scroll_to_logical_line(line, 0);
     }
 
     fn reveal_folded_line(&mut self, line: usize) {
+        let collapsed = self.tab().content.collapsed_folds.clone();
         let hidden_by: Vec<FoldAnchor> = self
+            .tab()
             .content
             .fold_regions
             .iter()
             .filter(|region| {
                 region.start_line < line
                     && line <= region.end_line
-                    && self.content.collapsed_folds.contains(&region.anchor)
+                    && collapsed.contains(&region.anchor)
             })
             .map(|region| region.anchor)
             .collect();
         for anchor in hidden_by {
-            self.content.collapsed_folds.remove(&anchor);
+            self.tab_mut().content.collapsed_folds.remove(&anchor);
         }
     }
 
     fn scroll_to_logical_line(&mut self, line: usize, byte: usize) {
         let width = self.ui_regions.content_inner.width.max(1);
         let rows = self.content_visual_rows(width);
-        let line_len = self.content.lines.get(line).map_or(0, String::len);
-        self.content.scroll = rows
+        let line_len = self.tab().content.lines.get(line).map_or(0, String::len);
+        let scroll = rows
             .iter()
             .position(|row| {
                 row.line_index == line
@@ -3943,22 +4121,23 @@ impl App {
             })
             .or_else(|| rows.iter().position(|row| row.line_index == line))
             .unwrap_or(0);
-        self.content.cursor_line = rows
-            .get(self.content.scroll)
-            .map_or(line, |row| row.line_index);
+        self.tab_mut().content.scroll = scroll;
+        let cursor_line = rows.get(scroll).map_or(line, |row| row.line_index);
+        self.tab_mut().content.cursor_line = cursor_line;
     }
 
     fn cache_current_folds(&mut self) {
-        if !self.content.successful || !self.content.fold_source.allows_folding() {
+        let content = &self.tab().content;
+        if !content.successful || !content.fold_source.allows_folding() {
             return;
         }
-        let Some(identity) = self.content.identity.clone() else {
+        let Some(identity) = content.identity.clone() else {
             return;
         };
+        let collapsed = content.collapsed_folds.clone();
         self.fold_cache
             .retain(|(candidate, _)| candidate != &identity);
-        self.fold_cache
-            .push_front((identity, self.content.collapsed_folds.clone()));
+        self.fold_cache.push_front((identity, collapsed));
         self.fold_cache.truncate(64);
     }
 
@@ -3971,10 +4150,15 @@ impl App {
 
     fn restore_content_viewport(&mut self, viewport: ContentViewportRestore) {
         let width = self.ui_regions.content_inner.width.max(1);
-        self.content.projection_width = width;
+        self.tab_mut().content.projection_width = width;
         let rows = self.content_visual_rows(width);
         let restored = viewport.line.and_then(|line| {
-            let line_len = self.content.lines.get(line).map_or(0, String::len);
+            let line_len = self
+                .tab_mut()
+                .content
+                .lines
+                .get(line)
+                .map_or(0, String::len);
             rows.iter()
                 .position(|row| {
                     viewport_row_matches(
@@ -3994,7 +4178,7 @@ impl App {
                     }
                 })
         });
-        self.content.scroll = restored
+        self.tab_mut().content.scroll = restored
             .unwrap_or(viewport.effective_scroll)
             .min(rows.len().saturating_sub(1));
     }
@@ -4003,14 +4187,16 @@ impl App {
         let row_count = self
             .content_visual_rows(self.ui_regions.content_inner.width.max(1))
             .len();
-        self.content.scroll = self.effective_content_scroll(row_count);
-        self.content.scroll = self
+        self.tab_mut().content.scroll = self.effective_content_scroll(row_count);
+        self.tab_mut().content.scroll = self
+            .tab_mut()
             .content
             .scroll
             .saturating_add_signed(vertical)
             .min(row_count.saturating_sub(1));
         if !self.content_wraps_lines() {
-            self.content.horizontal_scroll = self
+            self.tab_mut().content.horizontal_scroll = self
+                .tab_mut()
                 .content
                 .horizontal_scroll
                 .saturating_add_signed(horizontal);
@@ -4275,7 +4461,7 @@ impl App {
         self.loading_directories.clear();
 
         self.branch = snapshot.branch;
-        self.all_files_truncated = truncated;
+        self.tab_mut().files_mut().truncated = truncated;
         // Git status paths are synthesized into the filtered tree, but that
         // tree still comes from the bounded filesystem traversal. Keep the
         // conservative partial marker in both views instead of claiming the
@@ -4337,21 +4523,17 @@ impl App {
         }
         self.rebind_navigation_sources_after_refresh();
         self.reconcile_expansion_state();
+        let files_expansion = &self.tab().files().expansion;
         let expanded_boundaries: Vec<PathBuf> = self
             .unloaded_directories
             .iter()
-            .filter(|path| {
-                self.all_files_expansion
-                    .get(*path)
-                    .copied()
-                    .unwrap_or(false)
-            })
+            .filter(|path| files_expansion.get(*path).copied().unwrap_or(false))
             .cloned()
             .collect();
         for directory in expanded_boundaries {
             self.request_directory_load(directory);
         }
-        self.tree_state = ListState::default();
+        self.tab_mut().tree_state = ListState::default();
         self.rebuild_visible_rows();
         let visible_navigation_path = self
             .navigation_source
@@ -4369,7 +4551,8 @@ impl App {
                         self.reveal_all_files_selection(path);
                     }
                 } else {
-                    self.restore_visible_selection(self.all_files_selection.clone());
+                    let selection = self.tab().files().selection.clone();
+                    self.restore_visible_selection(selection);
                 }
             }
             TreeScope::GitChanges => {
@@ -4427,7 +4610,7 @@ impl App {
 
         self.unloaded_directories.remove(&completion.relative);
         self.unloaded_directories.extend(scan.unloaded_directories);
-        self.all_files_truncated |= scan.truncated;
+        self.tab_mut().files_mut().truncated |= scan.truncated;
         for entry in scan.entries {
             if let Some(existing) = self
                 .all_entries
@@ -4487,7 +4670,7 @@ impl App {
 
     fn default_selection_index(&self) -> Option<usize> {
         match self.tree_scope {
-            TreeScope::AllFiles => (!self.visible_rows.is_empty()).then_some(0),
+            TreeScope::AllFiles => (!self.tab().files().visible_rows.is_empty()).then_some(0),
             TreeScope::GitChanges => self
                 .visible_git_rows
                 .iter()
@@ -4509,7 +4692,9 @@ impl App {
 
     fn remember_current_selection(&mut self) {
         match self.tree_scope {
-            TreeScope::AllFiles => self.all_files_selection = self.selected_relative_path(),
+            TreeScope::AllFiles => {
+                self.tab_mut().files_mut().selection = self.selected_relative_path()
+            }
             TreeScope::GitChanges => {
                 self.git_changes_selection =
                     self.selected_git_row().map(|row| row.identity.clone());
@@ -4581,7 +4766,9 @@ impl App {
         self.pending_all_scope_path = Some(path.clone());
         let mut parent = path.parent();
         while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
-            self.all_files_expansion
+            self.tab_mut()
+                .files_mut()
+                .expansion
                 .insert(directory.to_path_buf(), true);
             parent = directory.parent();
         }
@@ -4603,7 +4790,7 @@ impl App {
         if load_content {
             self.select_optional(index);
         } else {
-            self.tree_state.select(index);
+            self.tab_mut().tree_state.select(index);
             self.normalize_tree_state();
             self.remember_current_selection();
         }
@@ -4648,7 +4835,7 @@ impl App {
             .map(|entry| entry.relative.clone())
             .collect();
         Self::reconcile_expansion_map(
-            &mut self.all_files_expansion,
+            &mut self.tab_mut().files_mut().expansion,
             &directories,
             Self::default_directory_expansion(TreeScope::AllFiles),
         );
@@ -4679,7 +4866,8 @@ impl App {
     }
 
     fn rebuild_visible_rows(&mut self) {
-        self.visible_rows = self
+        let files_expansion = self.tab().files().expansion.clone();
+        let rows: Vec<FileEntry> = self
             .entries_for_scope(TreeScope::AllFiles)
             .iter()
             .filter(|entry| {
@@ -4688,15 +4876,11 @@ impl App {
                     .ancestors()
                     .skip(1)
                     .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                    .all(|ancestor| {
-                        self.all_files_expansion
-                            .get(ancestor)
-                            .copied()
-                            .unwrap_or(false)
-                    })
+                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(false))
             })
             .cloned()
             .collect();
+        self.tab_mut().files_mut().visible_rows = rows;
         self.visible_git_rows = self
             .git_rows
             .iter()
@@ -4710,11 +4894,12 @@ impl App {
             })
             .cloned()
             .collect();
-        self.visible_changed_entries = self
+        let changed_entries: Vec<FileEntry> = self
             .visible_git_rows
             .iter()
             .filter_map(|row| row.file_entry.clone())
             .collect();
+        self.tab_mut().files_mut().visible_changed_entries = changed_entries;
         self.normalize_tree_state();
     }
 
@@ -4774,7 +4959,7 @@ impl App {
         if load_content {
             self.select_optional(index);
         } else {
-            self.tree_state.select(index);
+            self.tab_mut().tree_state.select(index);
             self.normalize_tree_state();
             self.remember_current_selection();
         }
@@ -4810,20 +4995,21 @@ impl App {
     fn normalize_tree_state(&mut self) {
         let row_count = self.tree_row_count();
         if row_count == 0 {
-            self.tree_state.select(None);
-            *self.tree_state.offset_mut() = 0;
+            self.tab_mut().tree_state.select(None);
+            *self.tab_mut().tree_state.offset_mut() = 0;
             return;
         }
 
         if self
+            .tab_mut()
             .tree_state
             .selected()
             .is_some_and(|selected| selected >= row_count)
         {
-            self.tree_state.select(Some(row_count - 1));
+            self.tab_mut().tree_state.select(Some(row_count - 1));
         }
-        let offset = self.tree_state.offset().min(row_count - 1);
-        *self.tree_state.offset_mut() = offset;
+        let offset = self.tab_mut().tree_state.offset().min(row_count - 1);
+        *self.tab_mut().tree_state.offset_mut() = offset;
     }
 
     fn load_scope_default_content(&mut self) {
@@ -5274,10 +5460,10 @@ impl App {
 
     fn current_external_open_target(&self) -> Option<(ContentTarget, String)> {
         if self.focused_pane == FocusPane::Content
-            && let Some(target) = self.content.source_target.clone()
-            && self.content.successful
+            && let Some(target) = self.tab().content.source_target.clone()
+            && self.tab().content.successful
         {
-            let label = self.content.identity.as_ref().map_or_else(
+            let label = self.tab().content.identity.as_ref().map_or_else(
                 || self.selected_content_label(),
                 ContentIdentity::display_label,
             );
@@ -5312,14 +5498,15 @@ impl App {
     }
 
     fn content_external_open_target(&self) -> Option<(ContentTarget, String)> {
-        let target = self.content.source_target.clone()?;
-        self.content.successful.then(|| {
-            let label = self.content.identity.as_ref().map_or_else(
-                || self.selected_content_label(),
-                ContentIdentity::display_label,
-            );
-            (target, label)
-        })
+        let target = self.tab().content.source_target.clone()?;
+        if !self.tab().content.successful {
+            return None;
+        }
+        let label = self.tab().content.identity.as_ref().map_or_else(
+            || self.selected_content_label(),
+            ContentIdentity::display_label,
+        );
+        Some((target, label))
     }
 
     pub(crate) fn can_open_content_externally(&self) -> bool {
@@ -5341,7 +5528,7 @@ impl App {
 
     fn confirm_terminal_image_preview(&mut self) {
         let Some(pending) = self.pending_terminal_image_preview.take() else {
-            if matches!(self.content.preview_kind, PreviewKind::Image(_)) {
+            if matches!(self.tab_mut().content.preview_kind, PreviewKind::Image(_)) {
                 self.set_navigation_status(
                     NavigationStatusLevel::Info,
                     "Press o first; terminal rendering is offered only when the system default app is unavailable.",
@@ -5369,13 +5556,14 @@ impl App {
         };
         self.cancel_pending_navigation();
         self.navigation_picker = None;
-        self.content.navigation_target_highlight = None;
+        self.tab_mut().content.navigation_target_highlight = None;
         let generation = self.content_requests.begin();
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(ContentMode::Preview);
         self.pending_diff_path = None;
-        self.content.lines = vec![format!("Rendering {} for this terminal…", pending.label)];
+        self.tab_mut().content.lines =
+            vec![format!("Rendering {} for this terminal…", pending.label)];
         self.runtime.request_content(ContentRequest {
             generation,
             kind: ContentKind::Preview,
@@ -5407,7 +5595,7 @@ impl App {
     ) -> u64 {
         self.cancel_pending_navigation();
         self.navigation_picker = None;
-        self.content.navigation_target_highlight = None;
+        self.tab_mut().content.navigation_target_highlight = None;
         let generation = self.content_requests.begin();
         self.cache_current_folds();
         self.cancel_external_open();
@@ -5416,7 +5604,7 @@ impl App {
             ContentKind::Preview => ContentMode::Preview,
         });
         self.pending_diff_path = review_path.map(|path| (generation, path));
-        self.content.lines = vec![format!("Loading {label}…")];
+        self.tab_mut().content.lines = vec![format!("Loading {label}…")];
         self.runtime.request_content(ContentRequest {
             generation,
             kind,
@@ -5467,7 +5655,7 @@ impl App {
             self.navigation_runtime.cancel(stage.invocation.generation);
         }
         self.navigation_picker = None;
-        self.content.navigation_hover_highlight = None;
+        self.tab_mut().content.navigation_hover_highlight = None;
         self.navigation_generation = self
             .navigation_generation
             .checked_add(1)
@@ -5488,7 +5676,7 @@ impl App {
             self.runtime.cancel_pending_content();
         }
         self.navigation_picker = None;
-        self.content.navigation_hover_highlight = None;
+        self.tab_mut().content.navigation_hover_highlight = None;
         self.navigation_generation = self
             .navigation_generation
             .checked_add(1)
@@ -5529,7 +5717,7 @@ impl App {
             synthetic: row.is_some_and(|row| row.synthetic),
             effective_scroll,
         };
-        let point = self.content.navigation_caret.point;
+        let point = self.tab().content.navigation_caret.point;
         Some(NavigationHistoryEntry {
             target: NavigationTarget {
                 document: source.identity.clone(),
@@ -5543,7 +5731,9 @@ impl App {
     }
 
     fn request_semantic_navigation(&mut self, operation: NavigationOperation) {
-        if self.focused_pane != FocusPane::Content || self.content.mode != ContentMode::Preview {
+        if self.focused_pane != FocusPane::Content
+            || self.tab_mut().content.mode != ContentMode::Preview
+        {
             self.set_navigation_status(NavigationStatusLevel::Info, "Focus Preview to navigate.");
             return;
         }
@@ -5565,7 +5755,7 @@ impl App {
         let Some(token) = source
             .structure
             .recognizable_tokens
-            .containing(self.content.navigation_caret.point)
+            .containing(self.tab_mut().content.navigation_caret.point)
         else {
             self.set_navigation_status(NavigationStatusLevel::Info, "No navigable token at caret.");
             return;
@@ -5587,7 +5777,7 @@ impl App {
         let request = NavigationRuntimeRequest {
             generation,
             operation,
-            origin: self.content.navigation_caret.point,
+            origin: self.tab_mut().content.navigation_caret.point,
             source,
             version: self.navigation_document_version,
         };
@@ -5609,7 +5799,9 @@ impl App {
     }
 
     fn open_document_symbols(&mut self) {
-        if self.focused_pane != FocusPane::Content || self.content.mode != ContentMode::Preview {
+        if self.focused_pane != FocusPane::Content
+            || self.tab_mut().content.mode != ContentMode::Preview
+        {
             self.set_navigation_status(NavigationStatusLevel::Info, "Focus Preview to navigate.");
             return;
         }
@@ -5642,7 +5834,7 @@ impl App {
             let request = NavigationRuntimeRequest {
                 generation,
                 operation: NavigationOperation::DocumentSymbols,
-                origin: self.content.navigation_caret.point,
+                origin: self.tab_mut().content.navigation_caret.point,
                 source,
                 version: self.navigation_document_version,
             };
@@ -5994,25 +6186,27 @@ impl App {
             .identity
             .as_ref()
             .map_or_else(HashSet::new, |identity| self.cached_folds(identity));
-        self.content.provider = snapshot.provider;
-        self.content.preview_kind = snapshot.preview_kind;
-        self.content.source_target = snapshot.source_target;
-        self.content.lines = snapshot.lines;
-        self.content.highlights = snapshot.highlights;
-        self.content.show_line_numbers = snapshot.show_line_numbers;
-        self.content.identity = snapshot.identity;
-        self.content.fold_source = snapshot.fold_source;
-        self.content.fold_regions = snapshot.fold_regions;
-        self.content.structure = snapshot.structure;
+        self.tab_mut().content.provider = snapshot.provider;
+        self.tab_mut().content.preview_kind = snapshot.preview_kind;
+        self.tab_mut().content.source_target = snapshot.source_target;
+        self.tab_mut().content.lines = snapshot.lines;
+        self.tab_mut().content.highlights = snapshot.highlights;
+        self.tab_mut().content.show_line_numbers = snapshot.show_line_numbers;
+        self.tab_mut().content.identity = snapshot.identity;
+        self.tab_mut().content.fold_source = snapshot.fold_source;
+        self.tab_mut().content.fold_regions = snapshot.fold_regions;
+        self.tab_mut().content.structure = snapshot.structure;
         self.navigation_source = snapshot.navigation_source.map(Arc::new);
         let valid_anchors: HashSet<_> = self
+            .tab_mut()
             .content
             .fold_regions
             .iter()
             .map(|region| region.anchor)
             .collect();
-        self.content.collapsed_folds = cached.intersection(&valid_anchors).copied().collect();
-        self.content.successful = true;
+        self.tab_mut().content.collapsed_folds =
+            cached.intersection(&valid_anchors).copied().collect();
+        self.tab_mut().content.successful = true;
         self.navigation_document_version = DocumentVersion(
             self.navigation_document_version
                 .0
@@ -6032,11 +6226,11 @@ impl App {
         if let Some(viewport) = invocation.destination_viewport {
             self.restore_content_viewport(viewport);
         }
-        self.content.navigation_caret = NavigationCaret {
+        self.tab_mut().content.navigation_caret = NavigationCaret {
             point: range.start,
             preferred_display_column: 0,
         };
-        self.content.navigation_target_highlight = Some(range);
+        self.tab_mut().content.navigation_target_highlight = Some(range);
         self.focused_pane = FocusPane::Content;
         if let Some(workspace_path) = document.workspace_path() {
             if self.tree_scope != TreeScope::AllFiles {
@@ -6239,8 +6433,8 @@ impl App {
                 .resolve_target_in_current_document(&target)
                 .map(|range| NavigationPickerPreview {
                     path: target.document.display_path(),
-                    lines: self.content.lines.clone(),
-                    highlights: self.content.highlights.clone(),
+                    lines: self.tab_mut().content.lines.clone(),
+                    highlights: self.tab_mut().content.highlights.clone(),
                     target: range,
                 });
             if let Some(preview) = preview {
@@ -6416,15 +6610,15 @@ impl App {
                     .identity
                     .as_ref()
                     .map_or_else(HashSet::new, |identity| self.cached_folds(identity));
-                self.content.provider = snapshot.provider;
-                self.content.preview_kind = snapshot.preview_kind;
-                self.content.source_target = snapshot.source_target;
-                self.content.lines = snapshot.lines;
-                self.content.highlights = snapshot.highlights;
-                self.content.identity = snapshot.identity;
-                self.content.fold_source = snapshot.fold_source;
-                self.content.fold_regions = snapshot.fold_regions;
-                self.content.structure = snapshot.structure;
+                self.tab_mut().content.provider = snapshot.provider;
+                self.tab_mut().content.preview_kind = snapshot.preview_kind;
+                self.tab_mut().content.source_target = snapshot.source_target;
+                self.tab_mut().content.lines = snapshot.lines;
+                self.tab_mut().content.highlights = snapshot.highlights;
+                self.tab_mut().content.identity = snapshot.identity;
+                self.tab_mut().content.fold_source = snapshot.fold_source;
+                self.tab_mut().content.fold_regions = snapshot.fold_regions;
+                self.tab_mut().content.structure = snapshot.structure;
                 self.navigation_source = snapshot.navigation_source.map(Arc::new);
                 self.navigation_document_version = DocumentVersion(
                     self.navigation_document_version
@@ -6433,18 +6627,19 @@ impl App {
                         .expect("navigation document version exhausted"),
                 );
                 let valid_anchors: HashSet<_> = self
+                    .tab()
                     .content
                     .fold_regions
                     .iter()
                     .map(|region| region.anchor)
                     .collect();
-                self.content.collapsed_folds =
+                self.tab_mut().content.collapsed_folds =
                     cached.intersection(&valid_anchors).copied().collect();
-                self.content.successful = true;
-                self.content.show_line_numbers =
+                self.tab_mut().content.successful = true;
+                self.tab_mut().content.show_line_numbers =
                     mode == ContentMode::Diff || snapshot.show_line_numbers;
-                self.content.diff_lines = if mode == ContentMode::Diff {
-                    annotate_diff(&self.content.lines)
+                self.tab_mut().content.diff_lines = if mode == ContentMode::Diff {
+                    annotate_diff(&self.tab_mut().content.lines)
                 } else {
                     Vec::new()
                 };
@@ -6457,15 +6652,17 @@ impl App {
                     .filter(|target| target.generation == generation);
                 if let Some(target) = search_target.as_ref() {
                     let line_index = target.line_number.saturating_sub(1);
-                    if let Some(line) = self.content.lines.get(line_index)
+                    let lines_len = self.tab().content.lines.len();
+                    if let Some(line) = self.tab().content.lines.get(line_index)
                         && target.byte_range.end <= line.len()
                     {
-                        if self.content.highlights.len() < self.content.lines.len() {
-                            self.content
+                        if self.tab().content.highlights.len() < lines_len {
+                            self.tab_mut()
+                                .content
                                 .highlights
-                                .resize_with(self.content.lines.len(), Vec::new);
+                                .resize_with(lines_len, Vec::new);
                         }
-                        self.content.highlights[line_index].push(HighlightSpan {
+                        self.tab_mut().content.highlights[line_index].push(HighlightSpan {
                             range: target.byte_range.clone(),
                             kind: HighlightKind::Search,
                         });
@@ -6481,8 +6678,8 @@ impl App {
                     self.last_error = None;
                 }
                 if mode == ContentMode::Preview {
-                    self.content.navigation_caret = NavigationCaret {
-                        point: first_navigation_point(&self.content.lines),
+                    self.tab_mut().content.navigation_caret = NavigationCaret {
+                        point: first_navigation_point(&self.tab_mut().content.lines),
                         preferred_display_column: 0,
                     };
                     self.preview_find = pending_preview_find;
@@ -6496,7 +6693,7 @@ impl App {
                 }
             }
             Err(error) => {
-                self.content.lines = vec![match kind {
+                self.tab_mut().content.lines = vec![match kind {
                     ContentKind::Diff => format!("Unable to load diff: {error}"),
                     ContentKind::Preview => format!("Unable to preview file: {error}"),
                 }];
@@ -6582,28 +6779,28 @@ impl App {
 
     fn reset_content(&mut self, mode: ContentMode) {
         self.preview_find = None;
-        self.content.scroll = 0;
-        self.content.horizontal_scroll = 0;
+        self.tab_mut().content.scroll = 0;
+        self.tab_mut().content.horizontal_scroll = 0;
         self.clear_content_selection();
         self.clipboard_status = None;
-        self.content.mode = mode;
-        self.content.provider = None;
-        self.content.preview_kind = PreviewKind::Text;
-        self.content.source_target = None;
-        self.content.highlights.clear();
-        self.content.show_line_numbers = false;
-        self.content.diff_lines.clear();
+        self.tab_mut().content.mode = mode;
+        self.tab_mut().content.provider = None;
+        self.tab_mut().content.preview_kind = PreviewKind::Text;
+        self.tab_mut().content.source_target = None;
+        self.tab_mut().content.highlights.clear();
+        self.tab_mut().content.show_line_numbers = false;
+        self.tab_mut().content.diff_lines.clear();
         self.current_diff_path = None;
-        self.content.identity = None;
-        self.content.fold_source = FoldSource::None;
-        self.content.fold_regions.clear();
-        self.content.structure = StructureSnapshot::unavailable();
+        self.tab_mut().content.identity = None;
+        self.tab_mut().content.fold_source = FoldSource::None;
+        self.tab_mut().content.fold_regions.clear();
+        self.tab_mut().content.structure = StructureSnapshot::unavailable();
         self.navigation_source = None;
-        self.content.navigation_hover_highlight = None;
-        self.content.navigation_target_highlight = None;
-        self.content.collapsed_folds.clear();
-        self.content.cursor_line = 0;
-        self.content.successful = false;
+        self.tab_mut().content.navigation_hover_highlight = None;
+        self.tab_mut().content.navigation_target_highlight = None;
+        self.tab_mut().content.collapsed_folds.clear();
+        self.tab_mut().content.cursor_line = 0;
+        self.tab_mut().content.successful = false;
     }
 
     fn set_info(&mut self, lines: Vec<String>) {
@@ -6614,7 +6811,7 @@ impl App {
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(ContentMode::Info);
-        self.content.lines = lines;
+        self.tab_mut().content.lines = lines;
     }
 
     fn cancel_external_open(&mut self) {
@@ -7465,12 +7662,13 @@ mod tests {
     }
 
     fn install_fold_fixture(app: &mut App, source: &str, path: &str) {
-        app.content.mode = ContentMode::Preview;
-        app.content.show_line_numbers = true;
-        app.content.lines = source.lines().map(ToOwned::to_owned).collect();
-        app.content.fold_regions = fold_regions(Path::new(path), &app.content.lines);
-        app.content.fold_source = FoldSource::BuiltinText;
-        app.content.successful = true;
+        app.tab_mut().content.mode = ContentMode::Preview;
+        app.tab_mut().content.show_line_numbers = true;
+        app.tab_mut().content.lines = source.lines().map(ToOwned::to_owned).collect();
+        app.tab_mut().content.fold_regions =
+            fold_regions(Path::new(path), &app.tab_mut().content.lines);
+        app.tab_mut().content.fold_source = FoldSource::BuiltinText;
+        app.tab_mut().content.successful = true;
         app.ui_regions.content_inner = Rect::new(0, 0, 40, 12);
         app.ui_regions.content_body = app.ui_regions.content_inner;
         app.focused_pane = FocusPane::Content;
@@ -7482,8 +7680,8 @@ mod tests {
         fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
         install_fold_fixture(&mut app, "fn 拿铁() {\n\tlet value = 1;\n}", "fixture.rs");
-        let anchor = app.content.fold_regions[0].anchor;
-        app.content.collapsed_folds.insert(anchor);
+        let anchor = app.tab_mut().content.fold_regions[0].anchor;
+        app.tab_mut().content.collapsed_folds.insert(anchor);
 
         let one = app.content_visual_rows(5);
         assert_eq!(one.last().and_then(|row| row.summary.as_deref()), Some("…"));
@@ -7497,16 +7695,17 @@ mod tests {
             full.last().and_then(|row| row.summary.as_deref()),
             Some(" … 2 lines")
         );
+        let first_line = &app.tab().content.lines[0];
         let rebuilt: String = full
             .iter()
             .filter(|row| row.line_index == 0 && !row.synthetic)
-            .filter_map(|row| app.content.lines[0].get(row.byte_range.clone()))
+            .filter_map(|row| first_line.get(row.byte_range.clone()))
             .collect();
-        assert_eq!(rebuilt, app.content.lines[0]);
+        assert_eq!(rebuilt, first_line.to_owned());
         assert!(full.iter().all(|row| row.line_index != 1));
 
-        app.content.lines.push("tail".to_owned());
-        app.content.selection = Some(ContentSelection {
+        app.tab_mut().content.lines.push("tail".to_owned());
+        app.tab_mut().content.selection = Some(ContentSelection {
             anchor_before: ContentPoint { line: 0, byte: 0 },
             anchor_after: ContentPoint { line: 0, byte: 1 },
             head: ContentPoint { line: 3, byte: 4 },
@@ -7526,9 +7725,8 @@ mod tests {
         fs::write(directory.path().join("fixture.rs"), "fixture").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
         install_fold_fixture(&mut app, "\tfn f() {\n\tlet value = 1;\n}", "fixture.rs");
-        app.content
-            .collapsed_folds
-            .insert(app.content.fold_regions[0].anchor);
+        let anchor = app.tab().content.fold_regions[0].anchor;
+        app.tab_mut().content.collapsed_folds.insert(anchor);
 
         // 4 gutter columns leave 18 text columns. Treating the leading tab as
         // zero-width would append the full summary and clip; tab expansion does not.
@@ -7551,14 +7749,15 @@ mod tests {
             "fixture.rs",
         );
         app.collapse_all_folds();
-        let collapsed = app.content.collapsed_folds.clone();
+        let collapsed = app.tab_mut().content.collapsed_folds.clone();
         assert!(collapsed.len() >= 3);
 
-        app.content.cursor_line = 0;
+        app.tab_mut().content.cursor_line = 0;
         app.toggle_cursor_fold();
-        assert!(app.content.collapsed_folds.len() < collapsed.len());
+        assert!(app.tab_mut().content.collapsed_folds.len() < collapsed.len());
         assert!(
-            app.content
+            app.tab_mut()
+                .content
                 .collapsed_folds
                 .iter()
                 .any(|anchor| collapsed.contains(anchor))
@@ -7570,14 +7769,14 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
         assert_eq!(app.preview_find_position(), Some((1, 1)));
-        assert!(app.content.collapsed_folds.iter().all(|anchor| {
-            app.content
-                .fold_regions
+        let fold_regions = &app.tab().content.fold_regions;
+        assert!(app.tab().content.collapsed_folds.iter().all(|anchor| {
+            fold_regions
                 .iter()
                 .find(|region| region.anchor == *anchor)
                 .is_none_or(|region| !(region.start_line < 3 && 3 <= region.end_line))
         }));
-        assert_eq!(app.content.cursor_line, 3);
+        assert_eq!(app.tab_mut().content.cursor_line, 3);
     }
 
     #[test]
@@ -7592,16 +7791,16 @@ mod tests {
         app.wait_for_background();
         app.focused_pane = FocusPane::Content;
         app.collapse_all_folds();
-        let collapsed = app.content.collapsed_folds.clone();
+        let collapsed = app.tab_mut().content.collapsed_folds.clone();
         assert!(!collapsed.is_empty());
 
         app.open_search(SearchMode::Files);
         app.close_search(true);
-        assert_eq!(app.content.collapsed_folds, collapsed);
+        assert_eq!(app.tab_mut().content.collapsed_folds, collapsed);
 
         app.load_selected_preview();
         app.wait_for_background();
-        assert_eq!(app.content.collapsed_folds, collapsed);
+        assert_eq!(app.tab_mut().content.collapsed_folds, collapsed);
         assert!(
             app.content_visual_rows(40)
                 .iter()
@@ -7620,9 +7819,9 @@ mod tests {
             "fixture.rs",
         );
         app.collapse_all_folds();
-        let collapsed = app.content.collapsed_folds.clone();
+        let collapsed = app.tab_mut().content.collapsed_folds.clone();
         let rows = app.content_visual_rows(40);
-        app.content.scroll = rows.len().saturating_sub(1);
+        app.tab_mut().content.scroll = rows.len().saturating_sub(1);
         let expected_scroll = app.effective_content_scroll(rows.len());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -7633,9 +7832,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(app.search.is_none());
-        assert_eq!(app.content.mode, ContentMode::Preview);
-        assert_eq!(app.content.collapsed_folds, collapsed);
-        assert_eq!(app.content.scroll, expected_scroll);
+        assert_eq!(app.tab_mut().content.mode, ContentMode::Preview);
+        assert_eq!(app.tab_mut().content.collapsed_folds, collapsed);
+        assert_eq!(app.tab_mut().content.scroll, expected_scroll);
     }
 
     #[test]
@@ -7646,12 +7845,15 @@ mod tests {
         install_fold_fixture(&mut app, "one\ntwo\nthree", "fixture.txt");
         app.ui_regions.content_inner.width = 40;
         let rows = app.content_visual_rows(40);
-        app.content.scroll = usize::MAX;
+        app.tab_mut().content.scroll = usize::MAX;
 
         app.scroll_content(-1, 0);
 
-        assert_eq!(app.content.scroll, rows.len() - 2);
-        assert_eq!(app.content.cursor_line, rows[rows.len() - 2].line_index);
+        assert_eq!(app.tab_mut().content.scroll, rows.len() - 2);
+        assert_eq!(
+            app.tab_mut().content.cursor_line,
+            rows[rows.len() - 2].line_index
+        );
     }
 
     #[test]
@@ -7664,12 +7866,12 @@ mod tests {
             "fn first_with_a_long_header_name() {\n let one = 1;\n}\nfn second_with_a_long_header_name() {\n let two = 2;\n}",
             "fixture.rs",
         );
-        app.content.projection_width = 18;
+        app.tab_mut().content.projection_width = 18;
         let old = app.content_visual_rows(18);
-        app.content.scroll = old.iter().position(|row| row.line_index == 3).unwrap();
+        app.tab_mut().content.scroll = old.iter().position(|row| row.line_index == 3).unwrap();
         app.prepare_content_width(50);
         let new = app.content_visual_rows(50);
-        assert_eq!(new[app.content.scroll].line_index, 3);
+        assert_eq!(new[app.tab_mut().content.scroll].line_index, 3);
     }
 
     #[test]
@@ -7683,16 +7885,16 @@ mod tests {
             "fixture.rs",
         );
         app.collapse_all_folds();
-        let collapsed = app.content.collapsed_folds.clone();
+        let collapsed = app.tab_mut().content.collapsed_folds.clone();
         app.ui_regions.content_inner.width = 14;
-        app.content.projection_width = 14;
+        app.tab_mut().content.projection_width = 14;
         let old_rows = app.content_visual_rows(14);
         let old_index = old_rows
             .iter()
             .position(|row| row.line_index == 0 && !row.synthetic && row.byte_range.start > 0)
             .unwrap();
         let anchor_byte = old_rows[old_index].byte_range.start;
-        app.content.scroll = old_index;
+        app.tab_mut().content.scroll = old_index;
 
         app.open_search(SearchMode::Files);
         app.ui_regions.content_inner.width = 28;
@@ -7700,14 +7902,14 @@ mod tests {
         app.close_search(true);
 
         let new_rows = app.content_visual_rows(28);
-        let restored = &new_rows[app.content.scroll];
+        let restored = &new_rows[app.tab_mut().content.scroll];
         assert_eq!(restored.line_index, 0);
         assert!(visual_row_contains_byte(
             restored,
             anchor_byte,
-            app.content.lines[0].len()
+            app.tab_mut().content.lines[0].len()
         ));
-        assert_eq!(app.content.collapsed_folds, collapsed);
+        assert_eq!(app.tab_mut().content.collapsed_folds, collapsed);
     }
 
     #[test]
@@ -7722,9 +7924,9 @@ mod tests {
         );
         app.collapse_all_folds();
         app.ui_regions.content_inner.width = 8;
-        app.content.projection_width = 8;
+        app.tab_mut().content.projection_width = 8;
         let old_rows = app.content_visual_rows(8);
-        app.content.scroll = old_rows.iter().position(|row| row.synthetic).unwrap();
+        app.tab_mut().content.scroll = old_rows.iter().position(|row| row.synthetic).unwrap();
 
         app.open_search(SearchMode::Files);
         app.ui_regions.content_inner.width = 80;
@@ -7732,10 +7934,10 @@ mod tests {
         app.close_search(true);
 
         let new_rows = app.content_visual_rows(80);
-        assert!(!new_rows[app.content.scroll].synthetic);
-        assert_eq!(new_rows[app.content.scroll].line_index, 0);
+        assert!(!new_rows[app.tab_mut().content.scroll].synthetic);
+        assert_eq!(new_rows[app.tab_mut().content.scroll].line_index, 0);
         assert_eq!(
-            app.content.scroll,
+            app.tab_mut().content.scroll,
             new_rows
                 .iter()
                 .rposition(|row| row.line_index == 0 && !row.synthetic)
@@ -7752,7 +7954,7 @@ mod tests {
         app.ui_regions.content_inner.width = 7; // 4-column gutter + 3 text columns.
         app.scroll_to_logical_line(0, 3);
         let rows = app.content_visual_rows(7);
-        assert_eq!(rows[app.content.scroll].byte_range, 3..6);
+        assert_eq!(rows[app.tab_mut().content.scroll].byte_range, 3..6);
     }
 
     #[test]
@@ -7765,22 +7967,22 @@ mod tests {
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
         app.content_requests.invalidate();
         app.runtime.cancel_pending_content();
-        app.content.mode = ContentMode::Preview;
-        app.content.show_line_numbers = true;
+        app.tab_mut().content.mode = ContentMode::Preview;
+        app.tab_mut().content.show_line_numbers = true;
         app.focused_pane = FocusPane::Content;
-        app.content.lines = (0..=FINAL_LINE)
+        app.tab_mut().content.lines = (0..=FINAL_LINE)
             .map(|index| format!("row-{index}"))
             .collect();
-        app.content.lines[AFTER_LIMIT_LINE] = "UNIQUE_AFTER_U16_LIMIT".to_owned();
-        app.content.lines[AFTER_LIMIT_LINE + 1] =
+        app.tab_mut().content.lines[AFTER_LIMIT_LINE] = "UNIQUE_AFTER_U16_LIMIT".to_owned();
+        app.tab_mut().content.lines[AFTER_LIMIT_LINE + 1] =
             "wrapped metadata stays attached to its original logical source line across continuations"
                 .to_owned();
-        app.content.lines[FINAL_LINE] = "UNIQUE_FINAL_SENTINEL".to_owned();
-        app.content.highlights = vec![Vec::new(); app.content.lines.len()];
+        app.tab_mut().content.lines[FINAL_LINE] = "UNIQUE_FINAL_SENTINEL".to_owned();
+        app.tab_mut().content.highlights = vec![Vec::new(); app.tab_mut().content.lines.len()];
         // A 100-column terminal produces a 54-column content inner area with
         // the default tree width.
         app.ui_regions.content_inner.width = 54;
-        app.content.projection_width = 54;
+        app.tab_mut().content.projection_width = 54;
         let visual_rows = app.content_visual_rows(54);
         let after_limit_row = visual_rows
             .iter()
@@ -7795,7 +7997,7 @@ mod tests {
         assert!(wrapped[1].continuation);
         assert_eq!(wrapped[1].line_index, AFTER_LIMIT_LINE + 1);
 
-        app.content.scroll = after_limit_row;
+        app.tab_mut().content.scroll = after_limit_row;
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -7819,7 +8021,7 @@ mod tests {
             .unwrap();
         assert_eq!(point.0.line, AFTER_LIMIT_LINE);
         app.sync_content_cursor_to_scroll();
-        assert_eq!(app.content.cursor_line, AFTER_LIMIT_LINE);
+        assert_eq!(app.tab_mut().content.cursor_line, AFTER_LIMIT_LINE);
         drag_content(
             &mut app,
             text_column,
@@ -7832,7 +8034,7 @@ mod tests {
                 .is_some_and(|selected| selected.starts_with("UNIQUE"))
         );
 
-        app.content.scroll = usize::MAX;
+        app.tab_mut().content.scroll = usize::MAX;
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
@@ -7854,16 +8056,16 @@ mod tests {
             "blank rows below EOF must not alias the final source row"
         );
 
-        app.content.horizontal_scroll = usize::MAX;
+        app.tab_mut().content.horizontal_scroll = usize::MAX;
         assert_eq!(app.effective_content_horizontal_scroll(), 0);
-        app.content.mode = ContentMode::Info;
+        app.tab_mut().content.mode = ContentMode::Info;
         assert_eq!(
             app.effective_content_horizontal_scroll(),
             usize::from(u16::MAX)
         );
-        app.content.lines.clear();
-        app.content.highlights.clear();
-        app.content.scroll = usize::MAX;
+        app.tab_mut().content.lines.clear();
+        app.tab_mut().content.highlights.clear();
+        app.tab_mut().content.scroll = usize::MAX;
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
@@ -7913,9 +8115,9 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             fs::write(directory.path().join("fixture.txt"), "fixture").unwrap();
             let mut app = App::new(directory.path().to_path_buf()).unwrap();
-            app.content.mode = mode;
-            app.content.show_line_numbers = false;
-            app.content.lines = vec!["a拿".to_owned(), "铁e\u{301}z".to_owned()];
+            app.tab_mut().content.mode = mode;
+            app.tab_mut().content.show_line_numbers = false;
+            app.tab_mut().content.lines = vec!["a拿".to_owned(), "铁e\u{301}z".to_owned()];
             app.ui_regions.content_inner = Rect::new(10, 20, 40, 8);
             app.ui_regions.content_body = app.ui_regions.content_inner;
             let first_row = app.content_text_rows().y;
@@ -7971,7 +8173,7 @@ mod tests {
         app.wait_for_background();
 
         assert_eq!(app.all_entries.len(), 2);
-        assert!(app.all_files_truncated);
+        assert!(app.tab_mut().files_mut().truncated);
         assert!(app.git_changes_truncated);
         assert!(app.scope_is_truncated());
         assert_eq!(app.scope_entry_count(), 2);
@@ -7980,10 +8182,10 @@ mod tests {
         assert!(app.scope_is_truncated());
         assert_eq!(app.scope_entry_count(), 0);
         assert_eq!(
-            app.content.lines,
+            app.tab_mut().content.lines,
             ["No Git changes found in the partial filesystem results."]
         );
-        assert!(!app.content.lines[0].contains("No uncommitted Git changes"));
+        assert!(!app.tab_mut().content.lines[0].contains("No uncommitted Git changes"));
     }
 
     #[test]
@@ -8022,7 +8224,7 @@ mod tests {
         let stale_preview = app.content_requests.begin();
         let current_diff = app.content_requests.begin();
         app.reset_content(ContentMode::Diff);
-        app.content.lines = vec!["Loading current diff…".to_owned()];
+        app.tab_mut().content.lines = vec!["Loading current diff…".to_owned()];
         app.apply_content_completion(ContentCompletion {
             generation: stale_preview,
             kind: ContentKind::Preview,
@@ -8031,8 +8233,8 @@ mod tests {
         });
 
         assert!(app.is_content_loading());
-        assert_eq!(app.content.mode, ContentMode::Diff);
-        assert_eq!(app.content.lines, ["Loading current diff…"]);
+        assert_eq!(app.tab_mut().content.mode, ContentMode::Diff);
+        assert_eq!(app.tab_mut().content.lines, ["Loading current diff…"]);
 
         app.apply_content_completion(ContentCompletion {
             generation: current_diff,
@@ -8041,8 +8243,8 @@ mod tests {
             result: Ok(content_snapshot("current diff")),
         });
         assert!(!app.is_content_loading());
-        assert_eq!(app.content.mode, ContentMode::Diff);
-        assert_eq!(app.content.lines, ["current diff"]);
+        assert_eq!(app.tab_mut().content.mode, ContentMode::Diff);
+        assert_eq!(app.tab_mut().content.lines, ["current diff"]);
     }
 
     #[test]
@@ -8084,7 +8286,7 @@ mod tests {
             result: Err("fixture content error".to_owned()),
         });
         assert!(!app.is_content_loading());
-        assert!(app.content.lines[0].contains("Unable to preview file"));
+        assert!(app.tab_mut().content.lines[0].contains("Unable to preview file"));
         assert_eq!(
             app.last_error.as_deref(),
             Some("content failed: fixture content error")
@@ -8255,7 +8457,7 @@ mod tests {
         app.focused_pane = FocusPane::Content;
         app.ui_regions.content_inner = Rect::new(0, 0, 80, 20);
         app.ui_regions.content_body = app.ui_regions.content_inner;
-        app.content.navigation_caret = NavigationCaret {
+        app.tab_mut().content.navigation_caret = NavigationCaret {
             point: SourcePosition { line: 0, byte: 3 },
             preferred_display_column: 3,
         };
@@ -8277,10 +8479,10 @@ mod tests {
     }
 
     fn mark_local_symbols_incomplete(app: &mut App) {
-        let mut structure = app.content.structure.clone();
+        let mut structure = app.tab_mut().content.structure.clone();
         structure.symbols.clear();
         structure.symbols_complete = false;
-        app.content.structure = structure.clone();
+        app.tab_mut().content.structure = structure.clone();
         let mut source = app
             .navigation_source
             .as_ref()
@@ -8331,13 +8533,13 @@ mod tests {
             start: SourcePosition { line: 0, byte: 3 },
             end: SourcePosition { line: 0, byte: 9 },
         };
-        app.content.navigation_caret = caller_caret;
-        app.content.navigation_target_highlight = Some(caller_highlight);
+        app.tab_mut().content.navigation_caret = caller_caret;
+        app.tab_mut().content.navigation_target_highlight = Some(caller_highlight);
         app.set_navigation_status(NavigationStatusLevel::Info, "caller navigation state");
         let history_entry = app.current_navigation_entry().unwrap();
         app.navigation_back.push_back(history_entry);
         let original_tree_scope = app.tree_scope;
-        let original_tree_selection = app.tree_state.selected();
+        let original_tree_selection = app.tab_mut().tree_state.selected();
 
         app.open_search(SearchMode::Files);
         set_search_result(&mut app, "target.rs");
@@ -8355,9 +8557,9 @@ mod tests {
             Some(&caller_source.identity)
         );
         assert_eq!(app.navigation_document_version, caller_version);
-        assert_eq!(app.content.navigation_caret, caller_caret);
+        assert_eq!(app.tab_mut().content.navigation_caret, caller_caret);
         assert_eq!(
-            app.content.navigation_target_highlight,
+            app.tab_mut().content.navigation_target_highlight,
             Some(caller_highlight)
         );
         let restored_source = app.navigation_source.as_ref().unwrap();
@@ -8366,7 +8568,7 @@ mod tests {
         assert_eq!(restored_source.text, caller_source.text);
         assert_eq!(app.navigation_back.len(), 1);
         assert_eq!(app.tree_scope, original_tree_scope);
-        assert_eq!(app.tree_state.selected(), original_tree_selection);
+        assert_eq!(app.tab_mut().tree_state.selected(), original_tree_selection);
 
         app.request_semantic_navigation(NavigationOperation::Definition);
         let current = app.navigation_invocation.clone().unwrap();
@@ -8438,7 +8640,7 @@ mod tests {
                 Some(&restored_caller.identity)
             );
             assert_eq!(
-                app.content.identity.as_ref(),
+                app.tab_mut().content.identity.as_ref(),
                 Some(&restored_caller.identity)
             );
         }
@@ -8447,7 +8649,7 @@ mod tests {
     #[test]
     fn complete_local_document_symbols_open_immediately_without_runtime_pending() {
         let mut app = navigation_app("mod outer {\n    fn inner() {}\n}\n");
-        assert!(app.content.structure.symbols_complete);
+        assert!(app.tab_mut().content.structure.symbols_complete);
 
         app.open_document_symbols();
 
@@ -8472,7 +8674,7 @@ mod tests {
     fn incomplete_document_symbols_without_lsp_report_unavailable_and_stay_put() {
         let mut app = navigation_app("fn caller() {}\n");
         mark_local_symbols_incomplete(&mut app);
-        let before = app.content.identity.clone();
+        let before = app.tab_mut().content.identity.clone();
 
         app.open_document_symbols();
         assert!(app.navigation_invocation.is_some());
@@ -8484,7 +8686,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        assert_eq!(app.content.identity, before);
+        assert_eq!(app.tab_mut().content.identity, before);
         assert!(app.navigation_picker.is_none());
         assert!(
             app.navigation_status
@@ -8528,8 +8730,14 @@ mod tests {
         app.move_navigation_picker(1);
         app.accept_navigation_picker_selection();
         assert!(app.navigation_picker.is_none());
-        assert_eq!(app.content.navigation_caret.point, caller_name.start);
-        assert_eq!(app.content.navigation_target_highlight, Some(caller_name));
+        assert_eq!(
+            app.tab_mut().content.navigation_caret.point,
+            caller_name.start
+        );
+        assert_eq!(
+            app.tab_mut().content.navigation_target_highlight,
+            Some(caller_name)
+        );
         assert_eq!(app.navigation_back.len(), 1);
 
         mark_local_symbols_incomplete(&mut app);
@@ -8626,7 +8834,7 @@ mod tests {
             let mut app = navigation_app("fn caller() {}\n");
             app.request_semantic_navigation(NavigationOperation::Definition);
             let invocation = app.navigation_invocation.clone().unwrap();
-            let before = app.content.identity.clone();
+            let before = app.tab_mut().content.identity.clone();
             app.apply_navigation_completion(NavigationRuntimeCompletion {
                 generation: invocation.generation,
                 operation: invocation.operation,
@@ -8635,7 +8843,7 @@ mod tests {
                 result: NavigationProtocolResult::Failed(message.to_owned()),
             });
             assert!(app.navigation_invocation.is_none());
-            assert_eq!(app.content.identity, before);
+            assert_eq!(app.tab_mut().content.identity, before);
             assert!(
                 app.navigation_status
                     .as_ref()
@@ -8647,7 +8855,7 @@ mod tests {
     #[test]
     fn refresh_cancels_pending_definition_and_document_symbols_and_rejects_late_results() {
         let mut app = navigation_app("fn caller() {}\n");
-        let identity = app.content.identity.clone();
+        let identity = app.tab_mut().content.identity.clone();
 
         app.request_semantic_navigation(NavigationOperation::Definition);
         let definition = app.navigation_invocation.clone().unwrap();
@@ -8668,7 +8876,7 @@ mod tests {
         });
         assert!(app.navigation_invocation.is_none());
         assert!(app.navigation_status.is_none());
-        assert_eq!(app.content.identity, identity);
+        assert_eq!(app.tab_mut().content.identity, identity);
 
         app.wait_for_background();
         assert!(!app.is_refreshing());
@@ -8816,8 +9024,8 @@ mod tests {
         app.ui_regions.content_inner = Rect::new(0, 0, 30, 3);
         app.ui_regions.content_body = app.ui_regions.content_inner;
         app.collapse_all_folds();
-        app.content.scroll = 1;
-        app.content.navigation_caret = NavigationCaret {
+        app.tab_mut().content.scroll = 1;
+        app.tab_mut().content.navigation_caret = NavigationCaret {
             point: SourcePosition { line: 1, byte: 4 },
             preferred_display_column: 4,
         };
@@ -8825,17 +9033,17 @@ mod tests {
             start: SourcePosition { line: 1, byte: 4 },
             end: SourcePosition { line: 1, byte: 10 },
         };
-        app.content.navigation_target_highlight = Some(highlight);
+        app.tab_mut().content.navigation_target_highlight = Some(highlight);
         app.navigation_back
             .push_back(app.current_navigation_entry().unwrap());
 
         let old_source = app.navigation_source.clone().unwrap();
         assert_eq!(old_source.server_root, old_root.canonicalize().unwrap());
-        let lines = app.content.lines.clone();
-        let folds = app.content.collapsed_folds.clone();
-        let viewport = app.content.scroll;
+        let lines = app.tab_mut().content.lines.clone();
+        let folds = app.tab_mut().content.collapsed_folds.clone();
+        let viewport = app.tab_mut().content.scroll;
         let version = app.navigation_document_version;
-        let caret = app.content.navigation_caret;
+        let caret = app.tab_mut().content.navigation_caret;
         let history = app.navigation_back.clone();
         app.open_search(SearchMode::Files);
 
@@ -8855,12 +9063,15 @@ mod tests {
         assert!(Arc::ptr_eq(&rebound.text, &old_source.text));
         assert!(Arc::ptr_eq(&rebound.line_index, &old_source.line_index));
         assert!(Arc::ptr_eq(&rebound.structure, &old_source.structure));
-        assert_eq!(app.content.lines, lines);
-        assert_eq!(app.content.collapsed_folds, folds);
-        assert_eq!(app.content.scroll, viewport);
+        assert_eq!(app.tab_mut().content.lines, lines);
+        assert_eq!(app.tab_mut().content.collapsed_folds, folds);
+        assert_eq!(app.tab_mut().content.scroll, viewport);
         assert_eq!(app.navigation_document_version, version);
-        assert_eq!(app.content.navigation_caret, caret);
-        assert_eq!(app.content.navigation_target_highlight, Some(highlight));
+        assert_eq!(app.tab_mut().content.navigation_caret, caret);
+        assert_eq!(
+            app.tab_mut().content.navigation_target_highlight,
+            Some(highlight)
+        );
         assert_eq!(app.navigation_back.len(), history.len());
         let actual_history = app.navigation_back.back().unwrap();
         let expected_history = history.back().unwrap();
@@ -8884,9 +9095,9 @@ mod tests {
                 .map(|source| source.server_root.as_path()),
             Some(canonical_new_root.as_path())
         );
-        assert_eq!(app.content.lines, lines);
-        assert_eq!(app.content.collapsed_folds, folds);
-        assert_eq!(app.content.scroll, viewport);
+        assert_eq!(app.tab_mut().content.lines, lines);
+        assert_eq!(app.tab_mut().content.collapsed_folds, folds);
+        assert_eq!(app.tab_mut().content.scroll, viewport);
         assert_eq!(app.navigation_back.len(), history.len());
         assert_eq!(
             app.navigation_back.back().unwrap().target,
@@ -8933,7 +9144,7 @@ mod tests {
     #[test]
     fn refresh_degrades_a_source_whose_workspace_identity_is_no_longer_valid() {
         let mut app = navigation_app("fn caller() {}\n");
-        let lines = app.content.lines.clone();
+        let lines = app.tab_mut().content.lines.clone();
         let mut invalid = app.navigation_source.as_ref().unwrap().as_ref().clone();
         invalid.absolute_path = app.root.join("../outside.rs");
         app.navigation_source = Some(Arc::new(invalid));
@@ -8941,8 +9152,8 @@ mod tests {
         app.rebind_navigation_sources_after_refresh();
 
         assert!(app.navigation_source.is_none());
-        assert_eq!(app.content.lines, lines);
-        assert!(app.content.identity.is_some());
+        assert_eq!(app.tab_mut().content.lines, lines);
+        assert!(app.tab_mut().content.identity.is_some());
     }
 
     fn navigation_picker_app(count: usize) -> App {
@@ -9053,7 +9264,10 @@ mod tests {
         };
         app.handle_mouse(mouse);
         assert!(app.navigation_picker.is_none());
-        assert_eq!(app.content.navigation_caret.point.line, expected_result);
+        assert_eq!(
+            app.tab_mut().content.navigation_caret.point.line,
+            expected_result
+        );
     }
 
     #[test]
@@ -9112,14 +9326,17 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(app.navigation_picker.is_none());
-        assert_eq!(app.content.navigation_caret.point.line, expected_result);
+        assert_eq!(
+            app.tab_mut().content.navigation_caret.point.line,
+            expected_result
+        );
     }
 
     #[test]
     fn semantic_navigation_without_an_available_engine_keeps_the_preview_in_place() {
         let mut app = navigation_app("fn caller() {}\n");
-        let before = app.content.lines.clone();
-        let identity = app.content.identity.clone();
+        let before = app.tab_mut().content.lines.clone();
+        let identity = app.tab_mut().content.identity.clone();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         for _ in 0..100 {
@@ -9130,8 +9347,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        assert_eq!(app.content.lines, before);
-        assert_eq!(app.content.identity, identity);
+        assert_eq!(app.tab_mut().content.lines, before);
+        assert_eq!(app.tab_mut().content.identity, identity);
         assert!(
             app.navigation_status
                 .as_ref()
@@ -9243,7 +9460,7 @@ mod tests {
             classified_target,
             NavigationFileTarget::Dependency(_)
         ));
-        let caller = app.content.identity.clone().unwrap();
+        let caller = app.tab_mut().content.identity.clone().unwrap();
 
         app.request_semantic_navigation(NavigationOperation::Definition);
         let invocation = app.navigation_invocation.clone().unwrap();
@@ -9263,11 +9480,12 @@ mod tests {
         app.wait_for_background();
 
         let Some(ContentIdentity::Dependency { root, relative, .. }) =
-            app.content.identity.as_ref()
+            app.tab().content.identity.as_ref()
         else {
             panic!(
                 "expected an external navigation target, got {:?}; status: {:?}",
-                app.content.identity, app.navigation_status
+                app.tab().content.identity,
+                app.navigation_status
             );
         };
         assert!(root.ends_with(Path::new("dependency-cache/example.com/module@v1.2.3")));
@@ -9284,13 +9502,13 @@ mod tests {
 
         app.navigate_history(NavigationHistoryIntent::Back);
         app.wait_for_background();
-        assert_eq!(app.content.identity.as_ref(), Some(&caller));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&caller));
     }
 
     #[test]
     fn results_preview_loads_cross_file_without_replacing_content_until_accept() {
         let mut app = navigation_app("fn caller() {}\n");
-        let caller = app.content.identity.clone().unwrap();
+        let caller = app.tab_mut().content.identity.clone().unwrap();
         let origin = app.current_navigation_entry().unwrap();
         let generation = app.next_navigation_generation();
         let target =
@@ -9323,19 +9541,19 @@ mod tests {
 
         assert!(app.is_navigation_preview_loading());
         assert!(!app.is_content_loading());
-        assert_eq!(app.content.identity.as_ref(), Some(&caller));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&caller));
         app.wait_for_background();
 
         let picker = app.navigation_picker.as_ref().unwrap();
         let preview = picker.preview.as_ref().unwrap();
         assert_eq!(preview.path, Path::new("target.rs"));
         assert_eq!(preview.lines, ["fn target() {}"]);
-        assert_eq!(app.content.identity.as_ref(), Some(&caller));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&caller));
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.wait_for_background();
         assert!(app.navigation_picker.is_none());
-        assert_eq!(app.content.identity.as_ref(), Some(&target));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&target));
         assert_eq!(app.navigation_back.len(), 1);
     }
 
@@ -9363,7 +9581,11 @@ mod tests {
         assert_eq!(picker.visible_rows, [NavigationPickerRow::Group(0)]);
         assert!(picker.preview.is_none());
         assert_eq!(
-            app.content.identity.as_ref().map(ContentIdentity::path),
+            app.tab_mut()
+                .content
+                .identity
+                .as_ref()
+                .map(ContentIdentity::path),
             Some(Path::new("caller.rs"))
         );
     }
@@ -9384,7 +9606,10 @@ mod tests {
             start: SourcePosition { line: 0, byte: 3 },
             end: SourcePosition { line: 0, byte: 9 },
         };
-        assert_eq!(app.content.navigation_hover_highlight, Some(token));
+        assert_eq!(
+            app.tab_mut().content.navigation_hover_highlight,
+            Some(token)
+        );
         assert!(app.navigation_highlights(0).iter().any(|highlight| {
             highlight.kind == HighlightKind::NavigationHover && highlight.range == (3..9)
         }));
@@ -9393,7 +9618,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
             ..hover
         });
-        assert!(app.content.navigation_hover_highlight.is_none());
+        assert!(app.tab_mut().content.navigation_hover_highlight.is_none());
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -9426,7 +9651,7 @@ mod tests {
         let mut app = navigation_app("fn caller() {}\n");
         app.request_semantic_navigation(NavigationOperation::Definition);
         let invocation = app.navigation_invocation.clone().unwrap();
-        let before = app.content.lines.clone();
+        let before = app.tab_mut().content.lines.clone();
 
         app.apply_navigation_completion(NavigationRuntimeCompletion {
             generation: invocation.generation.saturating_sub(1),
@@ -9436,7 +9661,7 @@ mod tests {
             result: NavigationProtocolResult::Locations(Vec::new()),
         });
 
-        assert_eq!(app.content.lines, before);
+        assert_eq!(app.tab_mut().content.lines, before);
         assert_eq!(
             app.navigation_invocation
                 .as_ref()
@@ -9449,8 +9674,8 @@ mod tests {
     #[test]
     fn failed_cross_file_navigation_stage_is_atomic() {
         let mut app = navigation_app("fn caller() {}\n");
-        let before_lines = app.content.lines.clone();
-        let before_identity = app.content.identity.clone();
+        let before_lines = app.tab_mut().content.lines.clone();
+        let before_identity = app.tab_mut().content.identity.clone();
         let before_scope = app.tree_scope;
         let origin = app.current_navigation_entry().unwrap();
         let generation = app.next_navigation_generation();
@@ -9487,8 +9712,8 @@ mod tests {
             result: Err("fixture stage failure".to_owned()),
         });
 
-        assert_eq!(app.content.lines, before_lines);
-        assert_eq!(app.content.identity, before_identity);
+        assert_eq!(app.tab_mut().content.lines, before_lines);
+        assert_eq!(app.tab_mut().content.identity, before_identity);
         assert_eq!(app.tree_scope, before_scope);
         assert!(app.navigation_back.is_empty());
         assert!(app.pending_navigation_stage.is_none());
@@ -9502,7 +9727,7 @@ mod tests {
     #[test]
     fn successful_cross_file_stage_commits_history_then_back_and_forward() {
         let mut app = navigation_app("fn caller() {}\n");
-        let caller = app.content.identity.clone().unwrap();
+        let caller = app.tab_mut().content.identity.clone().unwrap();
         let origin = app.current_navigation_entry().unwrap();
         let generation = app.next_navigation_generation();
         let invocation = NavigationInvocation {
@@ -9529,19 +9754,19 @@ mod tests {
         );
         app.wait_for_background();
 
-        assert_eq!(app.content.identity.as_ref(), Some(&target));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&target));
         assert_eq!(app.navigation_back.len(), 1);
         assert!(app.navigation_forward.is_empty());
 
         app.navigate_history(NavigationHistoryIntent::Back);
         app.wait_for_background();
-        assert_eq!(app.content.identity.as_ref(), Some(&caller));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&caller));
         assert!(app.navigation_back.is_empty());
         assert_eq!(app.navigation_forward.len(), 1);
 
         app.navigate_history(NavigationHistoryIntent::Forward);
         app.wait_for_background();
-        assert_eq!(app.content.identity.as_ref(), Some(&target));
+        assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&target));
         assert_eq!(app.navigation_back.len(), 1);
         assert!(app.navigation_forward.is_empty());
     }
@@ -9685,7 +9910,7 @@ mod tests {
             .iter()
             .position(|e| e.relative == Path::new("src"))
             .expect("src directory exists");
-        app.tree_state.select(Some(idx));
+        app.tab_mut().tree_state.select(Some(idx));
         app.queue_selected_path_copy(false);
 
         if let Some(status) = &app.clipboard_status {
@@ -9704,7 +9929,7 @@ mod tests {
         app.wait_for_background();
 
         // Clear the selection to simulate no entry selected.
-        app.tree_state.select(None);
+        app.tab_mut().tree_state.select(None);
         app.queue_selected_path_copy(false);
 
         assert_eq!(
@@ -9809,14 +10034,14 @@ mod tests {
     fn terminal_image_requires_an_explicit_unavailable_viewer_prompt() {
         let mut app = image_preview_app();
         assert!(matches!(
-            app.content.preview_kind,
+            app.tab_mut().content.preview_kind,
             PreviewKind::Image(crate::preview::ImagePreviewFormat::Png)
         ));
-        let original_lines = app.content.lines.clone();
+        let original_lines = app.tab_mut().content.lines.clone();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
 
-        assert_eq!(app.content.lines, original_lines);
+        assert_eq!(app.tab_mut().content.lines, original_lines);
         assert!(app.pending_terminal_image_preview.is_none());
         assert!(
             app.navigation_status
@@ -9829,7 +10054,7 @@ mod tests {
     fn unavailable_viewer_prompt_can_render_or_cancel_truecolor_preview() {
         let mut app = image_preview_app();
         app.terminal_truecolor_supported = true;
-        let target = app.content.source_target.clone().unwrap();
+        let target = app.tab_mut().content.source_target.clone().unwrap();
         let generation = app.external_open_requests.begin();
         app.apply_external_open_completion(ExternalOpenCompletion {
             generation,
@@ -9842,7 +10067,8 @@ mod tests {
         });
         assert!(app.pending_terminal_image_preview.is_some());
         assert!(
-            app.content
+            app.tab_mut()
+                .content
                 .lines
                 .iter()
                 .any(|line| line.contains("Press i"))
@@ -9852,7 +10078,8 @@ mod tests {
         app.wait_for_background();
         assert!(app.pending_terminal_image_preview.is_none());
         assert!(
-            app.content
+            app.tab_mut()
+                .content
                 .lines
                 .iter()
                 .any(|line| line.contains("Press o"))
@@ -9873,12 +10100,17 @@ mod tests {
 
         assert!(app.pending_terminal_image_preview.is_none());
         assert!(
-            app.content.lines.iter().any(|line| line.contains('▀')),
+            app.tab_mut()
+                .content
+                .lines
+                .iter()
+                .any(|line| line.contains('▀')),
             "expected terminal image rows, got {:?}",
-            app.content.lines
+            app.tab_mut().content.lines
         );
         assert!(
-            app.content
+            app.tab_mut()
+                .content
                 .highlights
                 .iter()
                 .flatten()

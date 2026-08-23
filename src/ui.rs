@@ -1060,7 +1060,7 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
-    let selected = app.tree_state.selected();
+    let selected = app.tab_mut().tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
     let items: Vec<ListItem> = if app.is_initial_loading() && !is_agents_scope(app) {
         vec![ListItem::new(Line::from(Span::styled(
@@ -1212,7 +1212,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         )),
         text_button,
     );
-    frame.render_stateful_widget(List::new(items), rows, &mut app.tree_state);
+    frame.render_stateful_widget(List::new(items), rows, &mut app.tab_mut().tree_state);
 }
 
 #[cfg(feature = "agent-observability")]
@@ -1633,12 +1633,12 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         draw_preview_find(frame, app);
     } else {
         let mut detail = app.selected_content_label();
-        if app.content.mode == ContentMode::Preview
-            && let Some(provider) = app.content.provider.as_deref()
+        if app.tab().content.mode == ContentMode::Preview
+            && let Some(provider) = app.tab().content.provider.as_deref()
         {
             detail.push_str(&format!(" · {provider}"));
         }
-        if app.content.mode == ContentMode::Preview
+        if app.tab().content.mode == ContentMode::Preview
             && let Some(real_path) = app.selected_symlink_real_path()
         {
             detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
@@ -1685,7 +1685,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     }
     let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
-    let render_area = if app.content.mode == ContentMode::Info {
+    let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
@@ -1694,15 +1694,16 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     let end = start
         .saturating_add(usize::from(render_area.height))
         .min(visual_rows.len());
+    let content = &app.tab().content;
     let lines: Vec<Line> = visual_rows[start..end]
         .iter()
         .filter_map(|visual_row| {
-            let line = app.content.lines.get(visual_row.line_index)?;
+            let line = content.lines.get(visual_row.line_index)?;
             let segment = line.get(visual_row.byte_range.clone())?;
             let mut highlights = if visual_row.synthetic {
                 Vec::new()
             } else {
-                app.content
+                content
                     .highlights
                     .get(visual_row.line_index)
                     .cloned()
@@ -1715,16 +1716,16 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             let selection = (!visual_row.synthetic)
                 .then(|| visual_row_selection(app, visual_row))
                 .flatten();
-            Some(match app.content.mode {
+            Some(match content.mode {
                 ContentMode::Diff => diff_line(
                     segment,
-                    app.content.diff_lines.get(visual_row.line_index).copied(),
+                    content.diff_lines.get(visual_row.line_index).copied(),
                     line_number_width,
                     visual_row.continuation,
                     visual_row.tab_origin,
                     selection,
                 ),
-                ContentMode::Preview if app.content.show_line_numbers => preview_line(
+                ContentMode::Preview if content.show_line_numbers => preview_line(
                     (!visual_row.continuation).then_some(visual_row.line_index + 1),
                     line_number_width,
                     segment,
@@ -1896,7 +1897,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         format!(
             "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
         )
-    } else if area.width < 96 && app.content.mode == ContentMode::Preview {
+    } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
             "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
         )
@@ -1904,11 +1905,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         format!(
             "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y path Y real  q×2 quit"
         )
-    } else if app.content.mode == ContentMode::Preview {
+    } else if app.tab().content.mode == ContentMode::Preview {
         format!(
             "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
         )
-    } else if app.content.mode == ContentMode::Diff {
+    } else if app.tab().content.mode == ContentMode::Diff {
         format!(
             "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
