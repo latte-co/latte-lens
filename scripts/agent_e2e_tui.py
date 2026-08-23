@@ -49,10 +49,15 @@ def agent_metadata_to_live(context: ScenarioContext) -> None:
     session = context.session
     session.wait_raw((b"?1000h",), "harness mouse-enabled terminal")
     session.wait_screen(
-        ("LATTE LENS", "1 Files", "2 Git changes", "3 Agents"),
-        "production UI with Agent scope",
+        ("LATTE LENS", "+"),
+        "production UI with tab bar",
     )
-    session.key(b"3")
+    # Open a Chat tab through the "+" menu (Files/Review/Search/Chat).
+    session.key(b"\x0e")  # Ctrl+N
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\x1b[B")  # Down → Search
+    session.key(b"\x1b[B")  # Down → Chat
+    session.key(b"\r")  # Enter
     session.wait_screen(
         ("Agents", "0/0 live", "No observed Agent sessions in this workspace."),
         "empty exact workspace does not invent Agent sessions",
@@ -138,20 +143,20 @@ def agent_metadata_to_live(context: ScenarioContext) -> None:
 
     session.resize(72, 24)
     session.wait_screen(
-        ("LATTE LENS", "Agents", "^⇧F", "Reconciling"),
+        ("LATTE LENS", "Agents", "^T", "Reconciling"),
         "Agent diagnostics remain usable in a narrow terminal",
     )
     session.resize(120, 30)
     session.wait_screen(("Agents", "Reconciling"), "Agent view redraws after terminal restore")
 
     session.key(b"\x1b[Z")
-    session.wait_screen(("2 Git changes", "Diff"), "BackTab moves from Agents to Git changes")
+    session.wait_screen(("Files",), "BackTab moves from Chat to Files")
     session.key(b"\x1b[Z")
-    session.wait_screen(("1 Files", "a-dir"), "BackTab moves from Git changes to Files")
-    click_screen_marker(context, "3 Agents")
+    session.wait_screen(("Agents",), "BackTab moves from Files to Chat")
+    click_screen_marker(context, "Chat")
     session.wait_screen(
         ("Agents", "1/2 live", "synthetic/harness"),
-        "mouse click returns to the Agent scope",
+        "mouse click returns to the Chat tab",
     )
     click_agent_row(context, 1)
     session.wait_screen(

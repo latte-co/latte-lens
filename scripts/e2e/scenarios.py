@@ -564,8 +564,8 @@ def keyboard_controls(context: ScenarioContext) -> None:
         ),
         "Git Changes refresh settles",
     )
-    # Select the first changed file to load its diff.
-    session.key(b"\r")
+    # Click the first changed file to load its diff.
+    _click_tree_row(session, "b-changed.rs")
     session.wait_screen(("Diff", "diff --git"), "Git Changes is ready for change cycling")
     session.key(b"\x1b[D")
     session.key(b"\x1b[H")
@@ -935,7 +935,7 @@ def search_preview(context: ScenarioContext) -> None:
     session.wait_screen(
         ("hidden.txt:1", "ignored_unique_phrase"), "F5 includes ignored search results"
     )
-    session.click_marker("File")
+    session.click_marker("File Text")
     session.wait_screen(("Open File", "File", "Text"), "mouse switches to file search")
     session.key(b"\x14")
     session.wait_screen(

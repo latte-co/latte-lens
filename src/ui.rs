@@ -1182,6 +1182,15 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         }
     };
     let entry_count = app.scope_entry_count();
+    let (file_button, text_button) = inactive_search_buttons(header);
+    let available_width = file_button.x.saturating_sub(header.x) as usize;
+    let heading = if is_agents_scope(app) {
+        "Agents"
+    } else if app.tree_scope == TreeScope::GitChanges {
+        "Git changes"
+    } else {
+        "Files"
+    };
     let detail = if is_agents_scope(app) {
         #[cfg(feature = "agent-observability")]
         {
@@ -1206,11 +1215,18 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             "entries"
         };
         let full = format!("{entry_count}+ {noun} · PARTIAL");
-        let heading_width = "● Files  ".chars().count() + full.chars().count();
-        if heading_width <= usize::from(header.width) {
+        let full_width = 2 + heading.chars().count() + 2 + full.chars().count();
+        if full_width <= available_width {
             full
         } else {
-            format!("{entry_count}+ · PARTIAL")
+            let short = format!("{entry_count}+ · PARTIAL");
+            let short_width = 2 + heading.chars().count() + 2 + short.chars().count();
+            if short_width <= available_width {
+                short
+            } else {
+                // Even the short form doesn't fit; show just the count.
+                format!("{entry_count}+")
+            }
         }
     } else if app.scope_has_unloaded_directories() {
         format!("{entry_count} loaded")
@@ -1236,15 +1252,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         format!("{entry_count} entries")
     };
-    let (file_button, text_button) = inactive_search_buttons(header);
     let heading_width = file_button.x.saturating_sub(header.x);
-    let heading = if is_agents_scope(app) {
-        "Agents"
-    } else if app.tree_scope == TreeScope::GitChanges {
-        "Git changes"
-    } else {
-        "Files"
-    };
     let tree_accent = if app.tree_scope == TreeScope::GitChanges {
         Theme::current().git_accent
     } else {
@@ -1275,7 +1283,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             if full_labels {
                 TEXT_SEARCH_LABEL
             } else {
-                "^⇧F "
+                "^T "
             },
             Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )),
