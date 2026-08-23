@@ -225,10 +225,16 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tab_bar.height,
     );
     let menu_height = (NewTabMenuState::items().len() as u16) + 2;
+    let menu_width = 20u16.min(tab_bar.width);
+    let menu_x = new_tab_button
+        .x
+        .saturating_add(new_tab_button.width)
+        .saturating_sub(menu_width)
+        .min(tab_bar.width.saturating_sub(menu_width));
     let new_tab_menu = Rect::new(
-        new_tab_button.x,
+        menu_x,
         new_tab_button.y.saturating_add(1),
-        20,
+        menu_width,
         menu_height,
     );
     let refresh_width = (REFRESH_LABEL.len() as u16).min(header.width);
@@ -529,14 +535,15 @@ fn draw_new_tab_menu(frame: &mut Frame, app: &App, anchor: Rect) {
         return;
     };
     let items = NewTabMenuState::items();
-    let menu_width = 20u16.min(frame.area().width.saturating_sub(anchor.x));
+    let menu_width = 20u16.min(frame.area().width);
     let menu_height = (items.len() as u16) + 2;
-    let menu = Rect::new(
-        anchor.x,
-        anchor.y.saturating_add(1),
-        menu_width,
-        menu_height,
-    );
+    // Right-align the menu to the terminal edge so it never clips off-screen.
+    let menu_x = anchor
+        .x
+        .saturating_add(anchor.width)
+        .saturating_sub(menu_width)
+        .min(frame.area().width.saturating_sub(menu_width));
+    let menu = Rect::new(menu_x, anchor.y.saturating_add(1), menu_width, menu_height);
     frame.render_widget(Clear, menu);
     frame.render_widget(
         Block::default()
@@ -1233,6 +1240,8 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     let heading_width = file_button.x.saturating_sub(header.x);
     let heading = if is_agents_scope(app) {
         "Agents"
+    } else if app.tree_scope == TreeScope::GitChanges {
+        "Git changes"
     } else {
         "Files"
     };

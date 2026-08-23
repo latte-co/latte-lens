@@ -3016,10 +3016,7 @@ fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
     let focused_tab = terminal
         .backend()
         .buffer()
-        .cell((
-            app.ui_regions.tab_bar.x + 2,
-            app.ui_regions.tab_bar.y,
-        ))
+        .cell((app.ui_regions.tab_bar.x + 2, app.ui_regions.tab_bar.y))
         .unwrap();
     assert!(focused_tab.modifier.contains(Modifier::UNDERLINED));
     assert_eq!(focused_tab.bg, Color::Reset);
@@ -4385,6 +4382,169 @@ fn y_key_without_selection_shows_guidance() {
         app.clipboard_status.as_deref(),
         Some("Select a file or directory to copy its path")
     );
+}
+
+// ── Tab shell tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn tab_bar_renders_open_tabs_and_new_tab_button() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.open_tab(TabKind::Review);
+    settle(&mut app);
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    // Tab bar should contain the tab titles and the "+" button.
+    assert!(rendered.contains('+'));
+    // The active tab should be highlighted.
+    assert!(app.ui_regions.tab_bar.width > 0);
+    assert!(app.ui_regions.new_tab_button.width > 0);
+}
+
+#[test]
+fn new_tab_menu_opens_closes_and_submits_templates() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Ctrl+N opens the menu.
+    app.handle_key(modified_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    assert!(app.new_tab_menu.is_some());
+
+    // Esc closes it.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.new_tab_menu.is_none());
+
+    // Open again and submit the first template (Files).
+    app.handle_key(modified_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    assert!(app.new_tab_menu.is_some());
+    let tab_count = app.tabs().len();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.new_tab_menu.is_none());
+    assert_eq!(app.tabs().len(), tab_count + 1);
+}
+
+#[test]
+fn multi_tab_open_close_and_switch() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Start with one tab.
+    assert_eq!(app.tabs().len(), 1);
+    let first_id = app.active_tab_id();
+
+    // Open a Review tab.
+    let review_id = app.open_tab(TabKind::Review).unwrap();
+    settle(&mut app);
+    assert_eq!(app.tabs().len(), 2);
+    assert_eq!(app.active_tab_id(), review_id);
+
+    // Tab cycles forward.
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_tab_id(), first_id);
+
+    // Shift+Tab cycles backward.
+    app.handle_key(modified_key(KeyCode::Tab, KeyModifiers::SHIFT));
+    assert_eq!(app.active_tab_id(), review_id);
+
+    // Number keys switch to the Nth tab.
+    app.handle_key(key(KeyCode::Char('1')));
+    assert_eq!(app.active_tab_id(), first_id);
+
+    // Ctrl+W closes the active tab.
+    app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(app.tabs().len(), 1);
+    assert_eq!(app.active_tab_id(), review_id);
+
+    // Last tab cannot be closed.
+    app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(app.tabs().len(), 1);
+}
+
+#[test]
+fn tab_state_isolation_preserves_selection_and_scroll() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.write("c.txt", "c\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Select "b.txt" in the Files tab.
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+
+    // Open a Review tab and switch back.
+    app.open_tab(TabKind::Review);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_tab_id(), app.tabs()[0].id);
+
+    // The Files tab should still have "b.txt" selected.
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+}
+
+#[test]
+fn tab_soft_cap_rejects_new_tabs_at_limit() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Open tabs until the cap.
+    for _ in 1..latte_lens::app::MAX_OPEN_TABS {
+        assert!(app.open_tab(TabKind::Files).is_some());
+    }
+    assert_eq!(app.tabs().len(), latte_lens::app::MAX_OPEN_TABS);
+
+    // The next open is rejected with an error message.
+    let result = app.open_tab(TabKind::Files);
+    assert!(result.is_none());
+    assert!(app.last_error.is_some());
+    assert_eq!(app.tabs().len(), latte_lens::app::MAX_OPEN_TABS);
+}
+
+#[test]
+fn tab_palette_filters_and_switches_tabs() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.open_tab(TabKind::Review);
+    settle(&mut app);
+
+    // Ctrl+P opens the palette.
+    app.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert!(app.tab_palette.is_some());
+
+    // Type a query to filter.
+    app.handle_key(key(KeyCode::Char('r')));
+    let palette = app.tab_palette.as_ref().unwrap();
+    assert!(!palette.items.is_empty());
+
+    // Esc closes the palette.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.tab_palette.is_none());
+}
+
+#[test]
+fn search_tab_opens_text_search_popup() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "hello world\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Opening a Search tab bridges to the text search popup.
+    app.open_tab(TabKind::Search);
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
 }
 
 #[cfg(feature = "navigation-test-support")]

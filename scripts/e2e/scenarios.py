@@ -83,7 +83,7 @@ class ScenarioContext:
 def wait_for_initial_files(session: PtySession) -> None:
     session.wait_raw((b"?1000h",), "initial mouse-enabled terminal")
     session.wait_screen(
-        ("LATTE LENS", "1 Files", "2 Git changes", "Files", "Tree"),
+        ("LATTE LENS", "Files", "Tree"),
         "initial all-files tree with tree focus",
         absent=(".git/",),
     )
@@ -94,6 +94,17 @@ def wait_for_initial_files(session: PtySession) -> None:
             and (" loaded" in screen.text() or " entries" in screen.text())
         ),
         "initial filesystem and repository snapshot",
+    )
+
+
+def open_review_tab(session: PtySession) -> None:
+    """Open a Review (Git Changes) tab via the new-tab menu."""
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review"), "new-tab menu opens")
+    session.key(b"\x1b[B")  # Down to Review
+    session.key(b"\r")  # Enter
+    session.wait_screen(
+        ("Git changes", "Diff"), "Review tab opens with Git Changes"
     )
 
 
@@ -212,9 +223,9 @@ def files_navigation(context: ScenarioContext) -> None:
 
     # Preserve the original cross-scope state assertion in the Files group.
     context.write_text("y-untracked.txt", "new file\n")
-    session.key(b"2")
+    open_review_tab(session)
     session.wait_screen(
-        ("Git changes", "b-changed.rs", "nested-owned.txt", "Diff", "diff --git"),
+        ("b-changed.rs", "nested-owned.txt", "Diff", "diff --git"),
         "Git Changes available for Files scope-state check",
     )
     session.key(b"l")
@@ -222,14 +233,13 @@ def files_navigation(context: ScenarioContext) -> None:
     session.key(b"h")
     session.key(b"\x1b[H")
     session.key(b"\x1b[A")
-    session.wait_screen(("Git changes", "Tabs"), "Files journey scope-tabs focus cue")
-    files_tab = session.screen.find("1 Files")
-    if files_tab is None:
-        raise E2EAssertionError("input_target", "Files scope tab is not visible")
-    session.click(*files_tab)
+    session.key(b"\x1b[H")  # Home to first tree row
+    session.key(b"\x1b[A")  # Up — no-op at first row (scope tabs removed)
+    session.wait_screen(("Tree",), "Files journey tree focus retained")
+    session.key(b"1")  # Switch to first tab (Files)
     session.wait_screen(
         ("Files", "a-dir", "Tree"),
-        "mouse-selected collapsed All Files scope",
+        "keyboard-selected All Files tab",
         absent=("nested", "b-changed.rs"),
     )
     _click_tree_row(session, "z-clean.rs")
@@ -480,20 +490,14 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
 
-    # Move through the explicit Tabs -> Tree -> Content focus model and both
-    # scope-tab arrow branches before exercising the global tab shortcuts.
-    session.key(b"\x1b[A")
-    session.wait_screen(("Tabs",), "Up from the first tree row focuses scope tabs")
-    session.key(b"\x1b[C")
-    session.wait_screen(("Git changes", "b-changed.rs", "Diff"), "Right tab selects Git Changes")
-    session.key(b"\x1b[D")
-    session.wait_screen(("Files", "a-dir", "Tabs"), "Left tab returns to Files")
-    session.key(b"\x1b[B")
-    session.wait_screen(("Tree",), "Down from tabs returns focus to the tree")
+    # Exercise the global tab shortcuts: Tab cycles, 1-9 switches.
+    open_review_tab(session)
     session.key(b"\t")
-    session.wait_screen(("Git changes", "Diff"), "Tab advances to Git Changes")
+    session.wait_screen(("Files", "Tree"), "Tab cycles to Files tab")
     session.key(b"\x1b[Z")
-    session.wait_screen(("Files", "a-dir"), "BackTab returns to Files")
+    session.wait_screen(("Git changes",), "BackTab cycles to Review tab")
+    session.key(b"1")
+    session.wait_screen(("Files", "a-dir"), "1 switches back to Files tab")
 
     # Tree navigation covers bounded first/last selection, activation, and
     # the transition into the content pane.
@@ -552,15 +556,17 @@ def keyboard_controls(context: ScenarioContext) -> None:
     # Changed-file navigation runs in both directions only while Diff owns the
     # content pane. Preview/Diff toggles then return to the same owning change.
     session.key(b"2")
-    session.wait_screen(("Git changes", "Diff", "diff --git"), "Git Changes is ready for change cycling")
+    session.wait_screen(("Git changes",), "Git Changes tab activates")
     session.wait_until(
         lambda screen: all(
             marker not in screen.text()
             for marker in ("Refreshing workspace", "Loading directory", "Loading content", "LOADING")
-        )
-        and "a-dir" in screen.text(),
-        "Git Changes refresh settles before directory interaction",
+        ),
+        "Git Changes refresh settles",
     )
+    # Select the first changed file to load its diff.
+    session.key(b"\r")
+    session.wait_screen(("Diff", "diff --git"), "Git Changes is ready for change cycling")
     session.key(b"\x1b[D")
     session.key(b"\x1b[H")
     session.key(b"\x1b[B")
@@ -612,6 +618,7 @@ def keyboard_controls(context: ScenarioContext) -> None:
 def git_navigation(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     context.write_text("y-untracked.txt", "new file\n")
     session.key(b"2")
     session.wait_screen(
@@ -666,9 +673,7 @@ def git_navigation(context: ScenarioContext) -> None:
     session.key(b"l")
     session.wait_screen(("Diff", "Content"), "visible content focus cue")
     session.key(b"h")
-    session.key(b"\x1b[H")
-    session.key(b"\x1b[A")
-    session.wait_screen(("Git changes", "Tabs"), "visible scope-tabs focus cue")
+    session.wait_screen(("Tree",), "visible tree focus cue")
 
 
 def _line_with(screen: TerminalScreen, marker: str) -> str:
@@ -683,6 +688,7 @@ def _line_with(screen: TerminalScreen, marker: str) -> str:
 def git_status_matrix(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     session.key(b"2")
     session.wait_screen(
         (
@@ -737,6 +743,7 @@ def git_status_matrix(context: ScenarioContext) -> None:
 def git_review_state(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     session.key(b"2")
     session.wait_until(
         lambda screen: all(
@@ -782,6 +789,7 @@ def git_review_state(context: ScenarioContext) -> None:
 def repository_relation_matrix(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     session.key(b"2")
     session.wait_screen(
         (
@@ -863,7 +871,7 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
 def search_preview(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
-    session.key(b"/")
+    session.click_marker("/ Open")
     session.wait_screen(("Open File", "File", "Text"), "file search opens")
     session.key(b"search-target")
     session.wait_screen(
@@ -927,8 +935,8 @@ def search_preview(context: ScenarioContext) -> None:
     session.wait_screen(
         ("hidden.txt:1", "ignored_unique_phrase"), "F5 includes ignored search results"
     )
-    session.key(b"\x10")
-    session.wait_screen(("Open File", "File", "Text"), "Ctrl+P switches to file search")
+    session.click_marker("File")
+    session.wait_screen(("Open File", "File", "Text"), "mouse switches to file search")
     session.key(b"\x14")
     session.wait_screen(
         ("Search Workspace", "ignored_unique_phrase"),
@@ -1742,7 +1750,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
     )
 
     for repository_name in ("repo-a", "repo-b"):
-        session.key(b"\x10")
+        session.key(b"/")
         session.wait_screen(("Open File",), f"file search opens for {repository_name}")
         session.key(b"\x15")
         session.key(f"{repository_name}/caller.rs".encode())

@@ -495,8 +495,14 @@ pub(crate) struct PreviewFindState {
 /// The 「+」new-tab menu: a small popup listing the tab kinds that can be
 /// opened. Selection is a row index into [`NewTabMenuState::items`].
 #[derive(Clone, Debug)]
-pub(crate) struct NewTabMenuState {
+pub struct NewTabMenuState {
     pub selected: usize,
+}
+
+impl Default for NewTabMenuState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NewTabMenuState {
@@ -519,7 +525,7 @@ impl NewTabMenuState {
 /// One row in the ⌘P palette: either an open tab to switch to, or a workspace
 /// file to open in the Files tab.
 #[derive(Clone, Debug)]
-pub(crate) enum PaletteItem {
+pub enum PaletteItem {
     Tab {
         id: TabId,
         title: String,
@@ -531,7 +537,7 @@ pub(crate) enum PaletteItem {
 /// The ⌘P command palette: fuzzy-switches between open tabs and opens
 /// workspace files. The item list is rebuilt from the query on each keystroke.
 #[derive(Clone, Debug)]
-pub(crate) struct TabPaletteState {
+pub struct TabPaletteState {
     pub query: String,
     pub items: Vec<PaletteItem>,
     pub selected: usize,
@@ -856,6 +862,11 @@ impl Tab {
     }
 }
 
+/// Soft cap on simultaneously open tabs. The "+" menu stays usable at the
+/// cap, but submitting a template is rejected with guidance to close a tab
+/// or use the ⌘P palette.
+pub const MAX_OPEN_TABS: usize = 16;
+
 pub struct App {
     pub root: PathBuf,
     pub repo: Option<GitRepo>,
@@ -939,8 +950,8 @@ pub struct App {
     navigation_invocation: Option<NavigationInvocation>,
     pending_navigation_stage: Option<PendingNavigationStage>,
     pub(crate) navigation_picker: Option<NavigationPickerState>,
-    pub(crate) new_tab_menu: Option<NewTabMenuState>,
-    pub(crate) tab_palette: Option<TabPaletteState>,
+    pub new_tab_menu: Option<NewTabMenuState>,
+    pub tab_palette: Option<TabPaletteState>,
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
@@ -978,7 +989,15 @@ impl App {
     /// Open a new tab of the given kind and activate it. The tab's projection
     /// kind is synced with the legacy `tree_scope` so the existing scope
     /// machinery (selection restore, refresh-on-review) keeps working.
-    pub fn open_tab(&mut self, kind: TabKind) -> TabId {
+    /// Returns `None` when the soft cap is reached; the caller should show
+    /// guidance to close a tab or use the ⌘P palette.
+    pub fn open_tab(&mut self, kind: TabKind) -> Option<TabId> {
+        if self.tabs.len() >= MAX_OPEN_TABS {
+            self.last_error = Some(format!(
+                "Tab limit reached ({MAX_OPEN_TABS}). Close a tab with Ctrl+W or switch with Ctrl+P."
+            ));
+            return None;
+        }
         let id = TabId(self.next_tab_id);
         self.next_tab_id = self.next_tab_id.saturating_add(1);
         let mut tab = Tab::new(id, kind);
@@ -997,7 +1016,7 @@ impl App {
         if kind == TabKind::Search {
             self.open_search(SearchMode::Text);
         }
-        id
+        Some(id)
     }
 
     /// Activate the tab with the given id, syncing `tree_scope`.
