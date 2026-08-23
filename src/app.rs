@@ -730,6 +730,8 @@ pub struct ContentState {
     navigation_caret: NavigationCaret,
     navigation_hover_highlight: Option<SourceRange>,
     navigation_target_highlight: Option<SourceRange>,
+    navigation_source: Option<Arc<NavigationSource>>,
+    navigation_document_version: DocumentVersion,
 }
 
 impl Default for ContentState {
@@ -760,6 +762,8 @@ impl Default for ContentState {
             },
             navigation_hover_highlight: None,
             navigation_target_highlight: None,
+            navigation_source: None,
+            navigation_document_version: DocumentVersion(0),
         }
     }
 }
@@ -944,8 +948,6 @@ pub struct App {
     pub(crate) navigation_settings: NavigationSettings,
     pub(crate) navigation_config_warning: Option<String>,
     navigation_runtime: NavigationRuntime,
-    navigation_source: Option<Arc<NavigationSource>>,
-    navigation_document_version: DocumentVersion,
     navigation_generation: u64,
     navigation_invocation: Option<NavigationInvocation>,
     pending_navigation_stage: Option<PendingNavigationStage>,
@@ -955,6 +957,7 @@ pub struct App {
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
+    content_request_tab: Option<TabId>,
 }
 
 impl App {
@@ -1035,6 +1038,28 @@ impl App {
         };
         if self.tree_scope != scope {
             self.set_tree_scope(scope);
+        } else {
+            self.populate_tab_projection(scope);
+        }
+    }
+
+    /// Rebuild the active tab's projection from global data and restore its
+    /// selection. Called when activating a tab whose scope matches the current
+    /// `tree_scope` (e.g. opening a second Files tab), so the new tab is not
+    /// left with an empty projection.
+    fn populate_tab_projection(&mut self, scope: TreeScope) {
+        self.tab_mut().tree_state = ListState::default();
+        self.rebuild_visible_rows();
+        match scope {
+            TreeScope::AllFiles => {
+                let selection = self.tab().files().selection.clone();
+                self.restore_visible_selection(selection);
+            }
+            TreeScope::GitChanges => {
+                self.restore_git_selection(self.git_changes_selection.clone());
+            }
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => self.restore_agent_selection(),
         }
     }
 
@@ -1255,8 +1280,6 @@ impl App {
             navigation_settings: options.navigation,
             navigation_config_warning: options.navigation_config_warning,
             navigation_runtime,
-            navigation_source: None,
-            navigation_document_version: DocumentVersion(0),
             navigation_generation: 0,
             navigation_invocation: None,
             pending_navigation_stage: None,
@@ -1266,6 +1289,7 @@ impl App {
             navigation_status: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
+            content_request_tab: None,
         };
         app.request_refresh(false);
         Ok(app)
@@ -2105,8 +2129,8 @@ impl App {
             content_successful: self.tab().content.successful,
             content_was_loading: self.is_content_loading(),
             last_error: self.last_error.clone(),
-            navigation_source: self.navigation_source.clone(),
-            navigation_document_version: self.navigation_document_version,
+            navigation_source: self.tab().content.navigation_source.clone(),
+            navigation_document_version: self.tab().content.navigation_document_version,
             navigation_caret: self.tab().content.navigation_caret,
             navigation_target_highlight: self.tab().content.navigation_target_highlight,
             navigation_status: self.navigation_status.clone(),
@@ -2994,6 +3018,7 @@ impl App {
         self.last_search_click = None;
         if restore_content {
             self.content_requests.invalidate();
+            self.content_request_tab = None;
             self.runtime.cancel_pending_content();
             let restored_tree_state = restore.tree_state;
             self.focused_pane = restore.focused_pane;
@@ -3026,8 +3051,9 @@ impl App {
             self.tab_mut().content.cursor_line = restore.content_cursor_line;
             self.tab_mut().content.successful = restore.content_successful;
             self.last_error = restore.last_error;
-            self.navigation_source = restore.navigation_source;
-            self.navigation_document_version = restore.navigation_document_version;
+            self.tab_mut().content.navigation_source = restore.navigation_source;
+            self.tab_mut().content.navigation_document_version =
+                restore.navigation_document_version;
             self.tab_mut().content.navigation_caret = restore.navigation_caret;
             self.tab_mut().content.navigation_target_highlight =
                 restore.navigation_target_highlight;
@@ -3654,7 +3680,7 @@ impl App {
         mouse: MouseEvent,
     ) -> Option<(SourcePosition, SourceRange)> {
         let point = self.navigation_point_at_mouse(mouse)?;
-        let source = self.navigation_source.as_ref()?;
+        let source = self.tab().content.navigation_source.as_ref()?;
         let token = source.structure.recognizable_tokens.containing(point)?;
         Some((point, token))
     }
@@ -4686,6 +4712,8 @@ impl App {
         self.tab_mut().tree_state = ListState::default();
         self.rebuild_visible_rows();
         let visible_navigation_path = self
+            .tab()
+            .content
             .navigation_source
             .as_ref()
             .and_then(|source| source.identity.workspace_path().map(Path::to_path_buf));
@@ -4720,7 +4748,7 @@ impl App {
                 };
                 self.restore_git_selection_inner(
                     synchronized.or(fallback),
-                    self.navigation_source.is_none(),
+                    self.tab().content.navigation_source.is_none(),
                 );
             }
             #[cfg(feature = "agent-observability")]
@@ -4781,6 +4809,8 @@ impl App {
         match self.tree_scope {
             TreeScope::AllFiles => {
                 if let Some(path) = self
+                    .tab()
+                    .content
                     .navigation_source
                     .as_ref()
                     .and_then(|source| source.identity.workspace_path().map(Path::to_path_buf))
@@ -4799,7 +4829,7 @@ impl App {
             TreeScope::GitChanges => {
                 self.restore_git_selection_inner(
                     self.git_changes_selection.clone(),
-                    self.navigation_source.is_none(),
+                    self.tab().content.navigation_source.is_none(),
                 );
             }
             #[cfg(feature = "agent-observability")]
@@ -5708,6 +5738,7 @@ impl App {
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
         let generation = self.content_requests.begin();
+        self.content_request_tab = Some(self.active_tab);
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(ContentMode::Preview);
@@ -5747,6 +5778,7 @@ impl App {
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
         let generation = self.content_requests.begin();
+        self.content_request_tab = Some(self.active_tab);
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(match kind {
@@ -5823,6 +5855,7 @@ impl App {
         if let Some(stage) = self.pending_navigation_stage.take() {
             self.navigation_runtime.cancel(stage.invocation.generation);
             self.content_requests.invalidate();
+            self.content_request_tab = None;
             self.runtime.cancel_pending_content();
         }
         self.navigation_picker = None;
@@ -5835,18 +5868,21 @@ impl App {
     }
 
     fn rebind_navigation_sources_after_refresh(&mut self) {
-        let root = &self.root;
-        let graph = self.repo_graph.as_ref();
-        self.navigation_source = self
-            .navigation_source
-            .as_deref()
-            .and_then(|source| rebind_navigation_source(root, graph, source).map(Arc::new));
+        let root = self.root.clone();
+        let graph = self.repo_graph.clone();
+        let current = self.tab().content.navigation_source.clone();
+        let rebound = current.as_deref().and_then(|source| {
+            rebind_navigation_source(&root, graph.as_ref(), source).map(Arc::new)
+        });
+        self.tab_mut().content.navigation_source = rebound;
         if let Some(search) = &mut self.search {
             search.restore.navigation_source = search
                 .restore
                 .navigation_source
                 .as_deref()
-                .and_then(|source| rebind_navigation_source(root, graph, source).map(Arc::new));
+                .and_then(|source| {
+                    rebind_navigation_source(&root, graph.as_ref(), source).map(Arc::new)
+                });
         }
     }
 
@@ -5857,7 +5893,7 @@ impl App {
     }
 
     fn current_navigation_entry(&self) -> Option<NavigationHistoryEntry> {
-        let source = self.navigation_source.as_ref()?;
+        let source = self.tab().content.navigation_source.as_ref()?;
         let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
         let effective_scroll = self.effective_content_scroll(rows.len());
         let row = rows.get(effective_scroll);
@@ -5887,7 +5923,7 @@ impl App {
             self.set_navigation_status(NavigationStatusLevel::Info, "Focus Preview to navigate.");
             return;
         }
-        let Some(source) = self.navigation_source.clone() else {
+        let Some(source) = self.tab().content.navigation_source.clone() else {
             self.set_navigation_status(
                 NavigationStatusLevel::Error,
                 "Navigation unavailable: preview is truncated or unsupported.",
@@ -5918,7 +5954,7 @@ impl App {
             generation,
             operation,
             source_identity: source.identity.clone(),
-            source_version: self.navigation_document_version,
+            source_version: self.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
@@ -5929,7 +5965,7 @@ impl App {
             operation,
             origin: self.tab_mut().content.navigation_caret.point,
             source,
-            version: self.navigation_document_version,
+            version: self.tab().content.navigation_document_version,
         };
         self.navigation_invocation = Some(invocation);
         if let Err(error) = self.navigation_runtime.request(request) {
@@ -5955,7 +5991,7 @@ impl App {
             self.set_navigation_status(NavigationStatusLevel::Info, "Focus Preview to navigate.");
             return;
         }
-        let Some(source) = self.navigation_source.clone() else {
+        let Some(source) = self.tab().content.navigation_source.clone() else {
             self.set_navigation_status(
                 NavigationStatusLevel::Error,
                 "Document symbols unavailable for this Preview.",
@@ -5974,7 +6010,7 @@ impl App {
             generation,
             operation: NavigationOperation::DocumentSymbols,
             source_identity: source.identity.clone(),
-            source_version: self.navigation_document_version,
+            source_version: self.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
@@ -5986,7 +6022,7 @@ impl App {
                 operation: NavigationOperation::DocumentSymbols,
                 origin: self.tab_mut().content.navigation_caret.point,
                 source,
-                version: self.navigation_document_version,
+                version: self.tab().content.navigation_document_version,
             };
             self.navigation_invocation = Some(invocation);
             if let Err(error) = self.navigation_runtime.request(request) {
@@ -6044,7 +6080,7 @@ impl App {
             self.navigation_invocation = Some(invocation);
             return;
         }
-        let Some(source) = self.navigation_source.as_ref() else {
+        let Some(source) = self.tab().content.navigation_source.as_ref() else {
             self.set_navigation_status(
                 NavigationStatusLevel::Error,
                 "Document symbol source is no longer available.",
@@ -6052,7 +6088,7 @@ impl App {
             return;
         };
         if source.identity != completion.source_identity
-            || self.navigation_document_version != completion.source_version
+            || self.tab().content.navigation_document_version != completion.source_version
         {
             // The runtime triple matched the invocation, but the visible
             // document moved on before this reducer turn.
@@ -6142,6 +6178,8 @@ impl App {
     ) {
         let had_locations = !locations.is_empty();
         let source_server_root = self
+            .tab()
+            .content
             .navigation_source
             .as_ref()
             .filter(|source| source.identity == invocation.source_identity)
@@ -6220,6 +6258,8 @@ impl App {
         target: NavigationTarget,
     ) {
         if self
+            .tab()
+            .content
             .navigation_source
             .as_ref()
             .is_some_and(|source| source.identity == target.document)
@@ -6254,7 +6294,7 @@ impl App {
     }
 
     fn resolve_target_in_current_document(&self, target: &NavigationTarget) -> Option<SourceRange> {
-        let source = self.navigation_source.as_ref()?;
+        let source = self.tab().content.navigation_source.as_ref()?;
         if source.identity != target.document {
             return None;
         }
@@ -6346,7 +6386,7 @@ impl App {
         self.tab_mut().content.fold_source = snapshot.fold_source;
         self.tab_mut().content.fold_regions = snapshot.fold_regions;
         self.tab_mut().content.structure = snapshot.structure;
-        self.navigation_source = snapshot.navigation_source.map(Arc::new);
+        self.tab_mut().content.navigation_source = snapshot.navigation_source.map(Arc::new);
         let valid_anchors: HashSet<_> = self
             .tab_mut()
             .content
@@ -6357,8 +6397,10 @@ impl App {
         self.tab_mut().content.collapsed_folds =
             cached.intersection(&valid_anchors).copied().collect();
         self.tab_mut().content.successful = true;
-        self.navigation_document_version = DocumentVersion(
-            self.navigation_document_version
+        self.tab_mut().content.navigation_document_version = DocumentVersion(
+            self.tab()
+                .content
+                .navigation_document_version
                 .0
                 .checked_add(1)
                 .expect("navigation document version exhausted"),
@@ -6427,6 +6469,8 @@ impl App {
             return;
         };
         let Some(source_identity) = self
+            .tab()
+            .content
             .navigation_source
             .as_ref()
             .map(|source| source.identity.clone())
@@ -6441,7 +6485,7 @@ impl App {
             generation,
             operation: NavigationOperation::Definition,
             source_identity,
-            source_version: self.navigation_document_version,
+            source_version: self.tab().content.navigation_document_version,
             origin,
             history_intent: intent,
             destination_viewport: Some(target.viewport),
@@ -6657,6 +6701,8 @@ impl App {
         };
 
         if self
+            .tab()
+            .content
             .navigation_source
             .as_ref()
             .is_some_and(|source| source.identity == target.document)
@@ -6826,6 +6872,21 @@ impl App {
             self.apply_navigation_stage_completion(navigation_generation, generation, result);
             return;
         }
+        // Bind the completion to the tab that initiated the request so that
+        // switching tabs mid-flight does not overwrite the wrong tab's content.
+        let target_tab = self.content_request_tab.take();
+        let original_tab = self.active_tab;
+        let target_exists = target_tab
+            .map(|id| self.tabs.iter().any(|tab| tab.id == id))
+            .unwrap_or(true);
+        if !target_exists {
+            // The requesting tab was closed before the completion arrived.
+            self.pending_diff_path = None;
+            return;
+        }
+        if let Some(tab_id) = target_tab {
+            self.active_tab = tab_id;
+        }
         let mode = match kind {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
@@ -6853,9 +6914,11 @@ impl App {
                 self.tab_mut().content.fold_source = snapshot.fold_source;
                 self.tab_mut().content.fold_regions = snapshot.fold_regions;
                 self.tab_mut().content.structure = snapshot.structure;
-                self.navigation_source = snapshot.navigation_source.map(Arc::new);
-                self.navigation_document_version = DocumentVersion(
-                    self.navigation_document_version
+                self.tab_mut().content.navigation_source = snapshot.navigation_source.map(Arc::new);
+                self.tab_mut().content.navigation_document_version = DocumentVersion(
+                    self.tab()
+                        .content
+                        .navigation_document_version
                         .0
                         .checked_add(1)
                         .expect("navigation document version exhausted"),
@@ -6934,6 +6997,7 @@ impl App {
                 self.last_error = Some(format!("content failed: {error}"));
             }
         }
+        self.active_tab = original_tab;
     }
 
     fn apply_external_open_completion(&mut self, completion: ExternalOpenCompletion) {
@@ -7029,7 +7093,7 @@ impl App {
         self.tab_mut().content.fold_source = FoldSource::None;
         self.tab_mut().content.fold_regions.clear();
         self.tab_mut().content.structure = StructureSnapshot::unavailable();
-        self.navigation_source = None;
+        self.tab_mut().content.navigation_source = None;
         self.tab_mut().content.navigation_hover_highlight = None;
         self.tab_mut().content.navigation_target_highlight = None;
         self.tab_mut().content.collapsed_folds.clear();
@@ -7040,6 +7104,7 @@ impl App {
     fn set_info(&mut self, lines: Vec<String>) {
         self.cancel_pending_navigation();
         self.content_requests.invalidate();
+        self.content_request_tab = None;
         self.runtime.cancel_pending_content();
         self.pending_diff_path = None;
         self.cache_current_folds();
@@ -8718,12 +8783,14 @@ mod tests {
         structure.symbols_complete = false;
         app.tab_mut().content.structure = structure.clone();
         let mut source = app
+            .tab()
+            .content
             .navigation_source
             .as_ref()
             .map(|source| source.as_ref().clone())
             .unwrap();
         source.structure = Arc::new(structure);
-        app.navigation_source = Some(Arc::new(source));
+        app.tab_mut().content.navigation_source = Some(Arc::new(source));
     }
 
     fn protocol_symbol(
@@ -8757,8 +8824,8 @@ mod tests {
     #[test]
     fn search_cancel_restores_navigation_identity_and_rejects_late_preview_state() {
         let mut app = navigation_app("fn caller() {}\n");
-        let caller_source = app.navigation_source.clone().unwrap();
-        let caller_version = app.navigation_document_version;
+        let caller_source = app.tab().content.navigation_source.clone().unwrap();
+        let caller_version = app.tab().content.navigation_document_version;
         let caller_caret = NavigationCaret {
             point: SourcePosition { line: 0, byte: 4 },
             preferred_display_column: 4,
@@ -8779,24 +8846,29 @@ mod tests {
         set_search_result(&mut app, "target.rs");
         app.preview_search_selection();
         app.wait_for_background();
-        let target_source = app.navigation_source.clone().unwrap();
-        let target_version = app.navigation_document_version;
+        let target_source = app.tab().content.navigation_source.clone().unwrap();
+        let target_version = app.tab().content.navigation_document_version;
         assert_ne!(target_source.identity, caller_source.identity);
 
         app.close_search(true);
         assert_eq!(
-            app.navigation_source
+            app.tab()
+                .content
+                .navigation_source
                 .as_ref()
                 .map(|source| &source.identity),
             Some(&caller_source.identity)
         );
-        assert_eq!(app.navigation_document_version, caller_version);
+        assert_eq!(
+            app.tab().content.navigation_document_version,
+            caller_version
+        );
         assert_eq!(app.tab_mut().content.navigation_caret, caller_caret);
         assert_eq!(
             app.tab_mut().content.navigation_target_highlight,
             Some(caller_highlight)
         );
-        let restored_source = app.navigation_source.as_ref().unwrap();
+        let restored_source = app.tab().content.navigation_source.as_ref().unwrap();
         assert_eq!(restored_source.absolute_path, caller_source.absolute_path);
         assert_eq!(restored_source.server_root, caller_source.server_root);
         assert_eq!(restored_source.text, caller_source.text);
@@ -8831,7 +8903,7 @@ mod tests {
     #[test]
     fn search_accept_adopts_target_navigation_identity_while_empty_and_error_cancel_restore() {
         let mut app = navigation_app("fn caller() {}\n");
-        let caller = app.navigation_source.clone().unwrap();
+        let caller = app.tab().content.navigation_source.clone().unwrap();
 
         app.open_search(SearchMode::Files);
         set_search_result(&mut app, "target.rs");
@@ -8841,7 +8913,9 @@ mod tests {
         app.wait_for_background();
         assert!(app.search.is_none());
         assert_eq!(
-            app.navigation_source
+            app.tab()
+                .content
+                .navigation_source
                 .as_ref()
                 .map(|source| source.identity.path()),
             Some(Path::new("target.rs"))
@@ -8853,7 +8927,7 @@ mod tests {
             ContentTarget::Workspace(PathBuf::from("caller.rs")),
         );
         app.wait_for_background();
-        let restored_caller = app.navigation_source.clone().unwrap();
+        let restored_caller = app.tab().content.navigation_source.clone().unwrap();
         assert_eq!(restored_caller.identity, caller.identity);
 
         for (lines, error) in [
@@ -8868,7 +8942,9 @@ mod tests {
             app.last_error = error;
             app.close_search(true);
             assert_eq!(
-                app.navigation_source
+                app.tab()
+                    .content
+                    .navigation_source
                     .as_ref()
                     .map(|source| &source.identity),
                 Some(&restored_caller.identity)
@@ -9143,7 +9219,7 @@ mod tests {
     #[test]
     fn refresh_failure_keeps_the_installed_graph_root_but_cancels_navigation_loading() {
         let mut app = navigation_app("fn caller() {}\n");
-        let source = app.navigation_source.clone().unwrap();
+        let source = app.tab().content.navigation_source.clone().unwrap();
         let graph = app.repo_graph.clone();
         app.request_semantic_navigation(NavigationOperation::Definition);
         let pending = app.navigation_invocation.clone().unwrap();
@@ -9159,7 +9235,9 @@ mod tests {
         assert!(app.navigation_invocation.is_none());
         assert!(app.pending_navigation_stage.is_none());
         assert_eq!(
-            app.navigation_source
+            app.tab()
+                .content
+                .navigation_source
                 .as_ref()
                 .map(|source| &source.server_root),
             Some(&source.server_root)
@@ -9201,7 +9279,7 @@ mod tests {
             generation,
             operation: NavigationOperation::Definition,
             source_identity: origin.target.document.clone(),
-            source_version: stage_app.navigation_document_version,
+            source_version: stage_app.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
@@ -9271,12 +9349,12 @@ mod tests {
         app.navigation_back
             .push_back(app.current_navigation_entry().unwrap());
 
-        let old_source = app.navigation_source.clone().unwrap();
+        let old_source = app.tab().content.navigation_source.clone().unwrap();
         assert_eq!(old_source.server_root, old_root.canonicalize().unwrap());
         let lines = app.tab_mut().content.lines.clone();
         let folds = app.tab_mut().content.collapsed_folds.clone();
         let viewport = app.tab_mut().content.scroll;
-        let version = app.navigation_document_version;
+        let version = app.tab().content.navigation_document_version;
         let caret = app.tab_mut().content.navigation_caret;
         let history = app.navigation_back.clone();
         app.open_search(SearchMode::Files);
@@ -9287,7 +9365,7 @@ mod tests {
         app.request_refresh(true);
         app.wait_for_background();
 
-        let rebound = app.navigation_source.as_ref().unwrap();
+        let rebound = app.tab().content.navigation_source.as_ref().unwrap();
         assert_eq!(rebound.server_root, canonical_new_root);
         assert_eq!(rebound.identity, old_source.identity);
         assert_eq!(rebound.absolute_path, old_source.absolute_path);
@@ -9300,7 +9378,7 @@ mod tests {
         assert_eq!(app.tab_mut().content.lines, lines);
         assert_eq!(app.tab_mut().content.collapsed_folds, folds);
         assert_eq!(app.tab_mut().content.scroll, viewport);
-        assert_eq!(app.navigation_document_version, version);
+        assert_eq!(app.tab().content.navigation_document_version, version);
         assert_eq!(app.tab_mut().content.navigation_caret, caret);
         assert_eq!(
             app.tab_mut().content.navigation_target_highlight,
@@ -9324,7 +9402,9 @@ mod tests {
 
         app.close_search(true);
         assert_eq!(
-            app.navigation_source
+            app.tab()
+                .content
+                .navigation_source
                 .as_ref()
                 .map(|source| source.server_root.as_path()),
             Some(canonical_new_root.as_path())
@@ -9341,7 +9421,9 @@ mod tests {
         app.request_semantic_navigation(NavigationOperation::Definition);
         assert!(app.navigation_invocation.is_some());
         assert_eq!(
-            app.navigation_source
+            app.tab()
+                .content
+                .navigation_source
                 .as_ref()
                 .map(|source| source.server_root.as_path()),
             Some(canonical_new_root.as_path())
@@ -9368,7 +9450,9 @@ mod tests {
             }),
         });
         assert_eq!(
-            app.navigation_source
+            app.tab()
+                .content
+                .navigation_source
                 .as_ref()
                 .map(|source| source.server_root.as_path()),
             Some(canonical_new_root.as_path())
@@ -9379,13 +9463,20 @@ mod tests {
     fn refresh_degrades_a_source_whose_workspace_identity_is_no_longer_valid() {
         let mut app = navigation_app("fn caller() {}\n");
         let lines = app.tab_mut().content.lines.clone();
-        let mut invalid = app.navigation_source.as_ref().unwrap().as_ref().clone();
+        let mut invalid = app
+            .tab()
+            .content
+            .navigation_source
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .clone();
         invalid.absolute_path = app.root.join("../outside.rs");
-        app.navigation_source = Some(Arc::new(invalid));
+        app.tab_mut().content.navigation_source = Some(Arc::new(invalid));
 
         app.rebind_navigation_sources_after_refresh();
 
-        assert!(app.navigation_source.is_none());
+        assert!(app.tab().content.navigation_source.is_none());
         assert_eq!(app.tab_mut().content.lines, lines);
         assert!(app.tab_mut().content.identity.is_some());
     }
@@ -9398,12 +9489,19 @@ mod tests {
         let mut app = navigation_app(&source);
         let origin = app.current_navigation_entry().unwrap();
         let generation = app.next_navigation_generation();
-        let identity = app.navigation_source.as_ref().unwrap().identity.clone();
+        let identity = app
+            .tab()
+            .content
+            .navigation_source
+            .as_ref()
+            .unwrap()
+            .identity
+            .clone();
         let invocation = NavigationInvocation {
             generation,
             operation: NavigationOperation::DocumentSymbols,
             source_identity: identity.clone(),
-            source_version: app.navigation_document_version,
+            source_version: app.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
@@ -9751,7 +9849,7 @@ mod tests {
             generation,
             operation: NavigationOperation::References,
             source_identity: caller.clone(),
-            source_version: app.navigation_document_version,
+            source_version: app.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
@@ -9917,7 +10015,7 @@ mod tests {
             generation,
             operation: NavigationOperation::Definition,
             source_identity: origin.target.document.clone(),
-            source_version: app.navigation_document_version,
+            source_version: app.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
@@ -9968,7 +10066,7 @@ mod tests {
             generation,
             operation: NavigationOperation::Definition,
             source_identity: caller.clone(),
-            source_version: app.navigation_document_version,
+            source_version: app.tab().content.navigation_document_version,
             origin,
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,

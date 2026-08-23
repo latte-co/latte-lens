@@ -1182,9 +1182,10 @@ fn decode_path(value: &str) -> Result<PathBuf> {
     if bytes.len() % 2 != 0 {
         bail!("encoded Windows hook backup path has an odd byte length");
     }
-    let wide = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let wide = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect::<Vec<_>>();
     Ok(PathBuf::from(OsString::from_wide(&wide)))
 }

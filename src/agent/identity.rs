@@ -91,7 +91,8 @@ impl StableDigest {
             return Err(StableDigestParseError);
         }
         let mut bytes = [0_u8; 32];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let (pairs, _) = value.as_bytes().as_chunks::<2>();
+        for (index, pair) in pairs.iter().enumerate() {
             bytes[index] = (hex_nibble(pair[0]).ok_or(StableDigestParseError)? << 4)
                 | hex_nibble(pair[1]).ok_or(StableDigestParseError)?;
         }
