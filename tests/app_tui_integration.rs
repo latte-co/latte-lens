@@ -63,7 +63,7 @@ fn preview_folding_renders_markers_and_find_reveals_hidden_body() {
     )
     .unwrap();
     let mut app = ready_app(directory.path().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(modified_key(KeyCode::Char('{'), KeyModifiers::SHIFT));
 
@@ -114,7 +114,7 @@ fn huge_raw_content_scroll_renders_and_navigates_from_the_effective_end() {
     fs::write(directory.path().join("plain.txt"), "one\ntwo\nthree\n").unwrap();
     let mut app = ready_app(directory.path().to_path_buf()).unwrap();
     app.handle_key(key(KeyCode::Char('l')));
-    app.content_scroll = usize::MAX;
+    app.content.scroll = usize::MAX;
 
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -126,7 +126,7 @@ fn huge_raw_content_scroll_renders_and_navigates_from_the_effective_end() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("two"));
-    assert_ne!(app.content_scroll, usize::MAX);
+    assert_ne!(app.content.scroll, usize::MAX);
 }
 
 #[test]
@@ -181,7 +181,8 @@ fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand
 
     assert!(app.is_directory_loading());
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line.contains("Loading"))
     );
@@ -208,7 +209,7 @@ fn app_starts_from_nested_path_and_renders_both_panes() {
     assert_eq!(app.branch.as_deref(), Some("main"));
     assert_eq!(app.changed_count, 1);
     assert_eq!(app.tree_scope, TreeScope::AllFiles);
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
 
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -228,7 +229,8 @@ fn app_starts_from_nested_path_and_renders_both_panes() {
     settle(&mut app);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("lib.rs")));
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line == "+pub fn changed() {}")
     );
@@ -358,7 +360,7 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
         app.selected_relative_path(),
         Some(PathBuf::from("a-clean.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.focused_pane, FocusPane::Content);
 
@@ -370,8 +372,8 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
         app.selected_relative_path(),
         Some(PathBuf::from("b-changed.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Diff);
-    assert!(app.content_lines.iter().any(|line| line == "+after"));
+    assert_eq!(app.content.mode, ContentMode::Diff);
+    assert!(app.content.lines.iter().any(|line| line == "+after"));
 
     app.handle_key(key(KeyCode::BackTab));
     settle(&mut app);
@@ -381,7 +383,7 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
         app.selected_relative_path(),
         Some(PathBuf::from("b-changed.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
 
     app.handle_key(key(KeyCode::Char('2')));
     settle(&mut app);
@@ -389,10 +391,10 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::GitChanges);
     assert_eq!(app.focused_pane, FocusPane::Content);
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
     assert_eq!(app.focused_pane, FocusPane::Content);
 }
 
@@ -532,7 +534,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
             PathBuf::from("src/nested/changed.rs"),
         ]
     );
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
 }
 
 #[test]
@@ -561,7 +563,7 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
         ]
     );
     assert_eq!(
-        app.content_lines,
+        app.content.lines,
         [
             "No changed files in this directory.",
             "",
@@ -592,8 +594,8 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
         app.selected_relative_path(),
         Some(PathBuf::from("src/file.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_lines, ["fixture"]);
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.lines, ["fixture"]);
     assert!(!app.is_external_open_loading());
 }
 
@@ -614,7 +616,7 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
-        app.content_lines,
+        app.content.lines,
         [
             "No changed files in this directory.",
             "",
@@ -650,8 +652,8 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
         app.selected_relative_path(),
         Some(PathBuf::from("src/file.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_lines, ["fixture"]);
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.lines, ["fixture"]);
     assert_eq!(visible_paths(&app), rows_before_file_click);
     assert!(!app.is_external_open_loading());
 }
@@ -950,7 +952,7 @@ fn entering_git_changes_refreshes_and_excludes_clean_files() {
         app.selected_relative_path(),
         Some(PathBuf::from("z-new-change.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
 }
 
 #[test]
@@ -984,8 +986,8 @@ fn clean_root_repository_is_a_selectable_empty_git_changes_node() {
     assert_ne!(row.label, ".");
     assert!(row.detail.contains("clean"));
     assert!(!row.detail.contains("files"));
-    assert_eq!(app.content_mode, ContentMode::Info);
-    assert!(app.content_lines[0].contains("0 changed files"));
+    assert_eq!(app.content.mode, ContentMode::Info);
+    assert!(app.content.lines[0].contains("0 changed files"));
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.visible_git_rows().len(), 1);
@@ -1219,15 +1221,15 @@ fn non_git_directory_previews_text_and_has_an_empty_changes_scope() {
 
     assert!(app.repo.is_none());
     assert_eq!(app.changed_count, 0);
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_provider.as_deref(), Some("text"));
-    assert_eq!(app.content_lines, ["hello"]);
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.provider.as_deref(), Some("text"));
+    assert_eq!(app.content.lines, ["hello"]);
 
     app.set_tree_scope(TreeScope::GitChanges);
     assert!(app.visible_entries().is_empty());
-    assert_eq!(app.content_mode, ContentMode::Info);
+    assert_eq!(app.content.mode, ContentMode::Info);
     assert_eq!(
-        app.content_lines,
+        app.content.lines,
         ["Workspace is not a Git repository and has no changed descendant repositories."]
     );
 }
@@ -1275,11 +1277,11 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
             .any(|row| row.detail.contains("untracked in parent"))
     );
 
-    assert!(app.content_lines.iter().any(|line| line == "+root after"));
+    assert!(app.content.lines.iter().any(|line| line == "+root after"));
     app.handle_key(key(KeyCode::Char('n')));
     settle(&mut app);
-    assert!(app.content_lines.iter().any(|line| line == "+nested after"));
-    assert!(!app.content_lines.iter().any(|line| line == "+root after"));
+    assert!(app.content.lines.iter().any(|line| line == "+nested after"));
+    assert!(!app.content.lines.iter().any(|line| line == "+root after"));
     let nested_selection = app
         .selected_git_row()
         .map(|row| row.identity.clone())
@@ -1292,7 +1294,7 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
         app.selected_git_row().map(|row| &row.identity),
         Some(&nested_selection)
     );
-    assert!(app.content_lines.iter().any(|line| line == "+nested after"));
+    assert!(app.content.lines.iter().any(|line| line == "+nested after"));
 
     let backend = TestBackend::new(100, 22);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1392,7 +1394,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
         .selected_git_row()
         .map(|row| row.identity.clone())
         .unwrap();
-    assert_eq!(app.content_lines[0], "1 changed file in this directory.");
+    assert_eq!(app.content.lines[0], "1 changed file in this directory.");
 
     // Collapse and reopen only the root repo's `src`, then select the nested
     // repo's independently identified `src` row.
@@ -1407,7 +1409,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
         .map(|row| row.identity.clone())
         .unwrap();
     assert_ne!(root_directory, nested_directory);
-    assert_eq!(app.content_lines[0], "1 changed file in this directory.");
+    assert_eq!(app.content.lines[0], "1 changed file in this directory.");
 
     // Refresh selection and directory info by the complete repo+path identity.
     app.handle_key(key(KeyCode::Char('r')));
@@ -1416,7 +1418,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
         app.selected_git_row().map(|row| &row.identity),
         Some(&nested_directory)
     );
-    assert_eq!(app.content_lines[0], "1 changed file in this directory.");
+    assert_eq!(app.content.lines[0], "1 changed file in this directory.");
 
     // Nested collapse must not hide the root repo's same-named descendant.
     app.handle_key(key(KeyCode::Enter));
@@ -1434,8 +1436,8 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
     app.handle_key(key(KeyCode::Enter));
     app.handle_key(key(KeyCode::Down));
     settle(&mut app);
-    assert!(app.content_lines.iter().any(|line| line == "+nested after"));
-    assert!(!app.content_lines.iter().any(|line| line == "+root after"));
+    assert!(app.content.lines.iter().any(|line| line == "+nested after"));
+    assert!(!app.content.lines.iter().any(|line| line == "+root after"));
 }
 
 #[test]
@@ -1467,7 +1469,7 @@ fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_error_visible() {
             .iter()
             .any(|row| row.label.contains("[error] bad-repo"))
     );
-    assert!(app.content_lines.iter().any(|line| line == "+after"));
+    assert!(app.content.lines.iter().any(|line| line == "+after"));
 
     let backend = TestBackend::new(100, 18);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1537,7 +1539,8 @@ fn submodule_pointer_internal_change_and_placeholder_are_separate_rows() {
             && row.detail.contains("uninitialized")
     }));
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line.contains("diff --git a/child b/child"))
     );
@@ -1545,12 +1548,14 @@ fn submodule_pointer_internal_change_and_placeholder_are_separate_rows() {
     app.handle_key(key(KeyCode::Char('n')));
     settle(&mut app);
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line == "+dirty inside child")
     );
     assert!(
-        !app.content_lines
+        !app.content
+            .lines
             .iter()
             .any(|line| line.contains("a/child b/child"))
     );
@@ -1649,7 +1654,7 @@ fn empty_directory_has_no_selection_and_safe_navigation() {
 
     assert!(app.all_entries.is_empty());
     assert!(app.selected_entry().is_none());
-    assert_eq!(app.content_lines, ["This directory is empty."]);
+    assert_eq!(app.content.lines, ["This directory is empty."]);
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::End));
     app.handle_key(key(KeyCode::Enter));
@@ -1671,7 +1676,7 @@ fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection
 
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
-        app.content_lines,
+        app.content.lines,
         [
             "1 changed file in this directory.",
             "",
@@ -1717,7 +1722,7 @@ fn selecting_a_removed_untracked_file_surfaces_diff_error() {
         app.selected_relative_path(),
         Some(PathBuf::from("z-untracked.txt"))
     );
-    assert!(app.content_lines[0].contains("Unable to load diff"));
+    assert!(app.content.lines[0].contains("Unable to load diff"));
 }
 
 #[test]
@@ -1737,32 +1742,32 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
     let selected = app.selected_relative_path();
 
     app.handle_key(key(KeyCode::Down));
-    assert_eq!(app.content_scroll, 1);
+    assert_eq!(app.content.scroll, 1);
     assert_eq!(app.selected_relative_path(), selected);
     assert_eq!(app.focused_pane, FocusPane::Content);
     app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.content_scroll, 0);
+    assert_eq!(app.content.scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
 
     app.handle_key(key(KeyCode::PageDown));
-    assert_eq!(app.content_scroll, 12);
+    assert_eq!(app.content.scroll, 12);
     app.handle_key(key(KeyCode::PageUp));
-    assert_eq!(app.content_scroll, 0);
+    assert_eq!(app.content.scroll, 0);
 
     app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
-    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.content.horizontal_scroll, 0);
     app.handle_key(key(KeyCode::Right));
     assert_eq!(app.focused_pane, FocusPane::Content);
-    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.content.horizontal_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
     app.handle_key(key(KeyCode::Left));
     assert_eq!(app.focused_pane, FocusPane::Tree);
-    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.content.horizontal_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
     app.handle_key(key(KeyCode::Right));
     assert_eq!(app.focused_pane, FocusPane::Content);
     app.handle_key(modified_key(KeyCode::Left, KeyModifiers::SHIFT));
-    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.content.horizontal_scroll, 0);
     assert_eq!(app.selected_relative_path(), selected);
 
     app.handle_key(key(KeyCode::Char('h')));
@@ -1835,9 +1840,9 @@ fn clean_source_defaults_to_numbered_text_preview() {
     fixture.commit_all("initial");
 
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_provider.as_deref(), Some("text"));
-    assert!(app.content_show_line_numbers);
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.provider.as_deref(), Some("text"));
+    assert!(app.content.show_line_numbers);
 
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1862,7 +1867,7 @@ fn go_tabs_render_as_indentation_but_copy_as_original_tabs() {
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     let content_x = app.ui_regions.content_inner.x;
     let row_text = |row: u16| -> String {
         (content_x..app.ui_regions.content_inner.right())
@@ -1910,8 +1915,8 @@ fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() 
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert!(app.content_show_line_numbers);
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert!(app.content.show_line_numbers);
     assert_eq!(app.ui_regions.content_inner.width, 30);
 
     let row_text = |row: u16| -> String {
@@ -1940,9 +1945,9 @@ fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() 
     assert_eq!(app.selected_preview_text().as_deref(), Some("yz0123"));
 
     app.handle_key(key(KeyCode::End));
-    assert_eq!(app.content_scroll, 2);
+    assert_eq!(app.content.scroll, 2);
     app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
-    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.content.horizontal_scroll, 0);
 }
 
 #[test]
@@ -1958,7 +1963,7 @@ fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
     let backend = TestBackend::new(60, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
     assert_eq!(app.ui_regions.content_inner.width, 30);
 
     let row_text = |row: u16| -> String {
@@ -1989,7 +1994,7 @@ fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
     assert_eq!(app.selected_content_text().as_deref(), Some("yz0123456"));
 
     app.handle_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
-    assert_eq!(app.content_horizontal_scroll, 0);
+    assert_eq!(app.content.horizontal_scroll, 0);
 }
 
 #[test]
@@ -2048,23 +2053,24 @@ fn changed_source_defaults_to_diff_but_can_toggle_preview() {
 
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line == "+fn after() {}")
     );
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_lines, ["fn after() {}"]);
-    assert!(app.content_highlights[0].iter().any(|highlight| {
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.lines, ["fn after() {}"]);
+    assert!(app.content.highlights[0].iter().any(|highlight| {
         highlight.kind == HighlightKind::Function
-            && app.content_lines[0].get(highlight.range.clone()) == Some("after")
+            && app.content.lines[0].get(highlight.range.clone()) == Some("after")
     }));
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
 }
 
 #[test]
@@ -2074,10 +2080,10 @@ fn binary_file_explains_how_to_add_a_preview_provider() {
     fixture.commit_all("initial");
 
     let app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert!(app.content_provider.is_none());
-    assert!(app.content_lines[0].contains("No preview provider accepted"));
-    assert!(app.content_lines[1].contains("PreviewProvider"));
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert!(app.content.provider.is_none());
+    assert!(app.content.lines[0].contains("No preview provider accepted"));
+    assert!(app.content.lines[1].contains("PreviewProvider"));
 }
 
 #[test]
@@ -2087,25 +2093,27 @@ fn app_uses_metadata_and_explicit_actions_for_png() {
     fixture.commit_all("initial");
 
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
-    assert!(!app.content_show_line_numbers);
-    assert!(app.content_lines.iter().any(|line| line == "Format: PNG"));
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.provider.as_deref(), Some("common-file"));
+    assert!(!app.content.show_line_numbers);
+    assert!(app.content.lines.iter().any(|line| line == "Format: PNG"));
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line == "Dimensions: 4 x 2")
     );
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line.contains("Press o"))
     );
-    assert!(app.content_lines.iter().all(|line| !line.contains('▀')));
+    assert!(app.content.lines.iter().all(|line| !line.contains('▀')));
 
-    let metadata = app.content_lines.clone();
+    let metadata = app.content.lines.clone();
     app.handle_key(key(KeyCode::Char('i')));
-    assert_eq!(app.content_lines, metadata);
+    assert_eq!(app.content.lines, metadata);
 }
 
 #[test]
@@ -2118,14 +2126,15 @@ fn app_uses_the_builtin_common_file_provider_for_every_pdf_page() {
     fixture.commit_all("initial");
 
     let app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
-    assert!(!app.content_show_line_numbers);
-    assert!(app.content_lines.iter().any(|line| line == "Pages: 2"));
-    assert!(app.content_lines.iter().any(|line| line == "Page 1 / 2"));
-    assert!(app.content_lines.iter().any(|line| line == "Page 2 / 2"));
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.provider.as_deref(), Some("common-file"));
+    assert!(!app.content.show_line_numbers);
+    assert!(app.content.lines.iter().any(|line| line == "Pages: 2"));
+    assert!(app.content.lines.iter().any(|line| line == "Page 1 / 2"));
+    assert!(app.content.lines.iter().any(|line| line == "Page 2 / 2"));
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line.contains("second page"))
     );
@@ -2139,7 +2148,7 @@ fn pdf_uses_the_same_o_and_clickable_open_action_without_image_fallback() {
         common_preview_pdf_fixture(&[Some("system open")]),
     );
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    let original = app.content_lines.clone();
+    let original = app.content.lines.clone();
     let backend = TestBackend::new(100, 22);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -2156,7 +2165,7 @@ fn pdf_uses_the_same_o_and_clickable_open_action_without_image_fallback() {
     app.handle_mouse(mouse_down(open.x, open.y));
     settle(&mut app);
 
-    assert_eq!(app.content_lines, original);
+    assert_eq!(app.content.lines, original);
     assert!(
         app.external_open_status_message()
             .is_some_and(|message| message.contains("unavailable"))
@@ -2178,7 +2187,7 @@ fn unknown_file_requires_o_confirmation_while_enter_previews_internally() {
 
     app.handle_key(key(KeyCode::Enter));
     settle(&mut app);
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     assert!(!app.is_external_open_loading());
 
     app.handle_key(key(KeyCode::Char('o')));
@@ -2224,17 +2233,19 @@ fn app_uses_the_builtin_common_file_provider_for_docx() {
     fixture.commit_all("initial");
 
     let app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
-    assert!(!app.content_show_line_numbers);
-    assert!(app.content_lines.iter().any(|line| line == "Format: DOCX"));
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.provider.as_deref(), Some("common-file"));
+    assert!(!app.content.show_line_numbers);
+    assert!(app.content.lines.iter().any(|line| line == "Format: DOCX"));
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line == "Title: Integration preview")
     );
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line == "# Document heading")
     );
@@ -2247,15 +2258,17 @@ fn app_does_not_render_a_script_disguised_as_a_pdf() {
     fixture.commit_all("initial");
 
     let app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_provider.as_deref(), Some("common-file"));
-    assert!(!app.content_show_line_numbers);
+    assert_eq!(app.content.provider.as_deref(), Some("common-file"));
+    assert!(!app.content.show_line_numbers);
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line.contains("Format mismatch"))
     );
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .all(|line| !line.contains("should-not-render"))
     );
@@ -2290,9 +2303,9 @@ fn app_accepts_a_custom_pdf_preview_provider() {
     registry.register(FakePdfProvider);
 
     let app = ready_app_with_preview_registry(fixture.root().to_path_buf(), registry).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Preview);
-    assert_eq!(app.content_provider.as_deref(), Some("fake-pdf"));
-    assert_eq!(app.content_lines, ["PDF page one"]);
+    assert_eq!(app.content.mode, ContentMode::Preview);
+    assert_eq!(app.content.provider.as_deref(), Some("fake-pdf"));
+    assert_eq!(app.content.lines, ["PDF page one"]);
 }
 
 fn common_preview_png_fixture() -> Vec<u8> {
@@ -2420,8 +2433,8 @@ fn all_files_expands_a_directory_symlink_and_previews_a_file_inside_it() {
     );
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
-    let content = app.content_lines.join("\n");
-    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    let content = app.content.lines.join("\n");
+    assert_eq!(app.content.provider.as_deref(), Some("text"));
     assert!(content.contains("inside-linked-directory-3a5e"));
 }
 
@@ -2436,7 +2449,7 @@ fn all_files_follows_an_internal_file_symlink_and_previews_target_content() {
     symlink("z-target.txt", workspace.path().join("a-link.txt")).unwrap();
 
     let app = ready_app(workspace.path().to_path_buf()).unwrap();
-    let content = app.content_lines.join("\n");
+    let content = app.content.lines.join("\n");
 
     assert_eq!(
         app.selected_relative_path(),
@@ -2444,7 +2457,7 @@ fn all_files_follows_an_internal_file_symlink_and_previews_target_content() {
     );
     // All Files follows the link and previews the target file as if it were a
     // regular file: the target content shows and the text provider handles it.
-    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert_eq!(app.content.provider.as_deref(), Some("text"));
     assert!(content.contains("internal-target-content-1d61"));
 }
 
@@ -2460,7 +2473,7 @@ fn all_files_follows_an_external_file_symlink_and_previews_target_content() {
     symlink(&outside_file, workspace.path().join("a-link.txt")).unwrap();
 
     let app = ready_app(workspace.path().to_path_buf()).unwrap();
-    let content = app.content_lines.join("\n");
+    let content = app.content.lines.join("\n");
 
     assert_eq!(
         app.selected_relative_path(),
@@ -2468,7 +2481,7 @@ fn all_files_follows_an_external_file_symlink_and_previews_target_content() {
     );
     // A file symlink pointing outside the workspace is followed too: All Files
     // is a filesystem view, so the user sees the linked file's content.
-    assert_eq!(app.content_provider.as_deref(), Some("text"));
+    assert_eq!(app.content.provider.as_deref(), Some("text"));
     assert!(content.contains("external-target-content-4c02"));
 }
 
@@ -2498,7 +2511,7 @@ fn all_files_treats_a_directory_symlink_as_an_expandable_directory() {
         link_entry.is_dir,
         "a directory symlink must be an expandable directory"
     );
-    assert_ne!(app.content_provider.as_deref(), Some("symlink"));
+    assert_ne!(app.content.provider.as_deref(), Some("symlink"));
 
     // Selecting the directory symlink shows its resolved real path in the info
     // pane (directory links never enter Preview mode, so this is where the
@@ -2509,7 +2522,7 @@ fn all_files_treats_a_directory_symlink_as_an_expandable_directory() {
     );
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
-    let info = app.content_lines.join("\n");
+    let info = app.content.lines.join("\n");
     assert!(
         info.contains('↗'),
         "info pane marks the resolved path with ↗"
@@ -2592,9 +2605,9 @@ fn git_changes_preview_does_not_follow_a_changed_symlink() {
     settle(&mut app);
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
-    let content = app.content_lines.join("\n");
+    let content = app.content.lines.join("\n");
 
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     assert!(content.contains(&outside_file.display().to_string()));
     assert!(!content.contains(secret));
 }
@@ -2607,7 +2620,7 @@ fn fifo_preview_returns_promptly_with_a_safe_message() {
         make_fifo(&workspace.path().join("pipe"));
 
         let app = ready_app(workspace.path().to_path_buf()).unwrap();
-        let content = app.content_lines.join("\n");
+        let content = app.content.lines.join("\n");
         assert!(content.contains("FIFO (named pipe)"));
         assert!(content.contains("reads only regular files"));
         drop(app);
@@ -2629,7 +2642,7 @@ fn untracked_symlink_to_fifo_diff_and_worker_drop_return_promptly() {
         let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
         app.set_tree_scope(TreeScope::GitChanges);
         app.wait_for_background();
-        let diff = app.content_lines.join("\n");
+        let diff = app.content.lines.join("\n");
         assert!(diff.contains("── UNTRACKED ──"));
         assert!(diff.contains("new file mode 120000"));
         assert!(diff.contains(&format!("+{}", fifo.display())));
@@ -2695,7 +2708,7 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
     assert!(rendered.contains("● Preview"));
     assert!(rendered.contains("Content"));
 
-    app.content_scroll = 99;
+    app.content.scroll = 99;
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("hello"));
@@ -3084,7 +3097,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
         app.selected_relative_path(),
         Some(PathBuf::from("b-changed.txt"))
     );
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
 
     app.handle_mouse(mouse_down(
         app.ui_regions.tree_inner.x,
@@ -3096,7 +3109,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
         app.selected_relative_path(),
         Some(PathBuf::from("c-changed.txt"))
     );
-    assert!(app.content_lines.iter().any(|line| line == "+after c"));
+    assert!(app.content.lines.iter().any(|line| line == "+after c"));
 
     app.handle_mouse(mouse(
         MouseEventKind::ScrollDown,
@@ -3104,7 +3117,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
         app.ui_regions.content_inner.y,
     ));
     assert_eq!(app.focused_pane, FocusPane::Content);
-    assert_eq!(app.content_scroll, 3);
+    assert_eq!(app.content.scroll, 3);
 
     app.handle_mouse(mouse_down(
         app.ui_regions.all_files_tab.x,
@@ -3112,7 +3125,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
     ));
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::AllFiles);
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     app.handle_mouse(mouse(
         MouseEventKind::ScrollDown,
         app.ui_regions.tree_inner.x,
@@ -3134,7 +3147,7 @@ fn preview_mouse_drag_selects_visible_text_and_ctrl_c_queues_exact_copy() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     assert!(format!("{:?}", terminal.backend().buffer()).contains("Ctrl+C"));
     let text_x = app.ui_regions.content_inner.x + 4;
     let first_row = app.ui_regions.content_inner.y;
@@ -3217,8 +3230,8 @@ fn default_diff_content_can_be_mouse_selected_and_copied() {
     settle(&mut app);
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
-    assert_eq!(app.content_mode, ContentMode::Diff);
-    assert!(app.content_show_line_numbers);
+    assert_eq!(app.content.mode, ContentMode::Diff);
+    assert!(app.content.show_line_numbers);
     let column = app.ui_regions.content_inner.x;
     let row_text = |row: u16| -> String {
         (column..app.ui_regions.content_inner.right())
@@ -3361,9 +3374,9 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     fixture.commit_all("initial");
     fixture.write("src/lib.rs", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.content_mode, ContentMode::Info);
+    assert_eq!(app.content.mode, ContentMode::Info);
     assert_eq!(
-        app.content_lines,
+        app.content.lines,
         [
             "1 changed file in this directory.",
             "",
@@ -3459,7 +3472,7 @@ fn diff_mode_cycles_between_changed_files() {
     app.handle_key(key(KeyCode::Char('n')));
     settle(&mut app);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("c.txt")));
-    assert!(app.content_lines.iter().any(|line| line == "+after c"));
+    assert!(app.content.lines.iter().any(|line| line == "+after c"));
     app.handle_key(key(KeyCode::Char('N')));
     settle(&mut app);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
@@ -3576,7 +3589,8 @@ fn file_search_filters_previews_and_reveals_collapsed_paths() {
         Some(Path::new("src/app_controller.rs"))
     );
     assert!(
-        app.content_lines
+        app.content
+            .lines
             .iter()
             .any(|line| line.contains("controller"))
     );
@@ -3792,7 +3806,7 @@ fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
     fixture.write("ignored/hidden.rs", "Needle hidden\n");
     fixture.write("binary.bin", b"Needle\0binary");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    let original_lines = app.content_lines.clone();
+    let original_lines = app.content.lines.clone();
 
     app.handle_key(modified_key(
         KeyCode::Char('F'),
@@ -3807,7 +3821,8 @@ fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
     assert_eq!(app.search_results()[0].path, Path::new("src/visible.rs"));
     assert_eq!(app.search_results()[0].line_number, Some(2));
     assert!(
-        app.content_highlights
+        app.content
+            .highlights
             .get(1)
             .is_some_and(|spans| spans.iter().any(|span| span.kind == HighlightKind::Search))
     );
@@ -3833,7 +3848,7 @@ fn text_search_streams_safe_matches_toggles_ignored_and_restores_on_escape() {
 
     app.handle_key(key(KeyCode::Esc));
     assert!(!app.search_is_active());
-    assert_eq!(app.content_lines, original_lines);
+    assert_eq!(app.content.lines, original_lines);
 }
 
 #[test]
@@ -3846,7 +3861,7 @@ fn preview_find_highlights_navigates_and_hands_off_to_workspace_search() {
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     settle(&mut app);
 
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(app.preview_find_is_active());
     assert!(!app.search_is_active());
@@ -3901,7 +3916,7 @@ fn ctrl_f_finds_in_the_current_diff_instead_of_opening_workspace_search() {
 
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
-    assert_eq!(app.content_mode, ContentMode::Diff);
+    assert_eq!(app.content.mode, ContentMode::Diff);
     app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
     for character in "needle".chars() {
         app.handle_key(key(KeyCode::Char(character)));
@@ -3958,7 +3973,7 @@ fn preview_find_can_open_while_the_selected_file_is_loading() {
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     app.handle_key(key(KeyCode::End));
-    assert_eq!(app.content_mode, ContentMode::Preview);
+    assert_eq!(app.content.mode, ContentMode::Preview);
     assert!(app.is_content_loading());
     app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
     for character in "needle".chars() {
@@ -4279,7 +4294,7 @@ fn run_production_spawner_framed_journey() {
         app.selected_relative_path(),
         Some(PathBuf::from("a-caller.rs"))
     );
-    assert_eq!(app.content_lines, [caller_text.trim_end()]);
+    assert_eq!(app.content.lines, [caller_text.trim_end()]);
 
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
@@ -4292,14 +4307,14 @@ fn run_production_spawner_framed_journey() {
         app.selected_relative_path(),
         Some(PathBuf::from("a-caller.rs"))
     );
-    assert_eq!(app.content_lines, [caller_text.trim_end()]);
+    assert_eq!(app.content.lines, [caller_text.trim_end()]);
 
     fs::write(&release, b"go").unwrap();
     let target_deadline = Instant::now() + Duration::from_secs(5);
     while {
         app.poll_background();
         app.selected_relative_path() != Some(PathBuf::from("b-target.rs"))
-            || app.content_lines != [target_text.trim_end()]
+            || app.content.lines != [target_text.trim_end()]
     } {
         if Instant::now() >= target_deadline {
             let backend = TestBackend::new(120, 24);
@@ -4315,7 +4330,7 @@ fn run_production_spawner_framed_journey() {
             panic!(
                 "target did not commit; selected={:?}, content={:?}, ui={rendered}",
                 app.selected_relative_path(),
-                app.content_lines
+                app.content.lines
             );
         }
         std::thread::sleep(Duration::from_millis(10));

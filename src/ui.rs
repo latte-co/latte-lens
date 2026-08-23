@@ -1633,12 +1633,12 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         draw_preview_find(frame, app);
     } else {
         let mut detail = app.selected_content_label();
-        if app.content_mode == ContentMode::Preview
-            && let Some(provider) = app.content_provider.as_deref()
+        if app.content.mode == ContentMode::Preview
+            && let Some(provider) = app.content.provider.as_deref()
         {
             detail.push_str(&format!(" · {provider}"));
         }
-        if app.content_mode == ContentMode::Preview
+        if app.content.mode == ContentMode::Preview
             && let Some(real_path) = app.selected_symlink_real_path()
         {
             detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
@@ -1685,7 +1685,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     }
     let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
-    let render_area = if app.content_mode == ContentMode::Info {
+    let render_area = if app.content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
@@ -1697,12 +1697,13 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     let lines: Vec<Line> = visual_rows[start..end]
         .iter()
         .filter_map(|visual_row| {
-            let line = app.content_lines.get(visual_row.line_index)?;
+            let line = app.content.lines.get(visual_row.line_index)?;
             let segment = line.get(visual_row.byte_range.clone())?;
             let mut highlights = if visual_row.synthetic {
                 Vec::new()
             } else {
-                app.content_highlights
+                app.content
+                    .highlights
                     .get(visual_row.line_index)
                     .cloned()
                     .unwrap_or_default()
@@ -1714,16 +1715,16 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             let selection = (!visual_row.synthetic)
                 .then(|| visual_row_selection(app, visual_row))
                 .flatten();
-            Some(match app.content_mode {
+            Some(match app.content.mode {
                 ContentMode::Diff => diff_line(
                     segment,
-                    app.content_diff_lines.get(visual_row.line_index).copied(),
+                    app.content.diff_lines.get(visual_row.line_index).copied(),
                     line_number_width,
                     visual_row.continuation,
                     visual_row.tab_origin,
                     selection,
                 ),
-                ContentMode::Preview if app.content_show_line_numbers => preview_line(
+                ContentMode::Preview if app.content.show_line_numbers => preview_line(
                     (!visual_row.continuation).then_some(visual_row.line_index + 1),
                     line_number_width,
                     segment,
@@ -1895,7 +1896,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         format!(
             "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
         )
-    } else if area.width < 96 && app.content_mode == ContentMode::Preview {
+    } else if area.width < 96 && app.content.mode == ContentMode::Preview {
         format!(
             "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
         )
@@ -1903,11 +1904,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         format!(
             "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y path Y real  q×2 quit"
         )
-    } else if app.content_mode == ContentMode::Preview {
+    } else if app.content.mode == ContentMode::Preview {
         format!(
             "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
         )
-    } else if app.content_mode == ContentMode::Diff {
+    } else if app.content.mode == ContentMode::Diff {
         format!(
             "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
