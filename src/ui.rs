@@ -17,7 +17,7 @@ use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
         GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, NewTabMenuState,
-        SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
+        PaletteItem, SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -173,7 +173,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
-    if app.new_tab_menu.is_some() {
+    if app.tab_palette.is_some() {
+        dim_underlay(frame);
+        draw_tab_palette(frame, app);
+    } else if app.new_tab_menu.is_some() {
         dim_underlay(frame);
         draw_new_tab_menu(frame, app, app.ui_regions.new_tab_button);
     } else if app.navigation_picker.is_some() {
@@ -550,6 +553,52 @@ fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
         .map(|_| Line::from(Span::styled(glyph, Style::default().fg(color))))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_tab_palette(frame: &mut Frame, app: &App) {
+    let Some(palette) = app.tab_palette.as_ref() else {
+        return;
+    };
+    let popup = search_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent())),
+        popup,
+    );
+    let inner = Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, popup.height - 2);
+    let [input, results] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("> {}", palette.query),
+            Style::default().fg(text_primary()),
+        ))),
+        input,
+    );
+    let items: Vec<ListItem> = palette
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let label = match item {
+                PaletteItem::Tab { title, kind, .. } => {
+                    format!("  {}  {}", kind.label(), title)
+                }
+                PaletteItem::File(path) => format!("  {}", path.display()),
+            };
+            let style = if index == palette.selected {
+                Style::default()
+                    .fg(accent())
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(text_primary())
+            };
+            ListItem::new(Span::styled(label, style))
+        })
+        .collect();
+    frame.render_widget(List::new(items), results);
 }
 
 fn draw_new_tab_menu(frame: &mut Frame, app: &App, anchor: Rect) {

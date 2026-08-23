@@ -3736,7 +3736,7 @@ fn search_popup_preserves_each_mode_until_the_user_clears_it() {
     settle(&mut app);
     assert!(!app.search_is_active());
 
-    app.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Char('/')));
     assert_eq!(app.search_mode(), Some(SearchMode::Files));
     assert_eq!(app.search_query(), Some("app"));
     assert_eq!(
@@ -3758,7 +3758,7 @@ fn search_popup_preserves_each_mode_until_the_user_clears_it() {
     assert_eq!(app.search_results().len(), 2);
     app.handle_key(key(KeyCode::Esc));
 
-    app.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Char('/')));
     assert_eq!(app.search_query(), Some("app"));
     app.handle_key(key(KeyCode::Esc));
     app.handle_key(modified_key(

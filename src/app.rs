@@ -548,6 +548,69 @@ impl NewTabMenuState {
     }
 }
 
+/// One row in the ⌘P palette: either an open tab to switch to, or a workspace
+/// file to open in the Files tab.
+#[derive(Clone, Debug)]
+pub(crate) enum PaletteItem {
+    Tab {
+        id: TabId,
+        title: String,
+        kind: TabKind,
+    },
+    File(PathBuf),
+}
+
+/// The ⌘P command palette: fuzzy-switches between open tabs and opens
+/// workspace files. The item list is rebuilt from the query on each keystroke.
+#[derive(Clone, Debug)]
+pub(crate) struct TabPaletteState {
+    pub query: String,
+    pub items: Vec<PaletteItem>,
+    pub selected: usize,
+}
+
+impl TabPaletteState {
+    pub fn new(tabs: &[Tab], files: &[FileEntry]) -> Self {
+        let mut state = Self {
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+        };
+        state.rebuild(tabs, files);
+        state
+    }
+
+    pub fn rebuild(&mut self, tabs: &[Tab], files: &[FileEntry]) {
+        self.items.clear();
+        let query = self.query.to_lowercase();
+        // Open tabs first, filtered by title.
+        for tab in tabs {
+            if query.is_empty() || tab.title.to_lowercase().contains(&query) {
+                self.items.push(PaletteItem::Tab {
+                    id: tab.id,
+                    title: tab.title.clone(),
+                    kind: tab.kind(),
+                });
+            }
+        }
+        // Then workspace files, filtered by relative path.
+        if !query.is_empty() {
+            for entry in files {
+                if entry.is_dir {
+                    continue;
+                }
+                let path = entry.relative.to_string_lossy().to_lowercase();
+                if path.contains(&query) {
+                    self.items.push(PaletteItem::File(entry.relative.clone()));
+                }
+            }
+        }
+        if self.selected >= self.items.len() {
+            self.selected = self.items.len().saturating_sub(1);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentMode {
     Info,
@@ -947,6 +1010,7 @@ pub struct App {
     pending_navigation_stage: Option<PendingNavigationStage>,
     pub(crate) navigation_picker: Option<NavigationPickerState>,
     pub(crate) new_tab_menu: Option<NewTabMenuState>,
+    pub(crate) tab_palette: Option<TabPaletteState>,
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
@@ -1244,6 +1308,7 @@ impl App {
             pending_navigation_stage: None,
             navigation_picker: None,
             new_tab_menu: None,
+            tab_palette: None,
             navigation_status: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
@@ -1857,6 +1922,11 @@ impl App {
             self.handle_new_tab_menu_key(key);
             return;
         }
+        if self.tab_palette.is_some() {
+            self.quit_confirmation = None;
+            self.handle_tab_palette_key(key);
+            return;
+        }
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
@@ -1925,7 +1995,7 @@ impl App {
             }
             (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(SearchMode::Files),
             (KeyCode::Char('p' | 'P'), KeyModifiers::CONTROL) => {
-                self.open_search(SearchMode::Files);
+                self.open_tab_palette();
             }
             (KeyCode::Char('f' | 'F'), modifiers)
                 if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
@@ -6489,6 +6559,66 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn open_tab_palette(&mut self) {
+        let palette = TabPaletteState::new(&self.tabs, &self.all_entries);
+        self.tab_palette = Some(palette);
+    }
+
+    fn handle_tab_palette_key(&mut self, key: KeyEvent) {
+        let Some(palette) = self.tab_palette.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.tab_palette = None;
+            }
+            (KeyCode::Down, _) => {
+                if !palette.items.is_empty() {
+                    palette.selected = (palette.selected + 1).min(palette.items.len() - 1);
+                }
+            }
+            (KeyCode::Up, _) => {
+                palette.selected = palette.selected.saturating_sub(1);
+            }
+            (KeyCode::Enter, _) => {
+                let Some(item) = palette.items.get(palette.selected).cloned() else {
+                    return;
+                };
+                self.tab_palette = None;
+                match item {
+                    PaletteItem::Tab { id, .. } => self.activate_tab(id),
+                    PaletteItem::File(path) => self.open_file_in_files_tab(path),
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                palette.query.pop();
+                palette.rebuild(&self.tabs, &self.all_entries);
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE) => {
+                palette.query.push(c);
+                palette.rebuild(&self.tabs, &self.all_entries);
+            }
+            _ => {}
+        }
+    }
+
+    /// Open a file in the active Files tab, creating one if needed.
+    fn open_file_in_files_tab(&mut self, path: PathBuf) {
+        // Ensure a Files tab is active.
+        let files_tab_id = self
+            .tabs
+            .iter()
+            .find(|tab| tab.kind() == TabKind::Files)
+            .map(|tab| tab.id);
+        if let Some(id) = files_tab_id {
+            self.activate_tab(id);
+        } else {
+            self.open_tab(TabKind::Files);
+        }
+        // Reveal and select the file.
+        self.reveal_all_files_selection(path);
     }
 
     fn handle_navigation_picker_mouse_down(&mut self, mouse: MouseEvent) {
