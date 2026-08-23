@@ -112,15 +112,18 @@ Inside the TUI:
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Move the focused tree or scroll focused content; `↑` at the first/empty tree row focuses scope tabs |
-| `←` / `→` | Focus Tree or Content; while scope tabs are focused, select All Files or refresh/select Git Changes |
+| `↑` / `↓` | Move the focused tree or scroll focused content |
+| `←` / `→` | Focus Tree or Content |
 | `shift-←` / `shift-→` | Scroll Diff/Info horizontally; Preview wraps automatically |
 | `j` / `k` | Move in the focused tree, or scroll the focused content pane |
-| `1` / `2` | Show all files, or refresh and show only Git changes, while retaining focus |
-| `tab` / `shift-tab` | Switch the left tree scope while retaining focus |
+| `1`-`9` | Switch to the Nth open tab |
+| `tab` / `shift-tab` | Cycle through open tabs |
+| `ctrl-n` | Open the new-tab menu (Files / Review / Search / Chat) |
+| `ctrl-w` | Close the current tab (the last tab cannot be closed) |
+| `ctrl-p` | Open the ⌘P palette (tab switching + file opening) |
 | `h` / `l` | Focus the tree or content pane |
 | `enter` | With Tree focused, expand/collapse a directory or open the selected file in Lens Preview; with Preview focused, retain the fold action below |
-| `/` / `ctrl-p` | Open the file popup |
+| `/` | Open the file search popup |
 | `ctrl-f` | Find in the current Preview or Diff |
 | `ctrl-d` | In focused Preview content, go to the definition; one result jumps directly and multiple results open the navigation popup |
 | `ctrl-r` | Find references in the navigation popup, including when there is only one result |
@@ -144,13 +147,13 @@ Inside the TUI:
 
 Mouse controls:
 
-- Click `Files` or `Git changes` to switch the left tree dataset; entering Git Changes refreshes it first.
+- Click a tab in the tab bar to switch to it; click `+` to open the new-tab menu (Files / Review / Search / Chat). Each tab owns its own projection (left pane) and content (right pane).
 - Click `Refresh` in the header (or press `r`) to re-scan the repository without leaving the current view.
 - Clicking a directory row anywhere, including its `▸`/`▾` disclosure, immediately expands or collapses it. A file-row click selects and internally previews it; double-click a file row focuses the same Lens Preview action as `Enter`.
 - Click `[Open]` in the Content heading to use the same system-open action. Unknown non-executable files change it to `[Open anyway]`; only that explicit button or a second `o` confirms, never `Enter`, double-click, or key repeat.
 - Click `Open` or `Text` in the Files heading to open file or workspace text search. Search uses a centered popup whose width is independent of the Files pane; text matches show their path and source line separately.
 - In the popup, type directly, use `↑`/`↓` to preview results, and press `Enter` to open one. `Esc`, the close button, and opening a result hide the popup without clearing its query, results, selection, or scroll position. Reopening File or Text search restores that mode's previous session.
-- Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `Ctrl+P` switches to the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` switches to the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
+- Press `Ctrl+U` or click `Clear` to explicitly clear the current search. `/` reopens the saved file-search session and `Ctrl+Shift+F` or `Ctrl+T` reopens the saved workspace-text session. Text search keeps `F2` for case sensitivity, `F3` for whole words, `F4` for regular expressions, and `F5` for ignored content.
 - In a Preview or Diff, `Ctrl+F` opens an in-content find bar. `Enter`/`↓` and `Shift+Enter`/`↑` move between matches, `F2` toggles case sensitivity, and `Esc` closes it. The same controls are clickable. Use `Ctrl+Shift+F` or the terminal-safe `Ctrl+T` for workspace text search.
 - Built-in source previews show `▾`/`▸` fold markers in the line-number gutter. Click a marker, or focus Content and use `[`/`]`, `Enter`/`Space`, and `{`/`}`. Markdown headings and fenced blocks fold structurally; Rust, TypeScript/JavaScript, Python, and Go fold semantic declarations. Finding a hidden body match expands its ancestors, while copied selections always use the original source rather than the visual summary.
 - In a supported built-in source Preview, hold `Alt` while moving the mouse to underline a complete navigable token, then `Alt`-click to request its definition. Keyboard navigation uses the same `Ctrl` + mnemonic style as search: `Ctrl+D` definition, `Ctrl+R` references, `Ctrl+O` implementations, and `Ctrl+S` document symbols. References and implementations always open a file-grouped results popup; on wide terminals it previews the selected location without replacing the main Content pane. Press `Enter` or click a location to commit its jump; file-group headers only expand or collapse their locations. A safe external result inside a recognized dependency package (`go.mod`, `Cargo.toml`, `package.json`, `pyproject.toml`, or `setup.py`) opens a read-only `Dependency Source` view without adding it to the workspace Tree or Git scopes; use `Alt`+`←` to return. Other external results are rejected. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.

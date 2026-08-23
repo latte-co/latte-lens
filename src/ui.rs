@@ -108,10 +108,6 @@ pub(crate) const MIN_TREE_WIDTH: u16 = 28;
 const MIN_CONTENT_WIDTH: u16 = 24;
 const DEFAULT_MAX_TREE_WIDTH: u16 = 44;
 
-const ALL_FILES_TAB_LABEL: &str = "  1 Files ";
-const GIT_CHANGES_TAB_LABEL: &str = "  2 Git changes ";
-#[cfg(feature = "agent-observability")]
-const AGENTS_TAB_LABEL: &str = "  3 Agents ";
 const REFRESH_LABEL: &str = " r  Refresh ";
 const FILE_SEARCH_LABEL: &str = "/ Open ";
 const TEXT_SEARCH_LABEL: &str = " ^T Text ";
@@ -132,8 +128,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(body);
     let search_status_height = 0;
-    let [scope_tabs, tree_header, search_status, tree_rows] = Layout::vertical([
-        Constraint::Length(1),
+    let [tree_header, search_status, tree_rows] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(search_status_height),
         Constraint::Min(2),
@@ -157,7 +152,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.ui_regions = regions(DrawAreas {
         tab_bar,
         header,
-        scope_tabs,
         tree_body,
         tree_header,
         tree_rows,
@@ -168,7 +162,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     });
     draw_tab_bar(frame, app, tab_bar);
     draw_header(frame, app, header);
-    draw_scope_tabs(frame, app, scope_tabs);
     draw_divider(frame, divider, app.tree_resize_dragging());
     draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
@@ -201,7 +194,6 @@ fn dim_underlay(frame: &mut Frame) {
 struct DrawAreas {
     tab_bar: Rect,
     header: Rect,
-    scope_tabs: Rect,
     tree_body: Rect,
     tree_header: Rect,
     tree_rows: Rect,
@@ -215,7 +207,6 @@ fn regions(areas: DrawAreas) -> UiRegions {
     let DrawAreas {
         tab_bar,
         header,
-        scope_tabs,
         tree_body,
         tree_header,
         tree_rows,
@@ -240,22 +231,6 @@ fn regions(areas: DrawAreas) -> UiRegions {
         20,
         menu_height,
     );
-    let all_files_width = (ALL_FILES_TAB_LABEL.len() as u16).min(scope_tabs.width);
-    let scope_end = scope_tabs.x.saturating_add(scope_tabs.width);
-    let git_changes_x = scope_tabs
-        .x
-        .saturating_add(ALL_FILES_TAB_LABEL.len() as u16)
-        .saturating_add(1)
-        .min(scope_end);
-    let git_changes_width =
-        (GIT_CHANGES_TAB_LABEL.len() as u16).min(scope_end.saturating_sub(git_changes_x));
-    #[cfg(feature = "agent-observability")]
-    let agents_x = git_changes_x
-        .saturating_add(GIT_CHANGES_TAB_LABEL.len() as u16)
-        .saturating_add(1)
-        .min(scope_end);
-    #[cfg(feature = "agent-observability")]
-    let agents_width = (AGENTS_TAB_LABEL.len() as u16).min(scope_end.saturating_sub(agents_x));
     let refresh_width = (REFRESH_LABEL.len() as u16).min(header.width);
     let refresh_x = header
         .x
@@ -283,20 +258,6 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tab_bar,
         new_tab_button,
         new_tab_menu,
-        all_files_tab: Rect::new(
-            scope_tabs.x,
-            scope_tabs.y,
-            all_files_width,
-            scope_tabs.height,
-        ),
-        git_changes_tab: Rect::new(
-            git_changes_x,
-            scope_tabs.y,
-            git_changes_width,
-            scope_tabs.height,
-        ),
-        #[cfg(feature = "agent-observability")]
-        agents_tab: Rect::new(agents_x, scope_tabs.y, agents_width, scope_tabs.height),
         refresh_button: Rect::new(refresh_x, header.y, refresh_width, header.height.min(1)),
         file_search_button,
         text_search_button,
@@ -503,44 +464,6 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ])),
         refresh,
     );
-}
-
-fn draw_scope_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    #[cfg(not(feature = "agent-observability"))]
-    let labels = [
-        (TreeScope::AllFiles, ALL_FILES_TAB_LABEL),
-        (TreeScope::GitChanges, GIT_CHANGES_TAB_LABEL),
-    ];
-    #[cfg(feature = "agent-observability")]
-    let labels = [
-        (TreeScope::AllFiles, ALL_FILES_TAB_LABEL),
-        (TreeScope::GitChanges, GIT_CHANGES_TAB_LABEL),
-        (TreeScope::Agents, AGENTS_TAB_LABEL),
-    ];
-    let mut spans = Vec::with_capacity(labels.len() * 2 - 1);
-    for (index, (scope, label)) in labels.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let active = app.tree_scope == scope;
-        let focused_active = app.focused_pane == FocusPane::ScopeTabs && active;
-        let style = if active {
-            Style::default()
-                .fg(accent())
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(muted())
-        };
-        // Replace one fixed leading space rather than adding a new cell:
-        // tab labels and their mouse hit boxes stay the same width.
-        let display_label = if focused_active {
-            format!("●{}", &label[1..])
-        } else {
-            label.to_owned()
-        };
-        spans.push(Span::styled(display_label, style));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
@@ -2017,42 +1940,41 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let focus = match app.focused_pane {
-        FocusPane::ScopeTabs => "Tabs",
         FocusPane::Tree => "Tree",
         FocusPane::Content => "Content",
     };
-    let scope_keys = if cfg!(feature = "agent-observability") {
-        "1/2/3 scope"
+    let tab_keys = if area.width < 96 {
+        "Tab cycle"
     } else {
-        "1/2 scope"
+        "Tab cycle  Ctrl+P palette  Ctrl+N new  Ctrl+W close"
     };
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
-            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path  q×2 quit"
         )
     } else if app.focused_pane == FocusPane::Tree {
         format!(
-            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
         )
     } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {tab_keys}  y path Y real  q×2 quit"
         )
     } else if area.width < 96 {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y path Y real  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {tab_keys}  r refresh  y path Y real  q×2 quit"
         )
     } else if app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {tab_keys}  y copy path Y real/abs  q×2 quit"
         )
     } else if app.tab().content.mode == ContentMode::Diff {
         format!(
-            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
     } else {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
     };
     let content = if let Some(message) = app.quit_confirmation_message() {

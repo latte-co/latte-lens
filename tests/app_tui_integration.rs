@@ -218,8 +218,6 @@ fn app_starts_from_nested_path_and_renders_both_panes() {
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("LATTE LENS"));
     assert!(rendered.contains("Files"));
-    assert!(rendered.contains("1 Files"));
-    assert!(rendered.contains("2 Git changes"));
     assert!(rendered.contains("Refresh"));
     assert!(rendered.contains("Preview"));
     assert!(!rendered.contains("1 TREE"));
@@ -327,18 +325,6 @@ fn narrow_repository_layout_clips_labels_and_hitboxes_without_backgrounds() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
-    let tree_end = app
-        .ui_regions
-        .tree_body
-        .x
-        .saturating_add(app.ui_regions.tree_body.width);
-    assert!(
-        app.ui_regions
-            .git_changes_tab
-            .x
-            .saturating_add(app.ui_regions.git_changes_tab.width)
-            <= tree_end
-    );
     assert!(
         terminal
             .backend()
@@ -401,89 +387,6 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
     assert_eq!(app.focused_pane, FocusPane::Content);
-}
-
-#[test]
-fn tree_top_up_focuses_scope_tabs_and_down_restores_tree_selection() {
-    let fixture = TestRepo::new();
-    fixture.write("a.txt", "a\n");
-    fixture.write("b.txt", "b\n");
-    fixture.commit_all("initial");
-    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
-
-    app.handle_key(key(KeyCode::Down));
-    assert_eq!(app.focused_pane, FocusPane::Tree);
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
-
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::Tree);
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
-
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
-}
-
-#[test]
-fn scope_tab_arrows_switch_scope_through_the_refresh_path() {
-    let fixture = TestRepo::new();
-    fixture.write("a-clean.txt", "clean\n");
-    fixture.write("b-changed.txt", "before\n");
-    fixture.commit_all("initial");
-    fixture.write("b-changed.txt", "after\n");
-    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    app.handle_key(key(KeyCode::Left));
-    #[cfg(feature = "agent-observability")]
-    assert_eq!(app.tree_scope, TreeScope::Agents);
-    #[cfg(not(feature = "agent-observability"))]
-    assert_eq!(app.tree_scope, TreeScope::GitChanges);
-    app.handle_key(key(KeyCode::Right));
-    settle(&mut app);
-    assert_eq!(app.tree_scope, TreeScope::AllFiles);
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    assert_eq!(
-        app.selected_relative_path(),
-        Some(PathBuf::from("a-clean.txt"))
-    );
-
-    // This change happens after startup, so Right must enter Git Changes via
-    // the same refresh path as the existing scope controls.
-    fixture.write("z-untracked.txt", "new\n");
-    app.handle_key(key(KeyCode::Right));
-    settle(&mut app);
-    assert_eq!(app.tree_scope, TreeScope::GitChanges);
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    assert_eq!(app.changed_count, 2);
-    let changed_paths: Vec<_> = app
-        .visible_entries()
-        .iter()
-        .map(|entry| entry.relative.clone())
-        .collect();
-    assert_eq!(
-        changed_paths,
-        [
-            PathBuf::from("b-changed.txt"),
-            PathBuf::from("z-untracked.txt")
-        ]
-    );
-    assert!(!changed_paths.contains(&PathBuf::from("a-clean.txt")));
-
-    app.handle_key(key(KeyCode::Left));
-    assert_eq!(app.tree_scope, TreeScope::AllFiles);
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    assert_eq!(
-        app.selected_relative_path(),
-        Some(PathBuf::from("b-changed.txt"))
-    );
 }
 
 #[test]
@@ -1714,8 +1617,6 @@ fn empty_directory_has_no_selection_and_safe_navigation() {
     assert!(app.selected_entry().is_none());
     assert_eq!(app.focused_pane, FocusPane::Tree);
     app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-    app.handle_key(key(KeyCode::Down));
     assert_eq!(app.focused_pane, FocusPane::Tree);
 }
 
@@ -2811,33 +2712,9 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
     assert!(rendered.contains("hello"));
 
     app.handle_key(key(KeyCode::Char('h')));
-    app.handle_key(key(KeyCode::Up));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    let active_tab = terminal
-        .backend()
-        .buffer()
-        .cell((
-            app.ui_regions.all_files_tab.x,
-            app.ui_regions.all_files_tab.y,
-        ))
-        .unwrap();
-    assert_eq!(active_tab.symbol(), "●");
-    assert!(active_tab.modifier.contains(Modifier::BOLD));
-    assert!(active_tab.modifier.contains(Modifier::UNDERLINED));
-    assert!(!active_tab.modifier.contains(Modifier::REVERSED));
-    let inactive_tab = terminal
-        .backend()
-        .buffer()
-        .cell((
-            app.ui_regions.git_changes_tab.x + 2,
-            app.ui_regions.git_changes_tab.y,
-        ))
-        .unwrap();
-    assert_eq!(inactive_tab.symbol(), "2");
-    assert!(!inactive_tab.modifier.contains(Modifier::UNDERLINED));
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains("● 1 Files"));
-    assert!(rendered.contains("Tabs"));
+    assert!(rendered.contains("Tree"));
     assert!(
         terminal
             .backend()
@@ -3135,15 +3012,13 @@ fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
         "the UI must inherit the terminal background"
     );
 
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let focused_tab = terminal
         .backend()
         .buffer()
         .cell((
-            app.ui_regions.all_files_tab.x + 2,
-            app.ui_regions.all_files_tab.y,
+            app.ui_regions.tab_bar.x + 2,
+            app.ui_regions.tab_bar.y,
         ))
         .unwrap();
     assert!(focused_tab.modifier.contains(Modifier::UNDERLINED));
@@ -3153,7 +3028,6 @@ fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
     settle(&mut app);
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains("Git changes"));
     assert!(rendered.contains("Diff"));
     assert!(rendered.contains("+after"));
     assert!(
@@ -3180,15 +3054,8 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focused_pane, FocusPane::ScopeTabs);
-
-    app.handle_mouse(mouse_down(
-        app.ui_regions.git_changes_tab.x,
-        app.ui_regions.git_changes_tab.y,
-    ));
+    app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
-    assert_eq!(app.tree_scope, TreeScope::GitChanges);
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(
         app.selected_relative_path(),
@@ -3222,10 +3089,7 @@ fn mouse_switches_scope_selects_rows_and_scrolls_the_pointed_pane() {
     assert_eq!(app.focused_pane, FocusPane::Content);
     assert_eq!(app.tab().content.scroll, 3);
 
-    app.handle_mouse(mouse_down(
-        app.ui_regions.all_files_tab.x,
-        app.ui_regions.all_files_tab.y,
-    ));
+    app.set_tree_scope(TreeScope::AllFiles);
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::AllFiles);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
@@ -4211,13 +4075,11 @@ fn agents_scope_renders_metadata_live_and_explain_states_from_the_view_model() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains("3 Agents"));
     assert!(rendered.contains("0/1 live"));
     assert!(rendered.contains("synthetic/agent"));
     assert!(rendered.contains("Unknown"));
     assert!(rendered.contains("metadata"));
     assert!(!rendered.contains("metadata Working"));
-    assert!(rendered.contains("1/2/3 scope"));
 
     let observer = ObserverId::parse("synthetic/hook").unwrap();
     let instance = ObserverInstanceId::from_digest(digest(10));

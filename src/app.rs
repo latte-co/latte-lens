@@ -181,41 +181,8 @@ impl GitTreeRow {
     }
 }
 
-impl TreeScope {
-    pub const fn next(self) -> Self {
-        match self {
-            Self::AllFiles => Self::GitChanges,
-            #[cfg(feature = "agent-observability")]
-            Self::GitChanges => Self::Agents,
-            #[cfg(not(feature = "agent-observability"))]
-            Self::GitChanges => Self::AllFiles,
-            #[cfg(feature = "agent-observability")]
-            Self::Agents => Self::AllFiles,
-        }
-    }
-
-    pub const fn previous(self) -> Self {
-        match self {
-            Self::AllFiles => {
-                #[cfg(feature = "agent-observability")]
-                {
-                    Self::Agents
-                }
-                #[cfg(not(feature = "agent-observability"))]
-                {
-                    Self::GitChanges
-                }
-            }
-            Self::GitChanges => Self::AllFiles,
-            #[cfg(feature = "agent-observability")]
-            Self::Agents => Self::GitChanges,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FocusPane {
-    ScopeTabs,
     #[default]
     Tree,
     Content,
@@ -686,10 +653,6 @@ pub struct UiRegions {
     pub tab_bar: Rect,
     pub new_tab_button: Rect,
     pub new_tab_menu: Rect,
-    pub all_files_tab: Rect,
-    pub git_changes_tab: Rect,
-    #[cfg(feature = "agent-observability")]
-    pub agents_tab: Rect,
     pub refresh_button: Rect,
     pub file_search_button: Rect,
     pub text_search_button: Rect,
@@ -719,40 +682,6 @@ pub struct UiRegions {
 }
 
 impl UiRegions {
-    fn scope_at(self, column: u16, row: u16) -> Option<TreeScope> {
-        if contains(self.all_files_tab, column, row) {
-            Some(TreeScope::AllFiles)
-        } else if contains(self.git_changes_tab, column, row) {
-            Some(TreeScope::GitChanges)
-        } else if cfg!(feature = "agent-observability")
-            && contains(
-                {
-                    #[cfg(feature = "agent-observability")]
-                    {
-                        self.agents_tab
-                    }
-                    #[cfg(not(feature = "agent-observability"))]
-                    {
-                        Rect::default()
-                    }
-                },
-                column,
-                row,
-            )
-        {
-            #[cfg(feature = "agent-observability")]
-            {
-                Some(TreeScope::Agents)
-            }
-            #[cfg(not(feature = "agent-observability"))]
-            {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
     fn refresh_at(self, column: u16, row: u16) -> bool {
         contains(self.refresh_button, column, row)
     }
@@ -2070,7 +1999,6 @@ impl App {
                 self.queue_selected_path_copy(true);
             }
             _ => match self.focused_pane {
-                FocusPane::ScopeTabs => self.handle_scope_tabs_key(key),
                 FocusPane::Tree => self.handle_tree_key(key),
                 FocusPane::Content => self.handle_content_key(key),
             },
@@ -3257,13 +3185,6 @@ impl App {
                     self.tree_resize_dragging = true;
                     return;
                 }
-                if let Some(scope) = self.ui_regions.scope_at(mouse.column, mouse.row) {
-                    self.clear_content_selection();
-                    self.focused_pane = FocusPane::Tree;
-                    self.last_tree_click = None;
-                    self.set_tree_scope(scope);
-                    return;
-                }
                 if contains(self.ui_regions.tree_inner, mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
@@ -3946,25 +3867,9 @@ impl App {
         self.search.as_ref().is_some_and(|search| search.searching)
     }
 
-    fn handle_scope_tabs_key(&mut self, key: KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Left, KeyModifiers::NONE) => {
-                self.set_tree_scope(self.tree_scope.previous());
-            }
-            (KeyCode::Right, KeyModifiers::NONE) => {
-                self.set_tree_scope(self.tree_scope.next());
-            }
-            (KeyCode::Down, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
-            _ => {}
-        }
-    }
-
     fn handle_tree_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Down | KeyCode::Char('j'), _) => self.move_selection(1),
-            (KeyCode::Up, KeyModifiers::NONE) if self.tree_is_at_first_row_or_empty() => {
-                self.focused_pane = FocusPane::ScopeTabs;
-            }
             (KeyCode::Up | KeyCode::Char('k'), _) => self.move_selection(-1),
             (KeyCode::Home | KeyCode::Char('g'), _) => self.select(0),
             (KeyCode::End | KeyCode::Char('G'), _) => {
@@ -4044,15 +3949,10 @@ impl App {
             self.scroll_content(delta, 0);
         } else {
             match self.focused_pane {
-                FocusPane::ScopeTabs => {}
                 FocusPane::Tree => self.move_selection(delta),
                 FocusPane::Content => self.scroll_content(delta, 0),
             }
         }
-    }
-
-    fn tree_is_at_first_row_or_empty(&self) -> bool {
-        self.tree_row_count() == 0 || self.tab().tree_state.selected().unwrap_or(0) == 0
     }
 
     fn move_selection(&mut self, delta: isize) {

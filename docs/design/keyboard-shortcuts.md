@@ -21,7 +21,7 @@ Latte Lens 的快捷键按"作用域"分组设计，而不是混用不同 IDE �
 
 | 作用域 | 修饰符约定 | 适用场景 | 现有示例 |
 | --- | --- | --- | --- |
-| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` 文件搜索、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索 |
+| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索 |
 | 代码语义命令 | `Ctrl` + 助记字母 | 基于语言服务器的语义导航 | `Ctrl+D` Definition、`Ctrl+R` References、`Ctrl+O` Implementations、`Ctrl+S` Document Symbols |
 | 面板/树/视口移动 | 无修饰方向键或 TUI 单键 | 焦点移动、滚动、树展开折叠 | `↑/↓/←/→`、`j/k`、`h/l`、`Tab`、`Enter`、`[/]`、`{/}` |
 | 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件 |
@@ -38,7 +38,10 @@ Search/Find/navigation results popup 时生效。
 
 | 按键 | 功能 |
 | --- | --- |
-| `Ctrl+P` | 打开文件搜索 popup |
+| `Ctrl+P` | 打开 ⌘P tab 面板（tab 切换 + 文件打开） |
+| `Ctrl+N` | 打开「+」新 tab 菜单（Files / Review / Search / Chat） |
+| `Ctrl+W` | 关闭当前 tab（最后一个 tab 不可关） |
+| `/` | 打开文件搜索 popup |
 | `Ctrl+F` | 在当前 Preview 或 Diff 中查找 |
 | `Ctrl+Shift+F` / `Ctrl+T` | 打开工作区文本搜索 popup；`Ctrl+T` 用于无法区分 `Ctrl+Shift+F` 与 `Ctrl+F` 的终端 |
 | `Ctrl+C` | 无内容选择时立即退出；有选择时复制当前选择 |
@@ -56,14 +59,14 @@ Search/Find/navigation results popup 时生效。
 
 | 按键 | 功能 |
 | --- | --- |
-| `↑` / `↓` | 移动焦点树或滚动焦点内容；`↑` 在首行/空树行时焦点 scope tabs |
-| `←` / `→` | 焦点 Tree 或 Content；scope tabs 聚焦时选择 All Files 或刷新/选择 Git Changes |
+| `↑` / `↓` | 移动焦点树或滚动焦点内容 |
+| `←` / `→` | 焦点 Tree 或 Content |
 | `Shift+←` / `Shift+→` | 水平滚动 Diff/Info；Preview 自动换行 |
 | `j` / `k` | 焦点树中移动，或滚动焦点内容窗格 |
 | `h` / `l` | 焦点树或内容窗格 |
-| `Tab` / `Shift+Tab` | 切换左树 scope 并保持焦点 |
+| `Tab` / `Shift+Tab` | 循环切换打开的 tab |
 | `Enter` | 展开/折叠选定仓库/目录，或对选定文件/pointer diff 焦点 Content |
-| `1` / `2` | 显示所有文件，或刷新并仅显示 Git 更改，保持焦点 |
+| `1`-`9` | 切换到第 N 个打开的 tab |
 | `[` / `]` | 在焦点 Preview 内容中跳转到上一个/下一个可见折叠标记 |
 | `Enter` / `Space` | 在焦点 Preview 内容中切换当前标记处的折叠 |
 | `{` / `}` | 在焦点 Preview 内容中折叠或展开所有折叠 |
@@ -101,7 +104,8 @@ Search/Find/navigation results popup 时生效。
 ### 4.1 `Ctrl` + 助记字母规范
 
 - 字母取功能英文助记：`D` = Definition、`R` = References、`O` = Open implementations、
-  `S` = Document Symbols、`P` = Project file search、`F` = Find、`T` = Text search。
+  `S` = Document Symbols、`P` = Palette（tab 切换 + 文件打开）、`N` = New tab、
+  `W` = Close tab（Window）、`F` = Find、`T` = Text search。
 - 同时接受大小写：`Char('d' | 'D')` + modifiers 恰为 `CONTROL` 均触发同一行为。用户无需
   主动按 `Shift`；`Ctrl+D` 与 `Ctrl+Shift+D` 等效。
 - 修饰符必须恰为 `CONTROL`；任何额外 `ALT/SUPER/SHIFT` 组合均忽略，不做近似匹配。
@@ -149,11 +153,11 @@ Footer help text 按以下优先级展示，高优先级状态覆盖低优先级
 
 | 条件 | 展示策略 |
 | --- | --- |
-| 宽度 < 96 且 Preview | 精简：滚动、复制/退出、折叠、导航、符号、查找、scope、复制路径、退出 |
-| 宽度 < 96 且非 Preview | 精简：移动、焦点、拖拽复制、退出、scope、刷新、复制路径、退出 |
-| 宽度 ≥ 96 且 Preview | 完整：滚动、复制/退出、折叠、回车切换、导航、符号、Alt 点击、历史、查找、scope、复制路径、退出 |
-| 宽度 ≥ 96 且 Diff | 完整：滚动、焦点、空格审阅、n/N 文件、查找、scope、预览/差异、刷新、复制路径、退出 |
-| 宽度 ≥ 96 且其他 | 完整：移动、焦点、拖拽复制、退出/复制、Shift 滚动、scope、预览/差异、刷新、复制路径、退出 |
+| 宽度 < 96 且 Preview | 精简：滚动、复制/退出、折叠、导航、符号、查找、tab、复制路径、退出 |
+| 宽度 < 96 且非 Preview | 精简：移动、焦点、拖拽复制、退出、tab、刷新、复制路径、退出 |
+| 宽度 ≥ 96 且 Preview | 完整：滚动、复制/退出、折叠、回车切换、导航、符号、Alt 点击、历史、查找、tab、复制路径、退出 |
+| 宽度 ≥ 96 且 Diff | 完整：滚动、焦点、空格审阅、n/N 文件、查找、tab、预览/差异、刷新、复制路径、退出 |
+| 宽度 ≥ 96 且其他 | 完整：移动、焦点、拖拽复制、退出/复制、Shift 滚动、tab、预览/差异、刷新、复制路径、退出 |
 
 Footer 只展示当前上下文可操作的快捷键，不列出全部清单；完整清单以 README controls 表
 和本文为准。
