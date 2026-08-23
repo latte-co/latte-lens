@@ -596,6 +596,8 @@ impl ContentSelection {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UiRegions {
+    pub tab_bar: Rect,
+    pub new_tab_button: Rect,
     pub all_files_tab: Rect,
     pub git_changes_tab: Rect,
     #[cfg(feature = "agent-observability")]
@@ -1052,6 +1054,11 @@ impl App {
         let navigation_runtime =
             NavigationRuntime::start(root.clone(), options.navigation.clone())?;
         let mut initial_tab = Tab::new(TabId(0), TabKind::Files);
+        initial_tab.title = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| TabKind::Files.label().to_owned());
         initial_tab.content.lines = vec![
             "Loading workspace…".to_owned(),
             String::new(),

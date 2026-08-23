@@ -118,8 +118,9 @@ const TEXT_SEARCH_LABEL: &str = " ^T Text ";
 const EXTERNAL_OPEN_WIDTH: u16 = 16;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(2),
+    let [tab_bar, header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(5),
         Constraint::Length(1),
     ])
@@ -154,6 +155,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
+        tab_bar,
         header,
         scope_tabs,
         tree_body,
@@ -164,6 +166,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
+    draw_tab_bar(frame, app, tab_bar);
     draw_header(frame, app, header);
     draw_scope_tabs(frame, app, scope_tabs);
     draw_divider(frame, divider, app.tree_resize_dragging());
@@ -190,6 +193,7 @@ fn dim_underlay(frame: &mut Frame) {
 }
 
 struct DrawAreas {
+    tab_bar: Rect,
     header: Rect,
     scope_tabs: Rect,
     tree_body: Rect,
@@ -203,6 +207,7 @@ struct DrawAreas {
 
 fn regions(areas: DrawAreas) -> UiRegions {
     let DrawAreas {
+        tab_bar,
         header,
         scope_tabs,
         tree_body,
@@ -213,6 +218,15 @@ fn regions(areas: DrawAreas) -> UiRegions {
         content_header,
         content_rows,
     } = areas;
+    let new_tab_width = 3u16.min(tab_bar.width);
+    let new_tab_button = Rect::new(
+        tab_bar
+            .x
+            .saturating_add(tab_bar.width.saturating_sub(new_tab_width)),
+        tab_bar.y,
+        new_tab_width,
+        tab_bar.height,
+    );
     let all_files_width = (ALL_FILES_TAB_LABEL.len() as u16).min(scope_tabs.width);
     let scope_end = scope_tabs.x.saturating_add(scope_tabs.width);
     let git_changes_x = scope_tabs
@@ -253,6 +267,8 @@ fn regions(areas: DrawAreas) -> UiRegions {
     );
 
     UiRegions {
+        tab_bar,
+        new_tab_button,
         all_files_tab: Rect::new(
             scope_tabs.x,
             scope_tabs.y,
@@ -354,6 +370,28 @@ fn active_search_controls(area: Rect) -> (Rect, Rect, [Rect; 4]) {
     (files, text, options)
 }
 
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let [tabs, plus] = Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(area);
+    let tab = app.tab();
+    let title = format!(" {} ", tab.title);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(accent())
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ))),
+        tabs,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " + ",
+            Style::default().fg(muted()),
+        ))),
+        plus,
+    );
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let refresh_width = (REFRESH_LABEL.len() as u16).min(area.width);
     let [header_text, refresh] =
@@ -419,14 +457,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         title.push(Span::styled("  directory", Style::default().fg(muted())));
     }
-    let subtitle = Line::from(Span::styled(
-        display_path(&app.root),
-        Style::default().fg(muted()),
-    ));
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(title), subtitle]),
-        header_text,
-    );
+    frame.render_widget(Paragraph::new(Line::from(title)), header_text);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
