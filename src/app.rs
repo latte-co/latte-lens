@@ -6372,12 +6372,14 @@ impl App {
         };
         // Bind the navigation stage completion to the tab that initiated it.
         let original_tab = self.active_tab;
+        let original_scope = self.tree_scope;
         if stage.tab_id != original_tab && self.tabs.iter().any(|tab| tab.id == stage.tab_id) {
             self.active_tab = stage.tab_id;
         }
         self.install_navigation_snapshot(snapshot);
         self.commit_navigation_reveal(&stage.invocation, stage.target.document, range);
         self.active_tab = original_tab;
+        self.tree_scope = original_scope;
     }
 
     fn install_navigation_snapshot(&mut self, snapshot: ContentSnapshot) {
