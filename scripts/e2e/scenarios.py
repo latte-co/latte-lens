@@ -1219,16 +1219,33 @@ def tab_shell(context: ScenarioContext) -> None:
     session.key(b"1")
     session.wait_screen(("Files",), "digit 1 switches to first tab")
 
-    # Ctrl+P opens the tab palette; Enter selects the highlighted tab.
+    # Ctrl+P opens the tab palette; Down + Enter selects the second tab.
     session.key(b"\x10")  # Ctrl+P
     session.wait_screen((">",), "⌘P palette opens")
-    session.key(b"\r")  # Enter → select first tab
+    session.key(b"\x1b[B")  # Down → navigate to second tab
+    session.key(b"\r")  # Enter → select
     session.wait_screen(("Files",), "palette Enter switches tab")
 
     # Ctrl+W closes the second Files tab.
     session.key(b"\x17")  # Ctrl+W
     session.wait_screen(
         ("Files",), "Ctrl+W closes second Files tab", absent=("Git changes",)
+    )
+
+    # Open a Search tab through the "+" menu (Ctrl+N → Down×2 → Enter).
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for Search")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\x1b[B")  # Down → Search
+    session.key(b"\r")  # Enter
+    session.wait_screen(("Search Workspace",), "Search tab opens text search")
+    session.key(b"\x1b")  # Esc → close search popup
+    session.wait_screen(("Files",), "Esc closes search popup", absent=("Search Workspace",))
+
+    # Ctrl+W closes the Search tab.
+    session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(
+        ("Files",), "Ctrl+W closes Search tab", absent=("Search Workspace",)
     )
 
 
