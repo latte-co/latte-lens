@@ -426,6 +426,10 @@ struct NavigationInvocation {
     history_intent: NavigationHistoryIntent,
     destination_viewport: Option<ContentViewportRestore>,
     return_focus: FocusPane,
+    /// The tab that initiated this navigation.  The LSP completion is
+    /// routed back to this tab so that switching tabs mid-flight does
+    /// not land navigation results on the wrong tab.
+    tab_id: TabId,
 }
 
 #[derive(Clone, Debug)]
@@ -6136,6 +6140,7 @@ impl App {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: self.focused_pane,
+            tab_id: self.active_tab,
         };
         let request = NavigationRuntimeRequest {
             generation,
@@ -6192,6 +6197,7 @@ impl App {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: self.focused_pane,
+            tab_id: self.active_tab,
         };
         if !source.structure.symbols_complete {
             let request = NavigationRuntimeRequest {
@@ -6354,11 +6360,14 @@ impl App {
         locations: Vec<ProtocolLocation>,
     ) {
         let had_locations = !locations.is_empty();
+        // Resolve the navigation source from the tab that initiated the
+        // navigation, not the currently active tab — the user may have
+        // switched tabs while the LSP request was in flight.
         let source_server_root = self
-            .tab()
-            .content
-            .navigation_source
-            .as_ref()
+            .tabs
+            .iter()
+            .find(|tab| tab.id == invocation.tab_id)
+            .and_then(|tab| tab.content.navigation_source.as_ref())
             .filter(|source| source.identity == invocation.source_identity)
             .map(|source| source.server_root.clone());
         let mut targets: Vec<_> = locations
@@ -6417,7 +6426,15 @@ impl App {
             .collect::<Vec<_>>();
         let direct = invocation.operation == NavigationOperation::Definition && items.len() == 1;
         if direct {
+            // Route the direct navigation to the tab that initiated it,
+            // not the currently active tab.
+            if !self.tabs.iter().any(|tab| tab.id == invocation.tab_id) {
+                return;
+            }
+            let original_tab = self.active_tab;
+            self.active_tab = invocation.tab_id;
             self.accept_navigation_target(invocation, items[0].target.clone());
+            self.active_tab = original_tab;
         } else {
             let title = match invocation.operation {
                 NavigationOperation::Definition => "Definitions",
@@ -6687,6 +6704,7 @@ impl App {
             history_intent: intent,
             destination_viewport: Some(target.viewport),
             return_focus: self.focused_pane,
+            tab_id: self.active_tab,
         };
         self.accept_navigation_target(invocation, target.target);
     }
@@ -9639,6 +9657,7 @@ mod tests {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: FocusPane::Content,
+            tab_id: stage_app.active_tab,
         };
         let target =
             ContentIdentity::from_absolute(&stage_app.root, &stage_app.root.join("target.rs"))
@@ -9862,6 +9881,7 @@ mod tests {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: FocusPane::Content,
+            tab_id: app.active_tab,
         };
         let results = (0..count)
             .map(|index| {
@@ -10210,6 +10230,7 @@ mod tests {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: FocusPane::Content,
+            tab_id: app.active_tab,
         };
         app.open_navigation_picker(
             "References",
@@ -10376,6 +10397,7 @@ mod tests {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: app.focused_pane,
+            tab_id: app.active_tab,
         };
         let target_path = app.root.join("target.rs");
         let target_identity = ContentIdentity::from_absolute(&app.root, &target_path).unwrap();
@@ -10428,6 +10450,7 @@ mod tests {
             history_intent: NavigationHistoryIntent::Jump,
             destination_viewport: None,
             return_focus: app.focused_pane,
+            tab_id: app.active_tab,
         };
         let target_path = app.root.join("target.rs");
         let target = ContentIdentity::from_absolute(&app.root, &target_path).unwrap();
