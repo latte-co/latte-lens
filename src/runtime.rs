@@ -52,6 +52,7 @@ pub(crate) struct DirectoryRequest {
 #[derive(Debug)]
 pub(crate) struct ContentRequest {
     pub generation: u64,
+    pub tab_id: u64,
     pub kind: ContentKind,
     pub purpose: ContentPurpose,
     pub target: ContentTarget,
@@ -222,6 +223,7 @@ pub(crate) struct DirectoryCompletion {
 #[derive(Debug)]
 pub(crate) struct ContentCompletion {
     pub generation: u64,
+    pub tab_id: u64,
     pub kind: ContentKind,
     pub purpose: ContentPurpose,
     pub result: Result<ContentSnapshot, String>,
@@ -316,6 +318,54 @@ impl DirectoryQueue {
     }
 }
 
+/// Per-tab coalescing queue for content requests.  Requests from different
+/// tabs coexist so that concurrent preview/diff loads do not overwrite each
+/// other; a newer request from the *same* tab replaces the older pending one.
+#[derive(Default)]
+struct ContentQueue {
+    active: bool,
+    pending: VecDeque<ContentRequest>,
+}
+
+impl ContentQueue {
+    fn submit(&mut self, request: ContentRequest) {
+        // Coalesce per tab: replace any pending request from the same tab.
+        if let Some(existing) = self.pending.iter_mut().find(|r| r.tab_id == request.tab_id) {
+            *existing = request;
+        } else {
+            self.pending.push_back(request);
+        }
+    }
+
+    fn start_next(&mut self) -> Option<ContentRequest> {
+        if self.active {
+            return None;
+        }
+        let request = self.pending.pop_front()?;
+        self.active = true;
+        Some(request)
+    }
+
+    fn complete(&mut self) {
+        debug_assert!(self.active);
+        self.active = false;
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Remove only the pending request for the given tab, leaving other
+    /// tabs' in-flight requests untouched.
+    fn cancel_pending_for_tab(&mut self, tab_id: u64) {
+        self.pending.retain(|r| r.tab_id != tab_id);
+    }
+
+    fn has_work(&self) -> bool {
+        self.active || !self.pending.is_empty()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RequestGeneration {
     next: u64,
@@ -360,13 +410,29 @@ struct SharedState {
     shutdown: bool,
     refresh: RequestSlot<RefreshRequest>,
     directory: DirectoryQueue,
-    content: RequestSlot<ContentRequest>,
+    content: ContentQueue,
     external_open: RequestSlot<ExternalOpenRequest>,
     completed_refresh: Option<RefreshCompletion>,
     completed_directories: VecDeque<DirectoryCompletion>,
-    completed_content: Option<ContentCompletion>,
+    completed_content: VecDeque<ContentCompletion>,
     completed_external_open: Option<ExternalOpenCompletion>,
     preview_registry_update: Option<PreviewRegistry>,
+    /// Test-only gate: when true the worker leaves content requests pending
+    /// instead of processing them, so queue assertions are deterministic.
+    #[cfg(test)]
+    content_suspended: bool,
+}
+
+impl SharedState {
+    #[cfg(test)]
+    const fn content_suspended(&self) -> bool {
+        self.content_suspended
+    }
+
+    #[cfg(not(test))]
+    const fn content_suspended(&self) -> bool {
+        false
+    }
 }
 
 struct Shared {
@@ -435,6 +501,43 @@ impl WorkerRuntime {
         state.content.cancel_pending();
     }
 
+    /// Cancel only the pending content request for the given tab, leaving
+    /// other tabs' in-flight requests untouched.
+    pub fn cancel_pending_content_for_tab(&self, tab_id: u64) {
+        let mut state = self.lock_state();
+        state.content.cancel_pending_for_tab(tab_id);
+    }
+
+    /// Test-only: park the worker so content requests stay queued. The
+    /// worker keeps handling refresh/directory/external-open work but leaves
+    /// content requests pending for deterministic queue assertions.
+    #[cfg(test)]
+    pub(crate) fn suspend_content_processing(&self) {
+        let mut state = self.lock_state();
+        state.content_suspended = true;
+        self.shared.changed.notify_all();
+    }
+
+    /// Test-only: pending content requests as `(tab_id, purpose)` pairs in
+    /// queue order, so per-tab coalescing can be asserted deterministically.
+    #[cfg(test)]
+    pub(crate) fn pending_content_summary(&self) -> Vec<(u64, &'static str)> {
+        let state = self.lock_state();
+        state
+            .content
+            .pending
+            .iter()
+            .map(|request| {
+                let purpose = match request.purpose {
+                    ContentPurpose::Display => "display",
+                    ContentPurpose::NavigationStage { .. } => "navigation_stage",
+                    ContentPurpose::NavigationPreview { .. } => "navigation_preview",
+                };
+                (request.tab_id, purpose)
+            })
+            .collect()
+    }
+
     pub fn cancel_pending_external_open(&self) {
         let mut state = self.lock_state();
         state.external_open.cancel_pending();
@@ -451,14 +554,14 @@ impl WorkerRuntime {
     ) -> (
         Option<RefreshCompletion>,
         Vec<DirectoryCompletion>,
-        Option<ContentCompletion>,
+        Vec<ContentCompletion>,
         Option<ExternalOpenCompletion>,
     ) {
         let mut state = self.lock_state();
         (
             state.completed_refresh.take(),
             state.completed_directories.drain(..).collect(),
-            state.completed_content.take(),
+            state.completed_content.drain(..).collect(),
             state.completed_external_open.take(),
         )
     }
@@ -470,7 +573,7 @@ impl WorkerRuntime {
         while !state.shutdown
             && state.completed_refresh.is_none()
             && state.completed_directories.is_empty()
-            && state.completed_content.is_none()
+            && state.completed_content.is_empty()
             && state.completed_external_open.is_none()
             && (state.refresh.has_work()
                 || state.directory.has_work()
@@ -485,7 +588,7 @@ impl WorkerRuntime {
         }
         state.completed_refresh.is_some()
             || !state.completed_directories.is_empty()
-            || state.completed_content.is_some()
+            || !state.completed_content.is_empty()
             || state.completed_external_open.is_some()
     }
 
@@ -538,7 +641,7 @@ fn worker_loop(
             while !state.shutdown
                 && state.refresh.pending.is_none()
                 && state.directory.pending.is_empty()
-                && state.content.pending.is_none()
+                && (state.content.pending.is_empty() || state.content_suspended())
                 && state.external_open.pending.is_none()
                 && state.preview_registry_update.is_none()
             {
@@ -594,6 +697,7 @@ fn worker_loop(
             }
             Work::Content(request) => {
                 let generation = request.generation;
+                let tab_id = request.tab_id;
                 let kind = request.kind;
                 let purpose = request.purpose;
                 let result = catch_worker_error(|| {
@@ -604,8 +708,9 @@ fn worker_loop(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.content.complete();
-                state.completed_content = Some(ContentCompletion {
+                state.completed_content.push_back(ContentCompletion {
                     generation,
+                    tab_id,
                     kind,
                     purpose,
                     result,
@@ -643,7 +748,9 @@ fn take_next_work(state: &mut SharedState) -> Option<Work> {
     if let Some(request) = state.directory.start_next() {
         return Some(Work::Directory(request));
     }
-    if let Some(request) = state.content.start_next() {
+    if !state.content_suspended()
+        && let Some(request) = state.content.start_next()
+    {
         return Some(Work::Content(request));
     }
     state.external_open.start_next().map(Work::ExternalOpen)
@@ -1135,9 +1242,10 @@ mod tests {
 
     #[test]
     fn content_request_coalescing_replaces_pending_selection_without_growth() {
-        let mut slot = RequestSlot::default();
+        let mut slot = ContentQueue::default();
         slot.submit(ContentRequest {
             generation: 1,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
@@ -1148,6 +1256,7 @@ mod tests {
         for generation in 2..=100 {
             slot.submit(ContentRequest {
                 generation,
+                tab_id: 0,
                 kind: ContentKind::Preview,
                 purpose: ContentPurpose::Display,
                 target: ContentTarget::Workspace(PathBuf::from(format!("{generation}.txt"))),
@@ -1164,6 +1273,68 @@ mod tests {
         ));
         slot.complete();
         assert!(!slot.has_work());
+    }
+
+    #[test]
+    fn content_queue_keeps_requests_from_different_tabs() {
+        let mut queue = ContentQueue::default();
+        queue.submit(ContentRequest {
+            generation: 1,
+            tab_id: 10,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            target: ContentTarget::Workspace(PathBuf::from("tab-a.txt")),
+            terminal_image_size: None,
+        });
+        queue.submit(ContentRequest {
+            generation: 1,
+            tab_id: 20,
+            kind: ContentKind::Diff,
+            purpose: ContentPurpose::Display,
+            target: ContentTarget::Workspace(PathBuf::from("tab-b.txt")),
+            terminal_image_size: None,
+        });
+
+        // Both requests coexist — neither overwrites the other.
+        let first = queue.start_next().unwrap();
+        assert_eq!(first.tab_id, 10);
+        queue.complete();
+
+        let second = queue.start_next().unwrap();
+        assert_eq!(second.tab_id, 20);
+        queue.complete();
+        assert!(!queue.has_work());
+    }
+
+    #[test]
+    fn content_queue_coalesces_same_tab_requests() {
+        let mut queue = ContentQueue::default();
+        queue.submit(ContentRequest {
+            generation: 1,
+            tab_id: 10,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            target: ContentTarget::Workspace(PathBuf::from("old.txt")),
+            terminal_image_size: None,
+        });
+        queue.submit(ContentRequest {
+            generation: 2,
+            tab_id: 10,
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            target: ContentTarget::Workspace(PathBuf::from("new.txt")),
+            terminal_image_size: None,
+        });
+
+        // Same tab: only the latest request survives.
+        let latest = queue.start_next().unwrap();
+        assert_eq!(latest.generation, 2);
+        assert!(matches!(
+            latest.target,
+            ContentTarget::Workspace(path) if path == std::path::Path::new("new.txt")
+        ));
+        queue.complete();
+        assert!(!queue.has_work());
     }
 
     #[test]

@@ -16,8 +16,8 @@ use crate::agent::{ActivityState, AgentViewSession, ObservationMode};
 use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
-        GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, SearchMode,
-        SearchResult, TreeScope, UiRegions, display_workspace_path,
+        GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, NewTabMenuState,
+        PaletteItem, SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -108,18 +108,15 @@ pub(crate) const MIN_TREE_WIDTH: u16 = 28;
 const MIN_CONTENT_WIDTH: u16 = 24;
 const DEFAULT_MAX_TREE_WIDTH: u16 = 44;
 
-const ALL_FILES_TAB_LABEL: &str = "  1 Files ";
-const GIT_CHANGES_TAB_LABEL: &str = "  2 Git changes ";
-#[cfg(feature = "agent-observability")]
-const AGENTS_TAB_LABEL: &str = "  3 Agents ";
 const REFRESH_LABEL: &str = " r  Refresh ";
 const FILE_SEARCH_LABEL: &str = "/ Open ";
 const TEXT_SEARCH_LABEL: &str = " ^T Text ";
 const EXTERNAL_OPEN_WIDTH: u16 = 16;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(2),
+    let [tab_bar, header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(5),
         Constraint::Length(1),
     ])
@@ -131,8 +128,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(body);
     let search_status_height = 0;
-    let [scope_tabs, tree_header, search_status, tree_rows] = Layout::vertical([
-        Constraint::Length(1),
+    let [tree_header, search_status, tree_rows] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(search_status_height),
         Constraint::Min(2),
@@ -154,8 +150,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
+        tab_bar,
         header,
-        scope_tabs,
         tree_body,
         tree_header,
         tree_rows,
@@ -164,13 +160,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
+    draw_tab_bar(frame, app, tab_bar);
     draw_header(frame, app, header);
-    draw_scope_tabs(frame, app, scope_tabs);
     draw_divider(frame, divider, app.tree_resize_dragging());
     draw_tree(frame, app, tree_header, tree_rows);
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
-    if app.navigation_picker.is_some() {
+    if app.tab_palette.is_some() {
+        dim_underlay(frame);
+        draw_tab_palette(frame, app);
+    } else if app.new_tab_menu.is_some() {
+        dim_underlay(frame);
+        draw_new_tab_menu(frame, app, app.ui_regions.new_tab_button);
+    } else if app.navigation_picker.is_some() {
         dim_underlay(frame);
         draw_navigation_picker(frame, app);
     } else if app.search_is_active() {
@@ -190,8 +192,8 @@ fn dim_underlay(frame: &mut Frame) {
 }
 
 struct DrawAreas {
+    tab_bar: Rect,
     header: Rect,
-    scope_tabs: Rect,
     tree_body: Rect,
     tree_header: Rect,
     tree_rows: Rect,
@@ -203,8 +205,8 @@ struct DrawAreas {
 
 fn regions(areas: DrawAreas) -> UiRegions {
     let DrawAreas {
+        tab_bar,
         header,
-        scope_tabs,
         tree_body,
         tree_header,
         tree_rows,
@@ -213,22 +215,28 @@ fn regions(areas: DrawAreas) -> UiRegions {
         content_header,
         content_rows,
     } = areas;
-    let all_files_width = (ALL_FILES_TAB_LABEL.len() as u16).min(scope_tabs.width);
-    let scope_end = scope_tabs.x.saturating_add(scope_tabs.width);
-    let git_changes_x = scope_tabs
+    let new_tab_width = 3u16.min(tab_bar.width);
+    let new_tab_button = Rect::new(
+        tab_bar
+            .x
+            .saturating_add(tab_bar.width.saturating_sub(new_tab_width)),
+        tab_bar.y,
+        new_tab_width,
+        tab_bar.height,
+    );
+    let menu_height = (NewTabMenuState::items().len() as u16) + 2;
+    let menu_width = 20u16.min(tab_bar.width);
+    let menu_x = new_tab_button
         .x
-        .saturating_add(ALL_FILES_TAB_LABEL.len() as u16)
-        .saturating_add(1)
-        .min(scope_end);
-    let git_changes_width =
-        (GIT_CHANGES_TAB_LABEL.len() as u16).min(scope_end.saturating_sub(git_changes_x));
-    #[cfg(feature = "agent-observability")]
-    let agents_x = git_changes_x
-        .saturating_add(GIT_CHANGES_TAB_LABEL.len() as u16)
-        .saturating_add(1)
-        .min(scope_end);
-    #[cfg(feature = "agent-observability")]
-    let agents_width = (AGENTS_TAB_LABEL.len() as u16).min(scope_end.saturating_sub(agents_x));
+        .saturating_add(new_tab_button.width)
+        .saturating_sub(menu_width)
+        .min(tab_bar.width.saturating_sub(menu_width));
+    let new_tab_menu = Rect::new(
+        menu_x,
+        new_tab_button.y.saturating_add(1),
+        menu_width,
+        menu_height,
+    );
     let refresh_width = (REFRESH_LABEL.len() as u16).min(header.width);
     let refresh_x = header
         .x
@@ -253,20 +261,9 @@ fn regions(areas: DrawAreas) -> UiRegions {
     );
 
     UiRegions {
-        all_files_tab: Rect::new(
-            scope_tabs.x,
-            scope_tabs.y,
-            all_files_width,
-            scope_tabs.height,
-        ),
-        git_changes_tab: Rect::new(
-            git_changes_x,
-            scope_tabs.y,
-            git_changes_width,
-            scope_tabs.height,
-        ),
-        #[cfg(feature = "agent-observability")]
-        agents_tab: Rect::new(agents_x, scope_tabs.y, agents_width, scope_tabs.height),
+        tab_bar,
+        new_tab_button,
+        new_tab_menu,
         refresh_button: Rect::new(refresh_x, header.y, refresh_width, header.height.min(1)),
         file_search_button,
         text_search_button,
@@ -354,6 +351,38 @@ fn active_search_controls(area: Rect) -> (Rect, Rect, [Rect; 4]) {
     (files, text, options)
 }
 
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let tabs = app.tabs();
+    let plus_width = 3u16;
+    let tabs_width = area.width.saturating_sub(plus_width);
+    let [tabs_area, plus] = Layout::horizontal([
+        Constraint::Length(tabs_width),
+        Constraint::Length(plus_width),
+    ])
+    .areas(area);
+    let active_id = app.active_tab_id();
+    let mut spans = Vec::new();
+    for tab in tabs {
+        let label = format!(" {} ", tab.title);
+        let style = if tab.id == active_id {
+            Style::default()
+                .fg(accent())
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(muted())
+        };
+        spans.push(Span::styled(label, style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " + ",
+            Style::default().fg(muted()),
+        ))),
+        plus,
+    );
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let refresh_width = (REFRESH_LABEL.len() as u16).min(area.width);
     let [header_text, refresh] =
@@ -419,14 +448,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         title.push(Span::styled("  directory", Style::default().fg(muted())));
     }
-    let subtitle = Line::from(Span::styled(
-        display_path(&app.root),
-        Style::default().fg(muted()),
-    ));
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(title), subtitle]),
-        header_text,
-    );
+    frame.render_widget(Paragraph::new(Line::from(title)), header_text);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -450,44 +472,6 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_scope_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    #[cfg(not(feature = "agent-observability"))]
-    let labels = [
-        (TreeScope::AllFiles, ALL_FILES_TAB_LABEL),
-        (TreeScope::GitChanges, GIT_CHANGES_TAB_LABEL),
-    ];
-    #[cfg(feature = "agent-observability")]
-    let labels = [
-        (TreeScope::AllFiles, ALL_FILES_TAB_LABEL),
-        (TreeScope::GitChanges, GIT_CHANGES_TAB_LABEL),
-        (TreeScope::Agents, AGENTS_TAB_LABEL),
-    ];
-    let mut spans = Vec::with_capacity(labels.len() * 2 - 1);
-    for (index, (scope, label)) in labels.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let active = app.tree_scope == scope;
-        let focused_active = app.focused_pane == FocusPane::ScopeTabs && active;
-        let style = if active {
-            Style::default()
-                .fg(accent())
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(muted())
-        };
-        // Replace one fixed leading space rather than adding a new cell:
-        // tab labels and their mouse hit boxes stay the same width.
-        let display_label = if focused_active {
-            format!("●{}", &label[1..])
-        } else {
-            label.to_owned()
-        };
-        spans.push(Span::styled(display_label, style));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
 fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
     let (glyph, color) = if resizing {
         ("┃", accent())
@@ -498,6 +482,89 @@ fn draw_divider(frame: &mut Frame, area: Rect, resizing: bool) {
         .map(|_| Line::from(Span::styled(glyph, Style::default().fg(color))))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_tab_palette(frame: &mut Frame, app: &App) {
+    let Some(palette) = app.tab_palette.as_ref() else {
+        return;
+    };
+    let popup = search_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent())),
+        popup,
+    );
+    let inner = Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, popup.height - 2);
+    let [input, results] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("> {}", palette.query),
+            Style::default().fg(text_primary()),
+        ))),
+        input,
+    );
+    let items: Vec<ListItem> = palette
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let label = match item {
+                PaletteItem::Tab { title, kind, .. } => {
+                    format!("  {}  {}", kind.label(), title)
+                }
+                PaletteItem::File(path) => format!("  {}", path.display()),
+            };
+            let style = if index == palette.selected {
+                Style::default()
+                    .fg(accent())
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(text_primary())
+            };
+            ListItem::new(Span::styled(label, style))
+        })
+        .collect();
+    frame.render_widget(List::new(items), results);
+}
+
+fn draw_new_tab_menu(frame: &mut Frame, app: &App, anchor: Rect) {
+    let Some(menu_state) = app.new_tab_menu.as_ref() else {
+        return;
+    };
+    let items = NewTabMenuState::items();
+    let menu_width = 20u16.min(frame.area().width);
+    let menu_height = (items.len() as u16) + 2;
+    // Right-align the menu to the terminal edge so it never clips off-screen.
+    let menu_x = anchor
+        .x
+        .saturating_add(anchor.width)
+        .saturating_sub(menu_width)
+        .min(frame.area().width.saturating_sub(menu_width));
+    let menu = Rect::new(menu_x, anchor.y.saturating_add(1), menu_width, menu_height);
+    frame.render_widget(Clear, menu);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent())),
+        menu,
+    );
+    let inner = Rect::new(menu.x + 1, menu.y + 1, menu.width - 2, menu.height - 2);
+    let mut lines = Vec::new();
+    for (index, kind) in items.iter().enumerate() {
+        let label = format!("  {}  ", kind.label());
+        let style = if index == menu_state.selected {
+            Style::default()
+                .fg(accent())
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(text_primary())
+        };
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_search_popup(frame: &mut Frame, app: &mut App) {
@@ -1060,7 +1127,7 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
-    let selected = app.tree_state.selected();
+    let selected = app.tab_mut().tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
     let items: Vec<ListItem> = if app.is_initial_loading() && !is_agents_scope(app) {
         vec![ListItem::new(Line::from(Span::styled(
@@ -1115,6 +1182,15 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         }
     };
     let entry_count = app.scope_entry_count();
+    let (file_button, text_button) = inactive_search_buttons(header);
+    let available_width = file_button.x.saturating_sub(header.x) as usize;
+    let heading = if is_agents_scope(app) {
+        "Agents"
+    } else if app.tree_scope == TreeScope::GitChanges {
+        "Git changes"
+    } else {
+        "Files"
+    };
     let detail = if is_agents_scope(app) {
         #[cfg(feature = "agent-observability")]
         {
@@ -1139,11 +1215,18 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             "entries"
         };
         let full = format!("{entry_count}+ {noun} · PARTIAL");
-        let heading_width = "● Files  ".chars().count() + full.chars().count();
-        if heading_width <= usize::from(header.width) {
+        let full_width = 2 + heading.chars().count() + 2 + full.chars().count();
+        if full_width <= available_width {
             full
         } else {
-            format!("{entry_count}+ · PARTIAL")
+            let short = format!("{entry_count}+ · PARTIAL");
+            let short_width = 2 + heading.chars().count() + 2 + short.chars().count();
+            if short_width <= available_width {
+                short
+            } else {
+                // Even the short form doesn't fit; show just the count.
+                format!("{entry_count}+")
+            }
         }
     } else if app.scope_has_unloaded_directories() {
         format!("{entry_count} loaded")
@@ -1169,13 +1252,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         format!("{entry_count} entries")
     };
-    let (file_button, text_button) = inactive_search_buttons(header);
     let heading_width = file_button.x.saturating_sub(header.x);
-    let heading = if is_agents_scope(app) {
-        "Agents"
-    } else {
-        "Files"
-    };
     let tree_accent = if app.tree_scope == TreeScope::GitChanges {
         Theme::current().git_accent
     } else {
@@ -1206,13 +1283,13 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             if full_labels {
                 TEXT_SEARCH_LABEL
             } else {
-                "^⇧F "
+                "^T "
             },
             Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )),
         text_button,
     );
-    frame.render_stateful_widget(List::new(items), rows, &mut app.tree_state);
+    frame.render_stateful_widget(List::new(items), rows, &mut app.tab_mut().tree_state);
 }
 
 #[cfg(feature = "agent-observability")]
@@ -1633,12 +1710,12 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         draw_preview_find(frame, app);
     } else {
         let mut detail = app.selected_content_label();
-        if app.content_mode == ContentMode::Preview
-            && let Some(provider) = app.content_provider.as_deref()
+        if app.tab().content.mode == ContentMode::Preview
+            && let Some(provider) = app.tab().content.provider.as_deref()
         {
             detail.push_str(&format!(" · {provider}"));
         }
-        if app.content_mode == ContentMode::Preview
+        if app.tab().content.mode == ContentMode::Preview
             && let Some(real_path) = app.selected_symlink_real_path()
         {
             detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
@@ -1685,7 +1762,7 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     }
     let line_number_width = app.content_line_number_width();
     let visual_rows = app.content_visual_rows(rows.width);
-    let render_area = if app.content_mode == ContentMode::Info {
+    let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
@@ -1694,15 +1771,17 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     let end = start
         .saturating_add(usize::from(render_area.height))
         .min(visual_rows.len());
+    let content = &app.tab().content;
     let lines: Vec<Line> = visual_rows[start..end]
         .iter()
         .filter_map(|visual_row| {
-            let line = app.content_lines.get(visual_row.line_index)?;
+            let line = content.lines.get(visual_row.line_index)?;
             let segment = line.get(visual_row.byte_range.clone())?;
             let mut highlights = if visual_row.synthetic {
                 Vec::new()
             } else {
-                app.content_highlights
+                content
+                    .highlights
                     .get(visual_row.line_index)
                     .cloned()
                     .unwrap_or_default()
@@ -1714,16 +1793,16 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
             let selection = (!visual_row.synthetic)
                 .then(|| visual_row_selection(app, visual_row))
                 .flatten();
-            Some(match app.content_mode {
+            Some(match content.mode {
                 ContentMode::Diff => diff_line(
                     segment,
-                    app.content_diff_lines.get(visual_row.line_index).copied(),
+                    content.diff_lines.get(visual_row.line_index).copied(),
                     line_number_width,
                     visual_row.continuation,
                     visual_row.tab_origin,
                     selection,
                 ),
-                ContentMode::Preview if app.content_show_line_numbers => preview_line(
+                ContentMode::Preview if content.show_line_numbers => preview_line(
                     (!visual_row.continuation).then_some(visual_row.line_index + 1),
                     line_number_width,
                     segment,
@@ -1878,42 +1957,41 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let focus = match app.focused_pane {
-        FocusPane::ScopeTabs => "Tabs",
         FocusPane::Tree => "Tree",
         FocusPane::Content => "Content",
     };
-    let scope_keys = if cfg!(feature = "agent-observability") {
-        "1/2/3 scope"
+    let tab_keys = if area.width < 96 {
+        "Tab cycle"
     } else {
-        "1/2 scope"
+        "Tab cycle  Ctrl+P palette  Ctrl+N new  Ctrl+W close"
     };
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
-            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path  q×2 quit"
         )
     } else if app.focused_pane == FocusPane::Tree {
         format!(
-            "  ↑↓ move  {scope_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
         )
-    } else if area.width < 96 && app.content_mode == ContentMode::Preview {
+    } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {scope_keys}  y path Y real  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {tab_keys}  y path Y real  q×2 quit"
         )
     } else if area.width < 96 {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {scope_keys}  r refresh  y path Y real  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {tab_keys}  r refresh  y path Y real  q×2 quit"
         )
-    } else if app.content_mode == ContentMode::Preview {
+    } else if app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {scope_keys}  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {tab_keys}  y copy path Y real/abs  q×2 quit"
         )
-    } else if app.content_mode == ContentMode::Diff {
+    } else if app.tab().content.mode == ContentMode::Diff {
         format!(
-            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
     } else {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {scope_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
         )
     };
     let content = if let Some(message) = app.quit_confirmation_message() {

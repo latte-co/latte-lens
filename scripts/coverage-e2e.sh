@@ -47,7 +47,9 @@ source "$env_file"
 # Exercise every final-binary CLI branch as part of the process-level profile.
 # The live Hook case accepts an idempotent metadata fallback when coverage
 # instrumentation consumes the fixed 5 ms ACK budget.
-"$cargo_command" test --all-features --locked --test cli_e2e
+# Run all integration tests (not just cli_e2e) so that headless App, LSP
+# process, git, tree, and repo graph tests all contribute to the E2E profile.
+"$cargo_command" test --all-features --locked --tests
 "$cargo_command" build --locked --features agent-observability-harness \
   --bin latte-lens-agent-harness
 "$python_command" scripts/agent_e2e_tui.py \

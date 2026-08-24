@@ -83,7 +83,7 @@ class ScenarioContext:
 def wait_for_initial_files(session: PtySession) -> None:
     session.wait_raw((b"?1000h",), "initial mouse-enabled terminal")
     session.wait_screen(
-        ("LATTE LENS", "1 Files", "2 Git changes", "Files", "Tree"),
+        ("LATTE LENS", "Files", "Tree"),
         "initial all-files tree with tree focus",
         absent=(".git/",),
     )
@@ -94,6 +94,17 @@ def wait_for_initial_files(session: PtySession) -> None:
             and (" loaded" in screen.text() or " entries" in screen.text())
         ),
         "initial filesystem and repository snapshot",
+    )
+
+
+def open_review_tab(session: PtySession) -> None:
+    """Open a Review (Git Changes) tab via the new-tab menu."""
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review"), "new-tab menu opens")
+    session.key(b"\x1b[B")  # Down to Review
+    session.key(b"\r")  # Enter
+    session.wait_screen(
+        ("Git changes", "Diff"), "Review tab opens with Git Changes"
     )
 
 
@@ -212,9 +223,9 @@ def files_navigation(context: ScenarioContext) -> None:
 
     # Preserve the original cross-scope state assertion in the Files group.
     context.write_text("y-untracked.txt", "new file\n")
-    session.key(b"2")
+    open_review_tab(session)
     session.wait_screen(
-        ("Git changes", "b-changed.rs", "nested-owned.txt", "Diff", "diff --git"),
+        ("b-changed.rs", "nested-owned.txt", "Diff", "diff --git"),
         "Git Changes available for Files scope-state check",
     )
     session.key(b"l")
@@ -222,14 +233,13 @@ def files_navigation(context: ScenarioContext) -> None:
     session.key(b"h")
     session.key(b"\x1b[H")
     session.key(b"\x1b[A")
-    session.wait_screen(("Git changes", "Tabs"), "Files journey scope-tabs focus cue")
-    files_tab = session.screen.find("1 Files")
-    if files_tab is None:
-        raise E2EAssertionError("input_target", "Files scope tab is not visible")
-    session.click(*files_tab)
+    session.key(b"\x1b[H")  # Home to first tree row
+    session.key(b"\x1b[A")  # Up — no-op at first row (scope tabs removed)
+    session.wait_screen(("Tree",), "Files journey tree focus retained")
+    session.key(b"1")  # Switch to first tab (Files)
     session.wait_screen(
         ("Files", "a-dir", "Tree"),
-        "mouse-selected collapsed All Files scope",
+        "keyboard-selected All Files tab",
         absent=("nested", "b-changed.rs"),
     )
     _click_tree_row(session, "z-clean.rs")
@@ -480,20 +490,14 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
 
-    # Move through the explicit Tabs -> Tree -> Content focus model and both
-    # scope-tab arrow branches before exercising the global tab shortcuts.
-    session.key(b"\x1b[A")
-    session.wait_screen(("Tabs",), "Up from the first tree row focuses scope tabs")
-    session.key(b"\x1b[C")
-    session.wait_screen(("Git changes", "b-changed.rs", "Diff"), "Right tab selects Git Changes")
-    session.key(b"\x1b[D")
-    session.wait_screen(("Files", "a-dir", "Tabs"), "Left tab returns to Files")
-    session.key(b"\x1b[B")
-    session.wait_screen(("Tree",), "Down from tabs returns focus to the tree")
+    # Exercise the global tab shortcuts: Tab cycles, 1-9 switches.
+    open_review_tab(session)
     session.key(b"\t")
-    session.wait_screen(("Git changes", "Diff"), "Tab advances to Git Changes")
+    session.wait_screen(("Files", "Tree"), "Tab cycles to Files tab")
     session.key(b"\x1b[Z")
-    session.wait_screen(("Files", "a-dir"), "BackTab returns to Files")
+    session.wait_screen(("Git changes",), "BackTab cycles to Review tab")
+    session.key(b"1")
+    session.wait_screen(("Files", "a-dir"), "1 switches back to Files tab")
 
     # Tree navigation covers bounded first/last selection, activation, and
     # the transition into the content pane.
@@ -552,15 +556,17 @@ def keyboard_controls(context: ScenarioContext) -> None:
     # Changed-file navigation runs in both directions only while Diff owns the
     # content pane. Preview/Diff toggles then return to the same owning change.
     session.key(b"2")
-    session.wait_screen(("Git changes", "Diff", "diff --git"), "Git Changes is ready for change cycling")
+    session.wait_screen(("Git changes",), "Git Changes tab activates")
     session.wait_until(
         lambda screen: all(
             marker not in screen.text()
             for marker in ("Refreshing workspace", "Loading directory", "Loading content", "LOADING")
-        )
-        and "a-dir" in screen.text(),
-        "Git Changes refresh settles before directory interaction",
+        ),
+        "Git Changes refresh settles",
     )
+    # Click the first changed file to load its diff.
+    _click_tree_row(session, "b-changed.rs")
+    session.wait_screen(("Diff", "diff --git"), "Git Changes is ready for change cycling")
     session.key(b"\x1b[D")
     session.key(b"\x1b[H")
     session.key(b"\x1b[B")
@@ -612,6 +618,7 @@ def keyboard_controls(context: ScenarioContext) -> None:
 def git_navigation(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     context.write_text("y-untracked.txt", "new file\n")
     session.key(b"2")
     session.wait_screen(
@@ -666,9 +673,7 @@ def git_navigation(context: ScenarioContext) -> None:
     session.key(b"l")
     session.wait_screen(("Diff", "Content"), "visible content focus cue")
     session.key(b"h")
-    session.key(b"\x1b[H")
-    session.key(b"\x1b[A")
-    session.wait_screen(("Git changes", "Tabs"), "visible scope-tabs focus cue")
+    session.wait_screen(("Tree",), "visible tree focus cue")
 
 
 def _line_with(screen: TerminalScreen, marker: str) -> str:
@@ -683,6 +688,7 @@ def _line_with(screen: TerminalScreen, marker: str) -> str:
 def git_status_matrix(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     session.key(b"2")
     session.wait_screen(
         (
@@ -737,6 +743,7 @@ def git_status_matrix(context: ScenarioContext) -> None:
 def git_review_state(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     session.key(b"2")
     session.wait_until(
         lambda screen: all(
@@ -782,6 +789,7 @@ def git_review_state(context: ScenarioContext) -> None:
 def repository_relation_matrix(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
+    open_review_tab(session)
     session.key(b"2")
     session.wait_screen(
         (
@@ -863,7 +871,7 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
 def search_preview(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
-    session.key(b"/")
+    session.click_marker("/ Open")
     session.wait_screen(("Open File", "File", "Text"), "file search opens")
     session.key(b"search-target")
     session.wait_screen(
@@ -927,8 +935,8 @@ def search_preview(context: ScenarioContext) -> None:
     session.wait_screen(
         ("hidden.txt:1", "ignored_unique_phrase"), "F5 includes ignored search results"
     )
-    session.key(b"\x10")
-    session.wait_screen(("Open File", "File", "Text"), "Ctrl+P switches to file search")
+    session.click_marker("File Text")
+    session.wait_screen(("Open File", "File", "Text"), "mouse switches to file search")
     session.key(b"\x14")
     session.wait_screen(
         ("Search Workspace", "ignored_unique_phrase"),
@@ -1170,6 +1178,156 @@ def _assert_process_gone(session: PtySession, pid: int, label: str) -> None:
             raise E2EAssertionError("helper_receipt", f"cannot inspect helper pid {pid}: {error}")
         time.sleep(0.02)
     raise E2EAssertionError("helper_receipt", f"helper pid {pid} was not killed and reaped")
+
+
+def tab_shell(context: ScenarioContext) -> None:
+    """Exercise the tab shell: open/switch/close tabs, palette, and same-scope."""
+    session = context.session
+    wait_for_initial_files(session)
+
+    # The tab bar shows the workspace name and "+" button.
+    session.wait_screen(("+",), "tab bar shows new tab button")
+
+    # Open a Review tab through the "+" menu (Ctrl+N → Down → Enter).
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu lists templates")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\r")  # Enter
+    session.wait_screen(("Git changes",), "Review tab activates Git changes scope")
+
+    # Shift+Tab cycles back to the Files tab.
+    session.key(b"\x1b[Z")  # Shift+Tab
+    session.wait_screen(("Files",), "Shift+Tab returns to Files tab")
+
+    # Tab cycles forward to the Review tab.
+    session.key(b"\t")
+    session.wait_screen(("Git changes",), "Tab cycles to Review tab")
+
+    # Ctrl+W closes the Review tab, leaving only the Files tab.
+    session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(
+        ("Files",), "Ctrl+W closes Review tab", absent=("Git changes",)
+    )
+
+    # Open a second Files tab (same scope) — projection must be populated.
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu reopens")
+    session.key(b"\r")  # Enter → Files (first item)
+    session.wait_screen(("Files",), "second Files tab has populated projection")
+
+    # Digit key 1 switches to the first tab.
+    session.key(b"1")
+    session.wait_screen(("Files",), "digit 1 switches to first tab")
+
+    # Ctrl+P opens the tab palette; Down + Enter selects the second tab.
+    session.key(b"\x10")  # Ctrl+P
+    session.wait_screen((">",), "⌘P palette opens")
+    session.key(b"\x1b[B")  # Down → navigate to second tab
+    session.key(b"\r")  # Enter → select
+    session.wait_screen(("Files",), "palette Enter switches tab")
+
+    # Ctrl+W closes the second Files tab.
+    session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(
+        ("Files",), "Ctrl+W closes second Files tab", absent=("Git changes",)
+    )
+
+    # Open a Search tab through the "+" menu (Ctrl+N → Down×2 → Enter).
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for Search")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\x1b[B")  # Down → Search
+    session.key(b"\r")  # Enter
+    session.wait_screen(("Search Workspace",), "Search tab opens text search")
+    session.key(b"\x1b")  # Esc → close search popup
+    session.wait_screen(("Files",), "Esc closes search popup", absent=("Search Workspace",))
+
+    # Ctrl+W closes the Search tab.
+    session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(
+        ("Files",), "Ctrl+W closes Search tab", absent=("Search Workspace",)
+    )
+
+    # --- Single-tab edge cases: cycling and closing are no-ops ---
+    session.key(b"\t")  # Tab with one tab → no-op
+    session.wait_screen(("Files",), "Tab with one tab is a no-op")
+    session.key(b"\x17")  # Ctrl+W on the last tab → rejected
+    session.wait_screen(("Files",), "Ctrl+W on the last tab is rejected")
+    session.key(b"9")  # digit beyond the tab count → no-op
+    session.wait_screen(("Files",), "digit beyond the tab count is a no-op")
+
+    # --- Palette query filtering, backspace, and file open ---
+    # Open a Review tab so the palette lists two distinct titles.
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for palette")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\r")  # Enter
+    session.wait_screen(("Git changes",), "Review tab active for palette")
+
+    session.key(b"\x10")  # Ctrl+P
+    session.wait_screen((">",), "palette opens for filtering")
+    session.key(b"review")
+    session.wait_screen(("> review",), "palette query filters to the Review tab")
+    for _ in range(6):
+        session.key(b"\x7f")  # Backspace
+    session.wait_screen((">",), "backspace restores the unfiltered palette")
+    session.key(b"\x1b[A")  # Up → clamps at the first item
+    session.key(b"\x1b")  # Esc → close palette
+    session.wait_screen(("Git changes",), "Esc closes the palette", absent=(">",))
+
+    # Palette file open: type a filename, Enter opens it in a Files tab.
+    session.key(b"\x10")  # Ctrl+P
+    session.wait_screen((">",), "palette reopens for file open")
+    session.key(b"clean")
+    session.wait_screen(("> clean", "z-clean.rs"), "palette lists the matching file")
+    session.key(b"\r")  # Enter → open file
+    session.wait_screen(
+        ("z-clean.rs", "clean()"), "palette Enter opens the file in a Files tab"
+    )
+
+    # --- New tab menu: Esc dismiss and Up clamp ---
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for Esc")
+    session.key(b"\x1b")  # Esc → dismiss
+    session.wait_screen(
+        ("Files",), "Esc dismisses the new tab menu", absent=("Search",)
+    )
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for Up clamp")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\x1b[A")  # Up → back to Files
+    session.key(b"\r")  # Enter → Files
+    session.wait_screen(("Files",), "Up clamp returns to the Files template")
+
+    # --- Mouse: "+" button, menu item click, tab bar click, outside dismiss ---
+    session.click(118, 0)  # "+" button
+    session.wait_screen(("Files", "Review", "Search"), "mouse + opens the new tab menu")
+    session.click(105, 3)  # Review menu item (row 3 → index 1)
+    session.wait_screen(("Git changes",), "mouse menu click opens a Review tab")
+    session.click(2, 0)  # first tab (Files) in the tab bar
+    session.wait_screen(("Files",), "mouse tab bar click switches to the Files tab")
+    session.click(118, 0)  # "+" button
+    session.wait_screen(("Files", "Review", "Search"), "mouse + reopens the menu")
+    session.click(50, 10)  # outside the menu → dismiss
+    session.wait_screen(
+        ("Files",), "outside click dismisses the new tab menu", absent=("Search",)
+    )
+
+    # --- Soft cap: open tabs until MAX_OPEN_TABS, then verify rejection ---
+    # Close the three extra tabs so one Review tab remains.
+    for _ in range(3):
+        session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(("Git changes",), "closed extra tabs for the cap test")
+    # Open 15 more Files tabs to reach the 16-tab soft cap.
+    for _ in range(15):
+        session.key(b"\x0e")  # Ctrl+N
+        session.key(b"\r")  # Enter → Files (first item)
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "menu opens at the cap")
+    session.key(b"\r")  # Enter → rejected
+    session.wait_screen(
+        ("Tab limit reached",), "the 17th tab is rejected with guidance"
+    )
 
 
 def code_navigation(context: ScenarioContext) -> None:
@@ -1742,7 +1900,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
     )
 
     for repository_name in ("repo-a", "repo-b"):
-        session.key(b"\x10")
+        session.key(b"/")
         session.wait_screen(("Open File",), f"file search opens for {repository_name}")
         session.key(b"\x15")
         session.key(f"{repository_name}/caller.rs".encode())
@@ -2175,6 +2333,12 @@ CASES = (
         "code-navigation",
         create_theme_matrix_config_fixture,
         theme_matrix_config,
+    ),
+    ScenarioCase(
+        "tab-shell",
+        "tab-shell",
+        create_navigation_fixture,
+        tab_shell,
     ),
 )
 
