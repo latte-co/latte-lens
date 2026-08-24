@@ -733,6 +733,15 @@ pub struct ContentState {
     navigation_target_highlight: Option<SourceRange>,
     navigation_source: Option<Arc<NavigationSource>>,
     navigation_document_version: DocumentVersion,
+    /// Per-tab diff identity.  When a diff is loaded for a tab, this records
+    /// which file the diff belongs to so that review toggles and diff
+    /// navigation stay scoped to the tab that loaded them.
+    current_diff_path: Option<RepoPath>,
+    /// Per-tab content request generation.  Each tab owns its own
+    /// generation counter so that concurrent preview/diff requests across
+    /// tabs do not discard each other's completions (a global gate would
+    /// let tab B's request invalidate tab A's in-flight completion).
+    content_requests: RequestGeneration,
 }
 
 impl Default for ContentState {
@@ -765,6 +774,8 @@ impl Default for ContentState {
             navigation_target_highlight: None,
             navigation_source: None,
             navigation_document_version: DocumentVersion(0),
+            current_diff_path: None,
+            content_requests: RequestGeneration::default(),
         }
     }
 }
@@ -795,6 +806,20 @@ impl TabKind {
             Self::Chat => "Chat",
         }
     }
+
+    /// The `TreeScope` this tab kind projects into.
+    pub(crate) const fn scope(self) -> TreeScope {
+        match self {
+            Self::Files | Self::Search => TreeScope::AllFiles,
+            Self::Review => TreeScope::GitChanges,
+            #[cfg(feature = "agent-observability")]
+            Self::Chat => TreeScope::Agents,
+        }
+    }
+}
+
+fn tab_kind_scope(kind: TabKind) -> TreeScope {
+    kind.scope()
 }
 
 /// Per-tab left-pane projection state. Each variant owns the selectable
@@ -907,14 +932,12 @@ pub struct App {
     tree_epoch: u64,
     git_changes_expansion: HashMap<GitRowIdentity, bool>,
     reviewed_change_versions: HashMap<RepoPath, ChangeVersion>,
-    current_diff_path: Option<RepoPath>,
     pending_diff_path: Option<(u64, RepoPath)>,
     git_rows: Vec<GitTreeRow>,
     visible_git_rows: Vec<GitTreeRow>,
     scan_entry_limit: usize,
     runtime: WorkerRuntime,
     refresh_requests: RequestGeneration,
-    content_requests: RequestGeneration,
     external_open_requests: RequestGeneration,
     navigation_preview_requests: RequestGeneration,
     search_runtime: SearchRuntime,
@@ -1028,18 +1051,27 @@ impl App {
         if !self.tabs.iter().any(|tab| tab.id == id) {
             return;
         }
-        self.active_tab = id;
-        let kind = self.tab().kind();
-        let scope = match kind {
-            TabKind::Files => TreeScope::AllFiles,
-            TabKind::Review => TreeScope::GitChanges,
-            TabKind::Search => TreeScope::AllFiles,
-            #[cfg(feature = "agent-observability")]
-            TabKind::Chat => TreeScope::Agents,
-        };
+        if self.active_tab == id {
+            return;
+        }
+        let kind = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .expect("tab exists")
+            .kind();
+        let scope = tab_kind_scope(kind);
         if self.tree_scope != scope {
-            self.set_tree_scope(scope);
+            // Capture the old tab's selection and scope-sync data BEFORE
+            // switching.  set_tree_scope_for_activation then enters the new
+            // scope on the new tab without re-reading (and corrupting) the
+            // old tab's selection.
+            let synchronized_file = self.selected_file_path_for_scope_sync();
+            self.remember_current_selection();
+            self.active_tab = id;
+            self.set_tree_scope_for_activation(scope, synchronized_file);
         } else {
+            self.active_tab = id;
             self.populate_tab_projection(scope);
         }
     }
@@ -1077,7 +1109,18 @@ impl App {
         if self.active_tab == id {
             let new_index = index.min(self.tabs.len() - 1);
             let new_id = self.tabs[new_index].id;
-            self.activate_tab(new_id);
+            // active_tab still points at the removed tab; set it directly
+            // before syncing the scope (activate_tab would panic reading
+            // the stale active tab).
+            self.active_tab = new_id;
+            let scope = tab_kind_scope(self.tab().kind());
+            if self.tree_scope != scope {
+                // The closed tab is gone, so there is no selection to sync
+                // from it; enter the new scope on the new tab directly.
+                self.set_tree_scope_for_activation(scope, None);
+            } else {
+                self.populate_tab_projection(scope);
+            }
         }
         true
     }
@@ -1240,14 +1283,12 @@ impl App {
             tree_epoch: 0,
             git_changes_expansion: HashMap::new(),
             reviewed_change_versions: HashMap::new(),
-            current_diff_path: None,
             pending_diff_path: None,
             git_rows: Vec::new(),
             visible_git_rows: Vec::new(),
             scan_entry_limit,
             runtime,
             refresh_requests: RequestGeneration::default(),
-            content_requests: RequestGeneration::default(),
             external_open_requests: RequestGeneration::default(),
             navigation_preview_requests: RequestGeneration::default(),
             search_runtime,
@@ -3018,7 +3059,7 @@ impl App {
         self.search_preview_target = None;
         self.last_search_click = None;
         if restore_content {
-            self.content_requests.invalidate();
+            self.invalidate_all_content_requests();
             self.content_request_tab = None;
             self.runtime.cancel_pending_content();
             let restored_tree_state = restore.tree_state;
@@ -3841,23 +3882,89 @@ impl App {
         }
     }
 
+    /// Scope transition for tab activation.  Identical to
+    /// [`App::set_tree_scope`] except that the scope-sync file is captured
+    /// from the *previously active* tab (before `active_tab` was switched)
+    /// and the current tab's selection is not re-saved (the caller already
+    /// called `remember_current_selection` on the old tab).
+    fn set_tree_scope_for_activation(
+        &mut self,
+        scope: TreeScope,
+        synchronized_file: Option<PathBuf>,
+    ) {
+        self.last_tree_click = None;
+        self.pending_external_open_confirmation = None;
+        let entering_git_changes =
+            scope == TreeScope::GitChanges && self.tree_scope != TreeScope::GitChanges;
+        if entering_git_changes {
+            self.pending_all_scope_path = None;
+            self.pending_all_scope_navigation = false;
+            self.pending_git_scope_path = synchronized_file.clone();
+            self.pending_git_scope_fallback = self
+                .pending_git_scope_path
+                .is_some()
+                .then(|| self.git_changes_selection.clone())
+                .flatten();
+        } else if scope != TreeScope::GitChanges {
+            self.pending_git_scope_path = None;
+            self.pending_git_scope_fallback = None;
+        }
+        let pending_path_is_changed = self
+            .pending_git_scope_path
+            .as_deref()
+            .and_then(|path| self.git_change_identity_for_workspace_path(path))
+            .is_some();
+        let first_git_entry_without_sync = entering_git_changes
+            && self.git_changes_selection.is_none()
+            && !pending_path_is_changed;
+        if scope == TreeScope::GitChanges {
+            self.request_refresh(true);
+        }
+        #[cfg(feature = "agent-observability")]
+        if scope == TreeScope::Agents {
+            self.request_agent_refresh();
+        }
+
+        self.enter_tree_scope(scope, synchronized_file, true);
+        if first_git_entry_without_sync {
+            self.tab_mut().tree_state.select(None);
+        }
+    }
+
     fn apply_tree_scope(&mut self, scope: TreeScope) {
         if self.tree_scope == scope {
             return;
         }
-
         let synchronized_file = self.selected_file_path_for_scope_sync();
         self.remember_current_selection();
+        self.enter_tree_scope(scope, synchronized_file, false);
+    }
+
+    /// Enter a new tree scope on the *active* tab using a pre-captured
+    /// synchronized file (from the previously active tab).  Unlike
+    /// [`apply_tree_scope`], this does not re-read or re-save the current
+    /// tab's selection — the caller ([`App::activate_tab`]) already saved
+    /// the old tab's selection before switching.  When `prefer_saved` is
+    /// true, the tab's own saved selection takes precedence over the
+    /// synchronized file (which comes from the previously active tab).
+    fn enter_tree_scope(
+        &mut self,
+        scope: TreeScope,
+        synchronized_file: Option<PathBuf>,
+        prefer_saved: bool,
+    ) {
         self.tree_scope = scope;
         self.tab_mut().tree_state = ListState::default();
         self.rebuild_visible_rows();
         match scope {
             TreeScope::AllFiles => {
-                if let Some(path) = synchronized_file {
+                let saved = self.tab().files().selection.clone();
+                if prefer_saved && saved.is_some() {
+                    self.restore_visible_selection(saved);
+                } else if let Some(path) = synchronized_file {
                     self.reveal_all_files_selection(path);
                 } else {
-                    let selection = self.tab().files().selection.clone();
-                    self.restore_visible_selection(selection);
+                    self.restore_visible_selection(saved);
                 }
             }
             TreeScope::GitChanges => {
@@ -3886,8 +3993,53 @@ impl App {
         self.is_refreshing() && !self.has_refresh_snapshot
     }
 
-    pub const fn is_content_loading(&self) -> bool {
-        self.content_requests.is_loading()
+    pub fn is_content_loading(&self) -> bool {
+        // Only the active tab's loading state drives the footer indicator.
+        // Background tabs may have in-flight requests, but they must not
+        // keep the active tab's "Loading content" indicator alive.
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == self.active_tab)
+            .is_some_and(|tab| tab.content.content_requests.is_loading())
+    }
+
+    /// Whether any tab (active or background) has a content request in
+    /// flight.  Used by `wait_for_background` in tests.
+    pub fn is_any_content_loading(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.content.content_requests.is_loading())
+    }
+
+    /// Begin a content request on the active tab's per-tab generation
+    /// counter and bind it via `content_request_tab`.
+    fn begin_active_tab_content_request(&mut self) -> u64 {
+        let tab_id = self.active_tab;
+        self.content_request_tab = Some(tab_id);
+        self.begin_content_request(tab_id)
+    }
+
+    /// Begin a content request on the specified tab's per-tab counter.
+    fn begin_content_request(&mut self, tab_id: TabId) -> u64 {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .map_or(0, |tab| tab.content.content_requests.begin())
+    }
+
+    /// Accept a content completion on the specified tab's per-tab counter.
+    fn accept_content_completion(&mut self, tab_id: TabId, generation: u64) -> bool {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .is_some_and(|tab| tab.content.content_requests.accept(generation))
+    }
+
+    /// Invalidate all pending content requests across every tab.
+    fn invalidate_all_content_requests(&mut self) {
+        for tab in &mut self.tabs {
+            tab.content.content_requests.invalidate();
+        }
     }
 
     pub const fn is_external_open_loading(&self) -> bool {
@@ -4575,14 +4727,14 @@ impl App {
     pub fn wait_for_background(&mut self) {
         while self.is_refreshing()
             || self.is_directory_loading()
-            || self.is_content_loading()
+            || self.is_any_content_loading()
             || self.is_external_open_loading()
             || self.is_navigation_preview_loading()
             || self.is_searching()
         {
             if self.is_refreshing()
                 || self.is_directory_loading()
-                || self.is_content_loading()
+                || self.is_any_content_loading()
                 || self.is_external_open_loading()
                 || self.is_navigation_preview_loading()
             {
@@ -5738,8 +5890,7 @@ impl App {
         self.cancel_pending_navigation();
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
-        let generation = self.content_requests.begin();
-        self.content_request_tab = Some(self.active_tab);
+        let generation = self.begin_active_tab_content_request();
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(ContentMode::Preview);
@@ -5778,8 +5929,7 @@ impl App {
         self.cancel_pending_navigation();
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
-        let generation = self.content_requests.begin();
-        self.content_request_tab = Some(self.active_tab);
+        let generation = self.begin_active_tab_content_request();
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(match kind {
@@ -5855,7 +6005,7 @@ impl App {
         }
         if let Some(stage) = self.pending_navigation_stage.take() {
             self.navigation_runtime.cancel(stage.invocation.generation);
-            self.content_requests.invalidate();
+            self.invalidate_all_content_requests();
             self.content_request_tab = None;
             self.runtime.cancel_pending_content();
         }
@@ -6275,7 +6425,7 @@ impl App {
             self.commit_navigation_reveal(&invocation, target.document.clone(), range);
             return;
         }
-        let content_generation = self.content_requests.begin();
+        let content_generation = self.begin_active_tab_content_request();
         self.runtime.request_content(ContentRequest {
             generation: content_generation,
             kind: ContentKind::Preview,
@@ -6876,7 +7026,20 @@ impl App {
             }
             return;
         }
-        if !self.content_requests.accept(generation) {
+        // Determine the target tab before consuming any state so the
+        // per-tab generation gate can be checked against the tab that
+        // actually initiated the request.
+        let target_tab = match &purpose {
+            ContentPurpose::NavigationStage { .. } => self
+                .pending_navigation_stage
+                .as_ref()
+                .map(|stage| stage.tab_id),
+            _ => self.content_request_tab,
+        };
+        let Some(tab_id) = target_tab else {
+            return;
+        };
+        if !self.accept_content_completion(tab_id, generation) {
             return;
         }
         if let ContentPurpose::NavigationStage {
@@ -6955,7 +7118,7 @@ impl App {
                     Vec::new()
                 };
                 if mode == ContentMode::Diff {
-                    self.current_diff_path = completed_diff_path;
+                    self.tab_mut().content.current_diff_path = completed_diff_path;
                 }
                 let search_target = self
                     .search_preview_target
@@ -7102,7 +7265,7 @@ impl App {
         self.tab_mut().content.highlights.clear();
         self.tab_mut().content.show_line_numbers = false;
         self.tab_mut().content.diff_lines.clear();
-        self.current_diff_path = None;
+        self.tab_mut().content.current_diff_path = None;
         self.tab_mut().content.identity = None;
         self.tab_mut().content.fold_source = FoldSource::None;
         self.tab_mut().content.fold_regions.clear();
@@ -7117,7 +7280,7 @@ impl App {
 
     fn set_info(&mut self, lines: Vec<String>) {
         self.cancel_pending_navigation();
-        self.content_requests.invalidate();
+        self.invalidate_all_content_requests();
         self.content_request_tab = None;
         self.runtime.cancel_pending_content();
         self.pending_diff_path = None;
@@ -7135,7 +7298,7 @@ impl App {
     }
 
     fn toggle_current_diff_review(&mut self) {
-        let Some(path) = self.current_diff_path.clone() else {
+        let Some(path) = self.tab().content.current_diff_path.clone() else {
             return;
         };
         let Some(version) = self
@@ -8278,7 +8441,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("fixture.txt"), "fixture").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
-        app.content_requests.invalidate();
+        app.invalidate_all_content_requests();
         app.runtime.cancel_pending_content();
         app.tab_mut().content.mode = ContentMode::Preview;
         app.tab_mut().content.show_line_numbers = true;
@@ -8534,8 +8697,8 @@ mod tests {
         fs::write(directory.path().join("file.txt"), "fixture").unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
 
-        let stale_preview = app.content_requests.begin();
-        let current_diff = app.content_requests.begin();
+        let stale_preview = app.begin_active_tab_content_request();
+        let current_diff = app.begin_active_tab_content_request();
         app.reset_content(ContentMode::Diff);
         app.tab_mut().content.lines = vec!["Loading current diff…".to_owned()];
         app.apply_content_completion(ContentCompletion {
@@ -8579,7 +8742,7 @@ mod tests {
             Some("refresh failed: fixture refresh error")
         );
 
-        let content = app.content_requests.begin();
+        let content = app.begin_active_tab_content_request();
         app.apply_content_completion(ContentCompletion {
             generation: content,
             kind: ContentKind::Preview,
@@ -8591,7 +8754,7 @@ mod tests {
             Some("refresh failed: fixture refresh error")
         );
 
-        let content = app.content_requests.begin();
+        let content = app.begin_active_tab_content_request();
         app.apply_content_completion(ContentCompletion {
             generation: content,
             kind: ContentKind::Preview,
@@ -9444,7 +9607,7 @@ mod tests {
         );
         app.cancel_pending_navigation();
 
-        let generation = app.content_requests.begin();
+        let generation = app.begin_active_tab_content_request();
         app.apply_content_completion(ContentCompletion {
             generation,
             kind: ContentKind::Preview,
