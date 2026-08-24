@@ -6889,8 +6889,13 @@ impl App {
             return;
         };
         self.navigation_preview_requests.invalidate();
-        self.runtime
-            .cancel_pending_content_for_tab(self.active_tab.value());
+        let picker_tab_id = self
+            .navigation_picker
+            .as_ref()
+            .map(|picker| picker.invocation.tab_id);
+        if let Some(tab_id) = picker_tab_id {
+            self.runtime.cancel_pending_content_for_tab(tab_id.value());
+        }
         let Some(picker) = self.navigation_picker.take() else {
             return;
         };
@@ -6916,8 +6921,13 @@ impl App {
 
     fn close_navigation_picker(&mut self) {
         self.navigation_preview_requests.invalidate();
-        self.runtime
-            .cancel_pending_content_for_tab(self.active_tab.value());
+        let picker_tab_id = self
+            .navigation_picker
+            .as_ref()
+            .map(|picker| picker.invocation.tab_id);
+        if let Some(tab_id) = picker_tab_id {
+            self.runtime.cancel_pending_content_for_tab(tab_id.value());
+        }
         if let Some(picker) = self.navigation_picker.take() {
             self.focused_pane = picker.return_focus;
         }
@@ -10482,6 +10492,103 @@ mod tests {
             app.runtime.pending_content_summary(),
             vec![(tab_b.value(), "display")]
         );
+    }
+
+    /// Set up a cross-file navigation picker opened on tab A while the
+    /// active tab is B (which has a pending display request). The tab switch
+    /// is simulated directly because real switches close the picker.
+    fn cross_file_picker_with_active_tab_switched() -> (App, TabId, TabId) {
+        let mut app = navigation_app("fn caller() {}\n");
+        let tab_a = app.active_tab;
+
+        app.runtime.suspend_content_processing();
+
+        let tab_b = app.open_tab(TabKind::Files).unwrap();
+        app.active_tab = tab_a;
+
+        let caller = app.tab().content.identity.clone().unwrap();
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let target =
+            ContentIdentity::from_absolute(&app.root, &app.root.join("target.rs")).unwrap();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::References,
+            source_identity: caller,
+            source_version: app.tab().content.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: FocusPane::Content,
+            tab_id: tab_a,
+        };
+        app.open_navigation_picker(
+            "References",
+            invocation,
+            vec![NavigationPickerItem {
+                target: NavigationTarget {
+                    document: target,
+                    range: NavigationTargetRange::Utf16(lsp_types::Range::new(
+                        lsp_types::Position::new(0, 3),
+                        lsp_types::Position::new(0, 9),
+                    )),
+                },
+                label: "target.rs:1:4".to_owned(),
+                detail: None,
+            }],
+        );
+        app.active_tab = tab_b;
+        (app, tab_a, tab_b)
+    }
+
+    #[test]
+    fn picker_enter_accept_cancels_invocation_tab_not_active_tab() {
+        // Regression: accepting the picker (Enter) cancels the invoker's
+        // pending preview request, never the active tab's pending content.
+        let (mut app, tab_a, tab_b) = cross_file_picker_with_active_tab_switched();
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![
+                (tab_b.value(), "display"),
+                (tab_a.value(), "navigation_preview")
+            ]
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // B's display request survives; A's preview was cancelled and
+        // replaced by A's navigation-stage request.
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![
+                (tab_b.value(), "display"),
+                (tab_a.value(), "navigation_stage")
+            ]
+        );
+        assert!(app.navigation_picker.is_none());
+    }
+
+    #[test]
+    fn picker_esc_close_cancels_invocation_tab_not_active_tab() {
+        // Regression: closing the picker (Esc) cancels the invoker's pending
+        // preview request, never the active tab's pending content.
+        let (mut app, tab_a, tab_b) = cross_file_picker_with_active_tab_switched();
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![
+                (tab_b.value(), "display"),
+                (tab_a.value(), "navigation_preview")
+            ]
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // B's display request survives; A's preview was cancelled.
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![(tab_b.value(), "display")]
+        );
+        assert!(app.navigation_picker.is_none());
     }
 
     #[test]
