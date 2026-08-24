@@ -742,6 +742,10 @@ pub struct ContentState {
     /// the completion can bind it to the tab that initiated the request,
     /// even if another tab starts a diff request in the meantime.
     pending_diff_path: Option<(u64, RepoPath)>,
+    /// Per-tab pending navigation stage.  When a semantic navigation is
+    /// loading a document into this tab's content pane, the stage is held
+    /// here so that another tab's navigation does not take it away.
+    pending_navigation_stage: Option<PendingNavigationStage>,
     /// Per-tab content request generation.  Each tab owns its own
     /// generation counter so that concurrent preview/diff requests across
     /// tabs do not discard each other's completions (a global gate would
@@ -781,6 +785,7 @@ impl Default for ContentState {
             navigation_document_version: DocumentVersion(0),
             current_diff_path: None,
             pending_diff_path: None,
+            pending_navigation_stage: None,
             content_requests: RequestGeneration::default(),
         }
     }
@@ -985,7 +990,6 @@ pub struct App {
     navigation_runtime: NavigationRuntime,
     navigation_generation: u64,
     navigation_invocation: Option<NavigationInvocation>,
-    pending_navigation_stage: Option<PendingNavigationStage>,
     pub(crate) navigation_picker: Option<NavigationPickerState>,
     pub new_tab_menu: Option<NewTabMenuState>,
     pub tab_palette: Option<TabPaletteState>,
@@ -1333,7 +1337,6 @@ impl App {
             navigation_runtime,
             navigation_generation: 0,
             navigation_invocation: None,
-            pending_navigation_stage: None,
             navigation_picker: None,
             new_tab_menu: None,
             tab_palette: None,
@@ -1995,7 +1998,9 @@ impl App {
                 self.load_selected_preview();
                 return;
             }
-            if self.navigation_invocation.is_some() || self.pending_navigation_stage.is_some() {
+            if self.navigation_invocation.is_some()
+                || self.tab().content.pending_navigation_stage.is_some()
+            {
                 self.cancel_pending_navigation();
                 return;
             }
@@ -6004,7 +6009,7 @@ impl App {
         if let Some(invocation) = self.navigation_invocation.take() {
             self.navigation_runtime.cancel(invocation.generation);
         }
-        if let Some(stage) = self.pending_navigation_stage.take() {
+        if let Some(stage) = self.tab_mut().content.pending_navigation_stage.take() {
             self.navigation_runtime.cancel(stage.invocation.generation);
         }
         self.navigation_picker = None;
@@ -6024,10 +6029,11 @@ impl App {
         if let Some(invocation) = self.navigation_invocation.take() {
             self.navigation_runtime.cancel(invocation.generation);
         }
-        if let Some(stage) = self.pending_navigation_stage.take() {
+        if let Some(stage) = self.tab_mut().content.pending_navigation_stage.take() {
             self.navigation_runtime.cancel(stage.invocation.generation);
-            self.invalidate_all_content_requests();
-            self.runtime.cancel_pending_content();
+            self.invalidate_active_tab_content_request();
+            self.runtime
+                .cancel_pending_content_for_tab(self.active_tab.value());
         }
         self.navigation_picker = None;
         self.tab_mut().content.navigation_hover_highlight = None;
@@ -6456,7 +6462,7 @@ impl App {
             target: content_target_for_navigation(&target.document),
             terminal_image_size: None,
         });
-        self.pending_navigation_stage = Some(PendingNavigationStage {
+        self.tab_mut().content.pending_navigation_stage = Some(PendingNavigationStage {
             invocation,
             content_generation,
             target,
@@ -6484,11 +6490,17 @@ impl App {
 
     fn apply_navigation_stage_completion(
         &mut self,
+        tab_id: TabId,
         navigation_generation: u64,
         content_generation: u64,
         result: Result<ContentSnapshot, String>,
     ) {
-        let Some(stage) = self.pending_navigation_stage.take() else {
+        let Some(stage) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.content.pending_navigation_stage.take())
+        else {
             return;
         };
         if stage.invocation.generation != navigation_generation
@@ -6630,7 +6642,7 @@ impl App {
             }
         }
         self.navigation_invocation = None;
-        self.pending_navigation_stage = None;
+        self.tab_mut().content.pending_navigation_stage = None;
         self.navigation_picker = None;
         self.set_navigation_status(NavigationStatusLevel::Info, "Navigation target opened.");
     }
@@ -7053,19 +7065,8 @@ impl App {
             }
             return;
         }
-        // Determine the target tab before consuming any state so the
-        // per-tab generation gate can be checked against the tab that
-        // actually initiated the request.
-        let target_tab = match &purpose {
-            ContentPurpose::NavigationStage { .. } => self
-                .pending_navigation_stage
-                .as_ref()
-                .map(|stage| stage.tab_id),
-            _ => Some(TabId(tab_id)),
-        };
-        let Some(tab_id) = target_tab else {
-            return;
-        };
+        // The completion carries the tab identity of the initiator.
+        let tab_id = TabId(tab_id);
         if !self.accept_content_completion(tab_id, generation) {
             return;
         }
@@ -7073,7 +7074,12 @@ impl App {
             navigation_generation,
         } = purpose
         {
-            self.apply_navigation_stage_completion(navigation_generation, generation, result);
+            self.apply_navigation_stage_completion(
+                tab_id,
+                navigation_generation,
+                generation,
+                result,
+            );
             return;
         }
         // The completion carries the tab identity of the initiator, so
@@ -9521,7 +9527,7 @@ mod tests {
         app.request_refresh(false);
         assert!(app.is_refreshing());
         assert!(app.navigation_invocation.is_none());
-        assert!(app.pending_navigation_stage.is_none());
+        assert!(app.tab().content.pending_navigation_stage.is_none());
         assert!(app.navigation_picker.is_none());
         assert!(!app.is_content_loading());
         assert!(app.navigation_status.is_none());
@@ -9582,7 +9588,7 @@ mod tests {
         assert!(!app.is_refreshing());
         assert!(!app.is_content_loading());
         assert!(app.navigation_invocation.is_none());
-        assert!(app.pending_navigation_stage.is_none());
+        assert!(app.tab().content.pending_navigation_stage.is_none());
         assert_eq!(
             app.tab()
                 .content
@@ -9647,11 +9653,11 @@ mod tests {
                 )),
             },
         );
-        assert!(stage_app.pending_navigation_stage.is_some());
+        assert!(stage_app.tab().content.pending_navigation_stage.is_some());
         assert!(stage_app.is_content_loading());
 
         let refresh = stage_app.request_refresh(false);
-        assert!(stage_app.pending_navigation_stage.is_none());
+        assert!(stage_app.tab().content.pending_navigation_stage.is_none());
         assert!(!stage_app.is_content_loading());
         stage_app.apply_refresh_completion(RefreshCompletion {
             generation: refresh,
@@ -10383,7 +10389,7 @@ mod tests {
                 )),
             },
         );
-        let stage = app.pending_navigation_stage.clone().unwrap();
+        let stage = app.tab().content.pending_navigation_stage.clone().unwrap();
 
         app.apply_content_completion(ContentCompletion {
             generation: stage.content_generation,
@@ -10399,7 +10405,7 @@ mod tests {
         assert_eq!(app.tab_mut().content.identity, before_identity);
         assert_eq!(app.tree_scope, before_scope);
         assert!(app.navigation_back.is_empty());
-        assert!(app.pending_navigation_stage.is_none());
+        assert!(app.tab().content.pending_navigation_stage.is_none());
         assert!(
             app.navigation_status
                 .as_ref()
