@@ -1248,6 +1248,87 @@ def tab_shell(context: ScenarioContext) -> None:
         ("Files",), "Ctrl+W closes Search tab", absent=("Search Workspace",)
     )
 
+    # --- Single-tab edge cases: cycling and closing are no-ops ---
+    session.key(b"\t")  # Tab with one tab → no-op
+    session.wait_screen(("Files",), "Tab with one tab is a no-op")
+    session.key(b"\x17")  # Ctrl+W on the last tab → rejected
+    session.wait_screen(("Files",), "Ctrl+W on the last tab is rejected")
+    session.key(b"9")  # digit beyond the tab count → no-op
+    session.wait_screen(("Files",), "digit beyond the tab count is a no-op")
+
+    # --- Palette query filtering, backspace, and file open ---
+    # Open a Review tab so the palette lists two distinct titles.
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for palette")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\r")  # Enter
+    session.wait_screen(("Git changes",), "Review tab active for palette")
+
+    session.key(b"\x10")  # Ctrl+P
+    session.wait_screen((">",), "palette opens for filtering")
+    session.key(b"review")
+    session.wait_screen(("> review",), "palette query filters to the Review tab")
+    for _ in range(6):
+        session.key(b"\x7f")  # Backspace
+    session.wait_screen((">",), "backspace restores the unfiltered palette")
+    session.key(b"\x1b[A")  # Up → clamps at the first item
+    session.key(b"\x1b")  # Esc → close palette
+    session.wait_screen(("Git changes",), "Esc closes the palette", absent=(">",))
+
+    # Palette file open: type a filename, Enter opens it in a Files tab.
+    session.key(b"\x10")  # Ctrl+P
+    session.wait_screen((">",), "palette reopens for file open")
+    session.key(b"clean")
+    session.wait_screen(("> clean", "z-clean.rs"), "palette lists the matching file")
+    session.key(b"\r")  # Enter → open file
+    session.wait_screen(
+        ("z-clean.rs", "clean()"), "palette Enter opens the file in a Files tab"
+    )
+
+    # --- New tab menu: Esc dismiss and Up clamp ---
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for Esc")
+    session.key(b"\x1b")  # Esc → dismiss
+    session.wait_screen(
+        ("Files",), "Esc dismisses the new tab menu", absent=("Search",)
+    )
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "new tab menu for Up clamp")
+    session.key(b"\x1b[B")  # Down → Review
+    session.key(b"\x1b[A")  # Up → back to Files
+    session.key(b"\r")  # Enter → Files
+    session.wait_screen(("Files",), "Up clamp returns to the Files template")
+
+    # --- Mouse: "+" button, menu item click, tab bar click, outside dismiss ---
+    session.click(118, 0)  # "+" button
+    session.wait_screen(("Files", "Review", "Search"), "mouse + opens the new tab menu")
+    session.click(105, 3)  # Review menu item (row 3 → index 1)
+    session.wait_screen(("Git changes",), "mouse menu click opens a Review tab")
+    session.click(2, 0)  # first tab (Files) in the tab bar
+    session.wait_screen(("Files",), "mouse tab bar click switches to the Files tab")
+    session.click(118, 0)  # "+" button
+    session.wait_screen(("Files", "Review", "Search"), "mouse + reopens the menu")
+    session.click(50, 10)  # outside the menu → dismiss
+    session.wait_screen(
+        ("Files",), "outside click dismisses the new tab menu", absent=("Search",)
+    )
+
+    # --- Soft cap: open tabs until MAX_OPEN_TABS, then verify rejection ---
+    # Close the three extra tabs so one Review tab remains.
+    for _ in range(3):
+        session.key(b"\x17")  # Ctrl+W
+    session.wait_screen(("Git changes",), "closed extra tabs for the cap test")
+    # Open 15 more Files tabs to reach the 16-tab soft cap.
+    for _ in range(15):
+        session.key(b"\x0e")  # Ctrl+N
+        session.key(b"\r")  # Enter → Files (first item)
+    session.key(b"\x0e")  # Ctrl+N
+    session.wait_screen(("Files", "Review", "Search"), "menu opens at the cap")
+    session.key(b"\r")  # Enter → rejected
+    session.wait_screen(
+        ("Tab limit reached",), "the 17th tab is rejected with guidance"
+    )
+
 
 def code_navigation(context: ScenarioContext) -> None:
     session = context.session
