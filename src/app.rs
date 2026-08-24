@@ -6427,14 +6427,20 @@ impl App {
         let direct = invocation.operation == NavigationOperation::Definition && items.len() == 1;
         if direct {
             // Route the direct navigation to the tab that initiated it,
-            // not the currently active tab.
+            // not the currently active tab.  Save and restore both
+            // active_tab and tree_scope so commit_navigation_reveal's
+            // scope switch does not leak to the tab the user switched to.
             if !self.tabs.iter().any(|tab| tab.id == invocation.tab_id) {
                 return;
             }
             let original_tab = self.active_tab;
+            let original_scope = self.tree_scope;
             self.active_tab = invocation.tab_id;
             self.accept_navigation_target(invocation, items[0].target.clone());
             self.active_tab = original_tab;
+            if self.tree_scope != original_scope {
+                self.apply_tree_scope(original_scope);
+            }
         } else {
             let title = match invocation.operation {
                 NavigationOperation::Definition => "Definitions",
