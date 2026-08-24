@@ -6263,15 +6263,26 @@ impl App {
             self.navigation_invocation = Some(invocation);
             return;
         }
-        let Some(source) = self.tab().content.navigation_source.as_ref() else {
+        // Resolve the navigation source from the tab that initiated the
+        // request, not the currently active tab — the user may have
+        // switched tabs while the LSP request was in flight.
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == invocation.tab_id) else {
             self.set_navigation_status(
                 NavigationStatusLevel::Error,
                 "Document symbol source is no longer available.",
             );
             return;
         };
+        let Some(source) = tab.content.navigation_source.as_ref() else {
+            self.set_navigation_status(
+                NavigationStatusLevel::Error,
+                "Document symbol source is no longer available.",
+            );
+            return;
+        };
+        let source_version = tab.content.navigation_document_version;
         if source.identity != completion.source_identity
-            || self.tab().content.navigation_document_version != completion.source_version
+            || source_version != completion.source_version
         {
             // The runtime triple matched the invocation, but the visible
             // document moved on before this reducer turn.
