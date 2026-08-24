@@ -652,11 +652,7 @@ fn e2e_refresh_with_changes_headless() {
     assert!(app.all_entries.len() > initial_count);
 
     // Modify a file and refresh.
-    std::fs::write(
-        repo.root().join("src/main.rs"),
-        "fn changed() {}\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root().join("src/main.rs"), "fn changed() {}\n").unwrap();
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
 
