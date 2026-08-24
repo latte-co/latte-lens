@@ -6924,6 +6924,10 @@ impl App {
     }
 
     fn request_navigation_picker_preview(&mut self) {
+        let picker_tab_id = self
+            .navigation_picker
+            .as_ref()
+            .map(|picker| picker.invocation.tab_id);
         let selected_target = self.navigation_picker.as_ref().and_then(|picker| {
             let row = picker
                 .list_state
@@ -6939,8 +6943,9 @@ impl App {
         });
         let Some(target) = selected_target else {
             self.navigation_preview_requests.invalidate();
-            self.runtime
-                .cancel_pending_content_for_tab(self.active_tab.value());
+            if let Some(tab_id) = picker_tab_id {
+                self.runtime.cancel_pending_content_for_tab(tab_id.value());
+            }
             if let Some(picker) = self.navigation_picker.as_mut() {
                 picker.preview = None;
                 picker.preview_loading = false;
@@ -6949,23 +6954,48 @@ impl App {
             return;
         };
 
-        if self
-            .tab()
-            .content
-            .navigation_source
-            .as_ref()
-            .is_some_and(|source| source.identity == target.document)
-        {
+        // Resolve the preview from the tab that initiated the picker,
+        // not the currently active tab — the user may have switched tabs.
+        let picker_has_source = picker_tab_id.is_some_and(|tab_id| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.content.navigation_source.as_ref())
+                .is_some_and(|source| source.identity == target.document)
+        });
+        if picker_has_source {
             self.navigation_preview_requests.invalidate();
-            self.runtime
-                .cancel_pending_content_for_tab(self.active_tab.value());
-            let preview = self
-                .resolve_target_in_current_document(&target)
-                .map(|range| NavigationPickerPreview {
-                    path: target.document.display_path(),
-                    lines: self.tab_mut().content.lines.clone(),
-                    highlights: self.tab_mut().content.highlights.clone(),
-                    target: range,
+            if let Some(tab_id) = picker_tab_id {
+                self.runtime.cancel_pending_content_for_tab(tab_id.value());
+            }
+            let preview = picker_tab_id
+                .and_then(|tab_id| self.tabs.iter().find(|tab| tab.id == tab_id))
+                .and_then(|tab| {
+                    tab.content
+                        .navigation_source
+                        .as_ref()
+                        .filter(|source| source.identity == target.document)
+                        .map(|_| (tab, target.clone()))
+                })
+                .and_then(|(tab, target)| {
+                    let source = tab.content.navigation_source.as_ref()?;
+                    let range = match target.range.clone() {
+                        NavigationTargetRange::Source(range) => source
+                            .line_index
+                            .to_utf16(range.start)
+                            .and_then(|_| source.line_index.to_utf16(range.end))
+                            .ok()
+                            .map(|_| range),
+                        NavigationTargetRange::Utf16(range) => {
+                            source.line_index.range_from_utf16(range).ok()
+                        }
+                    }?;
+                    Some(NavigationPickerPreview {
+                        path: target.document.display_path(),
+                        lines: tab.content.lines.clone(),
+                        highlights: tab.content.highlights.clone(),
+                        target: range,
+                    })
                 });
             if let Some(preview) = preview {
                 self.install_navigation_picker_preview(preview);
@@ -6990,7 +7020,7 @@ impl App {
         }
         self.runtime.request_content(ContentRequest {
             generation,
-            tab_id: self.active_tab.value(),
+            tab_id: picker_tab_id.map_or(0, |id| id.value()),
             kind: ContentKind::Preview,
             purpose: ContentPurpose::NavigationPreview {
                 navigation_generation,
@@ -10295,6 +10325,163 @@ mod tests {
         assert!(app.navigation_picker.is_none());
         assert_eq!(app.tab_mut().content.identity.as_ref(), Some(&target));
         assert_eq!(app.navigation_back.len(), 1);
+    }
+
+    #[test]
+    fn picker_preview_request_uses_invocation_tab_when_active_tab_has_switched() {
+        // Regression: the picker was opened on tab A, then the active tab
+        // switched to B which has a pending content request. The picker
+        // preview request must be tagged with tab A (the invoker); tagged
+        // with B it coalesces with and silently replaces tab B's request.
+        //
+        // Real tab switches close the picker, so the switch is simulated by
+        // moving `active_tab` directly — this locks the routing invariant
+        // independently of that UI behavior.
+        let mut app = navigation_app("fn caller() {}\n");
+        let tab_a = app.active_tab;
+
+        app.runtime.suspend_content_processing();
+
+        // Open tab B; its activation loads B's default content, leaving a
+        // pending display request tagged with B.
+        let tab_b = app.open_tab(TabKind::Files).unwrap();
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![(tab_b.value(), "display")]
+        );
+
+        // Switch back to A without reloading A's content (which would clear
+        // its navigation source), then open a cross-file picker on A.
+        app.active_tab = tab_a;
+        let caller = app.tab().content.identity.clone().unwrap();
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let target =
+            ContentIdentity::from_absolute(&app.root, &app.root.join("target.rs")).unwrap();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::References,
+            source_identity: caller,
+            source_version: app.tab().content.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: FocusPane::Content,
+            tab_id: tab_a,
+        };
+        app.open_navigation_picker(
+            "References",
+            invocation,
+            vec![NavigationPickerItem {
+                target: NavigationTarget {
+                    document: target,
+                    range: NavigationTargetRange::Utf16(lsp_types::Range::new(
+                        lsp_types::Position::new(0, 3),
+                        lsp_types::Position::new(0, 9),
+                    )),
+                },
+                label: "target.rs:1:4".to_owned(),
+                detail: None,
+            }],
+        );
+        // The first preview request is tagged A and coexists with B's display.
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![
+                (tab_b.value(), "display"),
+                (tab_a.value(), "navigation_preview")
+            ]
+        );
+
+        // The active tab switches to B while the picker stays open, then the
+        // picker requests its preview again (e.g. on a selection change).
+        app.active_tab = tab_b;
+        app.request_navigation_picker_preview();
+
+        // B's display request survives intact; the new preview request
+        // coalesces with A's existing preview under tab A.
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![
+                (tab_b.value(), "display"),
+                (tab_a.value(), "navigation_preview")
+            ]
+        );
+    }
+
+    #[test]
+    fn picker_preview_local_cancel_targets_invocation_tab_not_active_tab() {
+        // Regression: local (same-file) preview resolution cancels the picker
+        // invoker's stale pending request, never the active tab's. The tab
+        // switch is simulated directly (see the async test above).
+        let mut app = navigation_app("fn caller() {}\n");
+        let tab_a = app.active_tab;
+
+        app.runtime.suspend_content_processing();
+
+        // Tab B opens with a pending display request of its own.
+        let tab_b = app.open_tab(TabKind::Files).unwrap();
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![(tab_b.value(), "display")]
+        );
+
+        // Switch back to A without reloading its content and open a
+        // same-file picker there.
+        app.active_tab = tab_a;
+        let identity = app
+            .tab()
+            .content
+            .navigation_source
+            .as_ref()
+            .unwrap()
+            .identity
+            .clone();
+        let origin = app.current_navigation_entry().unwrap();
+        let generation = app.next_navigation_generation();
+        let invocation = NavigationInvocation {
+            generation,
+            operation: NavigationOperation::DocumentSymbols,
+            source_identity: identity.clone(),
+            source_version: app.tab().content.navigation_document_version,
+            origin,
+            history_intent: NavigationHistoryIntent::Jump,
+            destination_viewport: None,
+            return_focus: FocusPane::Content,
+            tab_id: tab_a,
+        };
+        app.open_navigation_picker(
+            "Document Symbols",
+            invocation,
+            vec![NavigationPickerItem {
+                target: NavigationTarget {
+                    document: identity,
+                    range: NavigationTargetRange::Source(SourceRange {
+                        start: SourcePosition { line: 0, byte: 3 },
+                        end: SourcePosition { line: 0, byte: 9 },
+                    }),
+                },
+                label: "caller.rs:1:4 · caller".to_owned(),
+                detail: None,
+            }],
+        );
+        // Local resolution needs no worker request; B's display survives.
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![(tab_b.value(), "display")]
+        );
+
+        // The active tab switches to B while the picker stays open, then the
+        // picker re-requests its local preview.
+        app.active_tab = tab_b;
+        app.request_navigation_picker_preview();
+
+        // The cancel targets tab A (the invoker, which has nothing pending),
+        // leaving tab B's display request untouched.
+        assert_eq!(
+            app.runtime.pending_content_summary(),
+            vec![(tab_b.value(), "display")]
+        );
     }
 
     #[test]

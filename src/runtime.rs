@@ -417,6 +417,22 @@ struct SharedState {
     completed_content: VecDeque<ContentCompletion>,
     completed_external_open: Option<ExternalOpenCompletion>,
     preview_registry_update: Option<PreviewRegistry>,
+    /// Test-only gate: when true the worker leaves content requests pending
+    /// instead of processing them, so queue assertions are deterministic.
+    #[cfg(test)]
+    content_suspended: bool,
+}
+
+impl SharedState {
+    #[cfg(test)]
+    const fn content_suspended(&self) -> bool {
+        self.content_suspended
+    }
+
+    #[cfg(not(test))]
+    const fn content_suspended(&self) -> bool {
+        false
+    }
 }
 
 struct Shared {
@@ -490,6 +506,36 @@ impl WorkerRuntime {
     pub fn cancel_pending_content_for_tab(&self, tab_id: u64) {
         let mut state = self.lock_state();
         state.content.cancel_pending_for_tab(tab_id);
+    }
+
+    /// Test-only: park the worker so content requests stay queued. The
+    /// worker keeps handling refresh/directory/external-open work but leaves
+    /// content requests pending for deterministic queue assertions.
+    #[cfg(test)]
+    pub(crate) fn suspend_content_processing(&self) {
+        let mut state = self.lock_state();
+        state.content_suspended = true;
+        self.shared.changed.notify_all();
+    }
+
+    /// Test-only: pending content requests as `(tab_id, purpose)` pairs in
+    /// queue order, so per-tab coalescing can be asserted deterministically.
+    #[cfg(test)]
+    pub(crate) fn pending_content_summary(&self) -> Vec<(u64, &'static str)> {
+        let state = self.lock_state();
+        state
+            .content
+            .pending
+            .iter()
+            .map(|request| {
+                let purpose = match request.purpose {
+                    ContentPurpose::Display => "display",
+                    ContentPurpose::NavigationStage { .. } => "navigation_stage",
+                    ContentPurpose::NavigationPreview { .. } => "navigation_preview",
+                };
+                (request.tab_id, purpose)
+            })
+            .collect()
     }
 
     pub fn cancel_pending_external_open(&self) {
@@ -595,7 +641,7 @@ fn worker_loop(
             while !state.shutdown
                 && state.refresh.pending.is_none()
                 && state.directory.pending.is_empty()
-                && state.content.pending.is_empty()
+                && (state.content.pending.is_empty() || state.content_suspended())
                 && state.external_open.pending.is_none()
                 && state.preview_registry_update.is_none()
             {
@@ -702,7 +748,9 @@ fn take_next_work(state: &mut SharedState) -> Option<Work> {
     if let Some(request) = state.directory.start_next() {
         return Some(Work::Directory(request));
     }
-    if let Some(request) = state.content.start_next() {
+    if !state.content_suspended()
+        && let Some(request) = state.content.start_next()
+    {
         return Some(Work::Content(request));
     }
     state.external_open.start_next().map(Work::ExternalOpen)
