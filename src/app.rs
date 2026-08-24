@@ -6897,7 +6897,21 @@ impl App {
         let Some(item) = picker.results.get(result_index) else {
             return;
         };
+        // Route the navigation to the tab that initiated the picker,
+        // not the currently active tab — the user may have switched
+        // tabs while the picker was open.
+        let target_tab = picker.invocation.tab_id;
+        if !self.tabs.iter().any(|tab| tab.id == target_tab) {
+            return;
+        }
+        let original_tab = self.active_tab;
+        let original_scope = self.tree_scope;
+        self.active_tab = target_tab;
         self.accept_navigation_target(picker.invocation, item.target.clone());
+        self.active_tab = original_tab;
+        if self.tree_scope != original_scope {
+            self.apply_tree_scope(original_scope);
+        }
     }
 
     fn close_navigation_picker(&mut self) {
