@@ -4604,7 +4604,7 @@ impl App {
         for completion in directories {
             self.apply_directory_completion(completion);
         }
-        if let Some(completion) = content {
+        for completion in content {
             self.apply_content_completion(completion);
         }
         if let Some(completion) = external_open {
