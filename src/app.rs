@@ -737,6 +737,11 @@ pub struct ContentState {
     /// which file the diff belongs to so that review toggles and diff
     /// navigation stay scoped to the tab that loaded them.
     current_diff_path: Option<RepoPath>,
+    /// Per-tab pending diff path paired with the content request generation.
+    /// When a diff request is in flight, this carries the review identity so
+    /// the completion can bind it to the tab that initiated the request,
+    /// even if another tab starts a diff request in the meantime.
+    pending_diff_path: Option<(u64, RepoPath)>,
     /// Per-tab content request generation.  Each tab owns its own
     /// generation counter so that concurrent preview/diff requests across
     /// tabs do not discard each other's completions (a global gate would
@@ -775,6 +780,7 @@ impl Default for ContentState {
             navigation_source: None,
             navigation_document_version: DocumentVersion(0),
             current_diff_path: None,
+            pending_diff_path: None,
             content_requests: RequestGeneration::default(),
         }
     }
@@ -938,7 +944,6 @@ pub struct App {
     tree_epoch: u64,
     git_changes_expansion: HashMap<GitRowIdentity, bool>,
     reviewed_change_versions: HashMap<RepoPath, ChangeVersion>,
-    pending_diff_path: Option<(u64, RepoPath)>,
     git_rows: Vec<GitTreeRow>,
     visible_git_rows: Vec<GitTreeRow>,
     scan_entry_limit: usize,
@@ -1288,7 +1293,6 @@ impl App {
             tree_epoch: 0,
             git_changes_expansion: HashMap::new(),
             reviewed_change_versions: HashMap::new(),
-            pending_diff_path: None,
             git_rows: Vec::new(),
             visible_git_rows: Vec::new(),
             scan_entry_limit,
@@ -5907,7 +5911,7 @@ impl App {
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(ContentMode::Preview);
-        self.pending_diff_path = None;
+        self.tab_mut().content.pending_diff_path = None;
         self.tab_mut().content.lines =
             vec![format!("Rendering {} for this terminal…", pending.label)];
         self.runtime.request_content(ContentRequest {
@@ -5950,7 +5954,7 @@ impl App {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         });
-        self.pending_diff_path = review_path.map(|path| (generation, path));
+        self.tab_mut().content.pending_diff_path = review_path.map(|path| (generation, path));
         self.tab_mut().content.lines = vec![format!("Loading {label}…")];
         self.runtime.request_content(ContentRequest {
             generation,
@@ -7071,7 +7075,7 @@ impl App {
         let original_tab = self.active_tab;
         if !self.tabs.iter().any(|tab| tab.id == tab_id) {
             // The requesting tab was closed before the completion arrived.
-            self.pending_diff_path = None;
+            // Its ContentState (including pending_diff_path) is gone with it.
             return;
         }
         self.active_tab = tab_id;
@@ -7080,6 +7084,8 @@ impl App {
             ContentKind::Preview => ContentMode::Preview,
         };
         let completed_diff_path = self
+            .tab_mut()
+            .content
             .pending_diff_path
             .take()
             .filter(|(pending_generation, _)| *pending_generation == generation)
@@ -7293,7 +7299,7 @@ impl App {
         self.cancel_pending_navigation();
         self.invalidate_active_tab_content_request();
         self.runtime.cancel_pending_content();
-        self.pending_diff_path = None;
+        self.tab_mut().content.pending_diff_path = None;
         self.cache_current_folds();
         self.cancel_external_open();
         self.reset_content(ContentMode::Info);
@@ -8809,6 +8815,75 @@ mod tests {
             .lines
             .clone();
         assert_eq!(content_b, ["tab B content"]);
+    }
+
+    #[test]
+    fn concurrent_tab_diff_requests_bind_review_identity_to_originator() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+
+        let tab_a = app.active_tab_id();
+        let tab_b = app.open_tab(TabKind::Files).expect("second tab");
+        assert_ne!(tab_a, tab_b);
+
+        // Simulate a diff request on tab A with review path "a.txt".
+        app.activate_tab(tab_a);
+        let gen_a = app.begin_active_tab_content_request();
+        let path_a = RepoPath {
+            repo_id: RepoId::for_test("repo"),
+            relative: PathBuf::from("a.txt"),
+        };
+        app.tab_mut().content.pending_diff_path = Some((gen_a, path_a.clone()));
+
+        // Switch to tab B and start a diff request with review path "b.txt".
+        // Without per-tab pending_diff_path, this would overwrite tab A's
+        // review identity.
+        app.activate_tab(tab_b);
+        let gen_b = app.begin_active_tab_content_request();
+        let path_b = RepoPath {
+            repo_id: RepoId::for_test("repo"),
+            relative: PathBuf::from("b.txt"),
+        };
+        app.tab_mut().content.pending_diff_path = Some((gen_b, path_b.clone()));
+
+        // Tab A's diff completion arrives first and must bind path_a.
+        app.apply_content_completion(ContentCompletion {
+            generation: gen_a,
+            tab_id: tab_a.value(),
+            kind: ContentKind::Diff,
+            purpose: ContentPurpose::Display,
+            result: Ok(content_snapshot("diff a")),
+        });
+
+        let diff_a = app
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_a)
+            .unwrap()
+            .content
+            .current_diff_path
+            .clone();
+        assert_eq!(diff_a, Some(path_a), "tab A must bind its own review path");
+
+        // Tab B's diff completion then arrives and must bind path_b.
+        app.apply_content_completion(ContentCompletion {
+            generation: gen_b,
+            tab_id: tab_b.value(),
+            kind: ContentKind::Diff,
+            purpose: ContentPurpose::Display,
+            result: Ok(content_snapshot("diff b")),
+        });
+
+        let diff_b = app
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_b)
+            .unwrap()
+            .content
+            .current_diff_path
+            .clone();
+        assert_eq!(diff_b, Some(path_b), "tab B must bind its own review path");
     }
 
     #[test]

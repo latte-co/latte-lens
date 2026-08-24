@@ -29,6 +29,11 @@ impl RepoId {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
