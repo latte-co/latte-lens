@@ -785,6 +785,12 @@ impl Default for ContentState {
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct TabId(u64);
 
+impl TabId {
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// What a tab shows. Determines the projection (left pane) kind and the
 /// default content (right pane) behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -981,7 +987,6 @@ pub struct App {
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
-    content_request_tab: Option<TabId>,
 }
 
 impl App {
@@ -1331,7 +1336,6 @@ impl App {
             navigation_status: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
-            content_request_tab: None,
         };
         app.request_refresh(false);
         Ok(app)
@@ -3060,7 +3064,6 @@ impl App {
         self.last_search_click = None;
         if restore_content {
             self.invalidate_all_content_requests();
-            self.content_request_tab = None;
             self.runtime.cancel_pending_content();
             let restored_tree_state = restore.tree_state;
             self.focused_pane = restore.focused_pane;
@@ -4012,10 +4015,10 @@ impl App {
     }
 
     /// Begin a content request on the active tab's per-tab generation
-    /// counter and bind it via `content_request_tab`.
+    /// counter. The tab identity travels with the [`ContentRequest`] so the
+    /// completion is routed back without a global slot.
     fn begin_active_tab_content_request(&mut self) -> u64 {
         let tab_id = self.active_tab;
-        self.content_request_tab = Some(tab_id);
         self.begin_content_request(tab_id)
     }
 
@@ -4038,6 +4041,16 @@ impl App {
     /// Invalidate all pending content requests across every tab.
     fn invalidate_all_content_requests(&mut self) {
         for tab in &mut self.tabs {
+            tab.content.content_requests.invalidate();
+        }
+    }
+
+    /// Invalidate the active tab's pending content request only.
+    /// Used when the active tab's content is replaced by an info message,
+    /// without disturbing in-flight requests on other tabs.
+    fn invalidate_active_tab_content_request(&mut self) {
+        let tab_id = self.active_tab;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             tab.content.content_requests.invalidate();
         }
     }
@@ -5899,6 +5912,7 @@ impl App {
             vec![format!("Rendering {} for this terminal…", pending.label)];
         self.runtime.request_content(ContentRequest {
             generation,
+            tab_id: self.active_tab.value(),
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             target: pending.target,
@@ -5940,6 +5954,7 @@ impl App {
         self.tab_mut().content.lines = vec![format!("Loading {label}…")];
         self.runtime.request_content(ContentRequest {
             generation,
+            tab_id: self.active_tab.value(),
             kind,
             purpose: ContentPurpose::Display,
             target,
@@ -6006,7 +6021,6 @@ impl App {
         if let Some(stage) = self.pending_navigation_stage.take() {
             self.navigation_runtime.cancel(stage.invocation.generation);
             self.invalidate_all_content_requests();
-            self.content_request_tab = None;
             self.runtime.cancel_pending_content();
         }
         self.navigation_picker = None;
@@ -6428,6 +6442,7 @@ impl App {
         let content_generation = self.begin_active_tab_content_request();
         self.runtime.request_content(ContentRequest {
             generation: content_generation,
+            tab_id: self.active_tab.value(),
             kind: ContentKind::Preview,
             purpose: ContentPurpose::NavigationStage {
                 navigation_generation: invocation.generation,
@@ -6904,6 +6919,7 @@ impl App {
         }
         self.runtime.request_content(ContentRequest {
             generation,
+            tab_id: self.active_tab.value(),
             kind: ContentKind::Preview,
             purpose: ContentPurpose::NavigationPreview {
                 navigation_generation,
@@ -7013,6 +7029,7 @@ impl App {
     fn apply_content_completion(&mut self, completion: ContentCompletion) {
         let ContentCompletion {
             generation,
+            tab_id,
             kind,
             purpose,
             result,
@@ -7034,7 +7051,7 @@ impl App {
                 .pending_navigation_stage
                 .as_ref()
                 .map(|stage| stage.tab_id),
-            _ => self.content_request_tab,
+            _ => Some(TabId(tab_id)),
         };
         let Some(tab_id) = target_tab else {
             return;
@@ -7049,21 +7066,15 @@ impl App {
             self.apply_navigation_stage_completion(navigation_generation, generation, result);
             return;
         }
-        // Bind the completion to the tab that initiated the request so that
+        // The completion carries the tab identity of the initiator, so
         // switching tabs mid-flight does not overwrite the wrong tab's content.
-        let target_tab = self.content_request_tab.take();
         let original_tab = self.active_tab;
-        let target_exists = target_tab
-            .map(|id| self.tabs.iter().any(|tab| tab.id == id))
-            .unwrap_or(true);
-        if !target_exists {
+        if !self.tabs.iter().any(|tab| tab.id == tab_id) {
             // The requesting tab was closed before the completion arrived.
             self.pending_diff_path = None;
             return;
         }
-        if let Some(tab_id) = target_tab {
-            self.active_tab = tab_id;
-        }
+        self.active_tab = tab_id;
         let mode = match kind {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
@@ -7280,8 +7291,7 @@ impl App {
 
     fn set_info(&mut self, lines: Vec<String>) {
         self.cancel_pending_navigation();
-        self.invalidate_all_content_requests();
-        self.content_request_tab = None;
+        self.invalidate_active_tab_content_request();
         self.runtime.cancel_pending_content();
         self.pending_diff_path = None;
         self.cache_current_folds();
@@ -8703,6 +8713,7 @@ mod tests {
         app.tab_mut().content.lines = vec!["Loading current diff…".to_owned()];
         app.apply_content_completion(ContentCompletion {
             generation: stale_preview,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             result: Ok(content_snapshot("obsolete preview")),
@@ -8714,6 +8725,7 @@ mod tests {
 
         app.apply_content_completion(ContentCompletion {
             generation: current_diff,
+            tab_id: 0,
             kind: ContentKind::Diff,
             purpose: ContentPurpose::Display,
             result: Ok(content_snapshot("current diff")),
@@ -8721,6 +8733,82 @@ mod tests {
         assert!(!app.is_content_loading());
         assert_eq!(app.tab_mut().content.mode, ContentMode::Diff);
         assert_eq!(app.tab_mut().content.lines, ["current diff"]);
+    }
+
+    #[test]
+    fn concurrent_tab_content_requests_route_completions_to_originator() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), "fixture").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+
+        // Capture the first tab's identity before opening a second one.
+        let tab_a = app.active_tab_id();
+
+        // Open a second Files tab so both tabs share the same TreeScope.
+        // open_tab activates the new tab, so tab_b is now active.
+        let tab_b = app.open_tab(TabKind::Files).expect("second tab");
+        assert_ne!(tab_a, tab_b);
+
+        // Start a content request on tab A.
+        app.activate_tab(tab_a);
+        let gen_a = app.begin_active_tab_content_request();
+
+        // Switch to tab B and start a content request there too.
+        // Each tab has its own RequestGeneration counter; the tab_id
+        // carried by the completion is what routes it correctly.
+        app.activate_tab(tab_b);
+        let gen_b = app.begin_active_tab_content_request();
+
+        // Tab A's completion arrives first (out of order) and must land on
+        // tab A, not the currently-active tab B.
+        app.apply_content_completion(ContentCompletion {
+            generation: gen_a,
+            tab_id: tab_a.value(),
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            result: Ok(content_snapshot("tab A content")),
+        });
+
+        let content_a = app
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_a)
+            .unwrap()
+            .content
+            .lines
+            .clone();
+        let content_b = app
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_b)
+            .unwrap()
+            .content
+            .lines
+            .clone();
+        assert_eq!(content_a, ["tab A content"]);
+        assert_ne!(
+            content_b, content_a,
+            "tab B must not receive tab A's completion"
+        );
+
+        // Tab B's completion then arrives and lands on tab B.
+        app.apply_content_completion(ContentCompletion {
+            generation: gen_b,
+            tab_id: tab_b.value(),
+            kind: ContentKind::Preview,
+            purpose: ContentPurpose::Display,
+            result: Ok(content_snapshot("tab B content")),
+        });
+
+        let content_b = app
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_b)
+            .unwrap()
+            .content
+            .lines
+            .clone();
+        assert_eq!(content_b, ["tab B content"]);
     }
 
     #[test]
@@ -8745,6 +8833,7 @@ mod tests {
         let content = app.begin_active_tab_content_request();
         app.apply_content_completion(ContentCompletion {
             generation: content,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             result: Ok(content_snapshot("recovered content")),
@@ -8757,6 +8846,7 @@ mod tests {
         let content = app.begin_active_tab_content_request();
         app.apply_content_completion(ContentCompletion {
             generation: content,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             result: Err("fixture content error".to_owned()),
@@ -9610,6 +9700,7 @@ mod tests {
         let generation = app.begin_active_tab_content_request();
         app.apply_content_completion(ContentCompletion {
             generation,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             result: Ok(ContentSnapshot {
@@ -10214,6 +10305,7 @@ mod tests {
 
         app.apply_content_completion(ContentCompletion {
             generation: stage.content_generation,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::NavigationStage {
                 navigation_generation: stage.invocation.generation,

@@ -52,6 +52,7 @@ pub(crate) struct DirectoryRequest {
 #[derive(Debug)]
 pub(crate) struct ContentRequest {
     pub generation: u64,
+    pub tab_id: u64,
     pub kind: ContentKind,
     pub purpose: ContentPurpose,
     pub target: ContentTarget,
@@ -222,6 +223,7 @@ pub(crate) struct DirectoryCompletion {
 #[derive(Debug)]
 pub(crate) struct ContentCompletion {
     pub generation: u64,
+    pub tab_id: u64,
     pub kind: ContentKind,
     pub purpose: ContentPurpose,
     pub result: Result<ContentSnapshot, String>,
@@ -594,6 +596,7 @@ fn worker_loop(
             }
             Work::Content(request) => {
                 let generation = request.generation;
+                let tab_id = request.tab_id;
                 let kind = request.kind;
                 let purpose = request.purpose;
                 let result = catch_worker_error(|| {
@@ -606,6 +609,7 @@ fn worker_loop(
                 state.content.complete();
                 state.completed_content = Some(ContentCompletion {
                     generation,
+                    tab_id,
                     kind,
                     purpose,
                     result,
@@ -1138,6 +1142,7 @@ mod tests {
         let mut slot = RequestSlot::default();
         slot.submit(ContentRequest {
             generation: 1,
+            tab_id: 0,
             kind: ContentKind::Preview,
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
@@ -1148,6 +1153,7 @@ mod tests {
         for generation in 2..=100 {
             slot.submit(ContentRequest {
                 generation,
+                tab_id: 0,
                 kind: ContentKind::Preview,
                 purpose: ContentPurpose::Display,
                 target: ContentTarget::Workspace(PathBuf::from(format!("{generation}.txt"))),
