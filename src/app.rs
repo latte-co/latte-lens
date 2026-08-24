@@ -5999,7 +5999,8 @@ impl App {
 
     fn next_navigation_generation(&mut self) -> u64 {
         self.navigation_preview_requests.invalidate();
-        self.runtime.cancel_pending_content();
+        self.runtime
+            .cancel_pending_content_for_tab(self.active_tab.value());
         if let Some(invocation) = self.navigation_invocation.take() {
             self.navigation_runtime.cancel(invocation.generation);
         }
@@ -6018,7 +6019,8 @@ impl App {
 
     fn cancel_pending_navigation(&mut self) {
         self.navigation_preview_requests.invalidate();
-        self.runtime.cancel_pending_content();
+        self.runtime
+            .cancel_pending_content_for_tab(self.active_tab.value());
         if let Some(invocation) = self.navigation_invocation.take() {
             self.navigation_runtime.cancel(invocation.generation);
         }
@@ -6840,7 +6842,8 @@ impl App {
             return;
         };
         self.navigation_preview_requests.invalidate();
-        self.runtime.cancel_pending_content();
+        self.runtime
+            .cancel_pending_content_for_tab(self.active_tab.value());
         let Some(picker) = self.navigation_picker.take() else {
             return;
         };
@@ -6852,7 +6855,8 @@ impl App {
 
     fn close_navigation_picker(&mut self) {
         self.navigation_preview_requests.invalidate();
-        self.runtime.cancel_pending_content();
+        self.runtime
+            .cancel_pending_content_for_tab(self.active_tab.value());
         if let Some(picker) = self.navigation_picker.take() {
             self.focused_pane = picker.return_focus;
         }
@@ -6874,7 +6878,8 @@ impl App {
         });
         let Some(target) = selected_target else {
             self.navigation_preview_requests.invalidate();
-            self.runtime.cancel_pending_content();
+            self.runtime
+                .cancel_pending_content_for_tab(self.active_tab.value());
             if let Some(picker) = self.navigation_picker.as_mut() {
                 picker.preview = None;
                 picker.preview_loading = false;
@@ -6891,7 +6896,8 @@ impl App {
             .is_some_and(|source| source.identity == target.document)
         {
             self.navigation_preview_requests.invalidate();
-            self.runtime.cancel_pending_content();
+            self.runtime
+                .cancel_pending_content_for_tab(self.active_tab.value());
             let preview = self
                 .resolve_target_in_current_document(&target)
                 .map(|range| NavigationPickerPreview {
@@ -7298,7 +7304,8 @@ impl App {
     fn set_info(&mut self, lines: Vec<String>) {
         self.cancel_pending_navigation();
         self.invalidate_active_tab_content_request();
-        self.runtime.cancel_pending_content();
+        self.runtime
+            .cancel_pending_content_for_tab(self.active_tab.value());
         self.tab_mut().content.pending_diff_path = None;
         self.cache_current_folds();
         self.cancel_external_open();

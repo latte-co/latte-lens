@@ -355,6 +355,12 @@ impl ContentQueue {
         self.pending.clear();
     }
 
+    /// Remove only the pending request for the given tab, leaving other
+    /// tabs' in-flight requests untouched.
+    fn cancel_pending_for_tab(&mut self, tab_id: u64) {
+        self.pending.retain(|r| r.tab_id != tab_id);
+    }
+
     fn has_work(&self) -> bool {
         self.active || !self.pending.is_empty()
     }
@@ -477,6 +483,13 @@ impl WorkerRuntime {
     pub fn cancel_pending_content(&self) {
         let mut state = self.lock_state();
         state.content.cancel_pending();
+    }
+
+    /// Cancel only the pending content request for the given tab, leaving
+    /// other tabs' in-flight requests untouched.
+    pub fn cancel_pending_content_for_tab(&self, tab_id: u64) {
+        let mut state = self.lock_state();
+        state.content.cancel_pending_for_tab(tab_id);
     }
 
     pub fn cancel_pending_external_open(&self) {
