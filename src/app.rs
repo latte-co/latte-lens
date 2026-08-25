@@ -1280,6 +1280,7 @@ impl App {
             String::new(),
             "The file tree and repository state are being scanned in the background.".to_owned(),
         ];
+        let layout = crate::config::load_layout_state();
         let mut app = Self {
             root,
             repo: None,
@@ -1290,7 +1291,11 @@ impl App {
             active_tab: TabId(0),
             next_tab_id: 1,
             tree_scope: TreeScope::AllFiles,
-            focused_pane: FocusPane::Tree,
+            focused_pane: if layout.tree_hidden {
+                FocusPane::Content
+            } else {
+                FocusPane::Tree
+            },
             pending_clipboard_text: None,
             clipboard_status: None,
             fold_cache: VecDeque::new(),
@@ -1319,8 +1324,8 @@ impl App {
             visible_git_rows: Vec::new(),
             existing_changes: HashSet::new(),
             ignored_error_paths: crate::config::load_ignored_error_paths(),
-            tree_side: crate::config::load_layout_state().tree_side,
-            tree_hidden: crate::config::load_layout_state().tree_hidden,
+            tree_side: layout.tree_side,
+            tree_hidden: layout.tree_hidden,
             scan_entry_limit,
             runtime,
             refresh_requests: RequestGeneration::default(),
@@ -1500,10 +1505,14 @@ impl App {
     }
 
     /// Toggle the tree pane between docked and collapsed, persisting the
-    /// choice. Content focus is unaffected; a hidden tree simply yields its
-    /// width to the content pane.
+    /// choice. Hiding the tree moves focus to the content pane so key
+    /// routing never targets the invisible tree; showing keeps the current
+    /// focus.
     pub(crate) fn toggle_tree_visibility(&mut self) {
         self.tree_hidden = !self.tree_hidden;
+        if self.tree_hidden && self.focused_pane == FocusPane::Tree {
+            self.focused_pane = FocusPane::Content;
+        }
         self.persist_layout();
     }
 
@@ -2126,7 +2135,9 @@ impl App {
             (KeyCode::Char('n' | 'N'), KeyModifiers::CONTROL) => {
                 self.new_tab_menu = Some(NewTabMenuState::new());
             }
-            (KeyCode::Char('h'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
+            (KeyCode::Char('h'), KeyModifiers::NONE) if !self.tree_hidden => {
+                self.focused_pane = FocusPane::Tree;
+            }
             (KeyCode::Char('l'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
             (KeyCode::Char('r'), _) => {
                 #[cfg(feature = "agent-observability")]
@@ -3104,7 +3115,11 @@ impl App {
             self.reveal_all_files_selection(result.path.clone());
         }
         if result.is_dir {
-            self.focused_pane = FocusPane::Tree;
+            self.focused_pane = if self.tree_hidden {
+                FocusPane::Content
+            } else {
+                FocusPane::Tree
+            };
             self.load_selected_info();
         } else {
             self.focused_pane = FocusPane::Content;
@@ -3337,7 +3352,11 @@ impl App {
                 }
                 if self.ui_regions.refresh_at(mouse.column, mouse.row) {
                     self.clear_content_selection();
-                    self.focused_pane = FocusPane::Tree;
+                    self.focused_pane = if self.tree_hidden {
+                        FocusPane::Content
+                    } else {
+                        FocusPane::Tree
+                    };
                     self.last_tree_click = None;
                     self.request_refresh(self.tree_scope == TreeScope::GitChanges);
                     return;
@@ -4215,7 +4234,9 @@ impl App {
             (KeyCode::PageUp, _) => self.scroll_content(-12, 0),
             (KeyCode::Left, KeyModifiers::SHIFT) => self.scroll_content(0, -4),
             (KeyCode::Right, KeyModifiers::SHIFT) => self.scroll_content(0, 4),
-            (KeyCode::Left, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
+            (KeyCode::Left, KeyModifiers::NONE) if !self.tree_hidden => {
+                self.focused_pane = FocusPane::Tree;
+            }
             (KeyCode::Right, KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
             (KeyCode::Home | KeyCode::Char('g'), _) => {
                 self.tab_mut().content.scroll = 0;
@@ -10033,6 +10054,70 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::CONTROL));
         assert!(!app.tree_hidden);
         assert_eq!(app.tree_panel_width(120), shown);
+    }
+
+    #[test]
+    fn hiding_tree_moves_focus_to_content_and_keeps_it_on_show() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("state").into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        assert_eq!(app.focused_pane, FocusPane::Tree);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(app.tree_hidden);
+        assert_eq!(app.focused_pane, FocusPane::Content);
+
+        // Showing again keeps content focus; the tree does not steal it back.
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(!app.tree_hidden);
+        assert_eq!(app.focused_pane, FocusPane::Content);
+    }
+
+    #[test]
+    fn hidden_tree_rejects_focus_migration_keys() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("state").into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.toggle_tree_visibility();
+        assert_eq!(app.focused_pane, FocusPane::Content);
+
+        // Neither the global `h` binding nor the content-pane Left binding may
+        // route focus back to the invisible tree.
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.focused_pane, FocusPane::Content);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.focused_pane, FocusPane::Content);
+    }
+
+    #[test]
+    fn hidden_layout_starts_with_content_focus() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("layout.json"),
+            r#"{"tree_side":"right","tree_hidden":true}"#,
+        )
+        .unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(state_dir.into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let app = App::new(workspace.path().to_path_buf()).unwrap();
+        assert!(app.tree_hidden);
+        assert_eq!(app.focused_pane, FocusPane::Content);
     }
 
     #[test]

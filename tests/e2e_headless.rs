@@ -45,11 +45,12 @@ fn settle(app: &mut App) {
 
 fn ready_app(path: PathBuf) -> anyhow::Result<App> {
     let mut app = App::with_system_open_disabled(path)?;
-    // Pin the tree to the left and visible so layout assertions stay
-    // deterministic; the right-side default and collapse are covered by
-    // unit tests.
+    // Pin the tree to the left, visible, and focused so layout and key
+    // routing assertions stay deterministic; the right-side default and
+    // collapse are covered by unit tests.
     app.set_tree_side(TreeSide::Left);
     app.set_tree_hidden(false);
+    app.focused_pane = FocusPane::Tree;
     settle(&mut app);
     Ok(app)
 }
