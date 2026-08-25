@@ -8030,6 +8030,12 @@ fn build_git_rows(
             &mut rows,
         );
     }
+    let symlink_targets: HashMap<PathBuf, PathBuf> = graph
+        .report()
+        .symlinks
+        .iter()
+        .map(|(access, target)| (access.clone(), target.clone()))
+        .collect();
     walk_virtual_trie(
         &trie,
         Path::new(""),
@@ -8039,6 +8045,7 @@ fn build_git_rows(
         &children,
         &change_projection,
         &issues_by_node,
+        &symlink_targets,
         &mut rows,
     );
     for error in unattached_issues {
@@ -8139,6 +8146,7 @@ fn walk_virtual_trie(
     children: &HashMap<RepoId, Vec<RepoId>>,
     change_projection: &GitChangeProjection<'_>,
     issues_by_node: &HashMap<PathBuf, Vec<&DiscoveryError>>,
+    symlink_targets: &HashMap<PathBuf, PathBuf>,
     rows: &mut Vec<GitTreeRow>,
 ) {
     // Directories (nodes with children or no repository) sort before
@@ -8176,6 +8184,7 @@ fn walk_virtual_trie(
                 children,
                 change_projection,
                 issues_by_node,
+                symlink_targets,
                 rows,
             );
             emit_node_issues(&child_path, &nested_ancestors, root, issues_by_node, rows);
@@ -8187,6 +8196,7 @@ fn walk_virtual_trie(
                 &name.to_string_lossy(),
                 ancestors.len(),
                 ancestors,
+                symlink_targets.get(&child_path).map(PathBuf::as_path),
             ));
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(dir_identity);
@@ -8199,6 +8209,7 @@ fn walk_virtual_trie(
                 children,
                 change_projection,
                 issues_by_node,
+                symlink_targets,
                 rows,
             );
             emit_node_issues(&child_path, &child_ancestors, root, issues_by_node, rows);
@@ -8212,19 +8223,25 @@ fn virtual_directory_row(
     name: &str,
     depth: usize,
     ancestors: &[GitRowIdentity],
+    symlink_target: Option<&Path>,
 ) -> GitTreeRow {
+    let counts = format!(
+        "{} repo{} · {} change{}",
+        node.repo_count,
+        if node.repo_count == 1 { "" } else { "s" },
+        node.change_count,
+        if node.change_count == 1 { "" } else { "s" },
+    );
+    let detail = match symlink_target {
+        Some(target) => format!("→ {} · {}", target.display(), counts),
+        None => counts,
+    };
     GitTreeRow {
         identity: GitRowIdentity::VirtualDirectory(path.to_path_buf()),
         kind: GitRowKind::Directory,
         depth,
         label: name.to_owned(),
-        detail: format!(
-            "{} repo{} · {} change{}",
-            node.repo_count,
-            if node.repo_count == 1 { "" } else { "s" },
-            node.change_count,
-            if node.change_count == 1 { "" } else { "s" },
-        ),
+        detail,
         status: None,
         exists: true,
         ancestors: ancestors.to_vec(),
@@ -8512,6 +8529,9 @@ pub(crate) fn display_workspace_path(path: &Path) -> String {
 
 fn repository_detail(snapshot: &RepoSnapshot, status_error: Option<&str>) -> String {
     let mut parts = vec![repo_kind_label(snapshot.node.kind).to_owned()];
+    if snapshot.node.kind == RepoKind::Symlinked {
+        parts.push(format!("→ {}", snapshot.node.worktree.display()));
+    }
     if let Some(branch) = &snapshot.branch {
         parts.push(branch.clone());
     }
@@ -8564,6 +8584,7 @@ const fn repo_kind_label(kind: RepoKind) -> &'static str {
         RepoKind::Containing => "containing",
         RepoKind::Nested => "nested",
         RepoKind::LinkedWorktree => "worktree",
+        RepoKind::Symlinked => "symlink",
         RepoKind::Submodule => "submodule",
         RepoKind::SubmodulePlaceholder => "submodule placeholder",
     }
@@ -9667,6 +9688,270 @@ mod tests {
             .find(|row| row.label == "solo")
             .expect("solo row");
         assert_eq!(solo.depth, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_changes_follows_directory_symlink_to_repo() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let external = tempfile::tempdir().unwrap();
+        init_git_repository(&external.path().join("linked-repo"));
+        symlink(external.path(), root.join("link")).unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        assert!(
+            graph.report().errors.is_empty(),
+            "{:?}",
+            graph.report().errors
+        );
+        let snapshot = graph
+            .repositories()
+            .iter()
+            .find(|snapshot| snapshot.node.kind == RepoKind::Symlinked)
+            .expect("symlinked repository");
+        assert_eq!(
+            snapshot.node.workspace_relative,
+            Some(PathBuf::from("link/linked-repo"))
+        );
+        assert!(
+            graph
+                .report()
+                .symlinks
+                .iter()
+                .any(|(access, _)| access == Path::new("link"))
+        );
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        let rows = app.visible_git_rows();
+        let link = rows
+            .iter()
+            .find(|row| {
+                row.label == "link" && matches!(row.identity, GitRowIdentity::VirtualDirectory(_))
+            })
+            .expect("virtual directory for the symlink");
+        assert!(link.detail.starts_with("→ "), "{}", link.detail);
+        let repo = rows
+            .iter()
+            .find(|row| row.label == "linked-repo")
+            .expect("linked repository row");
+        assert!(repo.ancestors.contains(&link.identity));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_changes_follows_symlink_to_repository_root() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let external = tempfile::tempdir().unwrap();
+        let repo_path = external.path().join("direct-repo");
+        init_git_repository(&repo_path);
+        symlink(&repo_path, root.join("repo-link")).unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        assert!(
+            graph.report().errors.is_empty(),
+            "{:?}",
+            graph.report().errors
+        );
+        let snapshot = graph
+            .repositories()
+            .iter()
+            .find(|snapshot| snapshot.node.kind == RepoKind::Symlinked)
+            .expect("symlinked repository");
+        assert_eq!(
+            snapshot.node.workspace_relative,
+            Some(PathBuf::from("repo-link"))
+        );
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        let rows = app.visible_git_rows();
+        let repo = rows
+            .iter()
+            .find(|row| row.label == "repo-link")
+            .expect("repository row labeled by link name");
+        assert!(repo.detail.starts_with("symlink · → "), "{}", repo.detail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_repo_changes_render_with_relative_paths() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let external = tempfile::tempdir().unwrap();
+        let repo_path = external.path().join("dirty-repo");
+        init_git_repository(&repo_path);
+        fs::write(repo_path.join("untracked.txt"), "hello\n").unwrap();
+        symlink(&repo_path, root.join("dirty-link")).unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let projected_change_count = graph.projected_change_count();
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        let rows = app.visible_git_rows();
+        let repo = rows
+            .iter()
+            .find(|row| row.label == "dirty-link")
+            .expect("symlinked repository row");
+        let change = rows
+            .iter()
+            .find(|row| row.label == "untracked.txt")
+            .expect("change row with relative label");
+        assert!(change.ancestors.contains(&repo.identity));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_repo_diff_and_preview_load_through_repo_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let external = tempfile::tempdir().unwrap();
+        let repo_path = external.path().join("diff-repo");
+        init_git_repository(&repo_path);
+        fs::write(repo_path.join("tracked.txt"), "before\n").unwrap();
+        for args in [
+            ["add", "."].as_slice(),
+            ["commit", "-m", "initial", "--quiet"].as_slice(),
+        ] {
+            let output = Command::new("git")
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        fs::write(repo_path.join("tracked.txt"), "after\n").unwrap();
+        symlink(&repo_path, root.join("diff-link")).unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let change = graph
+            .repositories()
+            .iter()
+            .flat_map(|snapshot| snapshot.changes.iter())
+            .find(|change| change.path.relative == Path::new("tracked.txt"))
+            .expect("tracked change")
+            .clone();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: graph.projected_change_count(),
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        app.request_content(
+            ContentKind::Diff,
+            "tracked.txt".to_owned(),
+            ContentTarget::Repository(change.clone()),
+        );
+        app.wait_for_background();
+        assert!(
+            app.tab().content.lines.iter().any(|line| line == "+after"),
+            "diff lines: {:?}",
+            app.tab().content.lines
+        );
+
+        app.request_content(
+            ContentKind::Preview,
+            "tracked.txt".to_owned(),
+            ContentTarget::Repository(change),
+        );
+        app.wait_for_background();
+        assert!(
+            app.tab().content.lines.iter().any(|line| line == "after"),
+            "preview lines: {:?}",
+            app.tab().content.lines
+        );
     }
 
     #[test]

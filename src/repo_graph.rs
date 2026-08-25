@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::content_safety::resolves_to_directory;
 use crate::git::{ChangeDetails, FileStatus, GitRepo, GitStatusEntry, SubmoduleStatus};
 
 /// Maximum number of directories considered while looking for Git worktrees.
@@ -44,6 +45,10 @@ pub enum RepoKind {
     Containing,
     Nested,
     LinkedWorktree,
+    /// Repository reached through a directory symlink under the workspace.
+    /// The worktree itself lives outside the workspace boundary, but the
+    /// repository is displayed at its symlink access path.
+    Symlinked,
     Submodule,
     SubmodulePlaceholder,
 }
@@ -141,11 +146,16 @@ pub struct DiscoveryError {
 pub struct DiscoveryReport {
     /// Number of directories considered for traversal.
     ///
-    /// Ordinary files, symlinks, and `.git` markers are excluded.
+    /// Ordinary files, dangling symlinks, and `.git` markers are excluded.
+    /// Directory symlinks are followed and do consume this budget.
     pub entries_scanned: usize,
     pub repositories_discovered: usize,
     pub truncations: Vec<DiscoveryTruncation>,
     pub errors: Vec<DiscoveryError>,
+    /// Directory symlinks followed during discovery, as
+    /// `(workspace-relative access path, raw link target)` pairs so the UI can
+    /// show where a linked repository actually lives.
+    pub symlinks: Vec<(PathBuf, PathBuf)>,
 }
 
 impl DiscoveryReport {
@@ -158,7 +168,8 @@ impl DiscoveryReport {
 pub struct DiscoveryOptions {
     /// Maximum number of directories considered for traversal.
     ///
-    /// Ordinary files, symlinks, and `.git` markers do not consume this budget.
+    /// Ordinary files, dangling symlinks, and `.git` markers do not consume
+    /// this budget. Directory symlinks are followed and do consume it.
     pub max_entries: usize,
     pub max_repositories: usize,
     pub max_depth: usize,
@@ -289,6 +300,13 @@ struct Candidate {
     repo: GitRepo,
     canonical_git_dir: PathBuf,
     layout: GitLayout,
+    /// Lexical path under the workspace through which the repository was
+    /// reached. Equal to the canonical worktree for ordinary discovery, but
+    /// keeps the symlink segments for linked repositories so the UI can group
+    /// them under their link path.
+    access_path: PathBuf,
+    /// True when the access path crosses at least one directory symlink.
+    via_symlink: bool,
 }
 
 struct Discovery {
@@ -326,21 +344,37 @@ impl Discovery {
             .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
         if canonical_root != self.workspace_root {
             let layout = git_layout(&canonical_root).unwrap_or(GitLayout::GitDirectory);
-            self.add_candidate(repo, canonical_root, layout);
+            self.add_candidate(repo, canonical_root.clone(), layout, &canonical_root, false);
         }
         Ok(())
     }
 
     fn walk_workspace(&mut self) {
-        let mut queue = VecDeque::from([(self.workspace_root.clone(), 0_usize)]);
+        // Entries carry both the canonical directory (for filesystem access,
+        // identity and cycle detection) and the lexical access path under the
+        // workspace (so repositories reached through symlinks keep their link
+        // path for display). `via_symlink` flips on once a subtree crosses a
+        // directory symlink and stays on below it.
+        let mut queue = VecDeque::from([(
+            self.workspace_root.clone(),
+            self.workspace_root.clone(),
+            0_usize,
+            false,
+        )]);
         let mut visited = HashSet::from([self.workspace_root.clone()]);
         let mut directory_limit_reached = false;
 
-        while let Some((directory, depth)) = queue.pop_front() {
+        while let Some((directory, access_path, depth, via_symlink)) = queue.pop_front() {
             if directory == self.workspace_root || has_git_marker(&directory) {
                 match self.discover_exact_repository(&directory) {
                     Ok(Some((repo, canonical_root, layout))) => {
-                        if !self.add_candidate(repo, canonical_root, layout) {
+                        if !self.add_candidate(
+                            repo,
+                            canonical_root,
+                            layout,
+                            &access_path,
+                            via_symlink,
+                        ) {
                             break;
                         }
                     }
@@ -391,15 +425,21 @@ impl Discovery {
                         continue;
                     }
                 };
-                if file_type.is_symlink() || !file_type.is_dir() {
+                // Directory symlinks are followed like real directories,
+                // matching the file tree; dangling links and file links are
+                // skipped silently.
+                let child_via_symlink = file_type.is_symlink();
+                let is_dir =
+                    file_type.is_dir() || (child_via_symlink && resolves_to_directory(&path));
+                if !is_dir {
                     continue;
                 }
-                directories.push(child);
+                directories.push((child, path, child_via_symlink));
             }
-            directories.sort_by_key(|child| child.file_name());
+            directories.sort_by_key(|(child, _, _)| child.file_name());
 
-            for child in directories {
-                let path = child.path();
+            for (child, path, child_via_symlink) in directories {
+                let child_access = access_path.join(child.file_name());
                 if self.report.entries_scanned == self.options.max_entries {
                     self.push_truncation(DiscoveryTruncation::EntryLimit {
                         limit: self.options.max_entries,
@@ -415,9 +455,26 @@ impl Discovery {
                         continue;
                     }
                 };
-                if !canonical_path.starts_with(&self.workspace_root) {
+                // Symlinks may legitimately leave the workspace (that is the
+                // point of linking a sibling repository in); once a subtree
+                // has crossed a symlink, everything below it is allowed
+                // outside too. The visited set still breaks cycles. Entries
+                // reached without crossing any symlink must stay inside.
+                if !child_via_symlink
+                    && !via_symlink
+                    && !canonical_path.starts_with(&self.workspace_root)
+                {
                     self.error(&path, "refusing to traverse outside the selected workspace");
                     continue;
+                }
+                if child_via_symlink
+                    && let Some(relative) = child_access
+                        .strip_prefix(&self.workspace_root)
+                        .ok()
+                        .filter(|path| !path.as_os_str().is_empty())
+                    && let Ok(target) = fs::read_link(&path)
+                {
+                    self.report.symlinks.push((relative.to_path_buf(), target));
                 }
                 if !visited.insert(canonical_path.clone()) {
                     continue;
@@ -429,7 +486,12 @@ impl Discovery {
                     });
                     continue;
                 }
-                queue.push_back((canonical_path, depth + 1));
+                queue.push_back((
+                    canonical_path,
+                    child_access,
+                    depth + 1,
+                    via_symlink || child_via_symlink,
+                ));
             }
         }
     }
@@ -457,7 +519,14 @@ impl Discovery {
         Ok(Some((repo, canonical_root, layout)))
     }
 
-    fn add_candidate(&mut self, repo: GitRepo, canonical_root: PathBuf, layout: GitLayout) -> bool {
+    fn add_candidate(
+        &mut self,
+        repo: GitRepo,
+        canonical_root: PathBuf,
+        layout: GitLayout,
+        access_path: &Path,
+        via_symlink: bool,
+    ) -> bool {
         let canonical_git_dir = match repo.git_dir().canonicalize() {
             Ok(git_dir) => git_dir,
             Err(error) => {
@@ -483,6 +552,8 @@ impl Discovery {
             repo,
             canonical_git_dir,
             layout,
+            access_path: access_path.to_path_buf(),
+            via_symlink,
         });
         true
     }
@@ -497,6 +568,8 @@ impl Discovery {
                 id: candidate.id.clone(),
                 kind: if candidate.id.path() == self.workspace_root {
                     RepoKind::WorkspaceRoot
+                } else if candidate.via_symlink {
+                    RepoKind::Symlinked
                 } else if candidate.id.path().starts_with(&self.workspace_root) {
                     match candidate.layout {
                         GitLayout::GitFile => RepoKind::LinkedWorktree,
@@ -510,8 +583,7 @@ impl Discovery {
                 worktree: candidate.id.0.clone(),
                 git_dir: Some(candidate.canonical_git_dir.clone()),
                 workspace_relative: candidate
-                    .id
-                    .path()
+                    .access_path
                     .strip_prefix(&self.workspace_root)
                     .ok()
                     .map(Path::to_path_buf),
@@ -563,10 +635,12 @@ impl Discovery {
                 } else {
                     declared
                 };
-                if !identity_path.starts_with(&self.workspace_root) {
+                if !identity_path.starts_with(&self.workspace_root)
+                    && !identity_path.starts_with(candidate.id.path())
+                {
                     self.error(
                         &identity_path,
-                        "submodule path escapes the selected workspace",
+                        "submodule path escapes the parent repository",
                     );
                     continue;
                 }
@@ -591,7 +665,9 @@ impl Discovery {
                         layout: GitLayout::Placeholder,
                         worktree: identity_path.clone(),
                         git_dir: None,
-                        workspace_relative: identity_path
+                        workspace_relative: candidate
+                            .access_path
+                            .join(&path)
                             .strip_prefix(&self.workspace_root)
                             .ok()
                             .map(Path::to_path_buf),
@@ -890,5 +966,34 @@ mod tests {
             ..DiscoveryReport::default()
         };
         assert!(report.is_truncated());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_terminates_on_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        fs::create_dir_all(root.join("real")).unwrap();
+        // A link back into the traversed tree and a link to the workspace
+        // itself would loop forever without canonical-path de-duplication.
+        symlink(root.join("real"), root.join("real/loop")).unwrap();
+        symlink(root, root.join("self-link")).unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        assert!(
+            graph.report().errors.is_empty(),
+            "{:?}",
+            graph.report().errors
+        );
     }
 }
