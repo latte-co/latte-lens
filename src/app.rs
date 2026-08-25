@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    ffi::OsString,
     io,
     ops::Range,
     path::{Component, Path, PathBuf},
@@ -8049,9 +8050,12 @@ fn build_git_rows(
 /// Prefix tree of root repository workspace-relative paths. Each node is
 /// either a pure directory, a repository leaf, or a repository that also
 /// contains nested root repositories.
+///
+/// Component keys are `OsString` (not `String`) so non-UTF-8 path components
+/// are preserved; lossy conversion happens only at label rendering time.
 #[derive(Default)]
 struct VirtualTrie {
-    children: BTreeMap<String, VirtualTrie>,
+    children: BTreeMap<OsString, VirtualTrie>,
     repo: Option<RepoId>,
     repo_count: usize,
     change_count: usize,
@@ -8059,10 +8063,10 @@ struct VirtualTrie {
 
 impl VirtualTrie {
     fn insert(&mut self, relative: &Path, id: RepoId) {
-        let components: Vec<&str> = relative
+        let components: Vec<OsString> = relative
             .components()
             .filter_map(|component| match component {
-                Component::Normal(value) => value.to_str(),
+                Component::Normal(value) => Some(value.to_os_string()),
                 _ => None,
             })
             .collect();
@@ -8071,10 +8075,10 @@ impl VirtualTrie {
         }
         let mut node = self;
         for component in &components[..components.len() - 1] {
-            node = node.children.entry((*component).to_owned()).or_default();
+            node = node.children.entry(component.clone()).or_default();
         }
         node.children
-            .entry(components[components.len() - 1].to_owned())
+            .entry(components[components.len() - 1].clone())
             .or_default()
             .repo = Some(id);
     }
@@ -8111,7 +8115,7 @@ impl VirtualTrie {
         for component in relative
             .components()
             .filter_map(|component| match component {
-                Component::Normal(value) => value.to_str(),
+                Component::Normal(value) => Some(value),
                 _ => None,
             })
         {
@@ -8139,7 +8143,7 @@ fn walk_virtual_trie(
 ) {
     // Directories (nodes with children or no repository) sort before
     // repository leaves, then alphabetically — matching compare_tree_paths.
-    let mut entries: Vec<(&String, &VirtualTrie)> = node.children.iter().collect();
+    let mut entries: Vec<(&OsString, &VirtualTrie)> = node.children.iter().collect();
     entries.sort_by(|(left_name, left), (right_name, right)| {
         let left_is_dir = left.repo.is_none() || !left.children.is_empty();
         let right_is_dir = right.repo.is_none() || !right.children.is_empty();
@@ -8158,7 +8162,7 @@ fn walk_virtual_trie(
                 children,
                 change_projection,
                 ancestors,
-                Some(name),
+                Some(&name.to_string_lossy()),
                 rows,
             );
             let mut nested_ancestors = ancestors.to_vec();
@@ -8180,7 +8184,7 @@ fn walk_virtual_trie(
             rows.push(virtual_directory_row(
                 child,
                 &child_path,
-                name,
+                &name.to_string_lossy(),
                 ancestors.len(),
                 ancestors,
             ));
@@ -9853,6 +9857,54 @@ mod tests {
             }
         )));
         assert_eq!(app.repository_error_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_changes_preserves_non_utf8_path_components() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        // A directory whose name is not valid UTF-8 (0x80, 0x81 are
+        // continuation bytes without a leading byte).
+        let non_utf8 = OsString::from_vec(vec![0x80, 0x81]);
+        let group = root.join("group");
+        let repo_dir = group.join(&non_utf8);
+        init_git_repository(&repo_dir);
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        // The repository must appear even though its path is not UTF-8.
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .any(|row| matches!(&row.kind, GitRowKind::Repository { .. })),
+            "repository with non-UTF-8 path must appear in the Git tree"
+        );
     }
 
     #[test]
