@@ -2,6 +2,7 @@
 pub mod agent;
 pub mod app;
 mod clipboard;
+mod config;
 mod content_safety;
 mod diff;
 mod folding;
