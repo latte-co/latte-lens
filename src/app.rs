@@ -4307,10 +4307,11 @@ impl App {
     /// Dismiss (or restore) the discovery errors under the selected Git row.
     ///
     /// - On an issue row: ignore that exact error path.
-    /// - On a repository row: ignore every error under the repository.
+    /// - On a repository row: ignore every error under the repository and
+    ///   suppress the repository's own status error.
     /// - On a virtual directory row: ignore every error under the group.
     ///
-    /// Ignored paths are persisted in the user config so the dismissal
+    /// Ignored paths are persisted in the Lens state file so the dismissal
     /// survives restarts.
     fn toggle_selected_issue_ignore(&mut self) {
         let Some(row) = self.selected_git_row() else {
@@ -4337,18 +4338,44 @@ impl App {
     /// Rebuild the Git tree from the current graph and ignore set, keeping
     /// the selection on the same row where possible.
     fn rebuild_git_rows(&mut self) {
-        let rows = if let Some(graph) = self.repo_graph.as_ref() {
-            build_git_rows(
+        let (rows, error_count) = if let Some(graph) = self.repo_graph.as_ref() {
+            let error_count = graph
+                .repositories()
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.status_error.is_some()
+                        && !crate::config::is_ignored_error_path(
+                            snapshot.node.id.path(),
+                            &self.ignored_error_paths,
+                        )
+                })
+                .count()
+                .saturating_add(
+                    graph
+                        .report()
+                        .errors
+                        .iter()
+                        .filter(|error| {
+                            !crate::config::is_ignored_error_path(
+                                &error.path,
+                                &self.ignored_error_paths,
+                            )
+                        })
+                        .count(),
+                );
+            let rows = build_git_rows(
                 &self.root,
                 graph,
                 &self.existing_changes,
                 &self.ignored_error_paths,
-            )
+            );
+            (rows, error_count)
         } else {
             return;
         };
         let selected = self.selected_git_row().map(|row| row.identity.clone());
         self.git_rows = rows;
+        self.repository_error_count = error_count;
         self.changed_count = self
             .git_rows
             .iter()
@@ -4916,14 +4943,25 @@ impl App {
             self.repository_error_count = graph
                 .repositories()
                 .iter()
-                .filter(|snapshot| snapshot.status_error.is_some())
+                .filter(|snapshot| {
+                    snapshot.status_error.is_some()
+                        && !crate::config::is_ignored_error_path(
+                            snapshot.node.id.path(),
+                            &self.ignored_error_paths,
+                        )
+                })
                 .count()
                 .saturating_add(
                     graph
                         .report()
                         .errors
                         .iter()
-                        .filter(|error| !self.ignored_error_paths.contains(&error.path))
+                        .filter(|error| {
+                            !crate::config::is_ignored_error_path(
+                                &error.path,
+                                &self.ignored_error_paths,
+                            )
+                        })
                         .count(),
                 );
             self.repository_graph_truncated =
@@ -7938,6 +7976,7 @@ fn build_git_rows(
         pointer_paths: &pointer_paths,
         existing_changes,
         single_repository: snapshots.len() == 1,
+        ignored_paths,
     };
 
     // Root repositories with a workspace-relative path are grouped by their
@@ -7963,10 +8002,7 @@ fn build_git_rows(
     let mut issues_by_node: HashMap<PathBuf, Vec<&DiscoveryError>> = HashMap::new();
     let mut unattached_issues = Vec::new();
     for error in &graph.report().errors {
-        if ignored_paths
-            .iter()
-            .any(|ignored| error.path.starts_with(ignored))
-        {
+        if crate::config::is_ignored_error_path(&error.path, ignored_paths) {
             continue;
         }
         match error.path.strip_prefix(root) {
@@ -8217,6 +8253,7 @@ struct GitChangeProjection<'a> {
     pointer_paths: &'a HashSet<RepoPath>,
     existing_changes: &'a HashSet<RepoPath>,
     single_repository: bool,
+    ignored_paths: &'a HashSet<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8250,7 +8287,13 @@ fn append_repository_rows(
             .as_ref()
             .is_some_and(RepoChange::submodule_pointer_changed),
     );
-    let detail = repository_detail(snapshot);
+    // Suppress the status error when the repository path is ignored so the
+    // row detail and error count stay consistent with the hidden issue rows.
+    let status_error = snapshot
+        .status_error
+        .as_deref()
+        .filter(|_| !crate::config::is_ignored_error_path(id.path(), changes.ignored_paths));
+    let detail = repository_detail(snapshot, status_error);
     let label = repo_label
         .map(str::to_owned)
         .unwrap_or_else(|| repository_label(root, snapshot, changes.single_repository));
@@ -8260,7 +8303,7 @@ fn append_repository_rows(
             repo_id: id.clone(),
             kind: snapshot.node.kind,
             change_count: direct_count + pointer_count,
-            status_error: snapshot.status_error.clone(),
+            status_error: status_error.map(str::to_owned),
         },
         depth: repo_ancestors.len(),
         label,
@@ -8463,12 +8506,12 @@ pub(crate) fn display_workspace_path(path: &Path) -> String {
         .join("/")
 }
 
-fn repository_detail(snapshot: &RepoSnapshot) -> String {
+fn repository_detail(snapshot: &RepoSnapshot, status_error: Option<&str>) -> String {
     let mut parts = vec![repo_kind_label(snapshot.node.kind).to_owned()];
     if let Some(branch) = &snapshot.branch {
         parts.push(branch.clone());
     }
-    if snapshot.status_error.is_some() {
+    if status_error.is_some() {
         parts.push("ERROR".to_owned());
     }
     if let Some(relation) = &snapshot.node.relation {
@@ -9721,6 +9764,95 @@ mod tests {
                 .iter()
                 .all(|row| !matches!(row.kind, GitRowKind::Issue(_)))
         );
+        // The header error count must stay in sync with the hidden rows.
+        assert_eq!(app.repository_error_count, 0);
+    }
+
+    #[test]
+    fn ignoring_repository_path_suppresses_status_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        // A repository with a broken submodule: git status fails, producing a
+        // status_error on the repository row.
+        let repo = root.join("broken-repo");
+        init_git_repository(&repo);
+        fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"proto\"]\n\tpath = proto\n\turl = https://example.com/proto.git\n",
+        )
+        .unwrap();
+        // Commit .gitmodules so the repository itself is clean and the only
+        // errors come from the broken submodule.
+        let output = Command::new("git")
+            .args(["add", ".gitmodules"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add gitmodules",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let submodule = repo.join("proto");
+        fs::create_dir_all(&submodule).unwrap();
+        fs::write(
+            submodule.join(".git"),
+            "gitdir: /nonexistent/modules/proto\n",
+        )
+        .unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        // There is at least one error (discovery error and/or status error).
+        assert!(app.repository_error_count > 0);
+
+        let repo_path = repo.canonicalize().unwrap();
+        app.ignored_error_paths.insert(repo_path);
+        app.rebuild_git_rows();
+
+        // After ignoring the repository path, all errors under it are
+        // suppressed and the count drops to zero.
+        assert!(app.visible_git_rows().iter().all(|row| matches!(
+            &row.kind,
+            GitRowKind::Repository {
+                status_error: None,
+                ..
+            }
+        )));
+        assert_eq!(app.repository_error_count, 0);
     }
 
     #[test]
