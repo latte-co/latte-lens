@@ -120,6 +120,7 @@ Inside the TUI:
 | `tab` / `shift-tab` | Cycle through open tabs |
 | `ctrl-n` | Open the new-tab menu (Files / Review / Search / Chat) |
 | `ctrl-w` | Close the current tab (the last tab cannot be closed) |
+| `ctrl-b` | Toggle the tree pane between docked and collapsed |
 | `ctrl-p` | Open the ⌘P palette (tab switching + file opening) |
 | `h` / `l` | Focus the tree or content pane |
 | `enter` | With Tree focused, expand/collapse a directory or open the selected file in Lens Preview; with Preview focused, retain the fold action below |

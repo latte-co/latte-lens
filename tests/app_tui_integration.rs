@@ -13,6 +13,7 @@ use latte_lens::agent::*;
 use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
     app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeScope},
+    config::TreeSide,
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
 };
@@ -33,6 +34,8 @@ fn startup_renders_before_the_initial_tree_snapshot_is_ready() {
     fs::write(directory.path().join("plain.txt"), "hello\n").unwrap();
 
     let mut app = App::new(directory.path().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Left);
+    app.set_tree_hidden(false);
     assert!(app.is_initial_loading());
     assert!(app.is_refreshing());
     assert!(app.all_entries.is_empty());
@@ -4667,6 +4670,11 @@ fn settle(app: &mut App) {
 
 fn ready_app(path: PathBuf) -> anyhow::Result<App> {
     let mut app = App::with_system_open_disabled(path)?;
+    // Pin the tree to the left and visible so layout assertions stay
+    // deterministic; the right-side default and collapse are covered by
+    // unit tests.
+    app.set_tree_side(TreeSide::Left);
+    app.set_tree_hidden(false);
     settle(&mut app);
     Ok(app)
 }
@@ -4676,6 +4684,8 @@ fn ready_app_with_preview_registry(
     registry: PreviewRegistry,
 ) -> anyhow::Result<App> {
     let mut app = App::with_preview_registry_and_system_open_disabled(path, registry)?;
+    app.set_tree_side(TreeSide::Left);
+    app.set_tree_hidden(false);
     settle(&mut app);
     Ok(app)
 }

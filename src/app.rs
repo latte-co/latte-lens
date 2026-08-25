@@ -965,6 +965,10 @@ pub struct App {
     existing_changes: HashSet<RepoPath>,
     /// Discovery error paths the user has dismissed; persisted via config.
     ignored_error_paths: crate::config::IgnoredErrorPaths,
+    /// Which side the tree pane docks to; persisted via config.
+    tree_side: crate::config::TreeSide,
+    /// Whether the tree pane is collapsed; persisted via config.
+    tree_hidden: bool,
     scan_entry_limit: usize,
     runtime: WorkerRuntime,
     refresh_requests: RequestGeneration,
@@ -1315,6 +1319,8 @@ impl App {
             visible_git_rows: Vec::new(),
             existing_changes: HashSet::new(),
             ignored_error_paths: crate::config::load_ignored_error_paths(),
+            tree_side: crate::config::load_layout_state().tree_side,
+            tree_hidden: crate::config::load_layout_state().tree_hidden,
             scan_entry_limit,
             runtime,
             refresh_requests: RequestGeneration::default(),
@@ -1466,11 +1472,49 @@ impl App {
     }
 
     pub(crate) fn tree_panel_width(&self, total_width: u16) -> u16 {
+        if self.tree_hidden {
+            return 0;
+        }
         ui::tree_panel_width(total_width, self.tab().panel_width)
     }
 
     pub(crate) const fn tree_resize_dragging(&self) -> bool {
         self.tree_resize_dragging
+    }
+
+    pub(crate) const fn tree_side(&self) -> crate::config::TreeSide {
+        self.tree_side
+    }
+
+    /// Dock the tree pane to the given side. Layout preference used by tests
+    /// and embedders that need a deterministic split.
+    pub fn set_tree_side(&mut self, side: crate::config::TreeSide) {
+        self.tree_side = side;
+    }
+
+    /// Override the collapsed state of the tree pane. Used by tests and
+    /// embedders that need a deterministic layout regardless of persisted
+    /// user state.
+    pub fn set_tree_hidden(&mut self, hidden: bool) {
+        self.tree_hidden = hidden;
+    }
+
+    /// Toggle the tree pane between docked and collapsed, persisting the
+    /// choice. Content focus is unaffected; a hidden tree simply yields its
+    /// width to the content pane.
+    pub(crate) fn toggle_tree_visibility(&mut self) {
+        self.tree_hidden = !self.tree_hidden;
+        self.persist_layout();
+    }
+
+    fn persist_layout(&mut self) {
+        let state = crate::config::LayoutState {
+            tree_side: self.tree_side,
+            tree_hidden: self.tree_hidden,
+        };
+        if let Err(error) = crate::config::save_layout_state(&state) {
+            self.last_error = Some(format!("cannot save layout state: {error:#}"));
+        }
     }
 
     pub fn scope_entry_count(&self) -> usize {
@@ -2036,6 +2080,9 @@ impl App {
                 self.request_semantic_navigation(NavigationOperation::Implementations);
             }
             (KeyCode::Char('s' | 'S'), KeyModifiers::CONTROL) => self.open_document_symbols(),
+            (KeyCode::Char('b' | 'B'), KeyModifiers::CONTROL) => {
+                self.toggle_tree_visibility();
+            }
             (KeyCode::Left, KeyModifiers::ALT) => {
                 self.navigate_history(NavigationHistoryIntent::Back);
             }
@@ -9952,6 +9999,94 @@ mod tests {
             "preview lines: {:?}",
             app.tab().content.lines
         );
+    }
+
+    #[test]
+    fn ctrl_b_toggles_tree_visibility_and_width() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("state").into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        assert!(!app.tree_hidden);
+        let shown = app.tree_panel_width(120);
+        assert!(shown >= ui::MIN_TREE_WIDTH);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(app.tree_hidden);
+        assert_eq!(app.tree_panel_width(120), 0);
+
+        // Uppercase variant toggles back.
+        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::CONTROL));
+        assert!(!app.tree_hidden);
+        assert_eq!(app.tree_panel_width(120), shown);
+    }
+
+    #[test]
+    fn tree_docks_right_by_default() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("state").into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        assert_eq!(app.tree_side(), crate::config::TreeSide::Right);
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        // Tree body sits to the right of the content body.
+        assert!(app.ui_regions.tree_body.x > app.ui_regions.content_body.x);
+        assert!(app.ui_regions.divider.width > 0);
+    }
+
+    #[test]
+    fn hidden_tree_yields_full_width_content() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("state").into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.toggle_tree_visibility();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.ui_regions.tree_body.width, 0);
+        assert_eq!(app.ui_regions.divider.width, 0);
+        // Content takes the full body width (minus the 1-col text inset).
+        assert!(app.ui_regions.content_body.width >= 119);
+    }
+
+    #[test]
+    fn tree_visibility_persists_across_instances() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(state_dir.clone().into_os_string()),
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+        app.toggle_tree_visibility();
+        assert!(app.tree_hidden);
+
+        // A fresh instance loads the persisted hidden state.
+        let second = App::new(workspace.path().to_path_buf()).unwrap();
+        assert!(second.tree_hidden);
     }
 
     #[test]
