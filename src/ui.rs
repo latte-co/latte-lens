@@ -1965,13 +1965,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Tab cycle  Ctrl+P palette  Ctrl+N new  Ctrl+W close"
     };
+    let ignore_hint = if app.tree_scope == TreeScope::GitChanges {
+        "  x ignore error"
+    } else {
+        ""
+    };
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
-            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path{ignore_hint}  q×2 quit"
         )
     } else if app.focused_pane == FocusPane::Tree {
         format!(
-            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path{ignore_hint}  q×2 quit"
         )
     } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(

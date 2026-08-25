@@ -1,8 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    ffi::OsString,
     io,
     ops::Range,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -118,6 +119,10 @@ pub enum TreeScope {
 pub enum GitRowIdentity {
     Repository(RepoId),
     Directory(RepoPath),
+    /// Synthetic grouping node for root repositories that share a
+    /// workspace-relative path prefix when the workspace itself is not a
+    /// repository. Holds the workspace-relative directory path.
+    VirtualDirectory(PathBuf),
     Change(RepoPath),
     Pointer(RepoPath),
     Issue(PathBuf),
@@ -955,6 +960,11 @@ pub struct App {
     reviewed_change_versions: HashMap<RepoPath, ChangeVersion>,
     git_rows: Vec<GitTreeRow>,
     visible_git_rows: Vec<GitTreeRow>,
+    /// Last set of existing changed paths, kept so the Git tree can be
+    /// rebuilt without a full refresh (e.g. after toggling an ignore).
+    existing_changes: HashSet<RepoPath>,
+    /// Discovery error paths the user has dismissed; persisted via config.
+    ignored_error_paths: crate::config::IgnoredErrorPaths,
     scan_entry_limit: usize,
     runtime: WorkerRuntime,
     refresh_requests: RequestGeneration,
@@ -1303,6 +1313,8 @@ impl App {
             reviewed_change_versions: HashMap::new(),
             git_rows: Vec::new(),
             visible_git_rows: Vec::new(),
+            existing_changes: HashSet::new(),
+            ignored_error_paths: crate::config::load_ignored_error_paths(),
             scan_entry_limit,
             runtime,
             refresh_requests: RequestGeneration::default(),
@@ -4101,6 +4113,11 @@ impl App {
             }
             (KeyCode::Left, KeyModifiers::NONE) => self.focused_pane = FocusPane::Tree,
             (KeyCode::Enter, _) => self.activate_selected_tree_entry(),
+            (KeyCode::Char('x'), KeyModifiers::NONE)
+                if self.tree_scope == TreeScope::GitChanges =>
+            {
+                self.toggle_selected_issue_ignore();
+            }
             (KeyCode::Right, KeyModifiers::NONE) => {
                 self.focused_pane = FocusPane::Content;
             }
@@ -4286,6 +4303,88 @@ impl App {
         }
         self.rebuild_visible_rows();
         self.restore_visible_selection(Some(relative));
+    }
+
+    /// Dismiss (or restore) the discovery errors under the selected Git row.
+    ///
+    /// - On an issue row: ignore that exact error path.
+    /// - On a repository row: ignore every error under the repository and
+    ///   suppress the repository's own status error.
+    /// - On a virtual directory row: ignore every error under the group.
+    ///
+    /// Ignored paths are persisted in the Lens state file so the dismissal
+    /// survives restarts.
+    fn toggle_selected_issue_ignore(&mut self) {
+        let Some(row) = self.selected_git_row() else {
+            return;
+        };
+        let path = match &row.identity {
+            GitRowIdentity::Issue(path) => path.clone(),
+            GitRowIdentity::Repository(repo_id) => repo_id.path().to_path_buf(),
+            GitRowIdentity::VirtualDirectory(relative) => self.root.join(relative),
+            _ => return,
+        };
+        let normalized = crate::config::normalize_path(&path);
+        if self.ignored_error_paths.contains(&normalized) {
+            self.ignored_error_paths.remove(&normalized);
+        } else {
+            self.ignored_error_paths.insert(normalized);
+        }
+        if let Err(error) = crate::config::save_ignored_error_paths(&self.ignored_error_paths) {
+            self.last_error = Some(format!("cannot save ignore config: {error:#}"));
+        }
+        self.rebuild_git_rows();
+    }
+
+    /// Rebuild the Git tree from the current graph and ignore set, keeping
+    /// the selection on the same row where possible.
+    fn rebuild_git_rows(&mut self) {
+        let (rows, error_count) = if let Some(graph) = self.repo_graph.as_ref() {
+            let error_count = graph
+                .repositories()
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.status_error.is_some()
+                        && !crate::config::is_ignored_error_path(
+                            snapshot.node.id.path(),
+                            &self.ignored_error_paths,
+                        )
+                })
+                .count()
+                .saturating_add(
+                    graph
+                        .report()
+                        .errors
+                        .iter()
+                        .filter(|error| {
+                            !crate::config::is_ignored_error_path(
+                                &error.path,
+                                &self.ignored_error_paths,
+                            )
+                        })
+                        .count(),
+                );
+            let rows = build_git_rows(
+                &self.root,
+                graph,
+                &self.existing_changes,
+                &self.ignored_error_paths,
+            );
+            (rows, error_count)
+        } else {
+            return;
+        };
+        let selected = self.selected_git_row().map(|row| row.identity.clone());
+        self.git_rows = rows;
+        self.repository_error_count = error_count;
+        self.changed_count = self
+            .git_rows
+            .iter()
+            .filter(|row| matches!(row.kind, GitRowKind::Change(_) | GitRowKind::Pointer(_)))
+            .count();
+        self.reconcile_expansion_state();
+        self.rebuild_visible_rows();
+        self.restore_git_selection(selected);
     }
 
     fn request_directory_load(&mut self, relative: PathBuf) {
@@ -4845,9 +4944,27 @@ impl App {
             self.repository_error_count = graph
                 .repositories()
                 .iter()
-                .filter(|snapshot| snapshot.status_error.is_some())
+                .filter(|snapshot| {
+                    snapshot.status_error.is_some()
+                        && !crate::config::is_ignored_error_path(
+                            snapshot.node.id.path(),
+                            &self.ignored_error_paths,
+                        )
+                })
                 .count()
-                .saturating_add(graph.report().errors.len());
+                .saturating_add(
+                    graph
+                        .report()
+                        .errors
+                        .iter()
+                        .filter(|error| {
+                            !crate::config::is_ignored_error_path(
+                                &error.path,
+                                &self.ignored_error_paths,
+                            )
+                        })
+                        .count(),
+                );
             self.repository_graph_truncated =
                 repository_graph_is_truncated(&graph, full_repository_discovery);
             self.git_changes_truncated |= self.repository_graph_truncated;
@@ -4858,7 +4975,13 @@ impl App {
                 self.reviewed_change_versions
                     .retain(|path, _| graph.change_details(path).is_some());
             }
-            self.git_rows = build_git_rows(&self.root, &graph, &snapshot.existing_changes);
+            self.existing_changes = snapshot.existing_changes.clone();
+            self.git_rows = build_git_rows(
+                &self.root,
+                &graph,
+                &self.existing_changes,
+                &self.ignored_error_paths,
+            );
             self.changed_count = self
                 .git_rows
                 .iter()
@@ -5550,29 +5673,47 @@ impl App {
                     lines
                 }
                 GitRowKind::Directory => {
-                    let selected = match &row.identity {
-                        GitRowIdentity::Directory(path) => path,
+                    let count = match &row.identity {
+                        GitRowIdentity::Directory(path) => self
+                            .git_rows
+                            .iter()
+                            .filter(|candidate| {
+                                matches!(
+                                    &candidate.identity,
+                                    GitRowIdentity::Change(selected)
+                                        if selected.repo_id == path.repo_id
+                                ) && candidate
+                                    .file_entry()
+                                    .is_some_and(|entry| entry.relative.starts_with(&path.relative))
+                            })
+                            .count(),
+                        GitRowIdentity::VirtualDirectory(_) => self
+                            .git_rows
+                            .iter()
+                            .filter(|candidate| {
+                                matches!(
+                                    &candidate.kind,
+                                    GitRowKind::Change(_) | GitRowKind::Pointer(_)
+                                ) && candidate.ancestors.contains(&row.identity)
+                            })
+                            .count(),
                         _ => unreachable!("directory rows use directory identities"),
                     };
-                    let count = self
-                        .git_rows
-                        .iter()
-                        .filter(|candidate| {
-                            matches!(
-                                &candidate.identity,
-                                GitRowIdentity::Change(path)
-                                    if path.repo_id == selected.repo_id
-                            ) && candidate
-                                .file_entry()
-                                .is_some_and(|entry| entry.relative.starts_with(&selected.relative))
-                        })
-                        .count();
                     vec![format!(
                         "{count} changed file{} in this directory.",
                         if count == 1 { "" } else { "s" }
                     )]
                 }
-                GitRowKind::Issue(message) => vec![message],
+                GitRowKind::Issue(message) => {
+                    let mut lines = vec![message.clone()];
+                    if let GitRowIdentity::Issue(path) = &row.identity
+                        && let Some(hint) = issue_hint(path, &message)
+                    {
+                        lines.push(String::new());
+                        lines.push(hint);
+                    }
+                    lines
+                }
                 GitRowKind::Pointer(_) => {
                     vec!["Submodule pointer change in the parent repository.".to_owned()]
                 }
@@ -7787,6 +7928,7 @@ fn build_git_rows(
     root: &Path,
     graph: &RepoGraph,
     existing_changes: &HashSet<RepoPath>,
+    ignored_paths: &HashSet<PathBuf>,
 ) -> Vec<GitTreeRow> {
     let snapshots: HashMap<RepoId, &RepoSnapshot> = graph
         .repositories()
@@ -7835,23 +7977,274 @@ fn build_git_rows(
         pointer_paths: &pointer_paths,
         existing_changes,
         single_repository: snapshots.len() == 1,
+        ignored_paths,
     };
+
+    // Root repositories with a workspace-relative path are grouped by their
+    // directory prefixes so the Review view cascades by directory instead of
+    // flattening every worktree into one long list. Roots without a
+    // workspace-relative path (repositories containing the workspace) stay
+    // flat at the top level.
+    let mut trie = VirtualTrie::default();
+    let mut flat_roots = Vec::new();
+    for id in &roots {
+        match snapshots[id].node.workspace_relative.as_deref() {
+            Some(relative) if !relative.as_os_str().is_empty() => {
+                trie.insert(relative, id.clone());
+            }
+            _ => flat_roots.push(id.clone()),
+        }
+    }
+    trie.compute_counts(&snapshots, &pointer_paths);
+
+    // Attach each discovery error to the deepest trie node (directory or
+    // repository) that contains its path, so errors render inside their
+    // group instead of a flat dump at the bottom of the list.
+    let mut issues_by_node: HashMap<PathBuf, Vec<&DiscoveryError>> = HashMap::new();
+    let mut unattached_issues = Vec::new();
+    for error in &graph.report().errors {
+        if crate::config::is_ignored_error_path(&error.path, ignored_paths) {
+            continue;
+        }
+        match error.path.strip_prefix(root) {
+            Ok(relative) if !relative.as_os_str().is_empty() => match trie.deepest_node(relative) {
+                Some((node_path, _)) => {
+                    issues_by_node.entry(node_path).or_default().push(error);
+                }
+                None => unattached_issues.push(error),
+            },
+            _ => unattached_issues.push(error),
+        }
+    }
+
     let mut rows = Vec::new();
-    for id in roots {
+    for id in &flat_roots {
         append_repository_rows(
             root,
-            &id,
+            id,
             &snapshots,
             &children,
             &change_projection,
             &[],
+            None,
             &mut rows,
         );
     }
-    for error in &graph.report().errors {
-        rows.push(issue_row(root, error));
+    walk_virtual_trie(
+        &trie,
+        Path::new(""),
+        &[],
+        root,
+        &snapshots,
+        &children,
+        &change_projection,
+        &issues_by_node,
+        &mut rows,
+    );
+    for error in unattached_issues {
+        rows.push(issue_row(root, error, None));
     }
     rows
+}
+
+/// Prefix tree of root repository workspace-relative paths. Each node is
+/// either a pure directory, a repository leaf, or a repository that also
+/// contains nested root repositories.
+///
+/// Component keys are `OsString` (not `String`) so non-UTF-8 path components
+/// are preserved; lossy conversion happens only at label rendering time.
+#[derive(Default)]
+struct VirtualTrie {
+    children: BTreeMap<OsString, VirtualTrie>,
+    repo: Option<RepoId>,
+    repo_count: usize,
+    change_count: usize,
+}
+
+impl VirtualTrie {
+    fn insert(&mut self, relative: &Path, id: RepoId) {
+        let components: Vec<OsString> = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        if components.is_empty() {
+            return;
+        }
+        let mut node = self;
+        for component in &components[..components.len() - 1] {
+            node = node.children.entry(component.clone()).or_default();
+        }
+        node.children
+            .entry(components[components.len() - 1].clone())
+            .or_default()
+            .repo = Some(id);
+    }
+
+    fn compute_counts(
+        &mut self,
+        snapshots: &HashMap<RepoId, &RepoSnapshot>,
+        pointer_paths: &HashSet<RepoPath>,
+    ) {
+        self.repo_count = usize::from(self.repo.is_some());
+        self.change_count = self
+            .repo
+            .as_ref()
+            .map(|id| {
+                snapshots[id]
+                    .changes
+                    .iter()
+                    .filter(|change| !pointer_paths.contains(&change.path))
+                    .count()
+            })
+            .unwrap_or(0);
+        for child in self.children.values_mut() {
+            child.compute_counts(snapshots, pointer_paths);
+            self.repo_count += child.repo_count;
+            self.change_count += child.change_count;
+        }
+    }
+
+    /// Follow `relative`'s components as far as the trie reaches, returning
+    /// the deepest node and its workspace-relative path.
+    fn deepest_node(&self, relative: &Path) -> Option<(PathBuf, &VirtualTrie)> {
+        let mut node = self;
+        let mut path = PathBuf::new();
+        for component in relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value),
+                _ => None,
+            })
+        {
+            let Some(child) = node.children.get(component) else {
+                break;
+            };
+            path.push(component);
+            node = child;
+        }
+        (!path.as_os_str().is_empty()).then_some((path, node))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_virtual_trie(
+    node: &VirtualTrie,
+    node_path: &Path,
+    ancestors: &[GitRowIdentity],
+    root: &Path,
+    snapshots: &HashMap<RepoId, &RepoSnapshot>,
+    children: &HashMap<RepoId, Vec<RepoId>>,
+    change_projection: &GitChangeProjection<'_>,
+    issues_by_node: &HashMap<PathBuf, Vec<&DiscoveryError>>,
+    rows: &mut Vec<GitTreeRow>,
+) {
+    // Directories (nodes with children or no repository) sort before
+    // repository leaves, then alphabetically — matching compare_tree_paths.
+    let mut entries: Vec<(&OsString, &VirtualTrie)> = node.children.iter().collect();
+    entries.sort_by(|(left_name, left), (right_name, right)| {
+        let left_is_dir = left.repo.is_none() || !left.children.is_empty();
+        let right_is_dir = right.repo.is_none() || !right.children.is_empty();
+        right_is_dir
+            .cmp(&left_is_dir)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    for (name, child) in entries {
+        let child_path = node_path.join(name);
+        if let Some(repo_id) = &child.repo {
+            let repo_identity = GitRowIdentity::Repository(repo_id.clone());
+            append_repository_rows(
+                root,
+                repo_id,
+                snapshots,
+                children,
+                change_projection,
+                ancestors,
+                Some(&name.to_string_lossy()),
+                rows,
+            );
+            let mut nested_ancestors = ancestors.to_vec();
+            nested_ancestors.push(repo_identity);
+            walk_virtual_trie(
+                child,
+                &child_path,
+                &nested_ancestors,
+                root,
+                snapshots,
+                children,
+                change_projection,
+                issues_by_node,
+                rows,
+            );
+            emit_node_issues(&child_path, &nested_ancestors, root, issues_by_node, rows);
+        } else {
+            let dir_identity = GitRowIdentity::VirtualDirectory(child_path.clone());
+            rows.push(virtual_directory_row(
+                child,
+                &child_path,
+                &name.to_string_lossy(),
+                ancestors.len(),
+                ancestors,
+            ));
+            let mut child_ancestors = ancestors.to_vec();
+            child_ancestors.push(dir_identity);
+            walk_virtual_trie(
+                child,
+                &child_path,
+                &child_ancestors,
+                root,
+                snapshots,
+                children,
+                change_projection,
+                issues_by_node,
+                rows,
+            );
+            emit_node_issues(&child_path, &child_ancestors, root, issues_by_node, rows);
+        }
+    }
+}
+
+fn virtual_directory_row(
+    node: &VirtualTrie,
+    path: &Path,
+    name: &str,
+    depth: usize,
+    ancestors: &[GitRowIdentity],
+) -> GitTreeRow {
+    GitTreeRow {
+        identity: GitRowIdentity::VirtualDirectory(path.to_path_buf()),
+        kind: GitRowKind::Directory,
+        depth,
+        label: name.to_owned(),
+        detail: format!(
+            "{} repo{} · {} change{}",
+            node.repo_count,
+            if node.repo_count == 1 { "" } else { "s" },
+            node.change_count,
+            if node.change_count == 1 { "" } else { "s" },
+        ),
+        status: None,
+        exists: true,
+        ancestors: ancestors.to_vec(),
+        file_entry: None,
+    }
+}
+
+fn emit_node_issues(
+    node_path: &Path,
+    node_ancestors: &[GitRowIdentity],
+    root: &Path,
+    issues_by_node: &HashMap<PathBuf, Vec<&DiscoveryError>>,
+    rows: &mut Vec<GitTreeRow>,
+) {
+    let Some(issues) = issues_by_node.get(node_path) else {
+        return;
+    };
+    for error in issues {
+        rows.push(issue_row(root, error, Some((node_path, node_ancestors))));
+    }
 }
 
 fn repository_graph_is_truncated(graph: &RepoGraph, full_repository_discovery: bool) -> bool {
@@ -7864,8 +8257,10 @@ struct GitChangeProjection<'a> {
     pointer_paths: &'a HashSet<RepoPath>,
     existing_changes: &'a HashSet<RepoPath>,
     single_repository: bool,
+    ignored_paths: &'a HashSet<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_repository_rows(
     root: &Path,
     id: &RepoId,
@@ -7873,6 +8268,7 @@ fn append_repository_rows(
     children: &HashMap<RepoId, Vec<RepoId>>,
     changes: &GitChangeProjection<'_>,
     repo_ancestors: &[GitRowIdentity],
+    repo_label: Option<&str>,
     rows: &mut Vec<GitTreeRow>,
 ) {
     let snapshot = snapshots[id];
@@ -7895,17 +8291,26 @@ fn append_repository_rows(
             .as_ref()
             .is_some_and(RepoChange::submodule_pointer_changed),
     );
-    let detail = repository_detail(snapshot);
+    // Suppress the status error when the repository path is ignored so the
+    // row detail and error count stay consistent with the hidden issue rows.
+    let status_error = snapshot
+        .status_error
+        .as_deref()
+        .filter(|_| !crate::config::is_ignored_error_path(id.path(), changes.ignored_paths));
+    let detail = repository_detail(snapshot, status_error);
+    let label = repo_label
+        .map(str::to_owned)
+        .unwrap_or_else(|| repository_label(root, snapshot, changes.single_repository));
     rows.push(GitTreeRow {
         identity: repo_identity.clone(),
         kind: GitRowKind::Repository {
             repo_id: id.clone(),
             kind: snapshot.node.kind,
             change_count: direct_count + pointer_count,
-            status_error: snapshot.status_error.clone(),
+            status_error: status_error.map(str::to_owned),
         },
         depth: repo_ancestors.len(),
-        label: repository_label(root, snapshot, changes.single_repository),
+        label,
         detail,
         status: None,
         exists: true,
@@ -7939,6 +8344,7 @@ fn append_repository_rows(
                 children,
                 changes,
                 &owned_ancestors,
+                None,
                 rows,
             );
         }
@@ -8104,12 +8510,12 @@ pub(crate) fn display_workspace_path(path: &Path) -> String {
         .join("/")
 }
 
-fn repository_detail(snapshot: &RepoSnapshot) -> String {
+fn repository_detail(snapshot: &RepoSnapshot, status_error: Option<&str>) -> String {
     let mut parts = vec![repo_kind_label(snapshot.node.kind).to_owned()];
     if let Some(branch) = &snapshot.branch {
         parts.push(branch.clone());
     }
-    if snapshot.status_error.is_some() {
+    if status_error.is_some() {
         parts.push("ERROR".to_owned());
     }
     if let Some(relation) = &snapshot.node.relation {
@@ -8163,18 +8569,71 @@ const fn repo_kind_label(kind: RepoKind) -> &'static str {
     }
 }
 
-fn issue_row(root: &Path, error: &DiscoveryError) -> GitTreeRow {
+fn issue_row(
+    root: &Path,
+    error: &DiscoveryError,
+    attachment: Option<(&Path, &[GitRowIdentity])>,
+) -> GitTreeRow {
+    let (label, depth, ancestors) = match attachment {
+        Some((node_relative, node_ancestors)) => {
+            let relative = error.path.strip_prefix(root).unwrap_or(&error.path);
+            let label_path = relative
+                .strip_prefix(node_relative)
+                .ok()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(relative);
+            (
+                format!("[error] {}", display_workspace_path(label_path)),
+                node_ancestors.len(),
+                node_ancestors.to_vec(),
+            )
+        }
+        None => (
+            format!("[error] {}", compact_workspace_path(root, &error.path)),
+            0,
+            Vec::new(),
+        ),
+    };
     GitTreeRow {
         identity: GitRowIdentity::Issue(error.path.clone()),
         kind: GitRowKind::Issue(error.message.clone()),
-        depth: 0,
-        label: format!("[error] {}", compact_workspace_path(root, &error.path)),
+        depth,
+        label,
         detail: error.message.clone(),
         status: None,
         exists: false,
-        ancestors: Vec::new(),
+        ancestors,
         file_entry: None,
     }
+}
+
+/// Actionable remediation hint for known discovery error classes. Returns
+/// `None` when the error message is already the best guidance.
+fn issue_hint(path: &Path, _message: &str) -> Option<String> {
+    // A stale worktree/submodule marker: the `.git` file points at a Git
+    // directory that no longer exists. This is the "workspace was moved or
+    // the worktree registration was pruned" case.
+    let marker = path.join(".git");
+    if marker.is_file()
+        && let Ok(content) = std::fs::read_to_string(&marker)
+        && let Some(rest) = content.strip_prefix("gitdir:")
+    {
+        let gitdir = Path::new(rest.trim());
+        let resolved = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            path.join(gitdir)
+        };
+        if !resolved.exists() {
+            return Some(format!(
+                "Stale Git marker — the linked directory no longer exists. \
+                 Run `git worktree prune` in the parent repository, then remove \
+                 {} if it is empty.",
+                path.display()
+            ));
+        }
+    }
+    None
 }
 
 fn compact_workspace_path(root: &Path, path: &Path) -> String {
@@ -9151,6 +9610,312 @@ mod tests {
                 .iter()
                 .all(|row| !row.label.starts_with("[partial]"))
         );
+    }
+
+    #[test]
+    fn git_changes_groups_root_repositories_by_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        init_git_repository(&root.join("team-a/repo-one"));
+        init_git_repository(&root.join("team-a/repo-two"));
+        init_git_repository(&root.join("solo"));
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        let rows = app.visible_git_rows();
+        let team_a = rows
+            .iter()
+            .find(|row| {
+                row.label == "team-a" && matches!(row.identity, GitRowIdentity::VirtualDirectory(_))
+            })
+            .expect("virtual directory team-a");
+        assert_eq!(team_a.depth, 0);
+        assert!(team_a.is_container());
+
+        let repo_one = rows
+            .iter()
+            .find(|row| row.label == "repo-one")
+            .expect("repo-one row");
+        assert_eq!(repo_one.depth, 1);
+        assert!(repo_one.ancestors.contains(&team_a.identity));
+
+        // A repository at the workspace root stays flat, not grouped.
+        let solo = rows
+            .iter()
+            .find(|row| row.label == "solo")
+            .expect("solo row");
+        assert_eq!(solo.depth, 0);
+    }
+
+    #[test]
+    fn git_changes_nests_issues_under_their_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        init_git_repository(&root.join("team-a/healthy"));
+        // A stale worktree marker: `.git` points at a missing Git directory.
+        let stale = root.join("team-a/stale-marker");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join(".git"), "gitdir: /nonexistent/git/directory\n").unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        assert!(!graph.report().errors.is_empty());
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        let rows = app.visible_git_rows();
+        let team_a = rows
+            .iter()
+            .find(|row| {
+                row.label == "team-a" && matches!(row.identity, GitRowIdentity::VirtualDirectory(_))
+            })
+            .expect("virtual directory team-a");
+        let issue = rows
+            .iter()
+            .find(|row| matches!(row.kind, GitRowKind::Issue(_)))
+            .expect("issue row");
+        assert_eq!(issue.label, "[error] stale-marker");
+        assert_eq!(issue.depth, team_a.depth + 1);
+        assert!(issue.ancestors.contains(&team_a.identity));
+    }
+
+    #[test]
+    fn git_changes_hides_ignored_error_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        init_git_repository(&root.join("repo"));
+        let stale = root.join("stale-marker");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join(".git"), "gitdir: /nonexistent/git/directory\n").unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let stale_path = stale.canonicalize().unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .any(|row| matches!(row.kind, GitRowKind::Issue(_)))
+        );
+
+        app.ignored_error_paths.insert(stale_path);
+        app.rebuild_git_rows();
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .all(|row| !matches!(row.kind, GitRowKind::Issue(_)))
+        );
+        // The header error count must stay in sync with the hidden rows.
+        assert_eq!(app.repository_error_count, 0);
+    }
+
+    #[test]
+    fn ignoring_repository_path_suppresses_status_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        // A repository with a broken submodule: git status fails, producing a
+        // status_error on the repository row.
+        let repo = root.join("broken-repo");
+        init_git_repository(&repo);
+        fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"proto\"]\n\tpath = proto\n\turl = https://example.com/proto.git\n",
+        )
+        .unwrap();
+        // Commit .gitmodules so the repository itself is clean and the only
+        // errors come from the broken submodule.
+        let output = Command::new("git")
+            .args(["add", ".gitmodules"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add gitmodules",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let submodule = repo.join("proto");
+        fs::create_dir_all(&submodule).unwrap();
+        fs::write(
+            submodule.join(".git"),
+            "gitdir: /nonexistent/modules/proto\n",
+        )
+        .unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        // There is at least one error (discovery error and/or status error).
+        assert!(app.repository_error_count > 0);
+
+        let repo_path = repo.canonicalize().unwrap();
+        app.ignored_error_paths.insert(repo_path);
+        app.rebuild_git_rows();
+
+        // After ignoring the repository path, all errors under it are
+        // suppressed and the count drops to zero.
+        assert!(app.visible_git_rows().iter().all(|row| matches!(
+            &row.kind,
+            GitRowKind::Repository {
+                status_error: None,
+                ..
+            }
+        )));
+        assert_eq!(app.repository_error_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_changes_preserves_non_utf8_path_components() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        // A directory whose name is not valid UTF-8 (0x80, 0x81 are
+        // continuation bytes without a leading byte).
+        let non_utf8 = OsString::from_vec(vec![0x80, 0x81]);
+        let group = root.join("group");
+        let repo_dir = group.join(&non_utf8);
+        init_git_repository(&repo_dir);
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        // The repository must appear even though its path is not UTF-8.
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .any(|row| matches!(&row.kind, GitRowKind::Repository { .. })),
+            "repository with non-UTF-8 path must appear in the Git tree"
+        );
+    }
+
+    #[test]
+    fn issue_hint_detects_stale_worktree_marker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let stale = workspace.path().join("stale-wt");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join(".git"), "gitdir: /nonexistent/git/directory\n").unwrap();
+        let hint = issue_hint(&stale, "Git marker is not a valid worktree")
+            .expect("stale marker should produce a hint");
+        assert!(hint.contains("git worktree prune"));
     }
 
     fn empty_snapshot() -> RefreshSnapshot {
