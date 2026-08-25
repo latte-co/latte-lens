@@ -2735,8 +2735,8 @@ fn visual_focus_cues_identify_tabs_tree_and_content_without_backgrounds() {
     wide_terminal
         .draw(|frame| ui::draw(frame, &mut app))
         .unwrap();
-    assert_eq!(app.ui_regions.tree_body.width, 44);
-    assert_eq!(app.ui_regions.content_body.x, 45);
+    assert_eq!(app.ui_regions.tree_body.width, 36);
+    assert_eq!(app.ui_regions.content_body.x, 37);
 }
 
 #[test]
@@ -3163,7 +3163,7 @@ fn preview_mouse_drag_selects_visible_text_and_ctrl_c_queues_exact_copy() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
-    assert!(format!("{:?}", terminal.backend().buffer()).contains("Ctrl+C"));
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("^C"));
     let text_x = app.ui_regions.content_inner.x + 4;
     let first_row = app.ui_regions.content_inner.y;
     app.handle_mouse(mouse_down(text_x + 6, first_row));
@@ -4019,8 +4019,8 @@ fn search_mouse_buttons_open_switch_and_close_without_backgrounds() {
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains("Open"));
-    assert!(rendered.contains("Text"));
+    // Tree width is 36 (default), so search buttons show compact labels.
+    assert!(rendered.contains(" / "));
     let file_button = app.ui_regions.file_search_button;
     assert!(file_button.width > 0);
     app.handle_mouse(mouse_down(file_button.x, file_button.y));
