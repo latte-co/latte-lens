@@ -1245,7 +1245,9 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         "Files"
     };
-    let detail = if is_agents_scope(app) {
+    let detail = if let Some(prefix) = app.tree_type_ahead_prefix() {
+        format!("› {prefix}")
+    } else if is_agents_scope(app) {
         #[cfg(feature = "agent-observability")]
         {
             let view = app.agent_view();

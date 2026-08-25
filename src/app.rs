@@ -360,6 +360,8 @@ const NAVIGATION_HISTORY_LIMIT: usize = 128;
 const NAVIGATION_STATUS_INFO: Duration = Duration::from_secs(4);
 const NAVIGATION_STATUS_ERROR: Duration = Duration::from_secs(8);
 const TREE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// Type-ahead prefix resets after this idle gap.
+const TREE_TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(800);
 const EXTERNAL_OPEN_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
 const EXTERNAL_OPEN_DEDUP_WINDOW: Duration = Duration::from_millis(500);
 
@@ -988,6 +990,10 @@ pub struct App {
     /// row). The hovered row is resolved at render time against the current
     /// scroll offset, so it stays correct after scrolling.
     tree_hover_pos: Option<(u16, u16)>,
+    /// Type-ahead filter buffer for the tree: the typed prefix and when the
+    /// last character was entered. Characters arriving after the timeout
+    /// start a fresh prefix.
+    tree_type_ahead: Option<(String, Instant)>,
     last_external_opened: Option<(ContentTarget, Instant)>,
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
@@ -1346,6 +1352,7 @@ impl App {
             last_search_click: None,
             last_tree_click: None,
             tree_hover_pos: None,
+            tree_type_ahead: None,
             last_external_opened: None,
             last_refresh_error: None,
             has_refresh_snapshot: false,
@@ -4261,8 +4268,84 @@ impl App {
             (KeyCode::Right, KeyModifiers::NONE) => {
                 self.focused_pane = FocusPane::Content;
             }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                self.type_tree_ahead_backspace();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE) if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' => {
+                self.type_tree_ahead(c);
+            }
             _ => {}
         }
+    }
+
+    /// Append a character to the tree type-ahead buffer and jump to the
+    /// first visible entry whose name starts with the resulting prefix
+    /// (case-insensitive). Characters arriving after
+    /// [`TREE_TYPE_AHEAD_TIMEOUT`] start a fresh prefix.
+    fn type_tree_ahead(&mut self, c: char) {
+        let now = Instant::now();
+        let prefix = match self.tree_type_ahead.take() {
+            Some((mut buffer, at))
+                if now.saturating_duration_since(at) <= TREE_TYPE_AHEAD_TIMEOUT =>
+            {
+                buffer.push(c);
+                buffer
+            }
+            _ => c.to_string(),
+        };
+        self.apply_tree_type_ahead(&prefix, now);
+    }
+
+    /// Drop the last character from the type-ahead buffer and re-apply the
+    /// remaining prefix.
+    fn type_tree_ahead_backspace(&mut self) {
+        let Some((mut buffer, at)) = self.tree_type_ahead.take() else {
+            return;
+        };
+        if Instant::now().saturating_duration_since(at) > TREE_TYPE_AHEAD_TIMEOUT {
+            return;
+        }
+        buffer.pop();
+        if buffer.is_empty() {
+            return;
+        }
+        self.apply_tree_type_ahead(&buffer, Instant::now());
+    }
+
+    fn apply_tree_type_ahead(&mut self, prefix: &str, now: Instant) {
+        let needle = prefix.to_lowercase();
+        let row_count = self.tree_row_count();
+        let mut found: Option<usize> = None;
+        for index in 0..row_count {
+            let name = match self.tree_scope {
+                TreeScope::AllFiles => self
+                    .visible_entries()
+                    .get(index)
+                    .map(|entry| entry.relative.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned())),
+                TreeScope::GitChanges => self
+                    .visible_git_rows()
+                    .get(index)
+                    .map(|row| row.label.clone()),
+                #[cfg(feature = "agent-observability")]
+                TreeScope::Agents => None,
+            };
+            if name.is_some_and(|name| name.to_lowercase().starts_with(&needle)) {
+                found = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = found {
+            self.select(index);
+        }
+        self.tree_type_ahead = Some((prefix.to_owned(), now));
+    }
+
+    /// The active type-ahead prefix, if the user typed within the timeout.
+    pub fn tree_type_ahead_prefix(&self) -> Option<&str> {
+        self.tree_type_ahead
+            .as_ref()
+            .filter(|(_, at)| Instant::now().saturating_duration_since(*at) <= TREE_TYPE_AHEAD_TIMEOUT)
+            .map(|(prefix, _)| prefix.as_str())
     }
 
     fn handle_content_key(&mut self, key: KeyEvent) {

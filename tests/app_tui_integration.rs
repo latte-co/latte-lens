@@ -644,6 +644,40 @@ fn mouse_move_highlights_hovered_tree_row() {
 }
 
 #[test]
+fn tree_type_ahead_jumps_to_matching_entry() {
+    let fixture = TestRepo::new();
+    fixture.write("alpha/file.txt", "a\n");
+    fixture.write("beta/file.txt", "b\n");
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // Collapse "src" so the visible rows are: alpha, beta, src, top-level files.
+    // Actually with the fixture above, visible top-level entries are
+    // alpha/, beta/, src/ (directories sort first). Type "b" → beta.
+    app.handle_key(key(KeyCode::Char('b')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("b"));
+
+    // Typing more characters narrows the prefix; "be" still matches beta.
+    app.handle_key(key(KeyCode::Char('e')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+
+    // Backspace drops the last character and re-applies the remaining prefix.
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("b"));
+
+    // A character with no match keeps the prefix but does not move.
+    app.handle_key(key(KeyCode::Char('z')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("bz"));
+
+    // Bound navigation keys (j/k/g) do not enter the type-ahead buffer.
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("bz"));
+}
+
+#[test]
 fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     let fixture = TestRepo::new();
     fixture.write("alpha/old.txt", "before\n");
