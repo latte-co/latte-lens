@@ -175,6 +175,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
+    // Reposition the + button to follow the last tab, and shift the new-tab
+    // menu anchor to match.
+    {
+        let tabs = app.tabs();
+        let mut x = tab_bar.x;
+        for tab in tabs {
+            // Each tab renders as "● title " or "  title " (marker + title + space).
+            let label_width = 2 + UnicodeWidthStr::width(tab.title.as_str()) as u16 + 1;
+            x = x.saturating_add(label_width);
+        }
+        let plus_x = x.min(tab_bar.x + tab_bar.width.saturating_sub(3));
+        app.ui_regions.new_tab_button =
+            Rect::new(plus_x, tab_bar.y, 3.min(tab_bar.width), tab_bar.height);
+        let menu_width = 20u16.min(tab_bar.width);
+        let menu_x = plus_x
+            .saturating_add(3)
+            .saturating_sub(menu_width)
+            .min(tab_bar.width.saturating_sub(menu_width));
+        app.ui_regions.new_tab_menu = Rect::new(
+            menu_x,
+            tab_bar.y.saturating_add(1),
+            menu_width,
+            app.ui_regions.new_tab_menu.height,
+        );
+    }
     draw_tab_bar(frame, app, tab_bar);
     draw_header(frame, app, header);
     if tree_width > 0 {
@@ -373,34 +398,36 @@ fn active_search_controls(area: Rect) -> (Rect, Rect, [Rect; 4]) {
 
 fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = app.tabs();
-    let plus_width = 3u16;
-    let tabs_width = area.width.saturating_sub(plus_width);
-    let [tabs_area, plus] = Layout::horizontal([
-        Constraint::Length(tabs_width),
-        Constraint::Length(plus_width),
-    ])
-    .areas(area);
     let active_id = app.active_tab_id();
+    let theme = Theme::current();
     let mut spans = Vec::new();
     for tab in tabs {
-        let label = format!(" {} ", tab.title);
-        let style = if tab.id == active_id {
-            Style::default()
-                .fg(accent())
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        let is_active = tab.id == active_id;
+        let (marker, style) = if is_active {
+            (
+                "● ",
+                Style::default()
+                    .fg(theme.content_accent)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
-            Style::default().fg(muted())
+            ("  ", Style::default().fg(theme.text_muted))
         };
-        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(marker, style));
+        spans.push(Span::styled(
+            format!("{} ", tab.title),
+            if is_active {
+                Style::default()
+                    .fg(theme.content_accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_muted)
+            },
+        ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " + ",
-            Style::default().fg(muted()),
-        ))),
-        plus,
-    );
+    // The + button follows the last tab, not the far right edge.
+    spans.push(Span::styled(" + ", Style::default().fg(theme.text_muted)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -1182,11 +1209,7 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
 
 /// Apply the hover background to a tree row when the pointer is over it.
 fn with_hover<'a>(item: ListItem<'a>, hovered: bool, style: Style) -> ListItem<'a> {
-    if hovered {
-        item.style(style)
-    } else {
-        item
-    }
+    if hovered { item.style(style) } else { item }
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
@@ -1852,7 +1875,9 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         if breadcrumbs.len() > 1 && available > 0 {
             app.content_breadcrumbs.clear();
             let title_style = if focused {
-                Style::default().fg(content_accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(content_accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
                     .fg(theme.text_subtle)
@@ -1861,7 +1886,11 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             let mut spans = vec![
                 Span::styled(
                     if focused { "● " } else { "  " },
-                    Style::default().fg(if focused { content_accent } else { theme.text_subtle }),
+                    Style::default().fg(if focused {
+                        content_accent
+                    } else {
+                        theme.text_subtle
+                    }),
                 ),
                 Span::styled(title.to_owned(), title_style),
                 Span::raw("  "),
@@ -1899,7 +1928,9 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 } else {
                     spans.push(Span::styled(
                         name.clone(),
-                        Style::default().fg(content_accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(content_accent)
+                            .add_modifier(Modifier::BOLD),
                     ));
                     app.content_breadcrumbs
                         .push((path.clone(), Rect::new(x, heading.y, seg_width, 1)));
@@ -1923,10 +1954,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             }
             if !extra.is_empty() {
                 let extra_width = UnicodeWidthStr::width(extra.as_str());
-                let remaining = heading
-                    .width
-                    .saturating_sub(x.saturating_sub(heading.x))
-                    as usize;
+                let remaining = heading.width.saturating_sub(x.saturating_sub(heading.x)) as usize;
                 if extra_width <= remaining {
                     spans.push(Span::styled(extra, Style::default().fg(theme.text_muted)));
                 }

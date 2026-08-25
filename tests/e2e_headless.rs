@@ -414,15 +414,17 @@ fn e2e_mouse_headless() {
     // Render to update ui_regions.
     render(&mut app);
 
-    // Click the "+" button (right end of tab bar, col 118).
-    app.handle_mouse(mouse_down(118, 0));
+    // Click the "+" button (positioned after the last tab).
+    let plus_x = app.ui_regions.new_tab_button.x;
+    app.handle_mouse(mouse_down(plus_x, 0));
     assert!(app.new_tab_menu.is_some());
 
     // Render to update ui_regions.
     render(&mut app);
 
-    // Click a menu item (Review, row 3 → index 1).
-    app.handle_mouse(mouse_down(105, 3));
+    // Click a menu item (Review, second item → row menu.y + 2).
+    let menu = app.ui_regions.new_tab_menu;
+    app.handle_mouse(mouse_down(menu.x + 2, menu.y + 2));
     assert!(app.new_tab_menu.is_none());
     assert_eq!(app.tab().kind(), TabKind::Review);
 }
@@ -981,9 +983,10 @@ fn e2e_tab_bar_mouse_headless() {
     app.handle_mouse(mouse_down(2, 0));
     assert_eq!(app.tab().kind(), TabKind::Files);
 
-    // Render and click the "+" button.
+    // Render and click the "+" button (positioned after the last tab).
     render(&mut app);
-    app.handle_mouse(mouse_down(118, 0));
+    let plus_x = app.ui_regions.new_tab_button.x;
+    app.handle_mouse(mouse_down(plus_x, 0));
     assert!(app.new_tab_menu.is_some());
 
     // Render and click outside the menu to dismiss.

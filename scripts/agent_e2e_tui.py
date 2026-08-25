@@ -93,6 +93,7 @@ def agent_metadata_to_live(context: ScenarioContext) -> None:
     session.key(b"G")
     session.key(b"g")
     session.key(b"h")
+    session.key(b"l")
     session.key(b"p")
     session.wait_screen(("Agent session", "Metadata only"), "preview keeps Agent detail")
     session.key(b"d")

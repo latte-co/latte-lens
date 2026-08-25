@@ -12,7 +12,10 @@ use latte_lens::agent::*;
 #[cfg(feature = "navigation-test-support")]
 use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
-    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeContextAction, TreeContextMenu, TreeScope},
+    app::{
+        App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeContextAction,
+        TreeContextMenu, TreeScope,
+    },
     config::TreeSide,
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
@@ -672,9 +675,9 @@ fn tree_type_ahead_jumps_to_matching_entry() {
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
     assert_eq!(app.tree_type_ahead_prefix(), Some("bz"));
 
-    // Bound navigation keys (j/k/g) do not enter the type-ahead buffer.
+    // Navigation keys (j/k/g) reset the type-ahead buffer.
     app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.tree_type_ahead_prefix(), Some("bz"));
+    assert_eq!(app.tree_type_ahead_prefix(), None);
 }
 
 #[test]
@@ -3304,7 +3307,7 @@ fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
         .buffer()
         .cell((app.ui_regions.tab_bar.x + 2, app.ui_regions.tab_bar.y))
         .unwrap();
-    assert!(focused_tab.modifier.contains(Modifier::UNDERLINED));
+    assert!(focused_tab.modifier.contains(Modifier::BOLD));
     assert_eq!(focused_tab.bg, Color::Reset);
 
     app.set_tree_scope(TreeScope::GitChanges);

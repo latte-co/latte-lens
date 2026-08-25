@@ -3778,11 +3778,7 @@ impl App {
             return None;
         }
         let visible_row = usize::from(row - self.ui_regions.tree_inner.y);
-        let index = self
-            .tab()
-            .tree_state
-            .offset()
-            .saturating_add(visible_row);
+        let index = self.tab().tree_state.offset().saturating_add(visible_row);
         (index < self.tree_row_count()).then_some(index)
     }
 
@@ -3801,7 +3797,10 @@ impl App {
         let row_y = tree.y.saturating_add(
             u16::try_from(menu.row.saturating_sub(self.tab().tree_state.offset())).unwrap_or(0),
         );
-        let menu_y = (row_y + 1).min(tree.y.saturating_add(tree.height.saturating_sub(menu_height)));
+        let menu_y = (row_y + 1).min(
+            tree.y
+                .saturating_add(tree.height.saturating_sub(menu_height)),
+        );
         let menu_x = tree.x.saturating_add(tree.width.saturating_sub(menu_width));
         Some(Rect::new(menu_x, menu_y, menu_width, menu_height))
     }
@@ -3811,11 +3810,18 @@ impl App {
     fn tree_context_menu_hit(&self, column: u16, row: u16) -> Option<usize> {
         let menu = self.tree_context_menu.as_ref()?;
         let rect = self.tree_context_menu_rect()?;
-        if !contains(rect, column, row) {
+        // Only hit-test the inner item area, not the border. Clicking the
+        // border dismisses the menu without executing an action.
+        let inner = Rect::new(
+            rect.x,
+            rect.y + 1,
+            rect.width,
+            rect.height.saturating_sub(2),
+        );
+        if !contains(inner, column, row) {
             return None;
         }
-        let inner_y = rect.y + 1; // skip top border
-        let index = usize::from(row - inner_y);
+        let index = usize::from(row - inner.y);
         let actions = TreeContextMenu::actions_for(self, menu.row);
         (index < actions.len()).then_some(index)
     }
@@ -4530,13 +4536,15 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
-        // Any non-type-ahead key resets the type-ahead buffer.
-        if !matches!(
+        // Any non-type-ahead key (including vim navigation j/k/g/G) resets
+        // the type-ahead buffer.
+        let is_pure_type_ahead = matches!(
             (key.code, key.modifiers),
             (KeyCode::Char(c), KeyModifiers::NONE)
-                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.'
-        ) && key.code != KeyCode::Backspace
-        {
+                if (c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+                && !matches!(c, 'j' | 'k' | 'g' | 'G')
+        );
+        if !is_pure_type_ahead && key.code != KeyCode::Backspace {
             self.tree_type_ahead = None;
         }
         match (key.code, key.modifiers) {
@@ -4559,7 +4567,9 @@ impl App {
             (KeyCode::Backspace, KeyModifiers::NONE) => {
                 self.type_tree_ahead_backspace();
             }
-            (KeyCode::Char(c), KeyModifiers::NONE) if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' => {
+            (KeyCode::Char(c), KeyModifiers::NONE)
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' =>
+            {
                 self.type_tree_ahead(c);
             }
             _ => {}
@@ -4606,10 +4616,12 @@ impl App {
         let mut found: Option<usize> = None;
         for index in 0..row_count {
             let name = match self.tree_scope {
-                TreeScope::AllFiles => self
-                    .visible_entries()
-                    .get(index)
-                    .map(|entry| entry.relative.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned())),
+                TreeScope::AllFiles => self.visible_entries().get(index).map(|entry| {
+                    entry
+                        .relative
+                        .file_name()
+                        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+                }),
                 TreeScope::GitChanges => self
                     .visible_git_rows()
                     .get(index)
@@ -4632,7 +4644,9 @@ impl App {
     pub fn tree_type_ahead_prefix(&self) -> Option<&str> {
         self.tree_type_ahead
             .as_ref()
-            .filter(|(_, at)| Instant::now().saturating_duration_since(*at) <= TREE_TYPE_AHEAD_TIMEOUT)
+            .filter(|(_, at)| {
+                Instant::now().saturating_duration_since(*at) <= TREE_TYPE_AHEAD_TIMEOUT
+            })
             .map(|(prefix, _)| prefix.as_str())
     }
 
