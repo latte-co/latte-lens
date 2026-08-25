@@ -162,21 +162,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let content_header = inset_left(content_header, 1);
     let content_rows = inset_left(content_rows, 1);
-    // Limit text width for readability on wide screens: center the text column
-    // with a max width. This is applied before regions() so content_inner (used
-    // for hit testing, hover, and wrap calculation) matches the render rect.
-    const MAX_TEXT_WIDTH: u16 = 100;
-    let content_rows = if content_rows.width > MAX_TEXT_WIDTH {
-        let padding = (content_rows.width - MAX_TEXT_WIDTH) / 2;
-        Rect::new(
-            content_rows.x.saturating_add(padding),
-            content_rows.y,
-            MAX_TEXT_WIDTH,
-            content_rows.height,
-        )
-    } else {
-        content_rows
-    };
     app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
