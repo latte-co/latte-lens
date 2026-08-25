@@ -3617,7 +3617,17 @@ impl App {
             .width
             .saturating_add(self.ui_regions.divider.width)
             .saturating_add(self.ui_regions.content_body.width);
-        let requested = column.saturating_sub(self.ui_regions.tree_body.x);
+        // The divider sits on the tree's inner edge: for a left-docked tree
+        // the width grows with `column - tree_left`, for a right-docked tree
+        // it grows with `tree_right - column`.
+        let requested = if self.tree_side == crate::config::TreeSide::Right {
+            self.ui_regions
+                .tree_body
+                .right()
+                .saturating_sub(column.saturating_add(1))
+        } else {
+            column.saturating_sub(self.ui_regions.tree_body.x)
+        };
         self.tab_mut().panel_width = Some(ui::tree_panel_width(total_width, Some(requested)));
     }
 

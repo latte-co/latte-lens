@@ -50,6 +50,14 @@ class Sandbox:
             self.tmp,
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Pin the tree to the left and visible so E2E scenarios that locate
+        # tree rows by their left-of-divider position stay deterministic;
+        # the right-side default is covered by unit tests.
+        state_dir = self.home / ".latte" / "lens" / "state"
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (state_dir / "layout.json").write_text(
+            json.dumps({"tree_side": "left", "tree_hidden": False}) + "\n"
+        )
         self.cleaned = False
 
     def environment(self, clipboard_mode: str = "osc52") -> dict[str, str]:

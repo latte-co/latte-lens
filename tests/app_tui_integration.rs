@@ -2994,6 +2994,51 @@ fn divider_drag_resizes_tree_with_minimum_tree_and_content_widths() {
 }
 
 #[test]
+fn divider_drag_resizes_right_docked_tree() {
+    let fixture = TestRepo::new();
+    fixture.write("file.txt", "hello\n");
+    fixture.commit_all("initial");
+    let mut app = App::with_system_open_disabled(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Right);
+    app.set_tree_hidden(false);
+    settle(&mut app);
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    // Right-docked: content first, then divider, then tree at the right edge.
+    assert_eq!(app.ui_regions.tree_body.width, 36);
+    assert!(app.ui_regions.tree_body.x > app.ui_regions.content_body.x);
+    assert_eq!(app.ui_regions.tree_body.right(), 100);
+    let drag_row = app.ui_regions.divider.y + 2;
+
+    // Dragging the divider left widens the right-docked tree.
+    app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 49);
+    assert_eq!(app.ui_regions.divider.x, 50);
+    assert_eq!(app.ui_regions.content_body.x, 0);
+    assert_eq!(app.ui_regions.content_body.width, 50);
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, drag_row));
+
+    // Dragging far right clamps to the minimum tree width.
+    app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 99, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 28);
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 99, drag_row));
+
+    // Dragging far left clamps to the maximum tree width (content minimum).
+    app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, drag_row));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(app.ui_regions.tree_body.width, 75);
+    assert_eq!(app.ui_regions.content_body.width, 24);
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, drag_row));
+}
+
+#[test]
 fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
     let fixture = TestRepo::new();
     fixture.write("a-clean.txt", "hello\n");
