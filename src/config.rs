@@ -109,21 +109,58 @@ pub(crate) fn is_ignored_error_path(error_path: &Path, ignored_paths: &HashSet<P
         .any(|ignored| normalized.starts_with(ignored))
 }
 
+/// Which side the tree pane docks to.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeSide {
+    Left,
+    #[default]
+    Right,
+}
+
+/// Persisted layout preferences for the main split.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct LayoutState {
+    pub tree_side: TreeSide,
+    pub tree_hidden: bool,
+}
+
+const LAYOUT_FILE: &str = "layout.json";
+
+fn layout_path() -> Result<PathBuf> {
+    Ok(state_root()?.join(LAYOUT_FILE))
+}
+
+/// Load the persisted layout. Missing or unreadable state yields the defaults
+/// (tree on the right, visible) so a corrupt file never blocks startup.
+pub(crate) fn load_layout_state() -> LayoutState {
+    let Ok(path) = layout_path() else {
+        return LayoutState::default();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return LayoutState::default();
+    };
+    serde_json::from_str::<LayoutState>(&content).unwrap_or_default()
+}
+
+/// Persist the layout, creating the state directory on demand.
+pub(crate) fn save_layout_state(state: &LayoutState) -> Result<()> {
+    let path = layout_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create state directory {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(state).context("cannot serialize layout state")?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("cannot write state file {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Env-var tests must run serially since they mutate process-global state.
-    /// Poison is tolerated so one assertion failure does not cascade into
-    /// lock-poison failures in sibling tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use crate::test_support::{EnvironmentGuard, lock_env};
 
     #[test]
     fn state_root_follows_latte_lens_state_dir() {
@@ -262,41 +299,52 @@ mod tests {
         ));
     }
 
-    /// Restores environment variables on drop.
-    struct EnvironmentGuard {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    #[test]
+    fn layout_defaults_to_right_side_visible() {
+        assert_eq!(TreeSide::default(), TreeSide::Right);
+        let state = LayoutState::default();
+        assert_eq!(state.tree_side, TreeSide::Right);
+        assert!(!state.tree_hidden);
     }
 
-    impl EnvironmentGuard {
-        fn apply(vars: &[(&'static str, Option<std::ffi::OsString>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(key, _)| (*key, env::var_os(key)))
-                .collect();
-            for (key, value) in vars {
-                // SAFETY: tests are single-threaded for env mutation.
-                unsafe {
-                    match value {
-                        Some(v) => env::set_var(key, v),
-                        None => env::remove_var(key),
-                    }
-                }
-            }
-            Self { saved }
-        }
+    #[test]
+    fn layout_round_trip_save_and_load() {
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let _guard = EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(state_dir.clone().into_os_string()),
+        )]);
+
+        let state = LayoutState {
+            tree_side: TreeSide::Left,
+            tree_hidden: true,
+        };
+        save_layout_state(&state).unwrap();
+        assert_eq!(load_layout_state(), state);
     }
 
-    impl Drop for EnvironmentGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                // SAFETY: tests are single-threaded for env mutation.
-                unsafe {
-                    match value {
-                        Some(v) => env::set_var(key, v),
-                        None => env::remove_var(key),
-                    }
-                }
-            }
-        }
+    #[test]
+    fn load_missing_layout_returns_default() {
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("missing").into_os_string()),
+        )]);
+        assert_eq!(load_layout_state(), LayoutState::default());
+    }
+
+    #[test]
+    fn load_corrupt_layout_returns_default() {
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join(LAYOUT_FILE), "not json {").unwrap();
+        let _guard =
+            EnvironmentGuard::apply(&[("LATTE_LENS_STATE_DIR", Some(state_dir.into_os_string()))]);
+        assert_eq!(load_layout_state(), LayoutState::default());
     }
 }

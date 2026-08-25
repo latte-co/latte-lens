@@ -21,7 +21,7 @@ Latte Lens 的快捷键按"作用域"分组设计，而不是混用不同 IDE �
 
 | 作用域 | 修饰符约定 | 适用场景 | 现有示例 |
 | --- | --- | --- | --- |
-| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索 |
+| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索、`Ctrl+B` 折叠/展开 Tree |
 | 代码语义命令 | `Ctrl` + 助记字母 | 基于语言服务器的语义导航 | `Ctrl+D` Definition、`Ctrl+R` References、`Ctrl+O` Implementations、`Ctrl+S` Document Symbols |
 | 面板/树/视口移动 | 无修饰方向键或 TUI 单键 | 焦点移动、滚动、树展开折叠 | `↑/↓/←/→`、`j/k`、`h/l`、`Tab`、`Enter`、`[/]`、`{/}` |
 | 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件、`x` 忽略错误 |
@@ -41,6 +41,7 @@ Search/Find/navigation results popup 时生效。
 | `Ctrl+P` | 打开 ⌘P tab 面板（tab 切换 + 文件打开） |
 | `Ctrl+N` | 打开「+」新 tab 菜单（Files / Review / Search / Chat） |
 | `Ctrl+W` | 关闭当前 tab（最后一个 tab 不可关） |
+| `Ctrl+B` | 折叠或展开 Tree 面板（VSCode 约定，B = sidebar） |
 | `/` | 打开文件搜索 popup |
 | `Ctrl+F` | 在当前 Preview 或 Diff 中查找 |
 | `Ctrl+Shift+F` / `Ctrl+T` | 打开工作区文本搜索 popup；`Ctrl+T` 用于无法区分 `Ctrl+Shift+F` 与 `Ctrl+F` 的终端 |
@@ -106,7 +107,7 @@ Search/Find/navigation results popup 时生效。
 
 - 字母取功能英文助记：`D` = Definition、`R` = References、`O` = Open implementations、
   `S` = Document Symbols、`P` = Palette（tab 切换 + 文件打开）、`N` = New tab、
-  `W` = Close tab（Window）、`F` = Find、`T` = Text search。
+  `W` = Close tab（Window）、`F` = Find、`T` = Text search、`B` = sidebar（折叠/展开 Tree）。
 - 同时接受大小写：`Char('d' | 'D')` + modifiers 恰为 `CONTROL` 均触发同一行为。用户无需
   主动按 `Shift`；`Ctrl+D` 与 `Ctrl+Shift+D` 等效。
 - 修饰符必须恰为 `CONTROL`；任何额外 `ALT/SUPER/SHIFT` 组合均忽略，不做近似匹配。

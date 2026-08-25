@@ -121,25 +121,39 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let [left, divider, right] = Layout::horizontal([
-        Constraint::Length(app.tree_panel_width(body.width)),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(body);
+    let tree_width = app.tree_panel_width(body.width);
+    let (tree_area, divider, content_area) = if tree_width == 0 {
+        (Rect::default(), Rect::default(), body)
+    } else if app.tree_side() == crate::config::TreeSide::Right {
+        let [content, divider, tree] = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(tree_width),
+        ])
+        .areas(body);
+        (tree, divider, content)
+    } else {
+        let [tree, divider, content] = Layout::horizontal([
+            Constraint::Length(tree_width),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        (tree, divider, content)
+    };
     let search_status_height = 0;
     let [tree_header, search_status, tree_rows] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(search_status_height),
         Constraint::Min(2),
     ])
-    .areas(left);
+    .areas(tree_area);
     let [content_header, content_rows] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(right);
+        Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(content_area);
     let tree_body = Rect::new(
-        left.x,
+        tree_area.x,
         tree_header.y,
-        left.width,
+        tree_area.width,
         tree_header
             .height
             .saturating_add(search_status.height)
@@ -156,14 +170,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         tree_header,
         tree_rows,
         divider,
-        content_body: right,
+        content_body: content_area,
         content_header,
         content_rows,
     });
     draw_tab_bar(frame, app, tab_bar);
     draw_header(frame, app, header);
-    draw_divider(frame, divider, app.tree_resize_dragging());
-    draw_tree(frame, app, tree_header, tree_rows);
+    if tree_width > 0 {
+        draw_divider(frame, divider, app.tree_resize_dragging());
+        draw_tree(frame, app, tree_header, tree_rows);
+    }
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
     if app.tab_palette.is_some() {
@@ -1972,31 +1988,31 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
-            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path{ignore_hint}  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path{ignore_hint}  ^B tree  q×2 quit"
         )
     } else if app.focused_pane == FocusPane::Tree {
         format!(
-            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path{ignore_hint}  q×2 quit"
+            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path{ignore_hint}  Ctrl+B tree  q×2 quit"
         )
     } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {tab_keys}  y path Y real  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {tab_keys}  y path Y real  ^B tree  q×2 quit"
         )
     } else if area.width < 96 {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {tab_keys}  r refresh  y path Y real  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {tab_keys}  r refresh  y path Y real  ^B tree  q×2 quit"
         )
     } else if app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {tab_keys}  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {tab_keys}  y copy path Y real/abs  Ctrl+B tree  q×2 quit"
         )
     } else if app.tab().content.mode == ContentMode::Diff {
         format!(
-            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  Ctrl+B tree  q×2 quit"
         )
     } else {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  q×2 quit"
+            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  Ctrl+B tree  q×2 quit"
         )
     };
     let content = if let Some(message) = app.quit_confirmation_message() {
