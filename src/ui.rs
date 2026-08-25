@@ -195,8 +195,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_divider(frame, divider, app.tree_resize_dragging());
         draw_tree(frame, app, tree_header, tree_rows);
     }
-    draw_content(frame, app, content_header, content_rows);
-    draw_footer(frame, app, footer);
+    draw_content(frame, app, content_header, content_rows);    draw_footer(frame, app, footer);
     if app.tab_palette.is_some() {
         dim_underlay(frame);
         draw_tab_palette(frame, app);
@@ -1797,24 +1796,10 @@ fn truncate_middle(value: &str, max_width: usize) -> String {
     format!("{head}…{tail}")
 }
 
-fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
+fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     if app.preview_find_is_active() {
         draw_preview_find(frame, app);
     } else {
-        let mut detail = app.selected_content_label();
-        if app.tab().content.mode == ContentMode::Preview
-            && let Some(provider) = app.tab().content.provider.as_deref()
-        {
-            detail.push_str(&format!(" · {provider}"));
-        }
-        if app.tab().content.mode == ContentMode::Preview
-            && let Some(real_path) = app.selected_symlink_real_path()
-        {
-            detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
-        }
-        if app.is_content_loading() {
-            detail.push_str(" · LOADING");
-        }
         let heading = if app.can_open_content_externally() {
             Rect::new(
                 header.x,
@@ -1827,19 +1812,122 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         } else {
             header
         };
-        // Truncate long file paths from the middle so the tail stays visible.
-        let title_width = UnicodeWidthStr::width(app.selected_content_title());
+        let title = app.selected_content_title();
+        let focused = app.content_is_focused();
+        let content_accent = Theme::current().content_accent;
+        let theme = Theme::current();
+        let title_width = UnicodeWidthStr::width(title);
         let overhead = 2 + title_width + 2; // "● " + title + "  "
         let available = heading.width.saturating_sub(overhead as u16) as usize;
-        let detail = truncate_middle(&detail, available);
-        draw_panel_heading(
-            frame,
-            heading,
-            app.selected_content_title(),
-            &detail,
-            app.content_is_focused(),
-            Theme::current().content_accent,
-        );
+
+        // Breadcrumb navigation: when the selected entry lives in the file
+        // tree, render its path as clickable segments. Parent directories are
+        // clickable (select that directory in the tree); the final segment
+        // is the current entry.
+        let breadcrumbs = app.selected_breadcrumbs();
+        if breadcrumbs.len() > 1 && available > 0 {
+            app.content_breadcrumbs.clear();
+            let title_style = if focused {
+                Style::default().fg(content_accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.text_subtle)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let mut spans = vec![
+                Span::styled(
+                    if focused { "● " } else { "  " },
+                    Style::default().fg(if focused { content_accent } else { theme.text_subtle }),
+                ),
+                Span::styled(title.to_owned(), title_style),
+                Span::raw("  "),
+            ];
+            let mut x = heading.x.saturating_add(overhead as u16);
+            // Drop leading segments that would overflow, keeping the tail.
+            let mut total: usize = breadcrumbs
+                .iter()
+                .map(|(name, _)| UnicodeWidthStr::width(name.as_str()))
+                .sum::<usize>()
+                + (breadcrumbs.len() - 1) * 3; // " / " separators
+            let mut skip = 0;
+            while total > available && skip < breadcrumbs.len() - 1 {
+                total -= UnicodeWidthStr::width(breadcrumbs[skip].0.as_str()) + 3;
+                skip += 1;
+            }
+            if skip > 0 {
+                spans.push(Span::styled("… / ", Style::default().fg(theme.text_subtle)));
+                x = x.saturating_add(UnicodeWidthStr::width("… / ") as u16);
+            }
+            for (i, (name, path)) in breadcrumbs.iter().enumerate().skip(skip) {
+                if i > skip {
+                    spans.push(Span::styled(" / ", Style::default().fg(theme.text_subtle)));
+                    x = x.saturating_add(3);
+                }
+                let seg_width = UnicodeWidthStr::width(name.as_str()) as u16;
+                let is_last = i == breadcrumbs.len() - 1;
+                if is_last {
+                    spans.push(Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(theme.text_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        name.clone(),
+                        Style::default().fg(content_accent).add_modifier(Modifier::BOLD),
+                    ));
+                    app.content_breadcrumbs
+                        .push((path.clone(), Rect::new(x, heading.y, seg_width, 1)));
+                }
+                x = x.saturating_add(seg_width);
+            }
+            // Append provider / symlink / loading hints after the breadcrumbs.
+            let mut extra = String::new();
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(provider) = app.tab().content.provider.as_deref()
+            {
+                extra.push_str(&format!(" · {provider}"));
+            }
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(real_path) = app.selected_symlink_real_path()
+            {
+                extra.push_str(&format!(" · ↗ {}", display_path(&real_path)));
+            }
+            if app.is_content_loading() {
+                extra.push_str(" · LOADING");
+            }
+            if !extra.is_empty() {
+                let extra_width = UnicodeWidthStr::width(extra.as_str());
+                let remaining = heading
+                    .width
+                    .saturating_sub(x.saturating_sub(heading.x))
+                    as usize;
+                if extra_width <= remaining {
+                    spans.push(Span::styled(extra, Style::default().fg(theme.text_muted)));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), heading);
+        } else {
+            app.content_breadcrumbs.clear();
+            let mut detail = app.selected_content_label();
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(provider) = app.tab().content.provider.as_deref()
+            {
+                detail.push_str(&format!(" · {provider}"));
+            }
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(real_path) = app.selected_symlink_real_path()
+            {
+                detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
+            }
+            if app.is_content_loading() {
+                detail.push_str(" · LOADING");
+            }
+            // Truncate long file paths from the middle so the tail stays visible.
+            let detail = truncate_middle(&detail, available);
+            draw_panel_heading(frame, heading, title, &detail, focused, content_accent);
+        }
         if app.can_open_content_externally() {
             let label = if app.external_open_confirmation_for_content() {
                 " [Open anyway] "

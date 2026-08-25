@@ -994,6 +994,10 @@ pub struct App {
     /// last character was entered. Characters arriving after the timeout
     /// start a fresh prefix.
     tree_type_ahead: Option<(String, Instant)>,
+    /// Clickable breadcrumb segments in the content header (path, rect),
+    /// recomputed each frame. A click on a segment selects that directory
+    /// in the tree.
+    pub(crate) content_breadcrumbs: Vec<(PathBuf, Rect)>,
     last_external_opened: Option<(ContentTarget, Instant)>,
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
@@ -1353,6 +1357,7 @@ impl App {
             last_tree_click: None,
             tree_hover_pos: None,
             tree_type_ahead: None,
+            content_breadcrumbs: Vec::new(),
             last_external_opened: None,
             last_refresh_error: None,
             has_refresh_snapshot: false,
@@ -1614,6 +1619,54 @@ impl App {
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => None,
         }
+    }
+
+    /// Breadcrumb segments (display name, relative path) for the selected
+    /// entry, from the workspace root to the entry itself. The last segment
+    /// is the selected entry; earlier segments are clickable parent
+    /// directories.
+    pub fn selected_breadcrumbs(&self) -> Vec<(String, PathBuf)> {
+        let Some(relative) = self.selected_relative_path() else {
+            return Vec::new();
+        };
+        let mut segments = Vec::new();
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            current.push(component);
+            let name = component.as_os_str().to_string_lossy().into_owned();
+            segments.push((name, current.clone()));
+        }
+        segments
+    }
+
+    /// Select the tree entry at `path` (relative to the workspace root),
+    /// expanding parent directories so the entry becomes visible. Used by
+    /// breadcrumb navigation. Returns true when the entry was found.
+    pub fn select_relative_path(&mut self, path: &Path) -> bool {
+        if self.tree_scope == TreeScope::AllFiles {
+            // Expand every ancestor so the target row is visible.
+            let mut ancestor = path.parent();
+            while let Some(dir) = ancestor {
+                if !dir.as_os_str().is_empty() {
+                    self.tab_mut()
+                        .files_mut()
+                        .expansion
+                        .entry(dir.to_path_buf())
+                        .or_insert(true);
+                }
+                ancestor = dir.parent();
+            }
+            self.rebuild_visible_rows();
+            if let Some(index) = self
+                .visible_entries()
+                .iter()
+                .position(|entry| entry.relative == path)
+            {
+                self.select(index);
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn git_row_is_expanded(&self, row: &GitTreeRow) -> bool {
@@ -3429,6 +3482,18 @@ impl App {
                             self.last_tree_click = Some((identity, Instant::now()));
                         }
                     }
+                } else if let Some((path, _)) = self
+                    .content_breadcrumbs
+                    .iter()
+                    .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
+                    .cloned()
+                {
+                    // Breadcrumb click: select the parent directory in the tree.
+                    self.clear_content_selection();
+                    self.last_tree_click = None;
+                    if self.select_relative_path(&path) {
+                        self.focused_pane = FocusPane::Tree;
+                    }
                 } else if contains(self.ui_regions.content_inner, mouse.column, mouse.row) {
                     self.last_tree_click = None;
                     self.focused_pane = FocusPane::Content;
@@ -4251,6 +4316,15 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
+        // Any non-type-ahead key resets the type-ahead buffer.
+        if !matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char(c), KeyModifiers::NONE)
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.'
+        ) && key.code != KeyCode::Backspace
+        {
+            self.tree_type_ahead = None;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Down | KeyCode::Char('j'), _) => self.move_selection(1),
             (KeyCode::Up | KeyCode::Char('k'), _) => self.move_selection(-1),
@@ -4346,6 +4420,11 @@ impl App {
             .as_ref()
             .filter(|(_, at)| Instant::now().saturating_duration_since(*at) <= TREE_TYPE_AHEAD_TIMEOUT)
             .map(|(prefix, _)| prefix.as_str())
+    }
+
+    /// Clickable breadcrumb segment rects from the last rendered frame.
+    pub fn content_breadcrumb_rects(&self) -> &[(PathBuf, Rect)] {
+        &self.content_breadcrumbs
     }
 
     fn handle_content_key(&mut self, key: KeyEvent) {

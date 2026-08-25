@@ -678,6 +678,54 @@ fn tree_type_ahead_jumps_to_matching_entry() {
 }
 
 #[test]
+fn breadcrumbs_show_selected_path_and_click_navigates_to_parent() {
+    let fixture = TestRepo::new();
+    fixture.write("src/nested/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Navigate to src/nested/main.rs using type-ahead + Enter.
+    // 's', 'n', 'm' are not globally bound, so they reach tree type-ahead.
+    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('n')));
+    app.handle_key(key(KeyCode::Enter)); // expand nested
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('m')));
+    app.handle_key(key(KeyCode::Enter)); // preview main.rs
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/nested/main.rs"))
+    );
+
+    // Breadcrumbs reflect the full path.
+    let breadcrumbs = app.selected_breadcrumbs();
+    assert_eq!(
+        breadcrumbs
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["src", "nested", "main.rs"]
+    );
+
+    // Draw to populate breadcrumb rects, then click the "src" segment.
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(!app.content_breadcrumb_rects().is_empty());
+
+    // The first breadcrumb segment is "src" — click it.
+    let (_, rect) = &app.content_breadcrumb_rects()[0];
+    app.handle_mouse(mouse_down(rect.x, rect.y));
+    // The tree should now have "src" selected.
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+}
+
+#[test]
 fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     let fixture = TestRepo::new();
     fixture.write("alpha/old.txt", "before\n");
