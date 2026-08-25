@@ -24,7 +24,7 @@ Latte Lens 的快捷键按"作用域"分组设计，而不是混用不同 IDE �
 | 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索 |
 | 代码语义命令 | `Ctrl` + 助记字母 | 基于语言服务器的语义导航 | `Ctrl+D` Definition、`Ctrl+R` References、`Ctrl+O` Implementations、`Ctrl+S` Document Symbols |
 | 面板/树/视口移动 | 无修饰方向键或 TUI 单键 | 焦点移动、滚动、树展开折叠 | `↑/↓/←/→`、`j/k`、`h/l`、`Tab`、`Enter`、`[/]`、`{/}` |
-| 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件 |
+| 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件、`x` 忽略错误 |
 | 历史方向 | `Alt` + 方向键 | 导航历史回退与前进 | `Alt+Left` Back、`Alt+Right` Forward |
 | 鼠标语义提示 | `Alt` + 鼠标 | 鼠标悬停 token 高亮与点击跳转 | `Alt+Moved` token 下划线、`Alt+左键` Definition |
 
@@ -84,6 +84,7 @@ Search/Find/navigation results popup 时生效。
 | `n` | Diff 中下一个更改文件 |
 | `N` | Diff 中上一个更改文件 |
 | `Space` | 标记显示的文件 diff 已审阅；再按清除标记 |
+| `x` | Review 树中忽略（或恢复）选中 issue / 仓库 / 目录组下的 discovery error |
 
 ### 3.5 历史方向
 
@@ -113,7 +114,7 @@ Search/Find/navigation results popup 时生效。
 ### 4.2 无修饰小写单键规范
 
 - 小写字母执行常规操作：`p` = Preview、`d` = Diff、`r` = Refresh、`q` = Quit、`y` = 复制
-  相对路径、`n` = 下一个更改文件。
+  相对路径、`n` = 下一个更改文件、`x` = 忽略当前选中的 discovery error。
 - 大写字母执行增强或反向操作：`Y` = 复制真实/绝对路径、`N` = 上一个更改文件。
 - 无修饰单键只在当前视图操作作用域内生效，不与 `Ctrl` + 助记字母冲突。
 

@@ -140,6 +140,7 @@ Inside the TUI:
 | `i` | Only after Lens reports that no system app is available for a verified image, confirm a bounded TrueColor terminal preview |
 | `y` / `Y` | Copy the selected path: `y` copies the relative path (the link path for symlinks), `Y` copies the real/absolute path (resolved target for symlinks in All Files scope); directories get a trailing `/` |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
+| `x` | In the Review tree, dismiss (or restore) discovery errors under the selected issue, repository, or directory group |
 | `n` / `N` | Next or previous changed file in Diff |
 | `r` | Refresh repository state |
 | `q` / `esc` | Press twice within 1.5 seconds to quit; `esc` closes an active search first |
