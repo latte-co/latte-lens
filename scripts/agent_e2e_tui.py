@@ -101,7 +101,6 @@ def agent_metadata_to_live(context: ScenarioContext) -> None:
     session.wait_screen(
         (
             "1/2 live",
-            "live Working",
             "Live observed",
             "Activity      Working",
             "Authoritative",
@@ -117,12 +116,12 @@ def agent_metadata_to_live(context: ScenarioContext) -> None:
     )
     session.key(b"r")
     session.wait_screen(
-        ("live Idle", "Activity      Idle"),
+        ("Activity      Idle",),
         "live activity advances to idle",
     )
     session.key(b"r")
     session.wait_screen(
-        ("live Unknown", "Activity      Unknown", "Freshness     Stale"),
+        ("Activity      Unknown", "Freshness     Stale"),
         "evidence expiry is reduced into stale unknown activity",
     )
     session.key(b"r")

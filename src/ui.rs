@@ -1737,7 +1737,8 @@ fn truncate_to_width_forced(value: &str, max_width: usize) -> String {
 
 /// Truncate a string to max_width, keeping the start and end with "…" in the
 /// middle. Used for long file paths where the tail is more useful than the
-/// middle.
+/// middle. Width-aware: counts display columns, not chars, so CJK and other
+/// double-width characters are handled correctly.
 fn truncate_middle(value: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(value) <= max_width {
         return value.to_owned();
@@ -1745,16 +1746,29 @@ fn truncate_middle(value: &str, max_width: usize) -> String {
     if max_width < 4 {
         return truncate_to_width_forced(value, max_width);
     }
-    let keep = (max_width - 1) / 2;
-    let head: String = value.chars().take(keep).collect();
-    let tail: String = value
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let ellipsis_width = UnicodeWidthChar::width('…').unwrap_or(1);
+    let keep = max_width.saturating_sub(ellipsis_width) / 2;
+    let mut head = String::new();
+    let mut head_width = 0;
+    for ch in value.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if head_width + w > keep {
+            break;
+        }
+        head.push(ch);
+        head_width += w;
+    }
+    let mut tail = String::new();
+    let mut tail_width = 0;
+    for ch in value.chars().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if tail_width + w > keep {
+            break;
+        }
+        tail.push(ch);
+        tail_width += w;
+    }
+    let tail: String = tail.chars().rev().collect();
     format!("{head}…{tail}")
 }
 
@@ -2706,6 +2720,25 @@ mod tests {
 
         assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 7);
         assert_eq!(truncated, "目录文…");
+    }
+
+    #[test]
+    fn middle_truncation_respects_double_width_names() {
+        // CJK chars are double-width; the result must not exceed max_width.
+        let truncated = truncate_middle("目录/benchmark/文件结构.md", 12);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 12);
+        // Head and tail are preserved with a middle ellipsis.
+        assert!(truncated.contains('…'));
+        assert!(truncated.starts_with("目录"));
+        assert!(truncated.ends_with(".md"));
+
+        // ASCII paths still work.
+        let ascii = truncate_middle("spec/benchmark/package-structure.md", 20);
+        assert!(UnicodeWidthStr::width(ascii.as_str()) <= 20);
+        assert!(ascii.contains('…'));
+
+        // Short strings pass through unchanged.
+        assert_eq!(truncate_middle("short.txt", 20), "short.txt");
     }
 
     #[test]
