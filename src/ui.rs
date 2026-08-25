@@ -17,7 +17,8 @@ use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
         GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, NewTabMenuState,
-        PaletteItem, SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
+        PaletteItem, SearchMode, SearchResult, TreeContextMenu, TreeScope, UiRegions,
+        display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -195,7 +196,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_divider(frame, divider, app.tree_resize_dragging());
         draw_tree(frame, app, tree_header, tree_rows);
     }
-    draw_content(frame, app, content_header, content_rows);    draw_footer(frame, app, footer);
+    draw_content(frame, app, content_header, content_rows);
+    draw_footer(frame, app, footer);
     if app.tab_palette.is_some() {
         dim_underlay(frame);
         draw_tab_palette(frame, app);
@@ -208,6 +210,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.search_is_active() {
         dim_underlay(frame);
         draw_search_popup(frame, app);
+    } else if app.tree_context_menu.is_some() {
+        dim_underlay(frame);
+        draw_tree_context_menu(frame, app);
     }
 }
 
@@ -593,6 +598,40 @@ fn draw_new_tab_menu(frame: &mut Frame, app: &App, anchor: Rect) {
             Style::default().fg(text_primary())
         };
         lines.push(Line::from(Span::styled(label, style)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_tree_context_menu(frame: &mut Frame, app: &App) {
+    let Some(menu) = app.tree_context_menu.as_ref() else {
+        return;
+    };
+    let Some(rect) = app.tree_context_menu_rect() else {
+        return;
+    };
+    let actions = TreeContextMenu::actions_for(app, menu.row);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent())),
+        rect,
+    );
+    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
+    let theme = Theme::current();
+    let mut lines = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        let style = if index == menu.selected {
+            Style::default()
+                .fg(theme.content_accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}  ", action.label()),
+            style,
+        )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }

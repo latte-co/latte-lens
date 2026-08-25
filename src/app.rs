@@ -534,6 +534,63 @@ impl NewTabMenuState {
     }
 }
 
+/// Actions offered by the tree right-click context menu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeContextAction {
+    /// Preview the file (same as Enter on a file row).
+    Preview,
+    /// Expand or collapse the directory (same as Enter on a directory row).
+    ToggleExpand,
+    /// Copy the path relative to the workspace root.
+    CopyRelative,
+    /// Copy the absolute filesystem path.
+    CopyAbsolute,
+    /// Open in the system default application.
+    OpenExternal,
+}
+
+impl TreeContextAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "Preview",
+            Self::ToggleExpand => "Expand / Collapse",
+            Self::CopyRelative => "Copy relative path",
+            Self::CopyAbsolute => "Copy absolute path",
+            Self::OpenExternal => "Open externally",
+        }
+    }
+}
+
+/// Right-click context menu for a tree row. The menu is anchored at the
+/// clicked row and offers row-appropriate actions.
+#[derive(Clone, Debug)]
+pub struct TreeContextMenu {
+    /// Tree row index this menu is anchored to.
+    pub row: usize,
+    /// Selected menu item index.
+    pub selected: usize,
+}
+
+impl TreeContextMenu {
+    /// The actions available for the given tree row, in display order.
+    pub fn actions_for(app: &App, row: usize) -> Vec<TreeContextAction> {
+        let is_container = app.tree_row_is_container(row);
+        let is_file = app.tree_row_is_file(row);
+        let mut actions = Vec::new();
+        if is_container {
+            actions.push(TreeContextAction::ToggleExpand);
+        } else if is_file {
+            actions.push(TreeContextAction::Preview);
+        }
+        actions.push(TreeContextAction::CopyRelative);
+        actions.push(TreeContextAction::CopyAbsolute);
+        if is_file {
+            actions.push(TreeContextAction::OpenExternal);
+        }
+        actions
+    }
+}
+
 /// One row in the ⌘P palette: either an open tab to switch to, or a workspace
 /// file to open in the Files tab.
 #[derive(Clone, Debug)]
@@ -998,6 +1055,8 @@ pub struct App {
     /// recomputed each frame. A click on a segment selects that directory
     /// in the tree.
     pub(crate) content_breadcrumbs: Vec<(PathBuf, Rect)>,
+    /// Right-click context menu for a tree row, when open.
+    pub tree_context_menu: Option<TreeContextMenu>,
     last_external_opened: Option<(ContentTarget, Instant)>,
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
@@ -1358,6 +1417,7 @@ impl App {
             tree_hover_pos: None,
             tree_type_ahead: None,
             content_breadcrumbs: Vec::new(),
+            tree_context_menu: None,
             last_external_opened: None,
             last_refresh_error: None,
             has_refresh_snapshot: false,
@@ -2095,6 +2155,11 @@ impl App {
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
+            return;
+        }
+        if self.tree_context_menu.is_some() {
+            self.quit_confirmation = None;
+            self.handle_tree_context_menu_key(key);
             return;
         }
         let copy_key = matches!(key.code, KeyCode::Char('c' | 'C'));
@@ -3396,9 +3461,41 @@ impl App {
             return;
         }
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.clipboard_status = None;
+                // Right-click on a tree row selects it and opens the context menu.
+                if contains(self.ui_regions.tree_inner, mouse.column, mouse.row) {
+                    let visible_row = usize::from(mouse.row - self.ui_regions.tree_inner.y);
+                    let index = self
+                        .tab_mut()
+                        .tree_state
+                        .offset()
+                        .saturating_add(visible_row);
+                    if index < self.tree_row_count() {
+                        self.select(index);
+                        self.tree_context_menu = Some(TreeContextMenu {
+                            row: index,
+                            selected: 0,
+                        });
+                    }
+                    return;
+                }
+                // Right-click elsewhere closes the menu.
+                self.tree_context_menu = None;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.clipboard_status = None;
                 self.tree_resize_dragging = false;
+                // If the context menu is open, left-click either activates an
+                // item or dismisses the menu.
+                if self.tree_context_menu.is_some() {
+                    if let Some(action_index) = self.tree_context_menu_hit(mouse.column, mouse.row)
+                    {
+                        self.execute_tree_context_action(action_index);
+                    }
+                    self.tree_context_menu = None;
+                    return;
+                }
                 if contains(self.ui_regions.new_tab_button, mouse.column, mouse.row) {
                     self.new_tab_menu = Some(NewTabMenuState::new());
                     return;
@@ -3634,6 +3731,22 @@ impl App {
         }
     }
 
+    /// Whether the row at `index` is a file (not a directory/container).
+    fn tree_row_is_file(&self, index: usize) -> bool {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .is_some_and(|entry| !entry.is_dir),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .is_some_and(|row| row.is_change()),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => false,
+        }
+    }
+
     fn tree_row_depth(&self, index: usize) -> usize {
         match self.tree_scope {
             TreeScope::AllFiles => self
@@ -3671,6 +3784,107 @@ impl App {
             .offset()
             .saturating_add(visible_row);
         (index < self.tree_row_count()).then_some(index)
+    }
+
+    /// Compute the on-screen rect for the open tree context menu, if any.
+    /// The menu is anchored at the clicked tree row, right-aligned to the
+    /// tree panel so it never clips off the right edge.
+    pub fn tree_context_menu_rect(&self) -> Option<Rect> {
+        let menu = self.tree_context_menu.as_ref()?;
+        let actions = TreeContextMenu::actions_for(self, menu.row);
+        if actions.is_empty() {
+            return None;
+        }
+        let tree = self.ui_regions.tree_inner;
+        let menu_width = 24u16.min(tree.width);
+        let menu_height = (actions.len() as u16) + 2; // border + items
+        let row_y = tree.y.saturating_add(
+            u16::try_from(menu.row.saturating_sub(self.tab().tree_state.offset())).unwrap_or(0),
+        );
+        let menu_y = (row_y + 1).min(tree.y.saturating_add(tree.height.saturating_sub(menu_height)));
+        let menu_x = tree.x.saturating_add(tree.width.saturating_sub(menu_width));
+        Some(Rect::new(menu_x, menu_y, menu_width, menu_height))
+    }
+
+    /// Hit-test a click against the open context menu items. Returns the
+    /// action index if the click lands on a menu item.
+    fn tree_context_menu_hit(&self, column: u16, row: u16) -> Option<usize> {
+        let menu = self.tree_context_menu.as_ref()?;
+        let rect = self.tree_context_menu_rect()?;
+        if !contains(rect, column, row) {
+            return None;
+        }
+        let inner_y = rect.y + 1; // skip top border
+        let index = usize::from(row - inner_y);
+        let actions = TreeContextMenu::actions_for(self, menu.row);
+        (index < actions.len()).then_some(index)
+    }
+
+    /// Execute the context menu action at `action_index` for the menu's row.
+    fn execute_tree_context_action(&mut self, action_index: usize) {
+        let Some(menu) = self.tree_context_menu.clone() else {
+            return;
+        };
+        let actions = TreeContextMenu::actions_for(self, menu.row);
+        let Some(&action) = actions.get(action_index) else {
+            return;
+        };
+        // Select the row so the action targets the right entry.
+        self.select(menu.row);
+        match action {
+            TreeContextAction::Preview => {
+                self.activate_selected_tree_entry();
+            }
+            TreeContextAction::ToggleExpand => {
+                self.activate_selected_tree_entry();
+            }
+            TreeContextAction::CopyRelative => {
+                self.queue_selected_path_copy(false);
+            }
+            TreeContextAction::CopyAbsolute => {
+                self.queue_selected_path_copy(true);
+            }
+            TreeContextAction::OpenExternal => {
+                self.request_external_open(ExternalOpenTrigger::ExplicitConfirm);
+            }
+        }
+    }
+
+    /// Handle a key event while the tree context menu is open. Returns true
+    /// if the key was consumed.
+    fn handle_tree_context_menu_key(&mut self, key: KeyEvent) -> bool {
+        let Some(mut menu) = self.tree_context_menu.clone() else {
+            return false;
+        };
+        let action_count = TreeContextMenu::actions_for(self, menu.row).len();
+        match key.code {
+            KeyCode::Esc => {
+                self.tree_context_menu = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if action_count > 0 {
+                    menu.selected = (menu.selected + 1) % action_count;
+                    self.tree_context_menu = Some(menu);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if action_count > 0 {
+                    menu.selected = if menu.selected == 0 {
+                        action_count - 1
+                    } else {
+                        menu.selected - 1
+                    };
+                    self.tree_context_menu = Some(menu);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let selected = menu.selected;
+                self.execute_tree_context_action(selected);
+                self.tree_context_menu = None;
+            }
+            _ => {}
+        }
+        true
     }
 
     fn handle_search_mouse_down(&mut self, mouse: MouseEvent) -> bool {

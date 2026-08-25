@@ -12,7 +12,7 @@ use latte_lens::agent::*;
 #[cfg(feature = "navigation-test-support")]
 use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
-    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeScope},
+    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeContextAction, TreeContextMenu, TreeScope},
     config::TreeSide,
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
@@ -723,6 +723,61 @@ fn breadcrumbs_show_selected_path_and_click_navigates_to_parent() {
     // The tree should now have "src" selected.
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(app.focused_pane, FocusPane::Tree);
+}
+
+#[test]
+fn right_click_opens_context_menu_and_actions_execute() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // Right-click on the "src" directory row opens the context menu.
+    app.handle_mouse(mouse_right_down(tree_x, tree_y));
+    assert!(app.tree_context_menu.is_some());
+    let menu = app.tree_context_menu.as_ref().unwrap();
+    assert_eq!(menu.row, 0);
+    assert_eq!(menu.selected, 0);
+
+    // The menu for a directory starts with ToggleExpand.
+    let actions = TreeContextMenu::actions_for(&app, 0);
+    assert_eq!(actions[0], TreeContextAction::ToggleExpand);
+
+    // Down arrow navigates, Enter executes the first action (toggle expand).
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 1);
+    // Navigate back to the first item.
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 0);
+
+    // Enter on ToggleExpand expands the directory and closes the menu.
+    let before = visible_paths(&app);
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.tree_context_menu.is_none());
+    assert!(visible_paths(&app).len() > before.len());
+
+    // Right-click on a file row shows Preview as the first action.
+    // First expand src, then right-click on the file row.
+    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    // Find the file row (src/main.rs).
+    let file_row = tree_y + 1; // src is row 0, src/main.rs is row 1
+    app.handle_mouse(mouse_right_down(tree_x, file_row));
+    let actions = TreeContextMenu::actions_for(&app, 1);
+    assert_eq!(actions[0], TreeContextAction::Preview);
+
+    // Esc closes the menu without executing.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.tree_context_menu.is_none());
 }
 
 #[test]
@@ -4814,6 +4869,10 @@ fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
 
 fn mouse_down(column: u16, row: u16) -> MouseEvent {
     mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+}
+
+fn mouse_right_down(column: u16, row: u16) -> MouseEvent {
+    mouse(MouseEventKind::Down(MouseButton::Right), column, row)
 }
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
