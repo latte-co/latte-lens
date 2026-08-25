@@ -651,20 +651,54 @@ fn regular_files_do_not_consume_the_repository_discovery_budget() {
 
 #[cfg(unix)]
 #[test]
-fn symlink_cycles_and_workspace_escapes_are_not_followed() {
+fn symlinked_repositories_are_followed_but_cycles_terminate() {
     use std::os::unix::fs::symlink;
 
     let workspace = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let outside_repo = outside.path().join("repo");
     init(&outside_repo);
+    // A repository nested in a real directory behind a link is reached
+    // through the link access path (the `link/dir/worktrees` layout).
+    let nested_repo = outside.path().join("group/nested");
+    init(&nested_repo);
     symlink(&outside_repo, workspace.path().join("outside-link")).unwrap();
+    symlink(outside.path(), workspace.path().join("group-link")).unwrap();
     symlink(workspace.path(), workspace.path().join("cycle")).unwrap();
 
     let graph = RepoGraph::discover(workspace.path()).unwrap();
 
-    assert!(graph.repositories().is_empty());
+    // Explicitly linked repositories outside the workspace are discovered
+    // and displayed at their link access path.
+    let snapshot = snapshot_at(&graph, &outside_repo);
+    assert_eq!(snapshot.node.kind, RepoKind::Symlinked);
+    assert_eq!(
+        snapshot.node.workspace_relative.as_deref(),
+        Some(Path::new("outside-link"))
+    );
+    let nested = snapshot_at(&graph, &nested_repo);
+    assert_eq!(nested.node.kind, RepoKind::Symlinked);
+    assert_eq!(
+        nested.node.workspace_relative.as_deref(),
+        Some(Path::new("group-link/group/nested"))
+    );
+    assert!(
+        graph
+            .report()
+            .symlinks
+            .iter()
+            .any(|(access, _)| access == Path::new("outside-link"))
+    );
+
+    // The self-referential cycle terminates without errors or truncation
+    // instead of walking the workspace a second time.
+    assert!(
+        graph.report().errors.is_empty(),
+        "{:?}",
+        graph.report().errors
+    );
     assert!(!graph.report().is_truncated());
+    assert_eq!(graph.repositories().len(), 2);
 }
 
 #[cfg(unix)]

@@ -9871,6 +9871,89 @@ mod tests {
         assert!(change.ancestors.contains(&repo.identity));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_repo_diff_and_preview_load_through_repo_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let external = tempfile::tempdir().unwrap();
+        let repo_path = external.path().join("diff-repo");
+        init_git_repository(&repo_path);
+        fs::write(repo_path.join("tracked.txt"), "before\n").unwrap();
+        for args in [
+            ["add", "."].as_slice(),
+            ["commit", "-m", "initial", "--quiet"].as_slice(),
+        ] {
+            let output = Command::new("git")
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        fs::write(repo_path.join("tracked.txt"), "after\n").unwrap();
+        symlink(&repo_path, root.join("diff-link")).unwrap();
+
+        let graph = RepoGraph::discover_with_options(
+            root,
+            DiscoveryOptions {
+                max_entries: 128,
+                max_repositories: 16,
+                max_depth: 8,
+            },
+        )
+        .unwrap();
+        let change = graph
+            .repositories()
+            .iter()
+            .flat_map(|snapshot| snapshot.changes.iter())
+            .find(|change| change.path.relative == Path::new("tracked.txt"))
+            .expect("tracked change")
+            .clone();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: graph.projected_change_count(),
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: Some(graph),
+            existing_changes: HashSet::new(),
+            full_repository_discovery: true,
+        });
+        app.apply_tree_scope(TreeScope::GitChanges);
+
+        app.request_content(
+            ContentKind::Diff,
+            "tracked.txt".to_owned(),
+            ContentTarget::Repository(change.clone()),
+        );
+        app.wait_for_background();
+        assert!(
+            app.tab().content.lines.iter().any(|line| line == "+after"),
+            "diff lines: {:?}",
+            app.tab().content.lines
+        );
+
+        app.request_content(
+            ContentKind::Preview,
+            "tracked.txt".to_owned(),
+            ContentTarget::Repository(change),
+        );
+        app.wait_for_background();
+        assert!(
+            app.tab().content.lines.iter().any(|line| line == "after"),
+            "preview lines: {:?}",
+            app.tab().content.lines
+        );
+    }
+
     #[test]
     fn git_changes_nests_issues_under_their_directory() {
         let workspace = tempfile::tempdir().unwrap();

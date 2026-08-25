@@ -893,10 +893,17 @@ fn resolve_preview_target(
             })?;
             let relative = change.path.relative;
             let absolute = snapshot.node.worktree.join(&relative);
+            // A symlinked repository lives outside the workspace; bound the
+            // preview by its own worktree instead so the file stays readable.
+            let content_root = if snapshot.node.kind == crate::repo_graph::RepoKind::Symlinked {
+                snapshot.node.worktree.clone()
+            } else {
+                root.to_path_buf()
+            };
             (
                 absolute.clone(),
                 relative,
-                root.to_path_buf(),
+                content_root,
                 ContentIdentity::from_absolute(root, &absolute),
                 server_root_for_document(root, Some(graph), &absolute),
             )
@@ -936,7 +943,18 @@ fn execute_content(
                     snapshot.node.worktree.display()
                 )
             })?;
-            ensure_beneath(root, &snapshot.node.worktree.join(&change.path.relative))?;
+            // Repository content is bounded by the owning worktree: a
+            // symlinked repository legitimately lives outside the workspace,
+            // so its diff must not be rejected by the workspace boundary.
+            let content_root = if snapshot.node.kind == crate::repo_graph::RepoKind::Symlinked {
+                snapshot.node.worktree.as_path()
+            } else {
+                root
+            };
+            ensure_beneath(
+                content_root,
+                &snapshot.node.worktree.join(&change.path.relative),
+            )?;
             Ok(ContentSnapshot {
                 provider: None,
                 lines: repo.diff_for_change(
