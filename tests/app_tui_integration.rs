@@ -781,6 +781,63 @@ fn right_click_opens_context_menu_and_actions_execute() {
 }
 
 #[test]
+fn content_scrollbar_appears_when_content_overflows() {
+    let fixture = TestRepo::new();
+    // Write a file with enough lines to overflow the 20-row viewport.
+    let long_content = (0..50)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fixture.write("long.txt", &long_content);
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // Select and preview the file.
+    app.handle_key(key(KeyCode::Char('l'))); // focus content? no, type-ahead
+    // Use type-ahead to select long.txt, then Enter to preview.
+    app.handle_key(key(KeyCode::Enter)); // first entry is long.txt? No, it's a file.
+    // Actually, the only entry is long.txt at the root. Select it.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // The content area should show a scrollbar on its right edge.
+    let content = app.ui_regions.content_inner;
+    let track_x = content.x + content.width - 1;
+    let buffer = terminal.backend().buffer();
+    let mut has_thumb = false;
+    let mut has_track = false;
+    for y in content.y..content.y + content.height {
+        let symbol = buffer[(track_x, y)].symbol();
+        if symbol == "█" {
+            has_thumb = true;
+        }
+        if symbol == "│" {
+            has_track = true;
+        }
+    }
+    assert!(has_thumb, "scrollbar thumb should be visible");
+    assert!(has_track, "scrollbar track should be visible");
+
+    // Scroll down and verify the thumb moves.
+    let thumb_y_before = (content.y..content.y + content.height)
+        .find(|&y| buffer[(track_x, y)].symbol() == "█")
+        .unwrap();
+    app.handle_key(key(KeyCode::PageDown));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let thumb_y_after = (content.y..content.y + content.height)
+        .find(|&y| buffer[(track_x, y)].symbol() == "█")
+        .unwrap();
+    assert!(
+        thumb_y_after > thumb_y_before,
+        "thumb should move down after PageDown"
+    );
+}
+
+#[test]
 fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     let fixture = TestRepo::new();
     fixture.write("alpha/old.txt", "before\n");

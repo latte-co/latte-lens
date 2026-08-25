@@ -2056,6 +2056,38 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         paragraph = paragraph.style(Style::default().add_modifier(Modifier::DIM));
     }
     frame.render_widget(paragraph, render_area);
+
+    // Content scrollbar: a 1-column indicator on the right edge of the
+    // content area, shown only when the content overflows the viewport.
+    let total = visual_rows.len();
+    let visible = usize::from(render_area.height);
+    if total > visible && visible > 0 {
+        let scroll = app.effective_content_scroll(total);
+        let track_x = render_area.x + render_area.width - 1;
+        let track_y = render_area.y;
+        let thumb_size = (visible * visible / total).max(1).min(visible);
+        let max_scroll = total.saturating_sub(visible);
+        let thumb_start = if max_scroll == 0 {
+            0
+        } else {
+            (scroll * (visible - thumb_size)) / max_scroll
+        };
+        let theme = Theme::current();
+        let track_style = Style::default().fg(theme.text_subtle);
+        let thumb_style = Style::default()
+            .fg(theme.content_accent)
+            .add_modifier(Modifier::BOLD);
+        let buffer = frame.buffer_mut();
+        for row in 0..visible {
+            let y = track_y + row as u16;
+            let cell = &mut buffer[(track_x, y)];
+            if row >= thumb_start && row < thumb_start + thumb_size {
+                cell.set_symbol("█").set_style(thumb_style);
+            } else {
+                cell.set_symbol("│").set_style(track_style);
+            }
+        }
+    }
 }
 
 fn draw_preview_find(frame: &mut Frame, app: &App) {
