@@ -897,6 +897,11 @@ fn user_config_path() -> Result<(PathBuf, bool)> {
     let home = absolute_env_path("HOME")?;
     #[cfg(windows)]
     let home = absolute_env_path("USERPROFILE")?;
+    // Resolve symlinked home directories (e.g. /home/user -> /data00/home/user)
+    // so the config path passes the no-symlink check in read_jsonc_file.
+    let home = home
+        .canonicalize()
+        .with_context(|| format!("cannot resolve home {}", home.display()))?;
     Ok((home.join(".latte/latte-lens.jsonc"), false))
 }
 
@@ -948,6 +953,9 @@ fn resolve_theme_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
         let home = absolute_env_path("HOME")?;
         #[cfg(windows)]
         let home = absolute_env_path("USERPROFILE")?;
+        let home = home
+            .canonicalize()
+            .with_context(|| format!("cannot resolve home {}", home.display()))?;
         return Ok(home.join(rest));
     }
     let path = PathBuf::from(value);
@@ -1996,6 +2004,25 @@ mod tests {
         let (path, explicit) = user_config_path().unwrap();
         assert!(!explicit);
         assert_eq!(path, home.path().join(".latte/latte-lens.jsonc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_config_path_canonicalizes_symlinked_home() {
+        let _environment = lock_navigation_environment();
+        let real_home = tempfile::tempdir().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("home-link");
+        std::os::unix::fs::symlink(real_home.path(), &link).unwrap();
+        let _variables = EnvironmentGuard::apply(&[
+            ("LATTELENS_CONFIG", None),
+            ("HOME", Some(link.as_os_str().to_os_string())),
+        ]);
+        let (path, _) = user_config_path().unwrap();
+        // The path must not traverse the symlink so it passes the
+        // no-symlink check in read_jsonc_file.
+        assert!(path.starts_with(real_home.path()));
+        assert!(!path.starts_with(&link));
     }
 
     #[test]
