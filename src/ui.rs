@@ -161,6 +161,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let content_header = inset_left(content_header, 1);
     let content_rows = inset_left(content_rows, 1);
+    // Limit text width for readability on wide screens: center the text column
+    // with a max width. This is applied before regions() so content_inner (used
+    // for hit testing, hover, and wrap calculation) matches the render rect.
+    const MAX_TEXT_WIDTH: u16 = 100;
+    let content_rows = if content_rows.width > MAX_TEXT_WIDTH {
+        let padding = (content_rows.width - MAX_TEXT_WIDTH) / 2;
+        Rect::new(
+            content_rows.x.saturating_add(padding),
+            content_rows.y,
+            MAX_TEXT_WIDTH,
+            content_rows.height,
+        )
+    } else {
+        content_rows
+    };
     app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
@@ -1420,21 +1435,16 @@ fn git_tree_line(
     } else {
         review_color.unwrap_or(theme.text_muted)
     };
-    let mut spans = vec![
-        Span::styled(
-            if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected && focused {
-                theme.git_accent
-            } else {
-                theme.text_subtle
-            }),
-        ),
-    ];
+    let mut spans = vec![Span::styled(
+        if selected { "▌ " } else { "  " },
+        Style::default().fg(if selected && focused {
+            theme.git_accent
+        } else {
+            theme.text_subtle
+        }),
+    )];
     for _ in 0..row.depth {
-        spans.push(Span::styled(
-            "│ ",
-            Style::default().fg(theme.text_muted),
-        ));
+        spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
     }
     spans.push(Span::styled(icon, Style::default().fg(icon_color)));
     let label_style = if !row.exists && !selected {
@@ -1551,21 +1561,16 @@ fn tree_line(
         theme.text_muted
     };
     // Build indent guides: a muted vertical bar at each depth level.
-    let mut spans = vec![
-        Span::styled(
-            if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected && focused {
-                theme.tree_accent
-            } else {
-                theme.text_subtle
-            }),
-        ),
-    ];
+    let mut spans = vec![Span::styled(
+        if selected { "▌ " } else { "  " },
+        Style::default().fg(if selected && focused {
+            theme.tree_accent
+        } else {
+            theme.text_subtle
+        }),
+    )];
     for _ in 0..entry.depth {
-        spans.push(Span::styled(
-            "│ ",
-            Style::default().fg(theme.text_muted),
-        ));
+        spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
     }
     spans.push(Span::styled(disclosure, Style::default().fg(icon_color)));
     let label = entry.name();
@@ -1742,7 +1747,14 @@ fn truncate_middle(value: &str, max_width: usize) -> String {
     }
     let keep = (max_width - 1) / 2;
     let head: String = value.chars().take(keep).collect();
-    let tail: String = value.chars().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}…{tail}")
 }
 
@@ -1807,22 +1819,11 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         }
     }
     let line_number_width = app.content_line_number_width();
-    // Limit text width for readability on wide screens: center the text column
-    // with a max width, leaving the rest as padding.
-    const MAX_TEXT_WIDTH: u16 = 100;
-    let text_width = rows.width.min(MAX_TEXT_WIDTH);
-    let text_padding = rows.width.saturating_sub(text_width) / 2;
-    let text_rows = Rect::new(
-        rows.x.saturating_add(text_padding),
-        rows.y,
-        text_width,
-        rows.height,
-    );
-    let visual_rows = app.content_visual_rows(text_rows.width);
+    let visual_rows = app.content_visual_rows(rows.width);
     let render_area = if app.tab().content.mode == ContentMode::Info {
-        inset_top(text_rows, 1)
+        inset_top(rows, 1)
     } else {
-        text_rows
+        rows
     };
     let start = app.effective_content_scroll(visual_rows.len());
     let end = start

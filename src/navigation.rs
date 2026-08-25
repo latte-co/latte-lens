@@ -2003,7 +2003,10 @@ mod tests {
         ]);
         let (path, explicit) = user_config_path().unwrap();
         assert!(!explicit);
-        assert_eq!(path, home.path().join(".latte/latte-lens.jsonc"));
+        // user_config_path canonicalizes HOME, so compare against the
+        // canonicalized form (Windows adds \\?\ prefix, Unix resolves links).
+        let canonical_home = home.path().canonicalize().unwrap();
+        assert_eq!(path, canonical_home.join(".latte/latte-lens.jsonc"));
     }
 
     #[cfg(unix)]

@@ -797,7 +797,7 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
             "(submodule pointer)",
             "modules/child",
             "tracked.txt",
-            "untracked-child.txt",
+            "untracked-child",
             "modules/missing",
             "modules/symlinked",
             "diff --git a/modules/child b/modules/child",
@@ -847,11 +847,11 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
     session.wait_screen(
         ("submodule repository", "pointer changed", "internal modified", "internal untracked"),
         "child relation details survive deliberate collapse",
-        absent=("tracked.txt", "untracked-child.txt"),
+        absent=("tracked.txt", "untracked-child"),
     )
     _click_tree_row(session, "modules/child")
     session.wait_screen(
-        ("tracked.txt", "untracked-child.txt"),
+        ("tracked.txt", "untracked-child"),
         "child repository reopens with both internal changes",
     )
     session.key(b"r")
@@ -859,7 +859,7 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
         lambda screen: (
             "Refreshing workspace" not in screen.text()
             and "tracked.txt" in screen.text()
-            and "untracked-child.txt" in screen.text()
+            and "untracked-child" in screen.text()
             and "▌" in _line_with(screen, "modules/child")
             and "pointer changed" in screen.text()
             and "internal untracked" in screen.text()
@@ -871,7 +871,7 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
 def search_preview(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
-    session.click_marker("/ Open")
+    session.click_marker(" / ^T")
     session.wait_screen(("Open File", "File", "Text"), "file search opens")
     session.key(b"search-target")
     session.wait_screen(
@@ -964,7 +964,7 @@ def search_controls(context: ScenarioContext) -> None:
 
     # Open the file picker through its real mouse hit box, exercise every query
     # editing/navigation branch, then open a production preview by double click.
-    session.click_marker("/ Open")
+    session.click_marker(" / ^T")
     session.wait_screen(("Open File", "File", "Text"), "mouse opens file search")
     session.key(b"alpha beta")
     session.key(b"\x1b[H")
@@ -1101,7 +1101,7 @@ def search_controls(context: ScenarioContext) -> None:
 
     # Inactive header buttons must remain mouse-addressable after a search
     # session has restored its preview.
-    session.click_marker("^T Text")
+    session.click_marker("^T")
     session.wait_screen(("Search Workspace",), "mouse reopens text search from the header")
     _click_marker_on_line(session, "Esc ×")
     session.wait_screen(("Preview", "ignored_unique_phrase"), "mouse closes text search")
