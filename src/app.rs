@@ -3566,10 +3566,7 @@ impl App {
                             })
                         });
                         self.select(index);
-                        if on_triangle {
-                            self.last_tree_click = None;
-                            self.toggle_selected_directory();
-                        } else if container && double_click {
+                        if on_triangle || (container && double_click) {
                             self.last_tree_click = None;
                             self.toggle_selected_directory();
                         } else if !container && double_click {
@@ -3835,8 +3832,10 @@ impl App {
         let Some(&action) = actions.get(action_index) else {
             return;
         };
-        // Select the row so the action targets the right entry.
+        // Select the row and focus the Tree so actions target the right
+        // entry — OpenExternal reads the focused pane's target first.
         self.select(menu.row);
+        self.focused_pane = FocusPane::Tree;
         match action {
             TreeContextAction::Preview => {
                 self.activate_selected_tree_entry();

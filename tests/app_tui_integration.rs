@@ -784,6 +784,80 @@ fn right_click_opens_context_menu_and_actions_execute() {
 }
 
 #[test]
+fn context_menu_open_external_targets_clicked_row_not_content_pane() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // Preview a.txt (row 0) so Content has a source_target and is focused.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('l'))); // focus Content
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+
+    // Right-click on b.txt (row 1) and choose OpenExternal.
+    app.handle_mouse(mouse_right_down(tree_x, tree_y + 1));
+    assert!(app.tree_context_menu.is_some());
+    let actions = TreeContextMenu::actions_for(&app, 1);
+    let open_external_index = actions
+        .iter()
+        .position(|a| *a == TreeContextAction::OpenExternal)
+        .expect("file row must offer OpenExternal");
+    for _ in 0..open_external_index {
+        app.handle_key(key(KeyCode::Down));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    // The context menu action must have switched focus to the Tree and
+    // selected b.txt (the right-clicked row), so that
+    // current_external_open_target resolves to b.txt — not a.txt from
+    // the Content pane's preview.
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+    // The external open request was triggered (status is set, even though
+    // the test harness disables the actual desktop launch).
+    assert!(app.external_open_status_message().is_some());
+}
+
+#[test]
+fn breadcrumbs_not_clickable_in_git_changes_scope() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    fixture.write("src/main.rs", "fn changed() {}\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // Switch to GitChanges; the changed file becomes selected.
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert!(app.selected_relative_path().is_some());
+
+    // Draw to populate breadcrumb rects.
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // Breadcrumbs are shown as path text but must not be clickable in
+    // GitChanges (select_relative_path only supports AllFiles).
+    assert!(
+        app.content_breadcrumb_rects().is_empty(),
+        "GitChanges breadcrumbs must not register clickable rects"
+    );
+}
+
+#[test]
 fn content_scrollbar_appears_when_content_overflows() {
     let fixture = TestRepo::new();
     // Write a file with enough lines to overflow the 20-row viewport.

@@ -1926,14 +1926,23 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ));
                 } else {
+                    // Parent segments are only clickable in the AllFiles tree;
+                    // GitChanges has no path-based selection yet.
+                    let clickable = app.tree_scope == TreeScope::AllFiles;
                     spans.push(Span::styled(
                         name.clone(),
-                        Style::default()
-                            .fg(content_accent)
-                            .add_modifier(Modifier::BOLD),
+                        if clickable {
+                            Style::default()
+                                .fg(content_accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text_subtle)
+                        },
                     ));
-                    app.content_breadcrumbs
-                        .push((path.clone(), Rect::new(x, heading.y, seg_width, 1)));
+                    if clickable {
+                        app.content_breadcrumbs
+                            .push((path.clone(), Rect::new(x, heading.y, seg_width, 1)));
+                    }
                 }
                 x = x.saturating_add(seg_width);
             }
@@ -2080,11 +2089,9 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         let track_y = render_area.y;
         let thumb_size = (visible * visible / total).max(1).min(visible);
         let max_scroll = total.saturating_sub(visible);
-        let thumb_start = if max_scroll == 0 {
-            0
-        } else {
-            (scroll * (visible - thumb_size)) / max_scroll
-        };
+        let thumb_start = (scroll * (visible - thumb_size))
+            .checked_div(max_scroll)
+            .unwrap_or(0);
         let theme = Theme::current();
         let track_style = Style::default().fg(theme.text_subtle);
         let thumb_style = Style::default()
