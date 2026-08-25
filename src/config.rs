@@ -113,61 +113,75 @@ mod tests {
     use std::sync::Mutex;
 
     /// Env-var tests must run serially since they mutate process-global state.
+    /// Poison is tolerated so one assertion failure does not cascade into
+    /// lock-poison failures in sibling tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn state_root_follows_latte_lens_state_dir() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("custom-state");
         let _guard = EnvironmentGuard::apply(&[
-            ("LATTE_LENS_STATE_DIR", Some("/tmp/lens-state".into())),
+            (
+                "LATTE_LENS_STATE_DIR",
+                Some(state_dir.clone().into_os_string()),
+            ),
             ("LATTE_HOME", None),
-            ("HOME", Some("/tmp/home".into())),
+            ("HOME", Some(temp.path().to_owned().into_os_string())),
         ]);
-        assert_eq!(state_root().unwrap(), PathBuf::from("/tmp/lens-state"));
+        assert_eq!(state_root().unwrap(), state_dir);
     }
 
     #[test]
     fn state_root_falls_back_to_latte_home() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let latte_home = temp.path().join("latte-home");
         let _guard = EnvironmentGuard::apply(&[
             ("LATTE_LENS_STATE_DIR", None),
-            ("LATTE_HOME", Some("/tmp/latte-home".into())),
-            ("HOME", Some("/tmp/home".into())),
+            ("LATTE_HOME", Some(latte_home.clone().into_os_string())),
+            ("HOME", Some(temp.path().to_owned().into_os_string())),
         ]);
-        assert_eq!(
-            state_root().unwrap(),
-            PathBuf::from("/tmp/latte-home/lens/state")
-        );
+        assert_eq!(state_root().unwrap(), latte_home.join("lens").join("state"));
     }
 
     #[test]
     fn state_root_defaults_to_home_latte() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
         let _guard = EnvironmentGuard::apply(&[
             ("LATTE_LENS_STATE_DIR", None),
             ("LATTE_HOME", None),
-            ("HOME", Some("/tmp/home".into())),
+            ("HOME", Some(temp.path().to_owned().into_os_string())),
         ]);
         assert_eq!(
             state_root().unwrap(),
-            PathBuf::from("/tmp/home/.latte/lens/state")
+            temp.path().join(".latte").join("lens").join("state")
         );
     }
 
     #[test]
     fn state_root_rejects_relative_env_paths() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
+        let temp = tempfile::tempdir().unwrap();
         let _guard = EnvironmentGuard::apply(&[
             ("LATTE_LENS_STATE_DIR", Some("relative/path".into())),
             ("LATTE_HOME", None),
-            ("HOME", Some("/tmp/home".into())),
+            ("HOME", Some(temp.path().to_owned().into_os_string())),
         ]);
         assert!(state_root().is_err());
     }
 
     #[test]
     fn round_trip_save_and_load() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         let _guard = EnvironmentGuard::apply(&[(
@@ -186,7 +200,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_empty() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
         let temp = tempfile::tempdir().unwrap();
         let _guard = EnvironmentGuard::apply(&[(
             "LATTE_LENS_STATE_DIR",
@@ -197,7 +211,7 @@ mod tests {
 
     #[test]
     fn load_corrupt_file_returns_empty() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = lock_env();
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
