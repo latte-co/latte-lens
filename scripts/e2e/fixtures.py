@@ -63,11 +63,18 @@ class Sandbox:
     def environment(self, clipboard_mode: str = "osc52") -> dict[str, str]:
         environment = os.environ.copy()
         for key in list(environment):
-            if key.startswith(("GIT_", "LATTELENS_")) or key == "OLDPWD":
+            if (
+                key.startswith(("GIT_", "LATTELENS_", "LATTE_"))
+                or key == "OLDPWD"
+            ):
                 environment.pop(key)
         environment.update(
             {
                 "HOME": str(self.home),
+                # Pin the state dir so the layout.json written above is always
+                # the one the binary reads, even if the parent environment
+                # exports LATTE_HOME / LATTE_LENS_STATE_DIR.
+                "LATTE_LENS_STATE_DIR": str(self.home / ".latte" / "lens" / "state"),
                 "XDG_CONFIG_HOME": str(self.xdg_config),
                 "XDG_DATA_HOME": str(self.xdg_data),
                 "XDG_STATE_HOME": str(self.xdg_state),

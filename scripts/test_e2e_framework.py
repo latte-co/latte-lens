@@ -57,7 +57,12 @@ class SandboxTests(unittest.TestCase):
     def test_environment_is_isolated_and_cleanup_is_receipted(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {"GIT_DIR": "/host/git", "LATTELENS_UNSAFE_TEST": "/host/lens"},
+            {
+                "GIT_DIR": "/host/git",
+                "LATTELENS_UNSAFE_TEST": "/host/lens",
+                "LATTE_HOME": "/host/latte",
+                "LATTE_LENS_STATE_DIR": "/host/latte/state",
+            },
         ):
             sandbox = Sandbox("self-test")
             root = sandbox.root
@@ -70,6 +75,11 @@ class SandboxTests(unittest.TestCase):
             self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
             self.assertNotIn("GIT_DIR", environment)
             self.assertNotIn("LATTELENS_UNSAFE_TEST", environment)
+            self.assertNotIn("LATTE_HOME", environment)
+            self.assertEqual(
+                environment["LATTE_LENS_STATE_DIR"],
+                str(sandbox.home / ".latte" / "lens" / "state"),
+            )
             receipt = sandbox.cleanup()
             self.assertTrue(receipt["sandbox_removed"])
             self.assertFalse(root.exists())
