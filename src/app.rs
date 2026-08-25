@@ -3378,19 +3378,28 @@ impl App {
                     if index < self.tree_row_count() {
                         let identity = self.tree_click_identity(index);
                         let container = self.tree_row_is_container(index);
-                        let double_click = !container
-                            && identity.as_ref().is_some_and(|identity| {
-                                self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
-                                    previous == identity
-                                        && Instant::now().saturating_duration_since(*at)
-                                            <= TREE_DOUBLE_CLICK_WINDOW
-                                })
-                            });
+                        let depth = self.tree_row_depth(index);
+                        // The disclosure triangle sits after the 2-col selection
+                        // indicator and 2 cols per indent depth.
+                        let triangle_x = self.ui_regions.tree_inner.x + 2 + (depth as u16) * 2;
+                        let on_triangle = container
+                            && mouse.column >= triangle_x
+                            && mouse.column < triangle_x + 2;
+                        let double_click = identity.as_ref().is_some_and(|identity| {
+                            self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
+                                previous == identity
+                                    && Instant::now().saturating_duration_since(*at)
+                                        <= TREE_DOUBLE_CLICK_WINDOW
+                            })
+                        });
                         self.select(index);
-                        if container {
+                        if on_triangle {
                             self.last_tree_click = None;
                             self.toggle_selected_directory();
-                        } else if double_click {
+                        } else if container && double_click {
+                            self.last_tree_click = None;
+                            self.toggle_selected_directory();
+                        } else if !container && double_click {
                             self.last_tree_click = None;
                             self.activate_selected_tree_entry();
                         } else if let Some(identity) = identity {
@@ -3534,6 +3543,21 @@ impl App {
                 .is_some_and(GitTreeRow::is_container),
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => false,
+        }
+    }
+
+    fn tree_row_depth(&self, index: usize) -> usize {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .map_or(0, |entry| entry.depth),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .map_or(0, |row| row.depth),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => 0,
         }
     }
 

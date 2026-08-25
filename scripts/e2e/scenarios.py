@@ -206,14 +206,14 @@ def files_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("▾ a-dir", "nested"), "keyboard-opened collapsed All Files directory"
     )
-    _click_tree_row(session, "a-dir")
+    _double_click_tree_row(session, "a-dir")
     session.wait_screen(
         ("a-dir", "Tree"),
-        "mouse-closed directory with one click",
+        "mouse-closed directory with double click",
         absent=("nested", "b-changed.rs"),
     )
-    _click_tree_row(session, "a-dir")
-    session.wait_screen(("a-dir", "nested"), "mouse-opened directory with one click")
+    _double_click_tree_row(session, "a-dir")
+    session.wait_screen(("a-dir", "nested"), "mouse-opened directory with double click")
     session.key(b"\r")
     session.wait_screen(
         ("a-dir",),
@@ -308,7 +308,7 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
     )
     # A directory symlink is expandable; opening it reveals the file inside the
     # target directory, which then previews normally.
-    _click_tree_row(session, "a-directory-link")
+    _double_click_tree_row(session, "a-directory-link")
     session.wait_screen(
         ("a-directory-link", "inside.txt"),
         "production binary expands a sandboxed directory symlink",
@@ -523,7 +523,7 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"g")
     session.key(b"\r")
     session.wait_screen(("▾ a-dir", "nested"), "tree Home and Enter expand the first directory")
-    _click_tree_row(session, "nested")
+    _double_click_tree_row(session, "nested")
     session.wait_screen(
         ("b-changed.rs",),
         "nested directory loading makes the changed file searchable",
@@ -647,13 +647,13 @@ def git_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("b-changed.rs", "nested-owned.txt"), "keyboard-reopened repository group"
     )
-    _click_tree_row(session, ".")
+    _double_click_tree_row(session, ".")
     session.wait_screen(
         ("Git changes",),
         "mouse-collapsed repository group",
         absent=("b-changed.rs", "nested-owned.txt"),
     )
-    _click_tree_row(session, ".")
+    _double_click_tree_row(session, ".")
     session.wait_screen(
         ("vendor/nested", "nested-owned.txt"), "mouse-reopened repository group"
     )
@@ -843,13 +843,13 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
         "repository issue selection explains the symlink boundary",
     )
 
-    _click_tree_row(session, "modules/child")
+    _double_click_tree_row(session, "modules/child")
     session.wait_screen(
         ("submodule repository", "pointer changed", "internal modified", "internal untracked"),
         "child relation details survive deliberate collapse",
         absent=("tracked.txt", "untracked-child"),
     )
-    _click_tree_row(session, "modules/child")
+    _double_click_tree_row(session, "modules/child")
     session.wait_screen(
         ("tracked.txt", "untracked-child"),
         "child repository reopens with both internal changes",

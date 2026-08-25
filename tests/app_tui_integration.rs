@@ -514,7 +514,7 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
 }
 
 #[test]
-fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_lens() {
+fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews_files() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -526,17 +526,17 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
+    // Single click selects but does not toggle.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
-        app.tab().content.lines,
-        [
-            "No changed files in this directory.",
-            "",
-            "Expanded · Enter or click to collapse."
-        ]
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
+
+    // Clicking the disclosure triangle toggles expand.
+    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     assert_eq!(
         visible_paths(&app),
         [
@@ -546,15 +546,15 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
         ]
     );
 
-    // Every directory-row click is the expand/collapse action; it does not
-    // wait for a double-click or require the disclosure glyph.
+    // Double-click on the directory row toggles collapse.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
-    // Clicking at the disclosure position has the same one-click row action.
+    // Double-click on a file row previews it.
     app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     let rows_before_file_click = visible_paths(&app);
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
@@ -573,7 +573,7 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
 }
 
 #[test]
-fn mouse_single_click_toggles_git_changes_containers() {
+fn mouse_triangle_and_double_click_toggles_git_changes_containers() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "before\n");
     fixture.commit_all("initial");
@@ -592,9 +592,16 @@ fn mouse_single_click_toggles_git_changes_containers() {
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
 
-    let directory_row = tree_y + 1; // Repository group occupies the first Git Changes row.
-    app.handle_mouse(mouse_down(tree_x, directory_row));
+    // "src" directory sits below the repository row; its triangle column is
+    // derived from the rendered depth (2 cols selection + 2 cols per depth).
+    let directory_row = tree_y + 1;
+    let directory_depth = app.visible_git_rows()[1].depth;
+    let triangle_x = tree_x + 2 + u16::try_from(directory_depth).unwrap() * 2;
+    // Triangle click toggles.
+    app.handle_mouse(mouse_down(triangle_x, directory_row));
     assert_eq!(visible_paths(&app), [PathBuf::from("src")]);
+    // Double-click toggles back.
+    app.handle_mouse(mouse_down(tree_x, directory_row));
     app.handle_mouse(mouse_down(tree_x, directory_row));
     assert_eq!(
         visible_paths(&app),
