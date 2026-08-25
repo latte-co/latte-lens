@@ -11948,6 +11948,12 @@ mod tests {
 
     #[test]
     fn retired_navigation_aliases_do_not_dispatch_semantic_navigation() {
+        let _env = crate::test_support::lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvironmentGuard::apply(&[(
+            "LATTE_LENS_STATE_DIR",
+            Some(temp.path().join("state").into_os_string()),
+        )]);
         let mut app = navigation_app("fn caller() {}\n");
         for key in [
             KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),

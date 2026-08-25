@@ -106,7 +106,7 @@ fn file_entry_color_with_theme(entry: &FileEntry, theme: &Theme) -> Color {
 
 pub(crate) const MIN_TREE_WIDTH: u16 = 28;
 const MIN_CONTENT_WIDTH: u16 = 24;
-const DEFAULT_MAX_TREE_WIDTH: u16 = 44;
+const DEFAULT_MAX_TREE_WIDTH: u16 = 36;
 
 const REFRESH_LABEL: &str = " r  Refresh ";
 const FILE_SEARCH_LABEL: &str = "/ Open ";
@@ -161,6 +161,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let content_header = inset_left(content_header, 1);
     let content_rows = inset_left(content_rows, 1);
+    // Limit text width for readability on wide screens: center the text column
+    // with a max width. This is applied before regions() so content_inner (used
+    // for hit testing, hover, and wrap calculation) matches the render rect.
+    const MAX_TEXT_WIDTH: u16 = 100;
+    let content_rows = if content_rows.width > MAX_TEXT_WIDTH {
+        let padding = (content_rows.width - MAX_TEXT_WIDTH) / 2;
+        Rect::new(
+            content_rows.x.saturating_add(padding),
+            content_rows.y,
+            MAX_TEXT_WIDTH,
+            content_rows.height,
+        )
+    } else {
+        content_rows
+    };
     app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
@@ -310,7 +325,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
 }
 
 fn inactive_search_buttons(area: Rect) -> (Rect, Rect) {
-    let (file_width, text_width) = if area.width >= 36 { (7, 10) } else { (3, 4) };
+    let (file_width, text_width) = if area.width >= 40 { (7, 10) } else { (3, 4) };
     let total = file_width + text_width;
     let start = area.x.saturating_add(area.width.saturating_sub(total));
     let file = Rect::new(start, area.y, file_width.min(area.width), area.height);
@@ -1378,7 +1393,6 @@ fn git_tree_line(
         _ => None,
     };
     let repository_has_changes = repository_change_count.is_some_and(|count| count > 0);
-    let indent = "  ".repeat(row.depth);
     let review_state = app.git_row_review_state(row);
     let icon = if row.is_container() {
         if app.git_row_is_expanded(row) {
@@ -1421,18 +1435,18 @@ fn git_tree_line(
     } else {
         review_color.unwrap_or(theme.text_muted)
     };
-    let spans = vec![
-        Span::styled(
-            if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected && focused {
-                theme.git_accent
-            } else {
-                theme.text_subtle
-            }),
-        ),
-        Span::raw(indent),
-        Span::styled(icon, Style::default().fg(icon_color)),
-    ];
+    let mut spans = vec![Span::styled(
+        if selected { "▌ " } else { "  " },
+        Style::default().fg(if selected && focused {
+            theme.git_accent
+        } else {
+            theme.text_subtle
+        }),
+    )];
+    for _ in 0..row.depth {
+        spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
+    }
+    spans.push(Span::styled(icon, Style::default().fg(icon_color)));
     let label_style = if !row.exists && !selected {
         dim_when_unfocused(Style::default().fg(theme.missing), focused)
     } else if repository_has_changes && !selected {
@@ -1512,7 +1526,6 @@ fn tree_line(
     focused: bool,
     width: u16,
 ) -> Line<'static> {
-    let indent = "  ".repeat(entry.depth);
     let disclosure = if entry.is_dir {
         if app.directory_is_loading(entry) {
             "… "
@@ -1547,18 +1560,19 @@ fn tree_line(
     } else {
         theme.text_muted
     };
-    let spans = vec![
-        Span::styled(
-            if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected && focused {
-                theme.tree_accent
-            } else {
-                theme.text_subtle
-            }),
-        ),
-        Span::raw(indent),
-        Span::styled(disclosure, Style::default().fg(icon_color)),
-    ];
+    // Build indent guides: a muted vertical bar at each depth level.
+    let mut spans = vec![Span::styled(
+        if selected { "▌ " } else { "  " },
+        Style::default().fg(if selected && focused {
+            theme.tree_accent
+        } else {
+            theme.text_subtle
+        }),
+    )];
+    for _ in 0..entry.depth {
+        spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
+    }
+    spans.push(Span::styled(disclosure, Style::default().fg(icon_color)));
     let label = entry.name();
     let label_style = if !entry.exists && !selected {
         dim_when_unfocused(Style::default().fg(theme.missing), focused)
@@ -1721,6 +1735,43 @@ fn truncate_to_width_forced(value: &str, max_width: usize) -> String {
     result
 }
 
+/// Truncate a string to max_width, keeping the start and end with "…" in the
+/// middle. Used for long file paths where the tail is more useful than the
+/// middle. Width-aware: counts display columns, not chars, so CJK and other
+/// double-width characters are handled correctly.
+fn truncate_middle(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width < 4 {
+        return truncate_to_width_forced(value, max_width);
+    }
+    let ellipsis_width = UnicodeWidthChar::width('…').unwrap_or(1);
+    let keep = max_width.saturating_sub(ellipsis_width) / 2;
+    let mut head = String::new();
+    let mut head_width = 0;
+    for ch in value.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if head_width + w > keep {
+            break;
+        }
+        head.push(ch);
+        head_width += w;
+    }
+    let mut tail = String::new();
+    let mut tail_width = 0;
+    for ch in value.chars().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if tail_width + w > keep {
+            break;
+        }
+        tail.push(ch);
+        tail_width += w;
+    }
+    let tail: String = tail.chars().rev().collect();
+    format!("{head}…{tail}")
+}
+
 fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
     if app.preview_find_is_active() {
         draw_preview_find(frame, app);
@@ -1751,6 +1802,11 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         } else {
             header
         };
+        // Truncate long file paths from the middle so the tail stays visible.
+        let title_width = UnicodeWidthStr::width(app.selected_content_title());
+        let overhead = 2 + title_width + 2; // "● " + title + "  "
+        let available = heading.width.saturating_sub(overhead as u16) as usize;
+        let detail = truncate_middle(&detail, available);
         draw_panel_heading(
             frame,
             heading,
@@ -1977,42 +2033,42 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         FocusPane::Content => "Content",
     };
     let tab_keys = if area.width < 96 {
-        "Tab cycle"
+        "Tab"
     } else {
-        "Tab cycle  Ctrl+P palette  Ctrl+N new  Ctrl+W close"
+        "Tab  ^P palette  ^N new  ^W close"
     };
     let ignore_hint = if app.tree_scope == TreeScope::GitChanges {
-        "  x ignore error"
+        "  x ignore"
     } else {
         ""
     };
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
-            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  y path{ignore_hint}  ^B tree  q×2 quit"
+            "  ↑↓  {tab_keys}  ^C quit  Enter preview  o open  y path{ignore_hint}  ^B tree  q×2"
         )
     } else if app.focused_pane == FocusPane::Tree {
         format!(
-            "  ↑↓ move  {tab_keys}  Ctrl+C quit/copy  Enter/double-click preview  o system open  →/l content  y/Y path{ignore_hint}  Ctrl+B tree  q×2 quit"
+            "  ↑↓  {tab_keys}  ^C quit  Enter preview  o open  →/l content  y/Y path{ignore_hint}  ^B tree  q×2"
         )
     } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Ctrl+D/R/O nav  Ctrl+S symbols  Ctrl+F find  {tab_keys}  y path Y real  ^B tree  q×2 quit"
+            "  ↑↓  ^C quit  [/] folds  ^D/R/O nav  ^S symbols  ^F find  {tab_keys}  y path Y real  ^B tree  q×2"
         )
     } else if area.width < 96 {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  ^C quit/copy  {tab_keys}  r refresh  y path Y real  ^B tree  q×2 quit"
+            "  ↑↓  ←→ focus  drag copy  ^C quit  {tab_keys}  r refresh  y path Y real  ^B tree  q×2"
         )
     } else if app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓ scroll  Ctrl+C copy/quit  [/] folds  Enter toggle  Ctrl+D/R/O nav  Ctrl+S symbols  Alt+click definition  Alt+←/→ history  Ctrl+F find  {tab_keys}  y copy path Y real/abs  Ctrl+B tree  q×2 quit"
+            "  ↑↓  ^C quit  [/] folds  Enter toggle  ^D/R/O nav  ^S symbols  Alt+click def  Alt+←/→ hist  ^F find  {tab_keys}  y copy Y real  ^B tree  q×2"
         )
     } else if app.tab().content.mode == ContentMode::Diff {
         format!(
-            "  ↑↓ scroll  ←→ focus  Space review  n/N file  Ctrl+F find  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  Ctrl+B tree  q×2 quit"
+            "  ↑↓  ←→ focus  Space review  n/N file  ^F find  {tab_keys}  p preview  d diff  r refresh  y copy Y real  ^B tree  q×2"
         )
     } else {
         format!(
-            "  ↑↓ move  ←→ focus  drag copies  Ctrl+C quit/copy selection  Shift+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy path Y real/abs  Ctrl+B tree  q×2 quit"
+            "  ↑↓  ←→ focus  drag copy  ^C quit  S+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy Y real  ^B tree  q×2"
         )
     };
     let content = if let Some(message) = app.quit_confirmation_message() {
@@ -2651,7 +2707,7 @@ mod tests {
     #[test]
     fn resizable_tree_width_preserves_both_panel_minimums() {
         assert_eq!(tree_panel_width(80, None), 28);
-        assert_eq!(tree_panel_width(200, None), 44);
+        assert_eq!(tree_panel_width(200, None), 36);
         assert_eq!(tree_panel_width(100, Some(50)), 50);
         assert_eq!(tree_panel_width(100, Some(0)), 28);
         assert_eq!(tree_panel_width(100, Some(99)), 75);
@@ -2664,6 +2720,25 @@ mod tests {
 
         assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 7);
         assert_eq!(truncated, "目录文…");
+    }
+
+    #[test]
+    fn middle_truncation_respects_double_width_names() {
+        // CJK chars are double-width; the result must not exceed max_width.
+        let truncated = truncate_middle("目录/benchmark/文件结构.md", 12);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 12);
+        // Head and tail are preserved with a middle ellipsis.
+        assert!(truncated.contains('…'));
+        assert!(truncated.starts_with("目录"));
+        assert!(truncated.ends_with(".md"));
+
+        // ASCII paths still work.
+        let ascii = truncate_middle("spec/benchmark/package-structure.md", 20);
+        assert!(UnicodeWidthStr::width(ascii.as_str()) <= 20);
+        assert!(ascii.contains('…'));
+
+        // Short strings pass through unchanged.
+        assert_eq!(truncate_middle("short.txt", 20), "short.txt");
     }
 
     #[test]
