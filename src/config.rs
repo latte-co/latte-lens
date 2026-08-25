@@ -45,12 +45,14 @@ fn state_root() -> Result<PathBuf> {
         return Ok(home.join("lens").join("state"));
     }
     let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
         .ok_or_else(|| anyhow::anyhow!("HOME or USERPROFILE must be set for state storage"))?;
-    Ok(PathBuf::from(home)
-        .join(".latte")
-        .join("lens")
-        .join("state"))
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        anyhow::bail!("HOME or USERPROFILE must be an absolute path");
+    }
+    Ok(home.join(".latte").join("lens").join("state"))
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -175,6 +177,30 @@ mod tests {
             ("LATTE_LENS_STATE_DIR", Some("relative/path".into())),
             ("LATTE_HOME", None),
             ("HOME", Some(temp.path().to_owned().into_os_string())),
+        ]);
+        assert!(state_root().is_err());
+    }
+
+    #[test]
+    fn state_root_rejects_relative_home() {
+        let _env = lock_env();
+        let _guard = EnvironmentGuard::apply(&[
+            ("LATTE_LENS_STATE_DIR", None),
+            ("LATTE_HOME", None),
+            ("HOME", Some("relative/home".into())),
+            ("USERPROFILE", None),
+        ]);
+        assert!(state_root().is_err());
+    }
+
+    #[test]
+    fn state_root_rejects_empty_home() {
+        let _env = lock_env();
+        let _guard = EnvironmentGuard::apply(&[
+            ("LATTE_LENS_STATE_DIR", None),
+            ("LATTE_HOME", None),
+            ("HOME", Some("".into())),
+            ("USERPROFILE", None),
         ]);
         assert!(state_root().is_err());
     }
