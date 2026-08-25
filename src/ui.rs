@@ -1157,9 +1157,20 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
     }
 }
 
+/// Apply the hover background to a tree row when the pointer is over it.
+fn with_hover<'a>(item: ListItem<'a>, hovered: bool, style: Style) -> ListItem<'a> {
+    if hovered {
+        item.style(style)
+    } else {
+        item
+    }
+}
+
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     let selected = app.tab_mut().tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
+    let hover_row = app.tree_hover_row();
+    let hover_style = Style::default().bg(Theme::current().surface_hover);
     let items: Vec<ListItem> = if app.is_initial_loading() && !is_agents_scope(app) {
         vec![ListItem::new(Line::from(Span::styled(
             "  Scanning files…",
@@ -1172,13 +1183,17 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| {
-                    ListItem::new(tree_line(
-                        app,
-                        entry,
-                        selected == Some(index),
-                        focused,
-                        rows.width,
-                    ))
+                    with_hover(
+                        ListItem::new(tree_line(
+                            app,
+                            entry,
+                            selected == Some(index),
+                            focused,
+                            rows.width,
+                        )),
+                        hover_row == Some(index),
+                        hover_style,
+                    )
                 })
                 .collect(),
             TreeScope::GitChanges => app
@@ -1186,13 +1201,17 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
-                    ListItem::new(git_tree_line(
-                        app,
-                        row,
-                        selected == Some(index),
-                        focused,
-                        rows.width,
-                    ))
+                    with_hover(
+                        ListItem::new(git_tree_line(
+                            app,
+                            row,
+                            selected == Some(index),
+                            focused,
+                            rows.width,
+                        )),
+                        hover_row == Some(index),
+                        hover_style,
+                    )
                 })
                 .collect(),
             #[cfg(feature = "agent-observability")]
@@ -1202,12 +1221,16 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, session)| {
-                    ListItem::new(agent_session_line(
-                        session,
-                        selected == Some(index),
-                        focused,
-                        rows.width,
-                    ))
+                    with_hover(
+                        ListItem::new(agent_session_line(
+                            session,
+                            selected == Some(index),
+                            focused,
+                            rows.width,
+                        )),
+                        hover_row == Some(index),
+                        hover_style,
+                    )
                 })
                 .collect(),
         }

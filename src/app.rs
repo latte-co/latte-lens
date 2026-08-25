@@ -984,6 +984,10 @@ pub struct App {
     recent_files: Vec<PathBuf>,
     last_search_click: Option<(usize, Instant)>,
     last_tree_click: Option<(TreeClickIdentity, Instant)>,
+    /// Last pointer position while hovering the tree area (screen column,
+    /// row). The hovered row is resolved at render time against the current
+    /// scroll offset, so it stays correct after scrolling.
+    tree_hover_pos: Option<(u16, u16)>,
     last_external_opened: Option<(ContentTarget, Instant)>,
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
@@ -1341,6 +1345,7 @@ impl App {
             recent_files: Vec::new(),
             last_search_click: None,
             last_tree_click: None,
+            tree_hover_pos: None,
             last_external_opened: None,
             last_refresh_error: None,
             has_refresh_snapshot: false,
@@ -3278,6 +3283,17 @@ impl App {
             {
                 self.tab_mut().content.navigation_hover_highlight = Some(token);
             }
+            // Track the pointer over the tree for row hover highlight.
+            self.tree_hover_pos = if self.navigation_picker.is_none()
+                && self.search.is_none()
+                && self.new_tab_menu.is_none()
+                && !self.tree_hidden
+                && contains(self.ui_regions.tree_inner, mouse.column, mouse.row)
+            {
+                Some((mouse.column, mouse.row))
+            } else {
+                None
+            };
             return;
         }
         if self.navigation_picker.is_some() {
@@ -3559,6 +3575,30 @@ impl App {
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => 0,
         }
+    }
+
+    /// Resolve the currently hovered tree row index against the live scroll
+    /// offset and region geometry. Returns `None` when the pointer is outside
+    /// the tree, a modal overlay is active, or the tree is hidden.
+    pub fn tree_hover_row(&self) -> Option<usize> {
+        if self.navigation_picker.is_some()
+            || self.search.is_some()
+            || self.new_tab_menu.is_some()
+            || self.tree_hidden
+        {
+            return None;
+        }
+        let (column, row) = self.tree_hover_pos?;
+        if !contains(self.ui_regions.tree_inner, column, row) {
+            return None;
+        }
+        let visible_row = usize::from(row - self.ui_regions.tree_inner.y);
+        let index = self
+            .tab()
+            .tree_state
+            .offset()
+            .saturating_add(visible_row);
+        (index < self.tree_row_count()).then_some(index)
     }
 
     fn handle_search_mouse_down(&mut self, mouse: MouseEvent) -> bool {

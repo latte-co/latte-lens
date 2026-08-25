@@ -610,6 +610,40 @@ fn mouse_triangle_and_double_click_toggles_git_changes_containers() {
 }
 
 #[test]
+fn mouse_move_highlights_hovered_tree_row() {
+    let fixture = TestRepo::new();
+    fixture.write("src/file.txt", "fixture\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // No hover before any mouse movement.
+    assert_eq!(app.tree_hover_row(), None);
+
+    // Moving over a tree row highlights it.
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y));
+    assert_eq!(app.tree_hover_row(), Some(0));
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y + 1));
+    assert_eq!(app.tree_hover_row(), Some(1));
+
+    // Moving outside the tree clears the hover.
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y - 1));
+    assert_eq!(app.tree_hover_row(), None);
+
+    // Hover over the last row, then hide the tree: hover must not render.
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y + 1));
+    assert_eq!(app.tree_hover_row(), Some(1));
+    app.set_tree_hidden(true);
+    assert_eq!(app.tree_hover_row(), None);
+}
+
+#[test]
 fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     let fixture = TestRepo::new();
     fixture.write("alpha/old.txt", "before\n");
