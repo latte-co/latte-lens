@@ -2316,7 +2316,10 @@ impl App {
                 self.focused_pane = FocusPane::Tree;
             }
             (KeyCode::Char('l'), KeyModifiers::NONE) => self.focused_pane = FocusPane::Content,
-            (KeyCode::Char('r'), _) => {
+            // r/p/d: when Tree is focused, route to type-ahead so common
+            // first letters can be used for jump-to-file. Content focus
+            // keeps the original actions.
+            (KeyCode::Char('r'), _) if self.focused_pane != FocusPane::Tree => {
                 #[cfg(feature = "agent-observability")]
                 if self.tree_scope == TreeScope::Agents {
                     self.request_agent_refresh();
@@ -2326,8 +2329,12 @@ impl App {
                 #[cfg(not(feature = "agent-observability"))]
                 self.request_refresh(self.tree_scope == TreeScope::GitChanges);
             }
-            (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
-            (KeyCode::Char('d'), KeyModifiers::NONE) => self.load_selected_diff(),
+            (KeyCode::Char('p'), KeyModifiers::NONE) if self.focused_pane != FocusPane::Tree => {
+                self.load_selected_preview()
+            }
+            (KeyCode::Char('d'), KeyModifiers::NONE) if self.focused_pane != FocusPane::Tree => {
+                self.load_selected_diff()
+            }
             (KeyCode::Char(' '), KeyModifiers::NONE)
                 if self.tab_mut().content.mode == ContentMode::Diff =>
             {

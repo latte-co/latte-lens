@@ -389,9 +389,11 @@ fn keyboard_switches_tree_scope_without_hiding_right_content() {
     settle(&mut app);
     assert_eq!(app.tree_scope, TreeScope::GitChanges);
     assert_eq!(app.focused_pane, FocusPane::Content);
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
@@ -960,8 +962,10 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     // directory remains collapsed.
     app.handle_key(key(KeyCode::Enter));
     fixture.write("beta/new.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     let all_after_refresh = visible_paths(&app);
     assert!(all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
     assert!(all_after_refresh.contains(&PathBuf::from("beta")));
@@ -977,6 +981,7 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("alpha")));
     app.handle_key(key(KeyCode::Enter));
     fixture.write("gamma/new.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     let changed_after_refresh = visible_paths(&app);
@@ -1007,9 +1012,11 @@ fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     fs::remove_dir_all(fixture.root().join("src")).unwrap();
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     fixture.write("src/child.txt", "returned\n");
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.set_tree_scope(TreeScope::AllFiles);
@@ -1565,8 +1572,10 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
         .map(|row| row.identity.clone())
         .unwrap();
     fixture.write("another-root-change.txt", "new\n");
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     assert_eq!(app.changed_count, 3);
     assert_eq!(
         app.selected_git_row().map(|row| &row.identity),
@@ -1702,8 +1711,10 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
     );
 
     // Refresh selection and directory info by the complete repo+path identity.
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     assert_eq!(
         app.selected_git_row().map(|row| &row.identity),
         Some(&nested_directory)
@@ -1926,6 +1937,7 @@ fn projected_submodule_change_count_matrix_is_stable_across_collapse_refresh_and
         assert_eq!(app.scope_entry_count(), expected_changes);
         app.handle_key(key(KeyCode::Enter));
 
+        app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
         app.handle_key(key(KeyCode::Char('r')));
         settle(&mut app);
         assert_eq!(app.changed_count, expected_changes, "state: {state:?}");
@@ -1989,6 +2001,7 @@ fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection
             "Collapsed · Enter or click to expand."
         ]
     );
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
@@ -2002,6 +2015,7 @@ fn refresh_failure_is_captured_for_the_footer() {
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     fs::remove_dir_all(fixture.root()).unwrap();
 
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     assert!(
@@ -2022,6 +2036,7 @@ fn selecting_a_removed_untracked_file_surfaces_diff_error() {
     app.handle_key(key(KeyCode::End));
     fs::remove_file(fixture.root().join("z-untracked.txt")).unwrap();
 
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
     assert_eq!(
@@ -2042,6 +2057,7 @@ fn pane_transfers_and_content_arrows_do_not_change_tree_selection() {
 
     app.handle_key(key(KeyCode::Char('j')));
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('d')));
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.focused_pane, FocusPane::Content);
@@ -2109,7 +2125,9 @@ fn refresh_and_content_loading_are_visible_without_blocking_navigation() {
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     let snapshot = app.all_entries.clone();
 
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree so Down moves selection
     app.handle_key(key(KeyCode::Down));
     assert!(app.is_refreshing());
     assert!(app.is_content_loading());
@@ -2367,6 +2385,7 @@ fn changed_source_defaults_to_diff_but_can_toggle_preview() {
             .iter()
             .any(|line| line == "+fn after() {}")
     );
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
@@ -2375,6 +2394,7 @@ fn changed_source_defaults_to_diff_but_can_toggle_preview() {
         highlight.kind == HighlightKind::Function
             && app.tab().content.lines[0].get(highlight.range.clone()) == Some("after")
     }));
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
@@ -2781,6 +2801,7 @@ fn all_files_expands_a_directory_symlink_and_previews_a_file_inside_it() {
         app.selected_relative_path(),
         Some(PathBuf::from("a-linked-dir/inner.txt"))
     );
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
     let content = app.tab().content.lines.join("\n");
@@ -2870,6 +2891,7 @@ fn all_files_treats_a_directory_symlink_as_an_expandable_directory() {
         app.selected_relative_path(),
         Some(PathBuf::from("AspectCore-Framework"))
     );
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
     let info = app.tab().content.lines.join("\n");
@@ -2918,6 +2940,7 @@ fn all_files_tree_marks_symlinks_with_their_target_and_header_shows_real_path() 
         app.selected_relative_path(),
         Some(PathBuf::from("a-link.txt"))
     );
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
     let real_path = app
@@ -2953,6 +2976,7 @@ fn git_changes_preview_does_not_follow_a_changed_symlink() {
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
     let content = app.tab().content.lines.join("\n");
@@ -3879,6 +3903,7 @@ fn diff_rows_show_line_stats_and_reviewed_versions_become_stale_after_refresh() 
     assert!(reviewed.contains('✓'));
     assert!(reviewed.contains("1/1 reviewed"));
 
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     assert!(render(&mut app).contains('✓'));
@@ -3887,6 +3912,7 @@ fn diff_rows_show_line_stats_and_reviewed_versions_become_stale_after_refresh() 
         "review.txt",
         "newer first line\nold two\nadded\nsecond addition\n",
     );
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     let changed = render(&mut app);
@@ -3917,6 +3943,7 @@ fn staged_content_change_invalidates_review_even_when_line_counts_match() {
 
     fixture.write("staged.txt", "after two\n");
     fixture.git(&["add", "staged.txt"]);
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
 
@@ -4104,6 +4131,7 @@ fn a_refresh_reuses_the_saved_text_query_but_updates_its_results() {
     app.handle_key(key(KeyCode::Esc));
 
     fixture.write("second.txt", "needle two\n");
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.handle_key(modified_key(
@@ -4283,6 +4311,7 @@ fn ctrl_f_finds_in_the_current_diff_instead_of_opening_workspace_search() {
     fixture.write("changed.txt", "after needle\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
+    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Diff);

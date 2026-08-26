@@ -2117,7 +2117,6 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     // Use the full rows width for all layout/scroll calculations; the
     // scrollbar overlays the last column when content overflows.
     let visual_rows = app.content_visual_rows(rows.width);
-    let needs_scrollbar = visual_rows.len() > usize::from(rows.height);
     let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
