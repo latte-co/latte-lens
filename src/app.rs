@@ -2049,7 +2049,9 @@ impl App {
         let new_thumb_start = click_row.saturating_sub(thumb_size / 2);
         let new_thumb_start = new_thumb_start.min(visible - thumb_size);
         // Map thumb position back to scroll offset.
-        let row_count = self.content_visual_rows(self.ui_regions.content_inner.width).len();
+        let row_count = self
+            .content_visual_rows(self.ui_regions.content_inner.width)
+            .len();
         let max_scroll = row_count.saturating_sub(visible);
         let scrollable = visible - thumb_size;
         let new_scroll = if scrollable > 0 {
@@ -3602,7 +3604,11 @@ impl App {
                 }
                 // Content scrollbar: click thumb to drag, click above/below
                 // thumb to page up/down.
-                if contains(self.ui_regions.content_scrollbar_track, mouse.column, mouse.row) {
+                if contains(
+                    self.ui_regions.content_scrollbar_track,
+                    mouse.column,
+                    mouse.row,
+                ) {
                     self.clear_content_selection();
                     let track = self.ui_regions.content_scrollbar_track;
                     let thumb_start = self.ui_regions.content_scrollbar_thumb_start;

@@ -181,7 +181,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     {
         let full_tree_width = tree_panel_width(body.width, app.tab().panel_width);
         let header_x = if app.tree_side() == crate::config::TreeSide::Right {
-            body.x.saturating_add(body.width.saturating_sub(full_tree_width))
+            body.x
+                .saturating_add(body.width.saturating_sub(full_tree_width))
         } else {
             body.x
         };
@@ -192,10 +193,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.ui_regions.tree_show_button = btn_rect;
         // Shift search-button hit areas left so they match the rendered
         // position (draw_tree shrinks the header by btn_width).
-        app.ui_regions.file_search_button.x =
-            app.ui_regions.file_search_button.x.saturating_sub(btn_width);
-        app.ui_regions.text_search_button.x =
-            app.ui_regions.text_search_button.x.saturating_sub(btn_width);
+        app.ui_regions.file_search_button.x = app
+            .ui_regions
+            .file_search_button
+            .x
+            .saturating_sub(btn_width);
+        app.ui_regions.text_search_button.x = app
+            .ui_regions
+            .text_search_button
+            .x
+            .saturating_sub(btn_width);
         // When the tree is hidden, the show button occupies the far-right
         // slot; shift external-open left so their hit areas don't overlap.
         if tree_width == 0 {
@@ -2107,30 +2114,15 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         }
     }
     let line_number_width = app.content_line_number_width();
-    // When content overflows, reserve the last column for the scrollbar so
-    // text isn't overwritten by the thumb/track.
-    let needs_scrollbar = app.content_visual_rows(rows.width).len() > usize::from(rows.height);
-    let content_width = if needs_scrollbar {
-        rows.width.saturating_sub(1)
-    } else {
-        rows.width
-    };
-    let visual_rows = app.content_visual_rows(content_width);
+    // Use the full rows width for all layout/scroll calculations; the
+    // scrollbar overlays the last column when content overflows.
+    let visual_rows = app.content_visual_rows(rows.width);
+    let needs_scrollbar = visual_rows.len() > usize::from(rows.height);
     let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
     };
-    let render_area = Rect::new(
-        render_area.x,
-        render_area.y,
-        if needs_scrollbar {
-            render_area.width.saturating_sub(1)
-        } else {
-            render_area.width
-        },
-        render_area.height,
-    );
     let start = app.effective_content_scroll(visual_rows.len());
     let end = start
         .saturating_add(usize::from(render_area.height))
@@ -2228,12 +2220,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             }
         }
         // Save track + thumb geometry for mouse interaction.
-        app.ui_regions.content_scrollbar_track = Rect::new(
-            track_x,
-            track_y,
-            1,
-            render_area.height,
-        );
+        app.ui_regions.content_scrollbar_track = Rect::new(track_x, track_y, 1, render_area.height);
         app.ui_regions.content_scrollbar_thumb_start = thumb_start;
         app.ui_regions.content_scrollbar_thumb_size = thumb_size;
     } else {

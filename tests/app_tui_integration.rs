@@ -5251,7 +5251,10 @@ fn tree_show_button_renders_when_hidden() {
     app.set_tree_hidden(true);
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let show = app.ui_regions.tree_show_button;
-    assert_eq!(show, visible_pos, "hide/show buttons must share one position");
+    assert_eq!(
+        show, visible_pos,
+        "hide/show buttons must share one position"
+    );
 
     let buffer = terminal.backend().buffer();
     let mut found = false;
@@ -5282,7 +5285,11 @@ fn clicking_hide_button_does_not_trigger_search() {
     assert!(btn.width > 0, "hide button should be positioned");
     let click_x = btn.x + 1; // click inside the button
     let click_y = btn.y;
-    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), click_x, click_y));
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        click_x,
+        click_y,
+    ));
 
     // Tree should be hidden, search should NOT be open
     assert!(
