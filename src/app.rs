@@ -2050,20 +2050,24 @@ impl App {
         let new_thumb_start = new_thumb_start.min(visible - thumb_size);
         // Map thumb position back to scroll offset. Use the same reduced
         // width as rendering (scrollbar reserves 1 column when visible).
-        let render_width = self.ui_regions.content_inner.width.saturating_sub(
-            if self.ui_regions.content_scrollbar_track.width > 0 {
-                1
-            } else {
-                0
-            },
-        );
-        let row_count = self.content_visual_rows(render_width).len();
+        let row_count = self.content_visual_rows(self.content_render_width()).len();
         let max_scroll = row_count.saturating_sub(visible);
         let scrollable = visible - thumb_size;
         let new_scroll = (new_thumb_start * max_scroll)
             .checked_div(scrollable)
             .unwrap_or(0);
         self.tab_mut().content.scroll = new_scroll.min(max_scroll);
+    }
+
+    /// The content width used for rendering and row-count calculations:
+    /// `content_inner.width` minus 1 column when the scrollbar is visible.
+    pub(crate) fn content_render_width(&self) -> u16 {
+        let base = self.ui_regions.content_inner.width;
+        if self.ui_regions.content_scrollbar_track.width > 0 {
+            base.saturating_sub(1)
+        } else {
+            base
+        }
     }
 
     pub(crate) fn prepare_content_width(&mut self, width: u16) {
@@ -4804,7 +4808,7 @@ impl App {
             }
             (KeyCode::End | KeyCode::Char('G'), _) => {
                 self.tab_mut().content.scroll = self
-                    .content_visual_rows(self.ui_regions.content_inner.width)
+                    .content_visual_rows(self.content_render_width())
                     .len()
                     .saturating_sub(1);
                 self.sync_content_cursor_to_scroll();
@@ -5078,7 +5082,7 @@ impl App {
         if self.tab_mut().content.mode != ContentMode::Preview {
             return;
         }
-        let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
+        let rows = self.content_visual_rows(self.content_render_width().max(1));
         self.tab_mut().content.scroll = self.effective_content_scroll(rows.len());
         if let Some(row) = rows.get(self.tab_mut().content.scroll) {
             self.tab_mut().content.cursor_line = row.line_index;
@@ -5277,7 +5281,7 @@ impl App {
 
     fn scroll_content(&mut self, vertical: isize, horizontal: isize) {
         let row_count = self
-            .content_visual_rows(self.ui_regions.content_inner.width.max(1))
+            .content_visual_rows(self.content_render_width().max(1))
             .len();
         self.tab_mut().content.scroll = self.effective_content_scroll(row_count);
         self.tab_mut().content.scroll = self
@@ -6854,7 +6858,7 @@ impl App {
 
     fn current_navigation_entry(&self) -> Option<NavigationHistoryEntry> {
         let source = self.tab().content.navigation_source.as_ref()?;
-        let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
+        let rows = self.content_visual_rows(self.content_render_width().max(1));
         let effective_scroll = self.effective_content_scroll(rows.len());
         let row = rows.get(effective_scroll);
         let viewport = ContentViewportRestore {
