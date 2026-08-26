@@ -241,12 +241,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_divider(frame, divider, app.tree_resize_dragging());
         draw_tree(frame, app, tree_header, tree_rows);
     } else {
-        // Slim edge strip to reveal the hidden tree panel.
+        // Slim edge strip to reveal the hidden tree panel. Arrow points
+        // toward the direction the tree will expand from.
         let show_rect = app.ui_regions.tree_show_button;
         if show_rect.width > 0 && show_rect.height > 0 {
+            let show_label = if app.tree_side() == crate::config::TreeSide::Right {
+                "«"
+            } else {
+                "»"
+            };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    "»",
+                    show_label,
                     Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 )),
                 show_rect,
@@ -1422,11 +1428,17 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         focused,
         tree_accent,
     );
-    // Hide-panel button sits just left of the search buttons.
+    // Hide-panel button sits just left of the search buttons. Arrow points
+    // toward the edge the tree will collapse to.
     if hide_rect.width > 0 {
+        let hide_label = if app.tree_side() == crate::config::TreeSide::Right {
+            " »"
+        } else {
+            " «"
+        };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                " «",
+                hide_label,
                 Style::default().fg(muted()).add_modifier(Modifier::BOLD),
             )),
             hide_rect,
