@@ -17,7 +17,7 @@ use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
         GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, NewTabMenuState,
-        PaletteItem, SearchMode, SearchResult, TreeContextMenu, TreeScope, UiRegions,
+        PaletteItem, SearchMode, SearchResult, TabId, TreeContextMenu, TreeScope, UiRegions,
         display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
@@ -178,12 +178,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Reposition the + button to follow the last tab, and shift the new-tab
     // menu anchor to match.
     {
-        let tabs = app.tabs();
+        let tab_info: Vec<(TabId, usize)> = app
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, UnicodeWidthStr::width(tab.title.as_str())))
+            .collect();
         let mut x = tab_bar.x;
-        for tab in tabs {
-            // Each tab renders as "● title " or "  title " (marker + title + space).
-            let label_width = 2 + UnicodeWidthStr::width(tab.title.as_str()) as u16 + 1;
-            x = x.saturating_add(label_width);
+        app.ui_regions.tab_close_buttons.clear();
+        for (id, title_width) in &tab_info {
+            // Each tab renders as " title × " (space + title + space + × + space).
+            let label_width = 1 + (*title_width as u16) + 1;
+            let close_x = x.saturating_add(label_width);
+            app.ui_regions.tab_close_buttons.push((
+                *id,
+                Rect::new(close_x, tab_bar.y, 2.min(tab_bar.width), tab_bar.height),
+            ));
+            x = close_x.saturating_add(2);
         }
         let plus_x = x.min(tab_bar.x + tab_bar.width.saturating_sub(3));
         app.ui_regions.new_tab_button =
@@ -309,6 +319,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tab_bar,
         new_tab_button,
         new_tab_menu,
+        tab_close_buttons: Vec::new(),
         refresh_button: Rect::new(refresh_x, header.y, refresh_width, header.height.min(1)),
         file_search_button,
         text_search_button,
@@ -403,26 +414,22 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
     for tab in tabs {
         let is_active = tab.id == active_id;
-        let (marker, style) = if is_active {
-            (
-                "● ",
-                Style::default()
-                    .fg(theme.content_accent)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let style = if is_active {
+            Style::default()
+                .fg(theme.content_accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            ("  ", Style::default().fg(theme.text_muted))
+            Style::default().fg(theme.text_muted)
         };
-        spans.push(Span::styled(marker, style));
+        spans.push(Span::styled(format!(" {} ", tab.title), style));
+        // Per-tab close button (×).
         spans.push(Span::styled(
-            format!("{} ", tab.title),
-            if is_active {
-                Style::default()
-                    .fg(theme.content_accent)
-                    .add_modifier(Modifier::BOLD)
+            "× ",
+            Style::default().fg(if is_active {
+                theme.content_accent
             } else {
-                Style::default().fg(theme.text_muted)
-            },
+                theme.text_subtle
+            }),
         ));
     }
     // The + button follows the last tab, not the far right edge.
@@ -924,7 +931,7 @@ fn navigation_picker_item(
                 .map(|parent| format!("  {}", display_workspace_path(parent)))
                 .unwrap_or_default();
             ListItem::new(Line::from(vec![
-                Span::styled(if group.expanded { "▾ " } else { "▸ " }, style),
+                Span::styled(if group.expanded { "« " } else { "» " }, style),
                 Span::styled(filename, style),
                 Span::styled(
                     parent,
@@ -1154,7 +1161,7 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
     } else {
         Style::default().fg(text_primary())
     };
-    let icon = if result.is_dir { "▸ " } else { "· " };
+    let icon = if result.is_dir { "» " } else { "· " };
     let location = result.line_number.map_or_else(
         || display_workspace_path(&result.path),
         |line| format!("{}:{line}", display_workspace_path(&result.path)),
@@ -1467,9 +1474,9 @@ fn git_tree_line(
     let review_state = app.git_row_review_state(row);
     let icon = if row.is_container() {
         if app.git_row_is_expanded(row) {
-            "▾ "
+            "« "
         } else {
-            "▸ "
+            "» "
         }
     } else {
         match (review_state, &row.kind) {
@@ -1601,9 +1608,9 @@ fn tree_line(
         if app.directory_is_loading(entry) {
             "… "
         } else if app.directory_is_expanded(entry) {
-            "▾ "
+            "« "
         } else {
-            "▸ "
+            "» "
         }
     } else {
         "  "
@@ -2516,8 +2523,8 @@ fn preview_line(
     let number = number.map(|number| number.to_string()).unwrap_or_default();
     let marker = match visual_row.fold_marker {
         FoldVisualMarker::None => '│',
-        FoldVisualMarker::Expanded => '▾',
-        FoldVisualMarker::Collapsed => '▸',
+        FoldVisualMarker::Expanded => '«',
+        FoldVisualMarker::Collapsed => '»',
     };
     let mut spans = vec![Span::styled(
         format!("{number:>width$} {marker} "),

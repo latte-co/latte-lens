@@ -723,11 +723,13 @@ impl ContentSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UiRegions {
     pub tab_bar: Rect,
     pub new_tab_button: Rect,
     pub new_tab_menu: Rect,
+    /// Per-tab close button (×) hit areas, in tab order.
+    pub tab_close_buttons: Vec<(TabId, Rect)>,
     pub refresh_button: Rect,
     pub file_search_button: Rect,
     pub text_search_button: Rect,
@@ -757,15 +759,15 @@ pub struct UiRegions {
 }
 
 impl UiRegions {
-    fn refresh_at(self, column: u16, row: u16) -> bool {
+    fn refresh_at(&self, column: u16, row: u16) -> bool {
         contains(self.refresh_button, column, row)
     }
 
-    fn file_search_at(self, column: u16, row: u16) -> bool {
+    fn file_search_at(&self, column: u16, row: u16) -> bool {
         contains(self.file_search_button, column, row)
     }
 
-    fn text_search_at(self, column: u16, row: u16) -> bool {
+    fn text_search_at(&self, column: u16, row: u16) -> bool {
         contains(self.text_search_button, column, row)
     }
 }
@@ -3642,10 +3644,21 @@ impl App {
         if !contains(self.ui_regions.tab_bar, mouse.column, mouse.row) {
             return false;
         }
+        // Check per-tab close buttons first.
+        let close_hit = self
+            .ui_regions
+            .tab_close_buttons
+            .iter()
+            .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
+            .map(|(id, _)| *id);
+        if let Some(tab_id) = close_hit {
+            self.close_tab(tab_id);
+            return true;
+        }
         let mut x = self.ui_regions.tab_bar.x;
         for tab in self.tabs() {
-            let label = format!(" {} ", tab.title);
-            let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+            // Tab renders as " title × " (space + title + space + × + space).
+            let width = 1 + unicode_width::UnicodeWidthStr::width(tab.title.as_str()) as u16 + 3;
             let rect = Rect::new(x, self.ui_regions.tab_bar.y, width, 1);
             if contains(rect, mouse.column, mouse.row) && tab.id != self.active_tab {
                 self.activate_tab(tab.id);
@@ -9649,7 +9662,7 @@ mod tests {
             .collect();
         assert!(final_top.contains("70001"), "{final_top:?}");
         assert!(final_top.contains("UNIQUE_FINAL_SENTINEL"), "{final_top:?}");
-        assert!(!final_top.contains('▸'));
+        assert!(!final_top.contains('»'));
         assert!(
             app.content_point_bounds(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
