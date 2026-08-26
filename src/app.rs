@@ -2048,10 +2048,12 @@ impl App {
         let click_row = usize::from(mouse_row.saturating_sub(track.y));
         let new_thumb_start = click_row.saturating_sub(thumb_size / 2);
         let new_thumb_start = new_thumb_start.min(visible - thumb_size);
-        // Map thumb position back to scroll offset.
-        let row_count = self
-            .content_visual_rows(self.ui_regions.content_inner.width)
-            .len();
+        // Map thumb position back to scroll offset. Use the same reduced
+        // width as rendering (scrollbar reserves 1 column when visible).
+        let render_width = self.ui_regions.content_inner.width.saturating_sub(
+            if self.ui_regions.content_scrollbar_track.width > 0 { 1 } else { 0 }
+        );
+        let row_count = self.content_visual_rows(render_width).len();
         let max_scroll = row_count.saturating_sub(visible);
         let scrollable = visible - thumb_size;
         let new_scroll = (new_thumb_start * max_scroll)

@@ -2114,14 +2114,32 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         }
     }
     let line_number_width = app.content_line_number_width();
-    // Use the full rows width for all layout/scroll calculations; the
-    // scrollbar overlays the last column when content overflows.
-    let visual_rows = app.content_visual_rows(rows.width);
+    // When content overflows, reserve the last column for the scrollbar so
+    // text isn't overwritten. All layout/scroll calculations use the same
+    // reduced width for consistency.
+    let needs_scrollbar =
+        app.content_visual_rows(rows.width).len() > usize::from(rows.height);
+    let content_width = if needs_scrollbar {
+        rows.width.saturating_sub(1)
+    } else {
+        rows.width
+    };
+    let visual_rows = app.content_visual_rows(content_width);
     let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
     };
+    let render_area = Rect::new(
+        render_area.x,
+        render_area.y,
+        if needs_scrollbar {
+            render_area.width.saturating_sub(1)
+        } else {
+            render_area.width
+        },
+        render_area.height,
+    );
     let start = app.effective_content_scroll(visual_rows.len());
     let end = start
         .saturating_add(usize::from(render_area.height))
