@@ -229,8 +229,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             x = close_x.saturating_add(2);
         }
         let plus_x = x.min(tab_bar.x + tab_bar.width.saturating_sub(3));
-        app.ui_regions.new_tab_button =
-            Rect::new(plus_x, tab_bar.y, 3.min(tab_bar.width), tab_bar.height);
+        // Only register the + hit area when it's actually visible (tabs
+        // don't overflow the bar). Otherwise the invisible hitbox would
+        // overlap tab text/close buttons.
+        if x <= tab_bar.x + tab_bar.width.saturating_sub(3) {
+            app.ui_regions.new_tab_button =
+                Rect::new(plus_x, tab_bar.y, 3.min(tab_bar.width), tab_bar.height);
+        } else {
+            app.ui_regions.new_tab_button = Rect::default();
+        }
         let menu_width = 20u16.min(tab_bar.width);
         let menu_x = plus_x
             .saturating_add(3)
@@ -2095,12 +2102,30 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         }
     }
     let line_number_width = app.content_line_number_width();
-    let visual_rows = app.content_visual_rows(rows.width);
+    // When content overflows, reserve the last column for the scrollbar so
+    // text isn't overwritten by the thumb/track.
+    let needs_scrollbar = app.content_visual_rows(rows.width).len() > usize::from(rows.height);
+    let content_width = if needs_scrollbar {
+        rows.width.saturating_sub(1)
+    } else {
+        rows.width
+    };
+    let visual_rows = app.content_visual_rows(content_width);
     let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
     };
+    let render_area = Rect::new(
+        render_area.x,
+        render_area.y,
+        if needs_scrollbar {
+            render_area.width.saturating_sub(1)
+        } else {
+            render_area.width
+        },
+        render_area.height,
+    );
     let start = app.effective_content_scroll(visual_rows.len());
     let end = start
         .saturating_add(usize::from(render_area.height))
@@ -2169,11 +2194,13 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
 
     // Content scrollbar: a 1-column indicator on the right edge of the
     // content area, shown only when the content overflows the viewport.
+    // The track sits on the last column of the full rows rect (which was
+    // reserved by shrinking render_area above).
     let total = visual_rows.len();
     let visible = usize::from(render_area.height);
     if total > visible && visible > 0 {
         let scroll = app.effective_content_scroll(total);
-        let track_x = render_area.x + render_area.width - 1;
+        let track_x = rows.x + rows.width - 1;
         let track_y = render_area.y;
         let thumb_size = (visible * visible / total).max(1).min(visible);
         let max_scroll = total.saturating_sub(visible);
