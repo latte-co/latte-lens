@@ -175,28 +175,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
-    // Position the tree hide/show buttons. The hide button sits in the
-    // global header just left of Refresh; the show button is a slim edge
-    // strip rendered only when the tree is collapsed.
+    // Position the tree hide/show buttons. Both states use the same spot:
+    // the right edge of where the tree header sits, so the button never
+    // jumps between expanded and collapsed. Only shown when the panel is
+    // wide enough to avoid clipping the heading text.
     {
-        if tree_width > 0 {
-            let hide_width = 3u16;
-            let hide_x = app
-                .ui_regions
-                .refresh_button
-                .x
-                .saturating_sub(hide_width);
-            app.ui_regions.tree_hide_button =
-                Rect::new(hide_x, header.y, hide_width, header.height);
-        }
-        if tree_width == 0 {
-            let show_x = if app.tree_side() == crate::config::TreeSide::Right {
-                body.x.saturating_add(body.width.saturating_sub(1))
+        let full_tree_width = tree_panel_width(body.width, app.tab().panel_width);
+        if full_tree_width >= 32 {
+            let header_x = if app.tree_side() == crate::config::TreeSide::Right {
+                body.x.saturating_add(body.width.saturating_sub(full_tree_width))
             } else {
                 body.x
             };
-            app.ui_regions.tree_show_button =
-                Rect::new(show_x, body.y, 1, body.height);
+            let btn_width = 3u16;
+            let btn_x = header_x.saturating_add(full_tree_width.saturating_sub(btn_width));
+            let btn_rect = Rect::new(btn_x, body.y, btn_width, 1);
+            app.ui_regions.tree_hide_button = btn_rect;
+            app.ui_regions.tree_show_button = btn_rect;
         }
     }
     // Reposition the + button to follow the last tab, and shift the new-tab
@@ -240,19 +235,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_divider(frame, divider, app.tree_resize_dragging());
         draw_tree(frame, app, tree_header, tree_rows);
     } else {
-        // Slim edge strip to reveal the hidden tree panel. Arrow points
-        // toward the direction the tree will expand from.
+        // Show-panel button at the same spot where the hide button lives
+        // when the tree is visible, so the toggle never jumps.
         let show_rect = app.ui_regions.tree_show_button;
-        if show_rect.width > 0 && show_rect.height > 0 {
+        if show_rect.width > 0 {
             let show_label = if app.tree_side() == crate::config::TreeSide::Right {
-                "«"
+                " «"
             } else {
-                "»"
+                " »"
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     show_label,
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(muted()).add_modifier(Modifier::BOLD),
                 )),
                 show_rect,
             );
@@ -547,22 +542,6 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         title.push(Span::styled("  directory", Style::default().fg(muted())));
     }
     frame.render_widget(Paragraph::new(Line::from(title)), header_text);
-    // Tree panel hide button, just left of Refresh.
-    let hide_rect = app.ui_regions.tree_hide_button;
-    if hide_rect.width > 0 {
-        let hide_label = if app.tree_side() == crate::config::TreeSide::Right {
-            " »"
-        } else {
-            " «"
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                hide_label,
-                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
-            )),
-            hide_rect,
-        );
-    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1350,7 +1329,11 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     };
     let entry_count = app.scope_entry_count();
     let (file_button, text_button) = inactive_search_buttons(header);
-    let available_width = file_button.x.saturating_sub(header.x) as usize;
+    let hide_btn_width = app.ui_regions.tree_hide_button.width;
+    let available_width = file_button
+        .x
+        .saturating_sub(header.x)
+        .saturating_sub(hide_btn_width) as usize;
     let heading = if is_agents_scope(app) {
         "Agents"
     } else if app.tree_scope == TreeScope::GitChanges {
@@ -1421,7 +1404,10 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         format!("{entry_count} entries")
     };
-    let heading_width = file_button.x.saturating_sub(header.x);
+    let heading_width = file_button
+        .x
+        .saturating_sub(header.x)
+        .saturating_sub(hide_btn_width);
     let tree_accent = if app.tree_scope == TreeScope::GitChanges {
         Theme::current().git_accent
     } else {
@@ -1435,6 +1421,22 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         focused,
         tree_accent,
     );
+    // Hide-panel button at the far right of the tree header.
+    let hide_rect = app.ui_regions.tree_hide_button;
+    if hide_rect.width > 0 {
+        let hide_label = if app.tree_side() == crate::config::TreeSide::Right {
+            " »"
+        } else {
+            " «"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                hide_label,
+                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+            )),
+            hide_rect,
+        );
+    }
     let full_labels = file_button.width >= 7;
     frame.render_widget(
         Paragraph::new(Span::styled(
