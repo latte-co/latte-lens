@@ -754,6 +754,10 @@ pub struct UiRegions {
     pub tree_body: Rect,
     pub tree_inner: Rect,
     pub divider: Rect,
+    /// Button in the tree header that hides the tree panel.
+    pub tree_hide_button: Rect,
+    /// Slim edge button shown when the tree is hidden; click to reveal.
+    pub tree_show_button: Rect,
     pub content_body: Rect,
     pub content_inner: Rect,
 }
@@ -3534,6 +3538,21 @@ impl App {
                     };
                     self.last_tree_click = None;
                     self.request_refresh(self.tree_scope == TreeScope::GitChanges);
+                    return;
+                }
+                // Tree panel hide/show buttons.
+                if !self.tree_hidden
+                    && contains(self.ui_regions.tree_hide_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.toggle_tree_visibility();
+                    return;
+                }
+                if self.tree_hidden
+                    && contains(self.ui_regions.tree_show_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.toggle_tree_visibility();
                     return;
                 }
                 if contains(self.ui_regions.divider, mouse.column, mouse.row) {
@@ -9662,7 +9681,7 @@ mod tests {
             .collect();
         assert!(final_top.contains("70001"), "{final_top:?}");
         assert!(final_top.contains("UNIQUE_FINAL_SENTINEL"), "{final_top:?}");
-        assert!(!final_top.contains('»'));
+        assert!(!final_top.contains('▸'));
         assert!(
             app.content_point_bounds(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),

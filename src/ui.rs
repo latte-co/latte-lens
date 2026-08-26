@@ -175,6 +175,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
+    // Position the tree hide/show buttons. The hide button sits in the tree
+    // header just left of the search buttons (only when the header is wide
+    // enough to avoid clipping the heading); the show button is a slim edge
+    // strip rendered only when the tree is collapsed.
+    {
+        let hide_width = 3u16.min(tree_header.width);
+        if tree_header.width >= 32 {
+            let hide_x = app
+                .ui_regions
+                .file_search_button
+                .x
+                .saturating_sub(hide_width);
+            app.ui_regions.tree_hide_button =
+                Rect::new(hide_x, tree_header.y, hide_width, tree_header.height);
+        }
+        if tree_width == 0 {
+            let show_x = if app.tree_side() == crate::config::TreeSide::Right {
+                body.x.saturating_add(body.width.saturating_sub(1))
+            } else {
+                body.x
+            };
+            app.ui_regions.tree_show_button =
+                Rect::new(show_x, body.y, 1, body.height);
+        }
+    }
     // Reposition the + button to follow the last tab, and shift the new-tab
     // menu anchor to match.
     {
@@ -215,6 +240,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if tree_width > 0 {
         draw_divider(frame, divider, app.tree_resize_dragging());
         draw_tree(frame, app, tree_header, tree_rows);
+    } else {
+        // Slim edge strip to reveal the hidden tree panel.
+        let show_rect = app.ui_regions.tree_show_button;
+        if show_rect.width > 0 && show_rect.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "»",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )),
+                show_rect,
+            );
+        }
     }
     draw_content(frame, app, content_header, content_rows);
     draw_footer(frame, app, footer);
@@ -344,6 +381,8 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tree_body,
         tree_inner: tree_rows,
         divider,
+        tree_hide_button: Rect::default(),
+        tree_show_button: Rect::default(),
         content_body,
         content_inner: content_rows,
     }
@@ -931,7 +970,7 @@ fn navigation_picker_item(
                 .map(|parent| format!("  {}", display_workspace_path(parent)))
                 .unwrap_or_default();
             ListItem::new(Line::from(vec![
-                Span::styled(if group.expanded { "« " } else { "» " }, style),
+                Span::styled(if group.expanded { "▾ " } else { "▸ " }, style),
                 Span::styled(filename, style),
                 Span::styled(
                     parent,
@@ -1161,7 +1200,7 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
     } else {
         Style::default().fg(text_primary())
     };
-    let icon = if result.is_dir { "» " } else { "· " };
+    let icon = if result.is_dir { "▸ " } else { "· " };
     let location = result.line_number.map_or_else(
         || display_workspace_path(&result.path),
         |line| format!("{}:{line}", display_workspace_path(&result.path)),
@@ -1290,7 +1329,11 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     };
     let entry_count = app.scope_entry_count();
     let (file_button, text_button) = inactive_search_buttons(header);
-    let available_width = file_button.x.saturating_sub(header.x) as usize;
+    let hide_width = app.ui_regions.tree_hide_button.width;
+    let available_width = file_button
+        .x
+        .saturating_sub(header.x)
+        .saturating_sub(hide_width) as usize;
     let heading = if is_agents_scope(app) {
         "Agents"
     } else if app.tree_scope == TreeScope::GitChanges {
@@ -1361,7 +1404,11 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         format!("{entry_count} entries")
     };
-    let heading_width = file_button.x.saturating_sub(header.x);
+    let hide_rect = app.ui_regions.tree_hide_button;
+    let heading_width = file_button
+        .x
+        .saturating_sub(header.x)
+        .saturating_sub(if hide_rect.width > 0 { hide_rect.width } else { 0 });
     let tree_accent = if app.tree_scope == TreeScope::GitChanges {
         Theme::current().git_accent
     } else {
@@ -1375,6 +1422,16 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         focused,
         tree_accent,
     );
+    // Hide-panel button sits just left of the search buttons.
+    if hide_rect.width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " «",
+                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+            )),
+            hide_rect,
+        );
+    }
     let full_labels = file_button.width >= 7;
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -1474,9 +1531,9 @@ fn git_tree_line(
     let review_state = app.git_row_review_state(row);
     let icon = if row.is_container() {
         if app.git_row_is_expanded(row) {
-            "« "
+            "▾ "
         } else {
-            "» "
+            "▸ "
         }
     } else {
         match (review_state, &row.kind) {
@@ -1608,9 +1665,9 @@ fn tree_line(
         if app.directory_is_loading(entry) {
             "… "
         } else if app.directory_is_expanded(entry) {
-            "« "
+            "▾ "
         } else {
-            "» "
+            "▸ "
         }
     } else {
         "  "
@@ -2523,8 +2580,8 @@ fn preview_line(
     let number = number.map(|number| number.to_string()).unwrap_or_default();
     let marker = match visual_row.fold_marker {
         FoldVisualMarker::None => '│',
-        FoldVisualMarker::Expanded => '«',
-        FoldVisualMarker::Collapsed => '»',
+        FoldVisualMarker::Expanded => '▾',
+        FoldVisualMarker::Collapsed => '▸',
     };
     let mut spans = vec![Span::styled(
         format!("{number:>width$} {marker} "),

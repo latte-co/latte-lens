@@ -77,7 +77,7 @@ fn preview_folding_renders_markers_and_find_reveals_hidden_body() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains('»'));
+    assert!(rendered.contains('▸'));
     assert!(rendered.contains("lines"));
     assert!(!rendered.contains("hidden_needle"));
 
@@ -86,7 +86,7 @@ fn preview_folding_renders_markers_and_find_reveals_hidden_body() {
         .buffer()
         .content()
         .iter()
-        .position(|cell| cell.symbol() == "»")
+        .position(|cell| cell.symbol() == "▸")
         .unwrap();
     let marker_column = u16::try_from(marker_index % 100).unwrap();
     let marker_row = u16::try_from(marker_index / 100).unwrap();
@@ -94,7 +94,7 @@ fn preview_folding_renders_markers_and_find_reveals_hidden_body() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(
-        rendered.contains('»'),
+        rendered.contains('▸'),
         "blank EOF rows must not alias the marker"
     );
 
@@ -2155,7 +2155,7 @@ fn clean_source_defaults_to_numbered_text_preview() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = format!("{:?}", terminal.backend().buffer());
     assert!(rendered.contains("Preview"));
-    assert!(rendered.contains("1 «"));
+    assert!(rendered.contains("1 ▾"));
     assert!(rendered.contains("2 │"));
     assert!(rendered.contains("println!"));
 }
@@ -3131,7 +3131,7 @@ fn all_files_aligns_directory_and_file_labels_with_a_blank_file_disclosure_slot(
             .cell((directory_label_x - 2, directory_y))
             .unwrap()
             .symbol(),
-        "»"
+        "▸"
     );
     for column in (file_label_x - 2)..file_label_x {
         assert_eq!(

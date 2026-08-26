@@ -380,7 +380,7 @@ fn e2e_folding_headless() {
     app.handle_key(key(KeyCode::Char('[')));
     let rendered = render(&mut app);
     // The fold marker should appear (or the content changed).
-    assert!(rendered.contains('»') || rendered.contains("lines"));
+    assert!(rendered.contains('▸') || rendered.contains("lines"));
 
     // ] unfolds.
     app.handle_key(key(KeyCode::Char(']')));
