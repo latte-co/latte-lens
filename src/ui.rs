@@ -17,7 +17,8 @@ use crate::{
     app::{
         App, ContentMode, ContentVisualRow, DiffReviewState, FocusPane, FoldVisualMarker,
         GitRowKind, GitTreeRow, NavigationPickerRow, NavigationPickerState, NewTabMenuState,
-        PaletteItem, SearchMode, SearchResult, TreeScope, UiRegions, display_workspace_path,
+        PaletteItem, SearchMode, SearchResult, TabId, TreeContextMenu, TreeScope, UiRegions,
+        display_workspace_path,
     },
     diff::{DiffLineAnnotation, DiffLineKind},
     git::FileStatus,
@@ -104,7 +105,7 @@ fn file_entry_color_with_theme(entry: &FileEntry, theme: &Theme) -> Color {
     }
 }
 
-pub(crate) const MIN_TREE_WIDTH: u16 = 28;
+pub(crate) const MIN_TREE_WIDTH: u16 = 16;
 const MIN_CONTENT_WIDTH: u16 = 24;
 const DEFAULT_MAX_TREE_WIDTH: u16 = 36;
 
@@ -161,21 +162,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let content_header = inset_left(content_header, 1);
     let content_rows = inset_left(content_rows, 1);
-    // Limit text width for readability on wide screens: center the text column
-    // with a max width. This is applied before regions() so content_inner (used
-    // for hit testing, hover, and wrap calculation) matches the render rect.
-    const MAX_TEXT_WIDTH: u16 = 100;
-    let content_rows = if content_rows.width > MAX_TEXT_WIDTH {
-        let padding = (content_rows.width - MAX_TEXT_WIDTH) / 2;
-        Rect::new(
-            content_rows.x.saturating_add(padding),
-            content_rows.y,
-            MAX_TEXT_WIDTH,
-            content_rows.height,
-        )
-    } else {
-        content_rows
-    };
     app.prepare_content_width(content_rows.width);
 
     app.ui_regions = regions(DrawAreas {
@@ -189,6 +175,86 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
+    // Position the tree hide/show buttons. Both states use the same spot:
+    // the far right edge of the tree header, so the button never jumps
+    // between expanded and collapsed.
+    {
+        let full_tree_width = tree_panel_width(body.width, app.tab().panel_width);
+        let header_x = if app.tree_side() == crate::config::TreeSide::Right {
+            body.x
+                .saturating_add(body.width.saturating_sub(full_tree_width))
+        } else {
+            body.x
+        };
+        let btn_width = 3u16;
+        let btn_x = header_x.saturating_add(full_tree_width.saturating_sub(btn_width));
+        let btn_rect = Rect::new(btn_x, body.y, btn_width, 1);
+        app.ui_regions.tree_hide_button = btn_rect;
+        app.ui_regions.tree_show_button = btn_rect;
+        // Shift search-button hit areas left so they match the rendered
+        // position (draw_tree shrinks the header by btn_width).
+        app.ui_regions.file_search_button.x = app
+            .ui_regions
+            .file_search_button
+            .x
+            .saturating_sub(btn_width);
+        app.ui_regions.text_search_button.x = app
+            .ui_regions
+            .text_search_button
+            .x
+            .saturating_sub(btn_width);
+        // When the tree is hidden, the show button occupies the far-right
+        // slot; shift external-open left so their hit areas don't overlap.
+        if tree_width == 0 {
+            app.ui_regions.external_open_button.x = app
+                .ui_regions
+                .external_open_button
+                .x
+                .saturating_sub(btn_width);
+        }
+    }
+    // Reposition the + button to follow the last tab, and shift the new-tab
+    // menu anchor to match.
+    {
+        let tab_info: Vec<(TabId, usize)> = app
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, UnicodeWidthStr::width(tab.title.as_str())))
+            .collect();
+        let mut x = tab_bar.x;
+        app.ui_regions.tab_close_buttons.clear();
+        for (id, title_width) in &tab_info {
+            // Each tab renders as " title × " (space + title + space + × + space).
+            let label_width = 1 + (*title_width as u16) + 1;
+            let close_x = x.saturating_add(label_width);
+            app.ui_regions.tab_close_buttons.push((
+                *id,
+                Rect::new(close_x, tab_bar.y, 2.min(tab_bar.width), tab_bar.height),
+            ));
+            x = close_x.saturating_add(2);
+        }
+        let plus_x = x.min(tab_bar.x + tab_bar.width.saturating_sub(3));
+        // Only register the + hit area when it's actually visible (tabs
+        // don't overflow the bar). Otherwise the invisible hitbox would
+        // overlap tab text/close buttons.
+        if x <= tab_bar.x + tab_bar.width.saturating_sub(3) {
+            app.ui_regions.new_tab_button =
+                Rect::new(plus_x, tab_bar.y, 3.min(tab_bar.width), tab_bar.height);
+        } else {
+            app.ui_regions.new_tab_button = Rect::default();
+        }
+        let menu_width = 20u16.min(tab_bar.width);
+        let menu_x = plus_x
+            .saturating_add(3)
+            .saturating_sub(menu_width)
+            .min(tab_bar.width.saturating_sub(menu_width));
+        app.ui_regions.new_tab_menu = Rect::new(
+            menu_x,
+            tab_bar.y.saturating_add(1),
+            menu_width,
+            app.ui_regions.new_tab_menu.height,
+        );
+    }
     draw_tab_bar(frame, app, tab_bar);
     draw_header(frame, app, header);
     if tree_width > 0 {
@@ -196,6 +262,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_tree(frame, app, tree_header, tree_rows);
     }
     draw_content(frame, app, content_header, content_rows);
+    // Show-panel button rendered after content so it isn't overwritten by
+    // the content header when the tree is hidden.
+    if tree_width == 0 {
+        let show_rect = app.ui_regions.tree_show_button;
+        if show_rect.width > 0 {
+            let show_label = if app.tree_side() == crate::config::TreeSide::Right {
+                " «"
+            } else {
+                " »"
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    show_label,
+                    Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+                )),
+                show_rect,
+            );
+        }
+    }
     draw_footer(frame, app, footer);
     if app.tab_palette.is_some() {
         dim_underlay(frame);
@@ -209,6 +294,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.search_is_active() {
         dim_underlay(frame);
         draw_search_popup(frame, app);
+    } else if app.tree_context_menu.is_some() {
+        dim_underlay(frame);
+        draw_tree_context_menu(frame, app);
     }
 }
 
@@ -295,6 +383,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tab_bar,
         new_tab_button,
         new_tab_menu,
+        tab_close_buttons: Vec::new(),
         refresh_button: Rect::new(refresh_x, header.y, refresh_width, header.height.min(1)),
         file_search_button,
         text_search_button,
@@ -319,6 +408,11 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tree_body,
         tree_inner: tree_rows,
         divider,
+        tree_hide_button: Rect::default(),
+        tree_show_button: Rect::default(),
+        content_scrollbar_track: Rect::default(),
+        content_scrollbar_thumb_start: 0,
+        content_scrollbar_thumb_size: 0,
         content_body,
         content_inner: content_rows,
     }
@@ -384,34 +478,32 @@ fn active_search_controls(area: Rect) -> (Rect, Rect, [Rect; 4]) {
 
 fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = app.tabs();
-    let plus_width = 3u16;
-    let tabs_width = area.width.saturating_sub(plus_width);
-    let [tabs_area, plus] = Layout::horizontal([
-        Constraint::Length(tabs_width),
-        Constraint::Length(plus_width),
-    ])
-    .areas(area);
     let active_id = app.active_tab_id();
+    let theme = Theme::current();
     let mut spans = Vec::new();
     for tab in tabs {
-        let label = format!(" {} ", tab.title);
-        let style = if tab.id == active_id {
+        let is_active = tab.id == active_id;
+        let style = if is_active {
             Style::default()
-                .fg(accent())
+                .fg(theme.content_accent)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default().fg(muted())
+            Style::default().fg(theme.text_muted)
         };
-        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(format!(" {} ", tab.title), style));
+        // Per-tab close button (×).
+        spans.push(Span::styled(
+            "× ",
+            Style::default().fg(if is_active {
+                theme.content_accent
+            } else {
+                theme.text_subtle
+            }),
+        ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " + ",
-            Style::default().fg(muted()),
-        ))),
-        plus,
-    );
+    // The + button follows the last tab, not the far right edge.
+    spans.push(Span::styled(" + ", Style::default().fg(theme.text_muted)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -594,6 +686,40 @@ fn draw_new_tab_menu(frame: &mut Frame, app: &App, anchor: Rect) {
             Style::default().fg(text_primary())
         };
         lines.push(Line::from(Span::styled(label, style)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_tree_context_menu(frame: &mut Frame, app: &App) {
+    let Some(menu) = app.tree_context_menu.as_ref() else {
+        return;
+    };
+    let Some(rect) = app.tree_context_menu_rect() else {
+        return;
+    };
+    let actions = TreeContextMenu::actions_for(app, menu.row);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent())),
+        rect,
+    );
+    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
+    let theme = Theme::current();
+    let mut lines = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        let style = if index == menu.selected {
+            Style::default()
+                .fg(theme.content_accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}  ", action.label()),
+            style,
+        )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1157,9 +1283,16 @@ fn search_result_item(result: &SearchResult, selected: bool, width: u16) -> List
     }
 }
 
+/// Apply the hover background to a tree row when the pointer is over it.
+fn with_hover<'a>(item: ListItem<'a>, hovered: bool, style: Style) -> ListItem<'a> {
+    if hovered { item.style(style) } else { item }
+}
+
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     let selected = app.tab_mut().tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
+    let hover_row = app.tree_hover_row();
+    let hover_style = Style::default().bg(Theme::current().surface_hover);
     let items: Vec<ListItem> = if app.is_initial_loading() && !is_agents_scope(app) {
         vec![ListItem::new(Line::from(Span::styled(
             "  Scanning files…",
@@ -1172,13 +1305,17 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| {
-                    ListItem::new(tree_line(
-                        app,
-                        entry,
-                        selected == Some(index),
-                        focused,
-                        rows.width,
-                    ))
+                    with_hover(
+                        ListItem::new(tree_line(
+                            app,
+                            entry,
+                            selected == Some(index),
+                            focused,
+                            rows.width,
+                        )),
+                        hover_row == Some(index),
+                        hover_style,
+                    )
                 })
                 .collect(),
             TreeScope::GitChanges => app
@@ -1186,13 +1323,17 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
-                    ListItem::new(git_tree_line(
-                        app,
-                        row,
-                        selected == Some(index),
-                        focused,
-                        rows.width,
-                    ))
+                    with_hover(
+                        ListItem::new(git_tree_line(
+                            app,
+                            row,
+                            selected == Some(index),
+                            focused,
+                            rows.width,
+                        )),
+                        hover_row == Some(index),
+                        hover_style,
+                    )
                 })
                 .collect(),
             #[cfg(feature = "agent-observability")]
@@ -1202,18 +1343,37 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(index, session)| {
-                    ListItem::new(agent_session_line(
-                        session,
-                        selected == Some(index),
-                        focused,
-                        rows.width,
-                    ))
+                    with_hover(
+                        ListItem::new(agent_session_line(
+                            session,
+                            selected == Some(index),
+                            focused,
+                            rows.width,
+                        )),
+                        hover_row == Some(index),
+                        hover_style,
+                    )
                 })
                 .collect(),
         }
     };
     let entry_count = app.scope_entry_count();
-    let (file_button, text_button) = inactive_search_buttons(header);
+    // Only reserve space for the hide button when the header is wide enough;
+    // on narrow panels the button overlays the right edge without shrinking
+    // the heading area.
+    let hide_btn_width = if header.width >= 32 {
+        app.ui_regions.tree_hide_button.width
+    } else {
+        0
+    };
+    // Search buttons sit left of the hide/show button at the far right.
+    let adjusted_header = Rect::new(
+        header.x,
+        header.y,
+        header.width.saturating_sub(hide_btn_width),
+        header.height,
+    );
+    let (file_button, text_button) = inactive_search_buttons(adjusted_header);
     let available_width = file_button.x.saturating_sub(header.x) as usize;
     let heading = if is_agents_scope(app) {
         "Agents"
@@ -1222,7 +1382,9 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         "Files"
     };
-    let detail = if is_agents_scope(app) {
+    let detail = if let Some(prefix) = app.tree_type_ahead_prefix() {
+        format!("› {prefix}")
+    } else if is_agents_scope(app) {
         #[cfg(feature = "agent-observability")]
         {
             let view = app.agent_view();
@@ -1297,6 +1459,22 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         focused,
         tree_accent,
     );
+    // Hide-panel button at the far right of the tree header.
+    let hide_rect = app.ui_regions.tree_hide_button;
+    if hide_rect.width > 0 {
+        let hide_label = if app.tree_side() == crate::config::TreeSide::Right {
+            " »"
+        } else {
+            " «"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                hide_label,
+                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+            )),
+            hide_rect,
+        );
+    }
     let full_labels = file_button.width >= 7;
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -1772,24 +1950,10 @@ fn truncate_middle(value: &str, max_width: usize) -> String {
     format!("{head}…{tail}")
 }
 
-fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
+fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     if app.preview_find_is_active() {
         draw_preview_find(frame, app);
     } else {
-        let mut detail = app.selected_content_label();
-        if app.tab().content.mode == ContentMode::Preview
-            && let Some(provider) = app.tab().content.provider.as_deref()
-        {
-            detail.push_str(&format!(" · {provider}"));
-        }
-        if app.tab().content.mode == ContentMode::Preview
-            && let Some(real_path) = app.selected_symlink_real_path()
-        {
-            detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
-        }
-        if app.is_content_loading() {
-            detail.push_str(" · LOADING");
-        }
         let heading = if app.can_open_content_externally() {
             Rect::new(
                 header.x,
@@ -1802,19 +1966,136 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         } else {
             header
         };
-        // Truncate long file paths from the middle so the tail stays visible.
-        let title_width = UnicodeWidthStr::width(app.selected_content_title());
+        let title = app.selected_content_title();
+        let focused = app.content_is_focused();
+        let content_accent = Theme::current().content_accent;
+        let theme = Theme::current();
+        let title_width = UnicodeWidthStr::width(title);
         let overhead = 2 + title_width + 2; // "● " + title + "  "
         let available = heading.width.saturating_sub(overhead as u16) as usize;
-        let detail = truncate_middle(&detail, available);
-        draw_panel_heading(
-            frame,
-            heading,
-            app.selected_content_title(),
-            &detail,
-            app.content_is_focused(),
-            Theme::current().content_accent,
-        );
+
+        // Breadcrumb navigation: when the selected entry lives in the file
+        // tree, render its path as clickable segments. Parent directories are
+        // clickable (select that directory in the tree); the final segment
+        // is the current entry.
+        let breadcrumbs = app.selected_breadcrumbs();
+        if breadcrumbs.len() > 1 && available > 0 {
+            app.content_breadcrumbs.clear();
+            let title_style = if focused {
+                Style::default()
+                    .fg(content_accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.text_subtle)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let mut spans = vec![
+                Span::styled(
+                    if focused { "● " } else { "  " },
+                    Style::default().fg(if focused {
+                        content_accent
+                    } else {
+                        theme.text_subtle
+                    }),
+                ),
+                Span::styled(title.to_owned(), title_style),
+                Span::raw("  "),
+            ];
+            let mut x = heading.x.saturating_add(overhead as u16);
+            // Drop leading segments that would overflow, keeping the tail.
+            let mut total: usize = breadcrumbs
+                .iter()
+                .map(|(name, _)| UnicodeWidthStr::width(name.as_str()))
+                .sum::<usize>()
+                + (breadcrumbs.len() - 1) * 3; // " / " separators
+            let mut skip = 0;
+            while total > available && skip < breadcrumbs.len() - 1 {
+                total -= UnicodeWidthStr::width(breadcrumbs[skip].0.as_str()) + 3;
+                skip += 1;
+            }
+            if skip > 0 {
+                spans.push(Span::styled("… / ", Style::default().fg(theme.text_subtle)));
+                x = x.saturating_add(UnicodeWidthStr::width("… / ") as u16);
+            }
+            for (i, (name, path)) in breadcrumbs.iter().enumerate().skip(skip) {
+                if i > skip {
+                    spans.push(Span::styled(" / ", Style::default().fg(theme.text_subtle)));
+                    x = x.saturating_add(3);
+                }
+                let seg_width = UnicodeWidthStr::width(name.as_str()) as u16;
+                let is_last = i == breadcrumbs.len() - 1;
+                if is_last {
+                    spans.push(Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(theme.text_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    // Parent segments are only clickable in the AllFiles tree;
+                    // GitChanges has no path-based selection yet.
+                    let clickable = app.tree_scope == TreeScope::AllFiles;
+                    spans.push(Span::styled(
+                        name.clone(),
+                        if clickable {
+                            Style::default()
+                                .fg(content_accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text_subtle)
+                        },
+                    ));
+                    if clickable {
+                        app.content_breadcrumbs
+                            .push((path.clone(), Rect::new(x, heading.y, seg_width, 1)));
+                    }
+                }
+                x = x.saturating_add(seg_width);
+            }
+            // Append provider / symlink / loading hints after the breadcrumbs.
+            let mut extra = String::new();
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(provider) = app.tab().content.provider.as_deref()
+            {
+                extra.push_str(&format!(" · {provider}"));
+            }
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(real_path) = app.selected_symlink_real_path()
+            {
+                extra.push_str(&format!(" · ↗ {}", display_path(&real_path)));
+            }
+            if app.is_content_loading() {
+                extra.push_str(" · LOADING");
+            }
+            if !extra.is_empty() {
+                let extra_width = UnicodeWidthStr::width(extra.as_str());
+                let remaining = heading.width.saturating_sub(x.saturating_sub(heading.x)) as usize;
+                if extra_width <= remaining {
+                    spans.push(Span::styled(extra, Style::default().fg(theme.text_muted)));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), heading);
+        } else {
+            app.content_breadcrumbs.clear();
+            let mut detail = app.selected_content_label();
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(provider) = app.tab().content.provider.as_deref()
+            {
+                detail.push_str(&format!(" · {provider}"));
+            }
+            if app.tab().content.mode == ContentMode::Preview
+                && let Some(real_path) = app.selected_symlink_real_path()
+            {
+                detail.push_str(&format!(" · ↗ {}", display_path(&real_path)));
+            }
+            if app.is_content_loading() {
+                detail.push_str(" · LOADING");
+            }
+            // Truncate long file paths from the middle so the tail stays visible.
+            let detail = truncate_middle(&detail, available);
+            draw_panel_heading(frame, heading, title, &detail, focused, content_accent);
+        }
         if app.can_open_content_externally() {
             let label = if app.external_open_confirmation_for_content() {
                 " [Open anyway] "
@@ -1833,12 +2114,31 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         }
     }
     let line_number_width = app.content_line_number_width();
-    let visual_rows = app.content_visual_rows(rows.width);
+    // When content overflows, reserve the last column for the scrollbar so
+    // text isn't overwritten. All layout/scroll calculations use the same
+    // reduced width for consistency.
+    let needs_scrollbar = app.content_visual_rows(rows.width).len() > usize::from(rows.height);
+    let content_width = if needs_scrollbar {
+        rows.width.saturating_sub(1)
+    } else {
+        rows.width
+    };
+    let visual_rows = app.content_visual_rows(content_width);
     let render_area = if app.tab().content.mode == ContentMode::Info {
         inset_top(rows, 1)
     } else {
         rows
     };
+    let render_area = Rect::new(
+        render_area.x,
+        render_area.y,
+        if needs_scrollbar {
+            render_area.width.saturating_sub(1)
+        } else {
+            render_area.width
+        },
+        render_area.height,
+    );
     let start = app.effective_content_scroll(visual_rows.len());
     let end = start
         .saturating_add(usize::from(render_area.height))
@@ -1904,6 +2204,44 @@ fn draw_content(frame: &mut Frame, app: &App, header: Rect, rows: Rect) {
         paragraph = paragraph.style(Style::default().add_modifier(Modifier::DIM));
     }
     frame.render_widget(paragraph, render_area);
+
+    // Content scrollbar: a 1-column indicator on the right edge of the
+    // content area, shown only when the content overflows the viewport.
+    // The track sits on the last column of the full rows rect (which was
+    // reserved by shrinking render_area above).
+    let total = visual_rows.len();
+    let visible = usize::from(render_area.height);
+    if total > visible && visible > 0 {
+        let scroll = app.effective_content_scroll(total);
+        let track_x = rows.x + rows.width - 1;
+        let track_y = render_area.y;
+        // Thumb size: proportional but capped so it doesn't dominate.
+        let raw_thumb = (visible * visible / total).max(1);
+        let thumb_size = raw_thumb.min(visible / 3).max(1);
+        let max_scroll = total.saturating_sub(visible);
+        let thumb_start = (scroll * (visible - thumb_size))
+            .checked_div(max_scroll)
+            .unwrap_or(0);
+        let theme = Theme::current();
+        let track_style = Style::default().fg(theme.text_subtle);
+        let thumb_style = Style::default().fg(theme.text_muted);
+        let buffer = frame.buffer_mut();
+        for row in 0..visible {
+            let y = track_y + row as u16;
+            let cell = &mut buffer[(track_x, y)];
+            if row >= thumb_start && row < thumb_start + thumb_size {
+                cell.set_symbol("┃").set_style(thumb_style);
+            } else {
+                cell.set_symbol("│").set_style(track_style);
+            }
+        }
+        // Save track + thumb geometry for mouse interaction.
+        app.ui_regions.content_scrollbar_track = Rect::new(track_x, track_y, 1, render_area.height);
+        app.ui_regions.content_scrollbar_thumb_start = thumb_start;
+        app.ui_regions.content_scrollbar_thumb_size = thumb_size;
+    } else {
+        app.ui_regions.content_scrollbar_track = Rect::default();
+    }
 }
 
 fn draw_preview_find(frame: &mut Frame, app: &App) {
@@ -2709,7 +3047,7 @@ mod tests {
         assert_eq!(tree_panel_width(80, None), 28);
         assert_eq!(tree_panel_width(200, None), 36);
         assert_eq!(tree_panel_width(100, Some(50)), 50);
-        assert_eq!(tree_panel_width(100, Some(0)), 28);
+        assert_eq!(tree_panel_width(100, Some(0)), 16);
         assert_eq!(tree_panel_width(100, Some(99)), 75);
         assert_eq!(tree_panel_width(32, Some(28)), 7);
     }

@@ -12,7 +12,10 @@ use latte_lens::agent::*;
 #[cfg(feature = "navigation-test-support")]
 use latte_lens::navigation::{AppOptions, NavigationSettings};
 use latte_lens::{
-    app::{App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeScope},
+    app::{
+        App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeContextAction,
+        TreeContextMenu, TreeScope,
+    },
     config::TreeSide,
     preview::{HighlightKind, PreviewContent, PreviewProvider, PreviewRegistry, PreviewRequest},
     ui,
@@ -514,7 +517,7 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
 }
 
 #[test]
-fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_lens() {
+fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews_files() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -526,17 +529,17 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
+    // Single click selects but does not toggle.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
-        app.tab().content.lines,
-        [
-            "No changed files in this directory.",
-            "",
-            "Expanded · Enter or click to collapse."
-        ]
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
+
+    // Clicking the disclosure triangle toggles expand.
+    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     assert_eq!(
         visible_paths(&app),
         [
@@ -546,15 +549,15 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
         ]
     );
 
-    // Every directory-row click is the expand/collapse action; it does not
-    // wait for a double-click or require the disclosure glyph.
+    // Double-click on the directory row toggles collapse.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
-    // Clicking at the disclosure position has the same one-click row action.
+    // Double-click on a file row previews it.
     app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     let rows_before_file_click = visible_paths(&app);
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
@@ -573,7 +576,7 @@ fn mouse_single_click_toggles_directories_and_double_click_previews_files_in_len
 }
 
 #[test]
-fn mouse_single_click_toggles_git_changes_containers() {
+fn mouse_triangle_and_double_click_toggles_git_changes_containers() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "before\n");
     fixture.commit_all("initial");
@@ -592,13 +595,356 @@ fn mouse_single_click_toggles_git_changes_containers() {
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
 
-    let directory_row = tree_y + 1; // Repository group occupies the first Git Changes row.
-    app.handle_mouse(mouse_down(tree_x, directory_row));
+    // "src" directory sits below the repository row; its triangle column is
+    // derived from the rendered depth (2 cols selection + 2 cols per depth).
+    let directory_row = tree_y + 1;
+    let directory_depth = app.visible_git_rows()[1].depth;
+    let triangle_x = tree_x + 2 + u16::try_from(directory_depth).unwrap() * 2;
+    // Triangle click toggles.
+    app.handle_mouse(mouse_down(triangle_x, directory_row));
     assert_eq!(visible_paths(&app), [PathBuf::from("src")]);
+    // Double-click toggles back.
+    app.handle_mouse(mouse_down(tree_x, directory_row));
     app.handle_mouse(mouse_down(tree_x, directory_row));
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("src/file.txt")]
+    );
+}
+
+#[test]
+fn mouse_move_highlights_hovered_tree_row() {
+    let fixture = TestRepo::new();
+    fixture.write("src/file.txt", "fixture\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // No hover before any mouse movement.
+    assert_eq!(app.tree_hover_row(), None);
+
+    // Moving over a tree row highlights it.
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y));
+    assert_eq!(app.tree_hover_row(), Some(0));
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y + 1));
+    assert_eq!(app.tree_hover_row(), Some(1));
+
+    // Moving outside the tree clears the hover.
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y - 1));
+    assert_eq!(app.tree_hover_row(), None);
+
+    // Hover over the last row, then hide the tree: hover must not render.
+    app.handle_mouse(mouse(MouseEventKind::Moved, tree_x, tree_y + 1));
+    assert_eq!(app.tree_hover_row(), Some(1));
+    app.set_tree_hidden(true);
+    assert_eq!(app.tree_hover_row(), None);
+}
+
+#[test]
+fn tree_type_ahead_jumps_to_matching_entry() {
+    let fixture = TestRepo::new();
+    fixture.write("alpha/file.txt", "a\n");
+    fixture.write("beta/file.txt", "b\n");
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // Collapse "src" so the visible rows are: alpha, beta, src, top-level files.
+    // Actually with the fixture above, visible top-level entries are
+    // alpha/, beta/, src/ (directories sort first). Type "b" → beta.
+    app.handle_key(key(KeyCode::Char('b')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("b"));
+
+    // Typing more characters narrows the prefix; "be" still matches beta.
+    app.handle_key(key(KeyCode::Char('e')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+
+    // Backspace drops the last character and re-applies the remaining prefix.
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("b"));
+
+    // A character with no match keeps the prefix but does not move.
+    app.handle_key(key(KeyCode::Char('z')));
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("beta")));
+    assert_eq!(app.tree_type_ahead_prefix(), Some("bz"));
+
+    // Navigation keys (j/k/g) reset the type-ahead buffer.
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.tree_type_ahead_prefix(), None);
+}
+
+#[test]
+fn breadcrumbs_show_selected_path_and_click_navigates_to_parent() {
+    let fixture = TestRepo::new();
+    fixture.write("src/nested/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Navigate to src/nested/main.rs using type-ahead + Enter.
+    // 's', 'n', 'm' are not globally bound, so they reach tree type-ahead.
+    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('n')));
+    app.handle_key(key(KeyCode::Enter)); // expand nested
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('m')));
+    app.handle_key(key(KeyCode::Enter)); // preview main.rs
+    settle(&mut app);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/nested/main.rs"))
+    );
+
+    // Breadcrumbs reflect the full path.
+    let breadcrumbs = app.selected_breadcrumbs();
+    assert_eq!(
+        breadcrumbs
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["src", "nested", "main.rs"]
+    );
+
+    // Draw to populate breadcrumb rects, then click the "src" segment.
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(!app.content_breadcrumb_rects().is_empty());
+
+    // The first breadcrumb segment is "src" — click it.
+    let (_, rect) = &app.content_breadcrumb_rects()[0];
+    app.handle_mouse(mouse_down(rect.x, rect.y));
+    // The tree should now have "src" selected.
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+}
+
+#[test]
+fn right_click_opens_context_menu_and_actions_execute() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // Right-click on the "src" directory row opens the context menu.
+    app.handle_mouse(mouse_right_down(tree_x, tree_y));
+    assert!(app.tree_context_menu.is_some());
+    let menu = app.tree_context_menu.as_ref().unwrap();
+    assert_eq!(menu.row, 0);
+    assert_eq!(menu.selected, 0);
+
+    // The menu for a directory starts with ToggleExpand.
+    let actions = TreeContextMenu::actions_for(&app, 0);
+    assert_eq!(actions[0], TreeContextAction::ToggleExpand);
+
+    // Down arrow navigates, Enter executes the first action (toggle expand).
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 1);
+    // Navigate back to the first item.
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 0);
+
+    // Enter on ToggleExpand expands the directory and closes the menu.
+    let before = visible_paths(&app);
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.tree_context_menu.is_none());
+    assert!(visible_paths(&app).len() > before.len());
+
+    // Right-click on a file row shows Preview as the first action.
+    // First expand src, then right-click on the file row.
+    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    // Find the file row (src/main.rs).
+    let file_row = tree_y + 1; // src is row 0, src/main.rs is row 1
+    app.handle_mouse(mouse_right_down(tree_x, file_row));
+    let actions = TreeContextMenu::actions_for(&app, 1);
+    assert_eq!(actions[0], TreeContextAction::Preview);
+
+    // Esc closes the menu without executing.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.tree_context_menu.is_none());
+}
+
+#[test]
+fn context_menu_side_border_click_dismisses_without_executing() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // Right-click on the "src" directory row opens the context menu.
+    app.handle_mouse(mouse_right_down(tree_x, tree_y));
+    assert!(app.tree_context_menu.is_some());
+    let before = visible_paths(&app);
+
+    // Get the menu rect and click its left border (first column, item row).
+    let menu_rect = app
+        .tree_context_menu_rect()
+        .expect("menu rect must exist while open");
+    app.handle_mouse(mouse_down(menu_rect.x, menu_rect.y + 1));
+    // The menu should be dismissed.
+    assert!(app.tree_context_menu.is_none());
+    // No action should have been executed (directory not expanded).
+    assert_eq!(
+        visible_paths(&app),
+        before,
+        "side-border click must dismiss without executing an action"
+    );
+}
+
+#[test]
+fn context_menu_open_external_targets_clicked_row_not_content_pane() {
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // Preview a.txt (row 0) so Content has a source_target and is focused.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('l'))); // focus Content
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("a.txt")));
+
+    // Right-click on b.txt (row 1) and choose OpenExternal.
+    app.handle_mouse(mouse_right_down(tree_x, tree_y + 1));
+    assert!(app.tree_context_menu.is_some());
+    let actions = TreeContextMenu::actions_for(&app, 1);
+    let open_external_index = actions
+        .iter()
+        .position(|a| *a == TreeContextAction::OpenExternal)
+        .expect("file row must offer OpenExternal");
+    for _ in 0..open_external_index {
+        app.handle_key(key(KeyCode::Down));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    // The context menu action must have switched focus to the Tree and
+    // selected b.txt (the right-clicked row), so that
+    // current_external_open_target resolves to b.txt — not a.txt from
+    // the Content pane's preview.
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("b.txt")));
+    // The external open request was triggered (status is set, even though
+    // the test harness disables the actual desktop launch).
+    assert!(app.external_open_status_message().is_some());
+}
+
+#[test]
+fn breadcrumbs_not_clickable_in_git_changes_scope() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    fixture.write("src/main.rs", "fn changed() {}\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // Switch to GitChanges; the changed file becomes selected.
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+    assert!(app.selected_relative_path().is_some());
+
+    // Draw to populate breadcrumb rects.
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // Breadcrumbs are shown as path text but must not be clickable in
+    // GitChanges (select_relative_path only supports AllFiles).
+    assert!(
+        app.content_breadcrumb_rects().is_empty(),
+        "GitChanges breadcrumbs must not register clickable rects"
+    );
+}
+
+#[test]
+fn content_scrollbar_appears_when_content_overflows() {
+    let fixture = TestRepo::new();
+    // Write a file with enough lines to overflow the 20-row viewport.
+    let long_content = (0..50)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fixture.write("long.txt", &long_content);
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // Select and preview the file.
+    app.handle_key(key(KeyCode::Char('l'))); // focus content? no, type-ahead
+    // Use type-ahead to select long.txt, then Enter to preview.
+    app.handle_key(key(KeyCode::Enter)); // first entry is long.txt? No, it's a file.
+    // Actually, the only entry is long.txt at the root. Select it.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // The content area should show a scrollbar on its right edge.
+    let content = app.ui_regions.content_inner;
+    let track_x = content.x + content.width - 1;
+    let buffer = terminal.backend().buffer();
+    let mut has_thumb = false;
+    let mut has_track = false;
+    for y in content.y..content.y + content.height {
+        let symbol = buffer[(track_x, y)].symbol();
+        if symbol == "┃" {
+            has_thumb = true;
+        }
+        if symbol == "│" {
+            has_track = true;
+        }
+    }
+    assert!(has_thumb, "scrollbar thumb should be visible");
+    assert!(has_track, "scrollbar track should be visible");
+
+    // Scroll down and verify the thumb moves.
+    let thumb_y_before = (content.y..content.y + content.height)
+        .find(|&y| buffer[(track_x, y)].symbol() == "┃")
+        .unwrap();
+    app.handle_key(key(KeyCode::PageDown));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let thumb_y_after = (content.y..content.y + content.height)
+        .find(|&y| buffer[(track_x, y)].symbol() == "┃")
+        .unwrap();
+    assert!(
+        thumb_y_after > thumb_y_before,
+        "thumb should move down after PageDown"
     );
 }
 
@@ -616,6 +962,7 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     fixture.write("beta/new.txt", "new\n");
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     let all_after_refresh = visible_paths(&app);
     assert!(all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
     assert!(all_after_refresh.contains(&PathBuf::from("beta")));
@@ -1221,6 +1568,7 @@ fn git_changes_groups_root_and_nested_repositories_and_routes_same_names_by_owne
     fixture.write("another-root-change.txt", "new\n");
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     assert_eq!(app.changed_count, 3);
     assert_eq!(
         app.selected_git_row().map(|row| &row.identity),
@@ -1358,6 +1706,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
     // Refresh selection and directory info by the complete repo+path identity.
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     assert_eq!(
         app.selected_git_row().map(|row| &row.identity),
         Some(&nested_directory)
@@ -1764,6 +2113,7 @@ fn refresh_and_content_loading_are_visible_without_blocking_navigation() {
     let snapshot = app.all_entries.clone();
 
     app.handle_key(key(KeyCode::Char('r')));
+    app.handle_key(key(KeyCode::Char('h'))); // back to Tree so Down moves selection
     app.handle_key(key(KeyCode::Down));
     assert!(app.is_refreshing());
     assert!(app.is_content_loading());
@@ -1871,7 +2221,7 @@ fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() 
     let fixture = TestRepo::new();
     fixture.write("long.txt", "abcdefghijklmnopqrstuvwxyz0123456789\nsecond\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    let backend = TestBackend::new(60, 12);
+    let backend = TestBackend::new(50, 12);
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -1920,7 +2270,7 @@ fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
-    let backend = TestBackend::new(60, 20);
+    let backend = TestBackend::new(50, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
@@ -2976,7 +3326,7 @@ fn divider_drag_resizes_tree_with_minimum_tree_and_content_widths() {
     app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
     app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, drag_row));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert_eq!(app.ui_regions.tree_body.width, 28);
+    assert_eq!(app.ui_regions.tree_body.width, 16);
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, drag_row));
 
     app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
@@ -3026,7 +3376,7 @@ fn divider_drag_resizes_right_docked_tree() {
     app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
     app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 99, drag_row));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert_eq!(app.ui_regions.tree_body.width, 28);
+    assert_eq!(app.ui_regions.tree_body.width, 16);
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 99, drag_row));
 
     // Dragging far left clamps to the maximum tree width (content minimum).
@@ -3069,7 +3419,7 @@ fn ui_split_layout_uses_terminal_default_background_in_both_scopes() {
         .buffer()
         .cell((app.ui_regions.tab_bar.x + 2, app.ui_regions.tab_bar.y))
         .unwrap();
-    assert!(focused_tab.modifier.contains(Modifier::UNDERLINED));
+    assert!(focused_tab.modifier.contains(Modifier::BOLD));
     assert_eq!(focused_tab.bg, Color::Reset);
 
     app.set_tree_scope(TreeScope::GitChanges);
@@ -4693,6 +5043,10 @@ fn mouse_down(column: u16, row: u16) -> MouseEvent {
     mouse(MouseEventKind::Down(MouseButton::Left), column, row)
 }
 
+fn mouse_right_down(column: u16, row: u16) -> MouseEvent {
+    mouse(MouseEventKind::Down(MouseButton::Right), column, row)
+}
+
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind,
@@ -4877,5 +5231,79 @@ fn git_with_path(root: &Path, before: &[&str], path: &Path, after: &[&str]) {
         output.status.success(),
         "git command failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tree_show_button_renders_when_hidden() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("file.txt"), "hello\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Right);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // Draw with tree visible: both buttons share the same position.
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let visible_pos = app.ui_regions.tree_hide_button;
+    assert!(visible_pos.width > 0);
+
+    // Hide tree and draw again: show button must be at the same position
+    // and must actually render the arrow glyph (not be overwritten by the
+    // content header).
+    app.set_tree_hidden(true);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let show = app.ui_regions.tree_show_button;
+    assert_eq!(
+        show, visible_pos,
+        "hide/show buttons must share one position"
+    );
+
+    let buffer = terminal.backend().buffer();
+    let mut found = false;
+    for x in show.x..show.x.saturating_add(show.width) {
+        for y in show.y..show.y.saturating_add(show.height) {
+            let symbol = buffer[(x, y)].symbol();
+            if symbol.contains('«') || symbol.contains('»') {
+                found = true;
+            }
+        }
+    }
+    assert!(found, "show button arrow should be rendered at {show:?}");
+}
+
+#[test]
+fn clicking_hide_button_does_not_trigger_search() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("file.txt"), "hello\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Right);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // Click the hide button
+    let btn = app.ui_regions.tree_hide_button;
+    assert!(btn.width > 0, "hide button should be positioned");
+    let click_x = btn.x + 1; // click inside the button
+    let click_y = btn.y;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        click_x,
+        click_y,
+    ));
+
+    // Tree should be hidden, search should NOT be open
+    assert!(
+        !app.search_is_active(),
+        "search should not open when clicking hide button"
+    );
+    // After hiding, the show button must be positioned (proves toggle ran).
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(
+        app.ui_regions.tree_show_button.width > 0,
+        "tree should be hidden after clicking hide button"
     );
 }

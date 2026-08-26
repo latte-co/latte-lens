@@ -206,14 +206,14 @@ def files_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("▾ a-dir", "nested"), "keyboard-opened collapsed All Files directory"
     )
-    _click_tree_row(session, "a-dir")
+    _double_click_tree_row(session, "a-dir")
     session.wait_screen(
         ("a-dir", "Tree"),
-        "mouse-closed directory with one click",
+        "mouse-closed directory with double click",
         absent=("nested", "b-changed.rs"),
     )
-    _click_tree_row(session, "a-dir")
-    session.wait_screen(("a-dir", "nested"), "mouse-opened directory with one click")
+    _double_click_tree_row(session, "a-dir")
+    session.wait_screen(("a-dir", "nested"), "mouse-opened directory with double click")
     session.key(b"\r")
     session.wait_screen(
         ("a-dir",),
@@ -308,7 +308,7 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
     )
     # A directory symlink is expandable; opening it reveals the file inside the
     # target directory, which then previews normally.
-    _click_tree_row(session, "a-directory-link")
+    _double_click_tree_row(session, "a-directory-link")
     session.wait_screen(
         ("a-directory-link", "inside.txt"),
         "production binary expands a sandboxed directory symlink",
@@ -523,7 +523,7 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"g")
     session.key(b"\r")
     session.wait_screen(("▾ a-dir", "nested"), "tree Home and Enter expand the first directory")
-    _click_tree_row(session, "nested")
+    _double_click_tree_row(session, "nested")
     session.wait_screen(
         ("b-changed.rs",),
         "nested directory loading makes the changed file searchable",
@@ -647,13 +647,13 @@ def git_navigation(context: ScenarioContext) -> None:
     session.wait_screen(
         ("b-changed.rs", "nested-owned.txt"), "keyboard-reopened repository group"
     )
-    _click_tree_row(session, ".")
+    _double_click_tree_row(session, ".")
     session.wait_screen(
         ("Git changes",),
         "mouse-collapsed repository group",
         absent=("b-changed.rs", "nested-owned.txt"),
     )
-    _click_tree_row(session, ".")
+    _double_click_tree_row(session, ".")
     session.wait_screen(
         ("vendor/nested", "nested-owned.txt"), "mouse-reopened repository group"
     )
@@ -843,13 +843,13 @@ def repository_relation_matrix(context: ScenarioContext) -> None:
         "repository issue selection explains the symlink boundary",
     )
 
-    _click_tree_row(session, "modules/child")
+    _double_click_tree_row(session, "modules/child")
     session.wait_screen(
         ("submodule repository", "pointer changed", "internal modified", "internal untracked"),
         "child relation details survive deliberate collapse",
         absent=("tracked.txt", "untracked-child"),
     )
-    _click_tree_row(session, "modules/child")
+    _double_click_tree_row(session, "modules/child")
     session.wait_screen(
         ("tracked.txt", "untracked-child"),
         "child repository reopens with both internal changes",
@@ -1298,15 +1298,23 @@ def tab_shell(context: ScenarioContext) -> None:
     session.key(b"\x1b[A")  # Up → back to Files
     session.key(b"\r")  # Enter → Files
     session.wait_screen(("Files",), "Up clamp returns to the Files template")
+    # Give the TUI a moment to render the new tab in the tab bar before
+    # locating the + button by screen marker.
+    time.sleep(0.3)
 
     # --- Mouse: "+" button, menu item click, tab bar click, outside dismiss ---
-    session.click(118, 0)  # "+" button
+    _click_marker_on_line(session, "+")
     session.wait_screen(("Files", "Review", "Search"), "mouse + opens the new tab menu")
-    session.click(105, 3)  # Review menu item (row 3 → index 1)
+    # Click the Review menu item by computing its position from the + button
+    # anchor (menu_width=20, right-aligned below the button). This avoids
+    # depending on border glyphs that render differently on macOS.
+    plus_x, plus_y = _marker_position_on_line(session, "+")
+    menu_x = plus_x + 3 - 20
+    session.click(menu_x + 3, plus_y + 3)  # inner col 2, item row 1 (Review)
     session.wait_screen(("Git changes",), "mouse menu click opens a Review tab")
     session.click(2, 0)  # first tab (Files) in the tab bar
     session.wait_screen(("Files",), "mouse tab bar click switches to the Files tab")
-    session.click(118, 0)  # "+" button
+    _click_marker_on_line(session, "+")
     session.wait_screen(("Files", "Review", "Search"), "mouse + reopens the menu")
     session.click(50, 10)  # outside the menu → dismiss
     session.wait_screen(
@@ -1912,7 +1920,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
         session.wait_screen(
             (
                 "Preview",
-                f"{repository_name}/caller.rs",
+                f"{repository_name} / caller.rs",
                 f"{repository_name.replace('-', '_')}!();",
             ),
             f"{repository_name} caller Preview opens",
@@ -1920,7 +1928,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
         )
         session.key(b"\x04")
         session.wait_screen(
-            ("No definition found.", f"{repository_name}/caller.rs"),
+            ("No definition found.", f"{repository_name} / caller.rs"),
             f"{repository_name} keeps one ready stalled-session tree",
             absent=("Finding definition…",),
         )

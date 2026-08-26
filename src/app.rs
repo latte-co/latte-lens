@@ -360,6 +360,8 @@ const NAVIGATION_HISTORY_LIMIT: usize = 128;
 const NAVIGATION_STATUS_INFO: Duration = Duration::from_secs(4);
 const NAVIGATION_STATUS_ERROR: Duration = Duration::from_secs(8);
 const TREE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// Type-ahead prefix resets after this idle gap.
+const TREE_TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(800);
 const EXTERNAL_OPEN_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
 const EXTERNAL_OPEN_DEDUP_WINDOW: Duration = Duration::from_millis(500);
 
@@ -532,6 +534,63 @@ impl NewTabMenuState {
     }
 }
 
+/// Actions offered by the tree right-click context menu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeContextAction {
+    /// Preview the file (same as Enter on a file row).
+    Preview,
+    /// Expand or collapse the directory (same as Enter on a directory row).
+    ToggleExpand,
+    /// Copy the path relative to the workspace root.
+    CopyRelative,
+    /// Copy the absolute filesystem path.
+    CopyAbsolute,
+    /// Open in the system default application.
+    OpenExternal,
+}
+
+impl TreeContextAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "Preview",
+            Self::ToggleExpand => "Expand / Collapse",
+            Self::CopyRelative => "Copy relative path",
+            Self::CopyAbsolute => "Copy absolute path",
+            Self::OpenExternal => "Open externally",
+        }
+    }
+}
+
+/// Right-click context menu for a tree row. The menu is anchored at the
+/// clicked row and offers row-appropriate actions.
+#[derive(Clone, Debug)]
+pub struct TreeContextMenu {
+    /// Tree row index this menu is anchored to.
+    pub row: usize,
+    /// Selected menu item index.
+    pub selected: usize,
+}
+
+impl TreeContextMenu {
+    /// The actions available for the given tree row, in display order.
+    pub fn actions_for(app: &App, row: usize) -> Vec<TreeContextAction> {
+        let is_container = app.tree_row_is_container(row);
+        let is_file = app.tree_row_is_file(row);
+        let mut actions = Vec::new();
+        if is_container {
+            actions.push(TreeContextAction::ToggleExpand);
+        } else if is_file {
+            actions.push(TreeContextAction::Preview);
+        }
+        actions.push(TreeContextAction::CopyRelative);
+        actions.push(TreeContextAction::CopyAbsolute);
+        if is_file {
+            actions.push(TreeContextAction::OpenExternal);
+        }
+        actions
+    }
+}
+
 /// One row in the ⌘P palette: either an open tab to switch to, or a workspace
 /// file to open in the Files tab.
 #[derive(Clone, Debug)]
@@ -664,11 +723,13 @@ impl ContentSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UiRegions {
     pub tab_bar: Rect,
     pub new_tab_button: Rect,
     pub new_tab_menu: Rect,
+    /// Per-tab close button (×) hit areas, in tab order.
+    pub tab_close_buttons: Vec<(TabId, Rect)>,
     pub refresh_button: Rect,
     pub file_search_button: Rect,
     pub text_search_button: Rect,
@@ -693,20 +754,30 @@ pub struct UiRegions {
     pub tree_body: Rect,
     pub tree_inner: Rect,
     pub divider: Rect,
+    /// Button in the tree header that hides the tree panel.
+    pub tree_hide_button: Rect,
+    /// Slim edge button shown when the tree is hidden; click to reveal.
+    pub tree_show_button: Rect,
+    /// Content scrollbar track (1-column right edge of content rows).
+    pub content_scrollbar_track: Rect,
+    /// Thumb offset within the track (rows from track top).
+    pub content_scrollbar_thumb_start: usize,
+    /// Thumb height in rows.
+    pub content_scrollbar_thumb_size: usize,
     pub content_body: Rect,
     pub content_inner: Rect,
 }
 
 impl UiRegions {
-    fn refresh_at(self, column: u16, row: u16) -> bool {
+    fn refresh_at(&self, column: u16, row: u16) -> bool {
         contains(self.refresh_button, column, row)
     }
 
-    fn file_search_at(self, column: u16, row: u16) -> bool {
+    fn file_search_at(&self, column: u16, row: u16) -> bool {
         contains(self.file_search_button, column, row)
     }
 
-    fn text_search_at(self, column: u16, row: u16) -> bool {
+    fn text_search_at(&self, column: u16, row: u16) -> bool {
         contains(self.text_search_button, column, row)
     }
 }
@@ -946,6 +1017,7 @@ pub struct App {
     pub last_error: Option<String>,
     pub ui_regions: UiRegions,
     tree_resize_dragging: bool,
+    content_scrollbar_dragging: bool,
     preview_registry: PreviewRegistry,
     repo_graph: Option<RepoGraph>,
     git_changes_selection: Option<GitRowIdentity>,
@@ -984,6 +1056,20 @@ pub struct App {
     recent_files: Vec<PathBuf>,
     last_search_click: Option<(usize, Instant)>,
     last_tree_click: Option<(TreeClickIdentity, Instant)>,
+    /// Last pointer position while hovering the tree area (screen column,
+    /// row). The hovered row is resolved at render time against the current
+    /// scroll offset, so it stays correct after scrolling.
+    tree_hover_pos: Option<(u16, u16)>,
+    /// Type-ahead filter buffer for the tree: the typed prefix and when the
+    /// last character was entered. Characters arriving after the timeout
+    /// start a fresh prefix.
+    tree_type_ahead: Option<(String, Instant)>,
+    /// Clickable breadcrumb segments in the content header (path, rect),
+    /// recomputed each frame. A click on a segment selects that directory
+    /// in the tree.
+    pub(crate) content_breadcrumbs: Vec<(PathBuf, Rect)>,
+    /// Right-click context menu for a tree row, when open.
+    pub tree_context_menu: Option<TreeContextMenu>,
     last_external_opened: Option<(ContentTarget, Instant)>,
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
@@ -1308,6 +1394,7 @@ impl App {
             last_error: None,
             ui_regions: UiRegions::default(),
             tree_resize_dragging: false,
+            content_scrollbar_dragging: false,
             preview_registry,
             repo_graph: None,
             git_changes_selection: None,
@@ -1341,6 +1428,10 @@ impl App {
             recent_files: Vec::new(),
             last_search_click: None,
             last_tree_click: None,
+            tree_hover_pos: None,
+            tree_type_ahead: None,
+            content_breadcrumbs: Vec::new(),
+            tree_context_menu: None,
             last_external_opened: None,
             last_refresh_error: None,
             has_refresh_snapshot: false,
@@ -1576,7 +1667,7 @@ impl App {
                 .expansion
                 .get(&entry.relative)
                 .copied()
-                .unwrap_or(false),
+                .unwrap_or(true),
             TreeScope::GitChanges => self
                 .selected_git_row()
                 .map(|row| self.git_row_is_expanded(row))
@@ -1602,6 +1693,54 @@ impl App {
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => None,
         }
+    }
+
+    /// Breadcrumb segments (display name, relative path) for the selected
+    /// entry, from the workspace root to the entry itself. The last segment
+    /// is the selected entry; earlier segments are clickable parent
+    /// directories.
+    pub fn selected_breadcrumbs(&self) -> Vec<(String, PathBuf)> {
+        let Some(relative) = self.selected_relative_path() else {
+            return Vec::new();
+        };
+        let mut segments = Vec::new();
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            current.push(component);
+            let name = component.as_os_str().to_string_lossy().into_owned();
+            segments.push((name, current.clone()));
+        }
+        segments
+    }
+
+    /// Select the tree entry at `path` (relative to the workspace root),
+    /// expanding parent directories so the entry becomes visible. Used by
+    /// breadcrumb navigation. Returns true when the entry was found.
+    pub fn select_relative_path(&mut self, path: &Path) -> bool {
+        if self.tree_scope == TreeScope::AllFiles {
+            // Expand every ancestor so the target row is visible.
+            let mut ancestor = path.parent();
+            while let Some(dir) = ancestor {
+                if !dir.as_os_str().is_empty() {
+                    self.tab_mut()
+                        .files_mut()
+                        .expansion
+                        .entry(dir.to_path_buf())
+                        .or_insert(true);
+                }
+                ancestor = dir.parent();
+            }
+            self.rebuild_visible_rows();
+            if let Some(index) = self
+                .visible_entries()
+                .iter()
+                .position(|entry| entry.relative == path)
+            {
+                self.select(index);
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn git_row_is_expanded(&self, row: &GitTreeRow) -> bool {
@@ -1890,6 +2029,47 @@ impl App {
         self.tab().content.scroll.min(row_count.saturating_sub(1))
     }
 
+    pub(crate) fn content_page_up(&mut self) {
+        self.scroll_content(-12, 0);
+    }
+
+    pub(crate) fn content_page_down(&mut self) {
+        self.scroll_content(12, 0);
+    }
+
+    fn drag_content_scrollbar(&mut self, mouse_row: u16) {
+        let track = self.ui_regions.content_scrollbar_track;
+        let thumb_size = self.ui_regions.content_scrollbar_thumb_size;
+        let visible = usize::from(track.height);
+        if visible == 0 || thumb_size == 0 || thumb_size >= visible {
+            return;
+        }
+        // Mouse row relative to track top; center the thumb on the cursor.
+        let click_row = usize::from(mouse_row.saturating_sub(track.y));
+        let new_thumb_start = click_row.saturating_sub(thumb_size / 2);
+        let new_thumb_start = new_thumb_start.min(visible - thumb_size);
+        // Map thumb position back to scroll offset. Use the same reduced
+        // width as rendering (scrollbar reserves 1 column when visible).
+        let row_count = self.content_visual_rows(self.content_render_width()).len();
+        let max_scroll = row_count.saturating_sub(visible);
+        let scrollable = visible - thumb_size;
+        let new_scroll = (new_thumb_start * max_scroll)
+            .checked_div(scrollable)
+            .unwrap_or(0);
+        self.tab_mut().content.scroll = new_scroll.min(max_scroll);
+    }
+
+    /// The content width used for rendering and row-count calculations:
+    /// `content_inner.width` minus 1 column when the scrollbar is visible.
+    pub(crate) fn content_render_width(&self) -> u16 {
+        let base = self.ui_regions.content_inner.width;
+        if self.ui_regions.content_scrollbar_track.width > 0 {
+            base.saturating_sub(1)
+        } else {
+            base
+        }
+    }
+
     pub(crate) fn prepare_content_width(&mut self, width: u16) {
         let width = width.max(1);
         let current = self.tab().content.projection_width;
@@ -2030,6 +2210,11 @@ impl App {
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
+            return;
+        }
+        if self.tree_context_menu.is_some() {
+            self.quit_confirmation = None;
+            self.handle_tree_context_menu_key(key);
             return;
         }
         let copy_key = matches!(key.code, KeyCode::Char('c' | 'C'));
@@ -3278,6 +3463,17 @@ impl App {
             {
                 self.tab_mut().content.navigation_hover_highlight = Some(token);
             }
+            // Track the pointer over the tree for row hover highlight.
+            self.tree_hover_pos = if self.navigation_picker.is_none()
+                && self.search.is_none()
+                && self.new_tab_menu.is_none()
+                && !self.tree_hidden
+                && contains(self.ui_regions.tree_inner, mouse.column, mouse.row)
+            {
+                Some((mouse.column, mouse.row))
+            } else {
+                None
+            };
             return;
         }
         if self.navigation_picker.is_some() {
@@ -3320,9 +3516,41 @@ impl App {
             return;
         }
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.clipboard_status = None;
+                // Right-click on a tree row selects it and opens the context menu.
+                if contains(self.ui_regions.tree_inner, mouse.column, mouse.row) {
+                    let visible_row = usize::from(mouse.row - self.ui_regions.tree_inner.y);
+                    let index = self
+                        .tab_mut()
+                        .tree_state
+                        .offset()
+                        .saturating_add(visible_row);
+                    if index < self.tree_row_count() {
+                        self.select(index);
+                        self.tree_context_menu = Some(TreeContextMenu {
+                            row: index,
+                            selected: 0,
+                        });
+                    }
+                    return;
+                }
+                // Right-click elsewhere closes the menu.
+                self.tree_context_menu = None;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.clipboard_status = None;
                 self.tree_resize_dragging = false;
+                // If the context menu is open, left-click either activates an
+                // item or dismisses the menu.
+                if self.tree_context_menu.is_some() {
+                    if let Some(action_index) = self.tree_context_menu_hit(mouse.column, mouse.row)
+                    {
+                        self.execute_tree_context_action(action_index);
+                    }
+                    self.tree_context_menu = None;
+                    return;
+                }
                 if contains(self.ui_regions.new_tab_button, mouse.column, mouse.row) {
                     self.new_tab_menu = Some(NewTabMenuState::new());
                     return;
@@ -3334,6 +3562,22 @@ impl App {
                     return;
                 }
                 if self.handle_search_mouse_down(mouse) {
+                    return;
+                }
+                // Tree panel hide/show buttons (checked before external-open
+                // because they overlap when the tree is hidden).
+                if !self.tree_hidden
+                    && contains(self.ui_regions.tree_hide_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.toggle_tree_visibility();
+                    return;
+                }
+                if self.tree_hidden
+                    && contains(self.ui_regions.tree_show_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.toggle_tree_visibility();
                     return;
                 }
                 if self.preview_find.is_none()
@@ -3366,6 +3610,30 @@ impl App {
                     self.tree_resize_dragging = true;
                     return;
                 }
+                // Content scrollbar: click thumb to drag, click above/below
+                // thumb to page up/down.
+                if contains(
+                    self.ui_regions.content_scrollbar_track,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    self.clear_content_selection();
+                    let track = self.ui_regions.content_scrollbar_track;
+                    let thumb_start = self.ui_regions.content_scrollbar_thumb_start;
+                    let thumb_size = self.ui_regions.content_scrollbar_thumb_size;
+                    let click_row = usize::from(mouse.row - track.y);
+                    if click_row >= thumb_start && click_row < thumb_start + thumb_size {
+                        // Clicked on thumb: start dragging.
+                        self.content_scrollbar_dragging = true;
+                    } else if click_row < thumb_start {
+                        // Clicked above thumb: page up.
+                        self.content_page_up();
+                    } else {
+                        // Clicked below thumb: page down.
+                        self.content_page_down();
+                    }
+                    return;
+                }
                 if contains(self.ui_regions.tree_inner, mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.focused_pane = FocusPane::Tree;
@@ -3378,24 +3646,42 @@ impl App {
                     if index < self.tree_row_count() {
                         let identity = self.tree_click_identity(index);
                         let container = self.tree_row_is_container(index);
-                        let double_click = !container
-                            && identity.as_ref().is_some_and(|identity| {
-                                self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
-                                    previous == identity
-                                        && Instant::now().saturating_duration_since(*at)
-                                            <= TREE_DOUBLE_CLICK_WINDOW
-                                })
-                            });
+                        let depth = self.tree_row_depth(index);
+                        // The disclosure triangle sits after the 2-col selection
+                        // indicator and 2 cols per indent depth.
+                        let triangle_x = self.ui_regions.tree_inner.x + 2 + (depth as u16) * 2;
+                        let on_triangle = container
+                            && mouse.column >= triangle_x
+                            && mouse.column < triangle_x + 2;
+                        let double_click = identity.as_ref().is_some_and(|identity| {
+                            self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
+                                previous == identity
+                                    && Instant::now().saturating_duration_since(*at)
+                                        <= TREE_DOUBLE_CLICK_WINDOW
+                            })
+                        });
                         self.select(index);
-                        if container {
+                        if on_triangle || (container && double_click) {
                             self.last_tree_click = None;
                             self.toggle_selected_directory();
-                        } else if double_click {
+                        } else if !container && double_click {
                             self.last_tree_click = None;
                             self.activate_selected_tree_entry();
                         } else if let Some(identity) = identity {
                             self.last_tree_click = Some((identity, Instant::now()));
                         }
+                    }
+                } else if let Some((path, _)) = self
+                    .content_breadcrumbs
+                    .iter()
+                    .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
+                    .cloned()
+                {
+                    // Breadcrumb click: select the parent directory in the tree.
+                    self.clear_content_selection();
+                    self.last_tree_click = None;
+                    if self.select_relative_path(&path) {
+                        self.focused_pane = FocusPane::Tree;
                     }
                 } else if contains(self.ui_regions.content_inner, mouse.column, mouse.row) {
                     self.last_tree_click = None;
@@ -3429,6 +3715,8 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.tree_resize_dragging {
                     self.resize_tree_panel(mouse.column);
+                } else if self.content_scrollbar_dragging {
+                    self.drag_content_scrollbar(mouse.row);
                 } else {
                     self.drag_content_selection(mouse);
                 }
@@ -3437,6 +3725,9 @@ impl App {
                 if self.tree_resize_dragging {
                     self.resize_tree_panel(mouse.column);
                     self.tree_resize_dragging = false;
+                } else if self.content_scrollbar_dragging {
+                    self.drag_content_scrollbar(mouse.row);
+                    self.content_scrollbar_dragging = false;
                 } else {
                     self.finish_content_selection(mouse);
                 }
@@ -3451,10 +3742,21 @@ impl App {
         if !contains(self.ui_regions.tab_bar, mouse.column, mouse.row) {
             return false;
         }
+        // Check per-tab close buttons first.
+        let close_hit = self
+            .ui_regions
+            .tab_close_buttons
+            .iter()
+            .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
+            .map(|(id, _)| *id);
+        if let Some(tab_id) = close_hit {
+            self.close_tab(tab_id);
+            return true;
+        }
         let mut x = self.ui_regions.tab_bar.x;
         for tab in self.tabs() {
-            let label = format!(" {} ", tab.title);
-            let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+            // Tab renders as " title × " (space + title + space + × + space).
+            let width = 1 + unicode_width::UnicodeWidthStr::width(tab.title.as_str()) as u16 + 3;
             let rect = Rect::new(x, self.ui_regions.tab_bar.y, width, 1);
             if contains(rect, mouse.column, mouse.row) && tab.id != self.active_tab {
                 self.activate_tab(tab.id);
@@ -3535,6 +3837,170 @@ impl App {
             #[cfg(feature = "agent-observability")]
             TreeScope::Agents => false,
         }
+    }
+
+    /// Whether the row at `index` is a file (not a directory/container).
+    fn tree_row_is_file(&self, index: usize) -> bool {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .is_some_and(|entry| !entry.is_dir),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .is_some_and(|row| row.is_change()),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => false,
+        }
+    }
+
+    fn tree_row_depth(&self, index: usize) -> usize {
+        match self.tree_scope {
+            TreeScope::AllFiles => self
+                .visible_entries()
+                .get(index)
+                .map_or(0, |entry| entry.depth),
+            TreeScope::GitChanges => self
+                .visible_git_rows()
+                .get(index)
+                .map_or(0, |row| row.depth),
+            #[cfg(feature = "agent-observability")]
+            TreeScope::Agents => 0,
+        }
+    }
+
+    /// Resolve the currently hovered tree row index against the live scroll
+    /// offset and region geometry. Returns `None` when the pointer is outside
+    /// the tree, a modal overlay is active, or the tree is hidden.
+    pub fn tree_hover_row(&self) -> Option<usize> {
+        if self.navigation_picker.is_some()
+            || self.search.is_some()
+            || self.new_tab_menu.is_some()
+            || self.tree_hidden
+        {
+            return None;
+        }
+        let (column, row) = self.tree_hover_pos?;
+        if !contains(self.ui_regions.tree_inner, column, row) {
+            return None;
+        }
+        let visible_row = usize::from(row - self.ui_regions.tree_inner.y);
+        let index = self.tab().tree_state.offset().saturating_add(visible_row);
+        (index < self.tree_row_count()).then_some(index)
+    }
+
+    /// Compute the on-screen rect for the open tree context menu, if any.
+    /// The menu is anchored at the clicked tree row, right-aligned to the
+    /// tree panel so it never clips off the right edge.
+    pub fn tree_context_menu_rect(&self) -> Option<Rect> {
+        let menu = self.tree_context_menu.as_ref()?;
+        let actions = TreeContextMenu::actions_for(self, menu.row);
+        if actions.is_empty() {
+            return None;
+        }
+        let tree = self.ui_regions.tree_inner;
+        let menu_width = 24u16.min(tree.width);
+        let menu_height = (actions.len() as u16) + 2; // border + items
+        let row_y = tree.y.saturating_add(
+            u16::try_from(menu.row.saturating_sub(self.tab().tree_state.offset())).unwrap_or(0),
+        );
+        let menu_y = (row_y + 1).min(
+            tree.y
+                .saturating_add(tree.height.saturating_sub(menu_height)),
+        );
+        let menu_x = tree.x.saturating_add(tree.width.saturating_sub(menu_width));
+        Some(Rect::new(menu_x, menu_y, menu_width, menu_height))
+    }
+
+    /// Hit-test a click against the open context menu items. Returns the
+    /// action index if the click lands on a menu item.
+    fn tree_context_menu_hit(&self, column: u16, row: u16) -> Option<usize> {
+        let menu = self.tree_context_menu.as_ref()?;
+        let rect = self.tree_context_menu_rect()?;
+        // Only hit-test the inner item area, not the border. Clicking the
+        // border dismisses the menu without executing an action.
+        let inner = Rect::new(
+            rect.x + 1,
+            rect.y + 1,
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(2),
+        );
+        if !contains(inner, column, row) {
+            return None;
+        }
+        let index = usize::from(row - inner.y);
+        let actions = TreeContextMenu::actions_for(self, menu.row);
+        (index < actions.len()).then_some(index)
+    }
+
+    /// Execute the context menu action at `action_index` for the menu's row.
+    fn execute_tree_context_action(&mut self, action_index: usize) {
+        let Some(menu) = self.tree_context_menu.clone() else {
+            return;
+        };
+        let actions = TreeContextMenu::actions_for(self, menu.row);
+        let Some(&action) = actions.get(action_index) else {
+            return;
+        };
+        // Select the row and focus the Tree so actions target the right
+        // entry — OpenExternal reads the focused pane's target first.
+        self.select(menu.row);
+        self.focused_pane = FocusPane::Tree;
+        match action {
+            TreeContextAction::Preview => {
+                self.activate_selected_tree_entry();
+            }
+            TreeContextAction::ToggleExpand => {
+                self.activate_selected_tree_entry();
+            }
+            TreeContextAction::CopyRelative => {
+                self.queue_selected_path_copy(false);
+            }
+            TreeContextAction::CopyAbsolute => {
+                self.queue_selected_path_copy(true);
+            }
+            TreeContextAction::OpenExternal => {
+                self.request_external_open(ExternalOpenTrigger::ExplicitConfirm);
+            }
+        }
+    }
+
+    /// Handle a key event while the tree context menu is open. Returns true
+    /// if the key was consumed.
+    fn handle_tree_context_menu_key(&mut self, key: KeyEvent) -> bool {
+        let Some(mut menu) = self.tree_context_menu.clone() else {
+            return false;
+        };
+        let action_count = TreeContextMenu::actions_for(self, menu.row).len();
+        match key.code {
+            KeyCode::Esc => {
+                self.tree_context_menu = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if action_count > 0 {
+                    menu.selected = (menu.selected + 1) % action_count;
+                    self.tree_context_menu = Some(menu);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if action_count > 0 {
+                    menu.selected = if menu.selected == 0 {
+                        action_count - 1
+                    } else {
+                        menu.selected - 1
+                    };
+                    self.tree_context_menu = Some(menu);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let selected = menu.selected;
+                self.execute_tree_context_action(selected);
+                self.tree_context_menu = None;
+            }
+            _ => {}
+        }
+        true
     }
 
     fn handle_search_mouse_down(&mut self, mouse: MouseEvent) -> bool {
@@ -4180,6 +4646,17 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
+        // Any non-type-ahead key (including vim navigation j/k/g/G) resets
+        // the type-ahead buffer.
+        let is_pure_type_ahead = matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char(c), KeyModifiers::NONE)
+                if (c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+                && !matches!(c, 'j' | 'k' | 'g' | 'G')
+        );
+        if !is_pure_type_ahead && key.code != KeyCode::Backspace {
+            self.tree_type_ahead = None;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Down | KeyCode::Char('j'), _) => self.move_selection(1),
             (KeyCode::Up | KeyCode::Char('k'), _) => self.move_selection(-1),
@@ -4197,8 +4674,95 @@ impl App {
             (KeyCode::Right, KeyModifiers::NONE) => {
                 self.focused_pane = FocusPane::Content;
             }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                self.type_tree_ahead_backspace();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE)
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' =>
+            {
+                self.type_tree_ahead(c);
+            }
             _ => {}
         }
+    }
+
+    /// Append a character to the tree type-ahead buffer and jump to the
+    /// first visible entry whose name starts with the resulting prefix
+    /// (case-insensitive). Characters arriving after
+    /// [`TREE_TYPE_AHEAD_TIMEOUT`] start a fresh prefix.
+    fn type_tree_ahead(&mut self, c: char) {
+        let now = Instant::now();
+        let prefix = match self.tree_type_ahead.take() {
+            Some((mut buffer, at))
+                if now.saturating_duration_since(at) <= TREE_TYPE_AHEAD_TIMEOUT =>
+            {
+                buffer.push(c);
+                buffer
+            }
+            _ => c.to_string(),
+        };
+        self.apply_tree_type_ahead(&prefix, now);
+    }
+
+    /// Drop the last character from the type-ahead buffer and re-apply the
+    /// remaining prefix.
+    fn type_tree_ahead_backspace(&mut self) {
+        let Some((mut buffer, at)) = self.tree_type_ahead.take() else {
+            return;
+        };
+        if Instant::now().saturating_duration_since(at) > TREE_TYPE_AHEAD_TIMEOUT {
+            return;
+        }
+        buffer.pop();
+        if buffer.is_empty() {
+            return;
+        }
+        self.apply_tree_type_ahead(&buffer, Instant::now());
+    }
+
+    fn apply_tree_type_ahead(&mut self, prefix: &str, now: Instant) {
+        let needle = prefix.to_lowercase();
+        let row_count = self.tree_row_count();
+        let mut found: Option<usize> = None;
+        for index in 0..row_count {
+            let name = match self.tree_scope {
+                TreeScope::AllFiles => self.visible_entries().get(index).map(|entry| {
+                    entry
+                        .relative
+                        .file_name()
+                        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+                }),
+                TreeScope::GitChanges => self
+                    .visible_git_rows()
+                    .get(index)
+                    .map(|row| row.label.clone()),
+                #[cfg(feature = "agent-observability")]
+                TreeScope::Agents => None,
+            };
+            if name.is_some_and(|name| name.to_lowercase().starts_with(&needle)) {
+                found = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = found {
+            self.select(index);
+        }
+        self.tree_type_ahead = Some((prefix.to_owned(), now));
+    }
+
+    /// The active type-ahead prefix, if the user typed within the timeout.
+    pub fn tree_type_ahead_prefix(&self) -> Option<&str> {
+        self.tree_type_ahead
+            .as_ref()
+            .filter(|(_, at)| {
+                Instant::now().saturating_duration_since(*at) <= TREE_TYPE_AHEAD_TIMEOUT
+            })
+            .map(|(prefix, _)| prefix.as_str())
+    }
+
+    /// Clickable breadcrumb segment rects from the last rendered frame.
+    pub fn content_breadcrumb_rects(&self) -> &[(PathBuf, Rect)] {
+        &self.content_breadcrumbs
     }
 
     fn handle_content_key(&mut self, key: KeyEvent) {
@@ -4244,7 +4808,7 @@ impl App {
             }
             (KeyCode::End | KeyCode::Char('G'), _) => {
                 self.tab_mut().content.scroll = self
-                    .content_visual_rows(self.ui_regions.content_inner.width)
+                    .content_visual_rows(self.content_render_width())
                     .len()
                     .saturating_sub(1);
                 self.sync_content_cursor_to_scroll();
@@ -4518,7 +5082,7 @@ impl App {
         if self.tab_mut().content.mode != ContentMode::Preview {
             return;
         }
-        let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
+        let rows = self.content_visual_rows(self.content_render_width().max(1));
         self.tab_mut().content.scroll = self.effective_content_scroll(rows.len());
         if let Some(row) = rows.get(self.tab_mut().content.scroll) {
             self.tab_mut().content.cursor_line = row.line_index;
@@ -4717,7 +5281,7 @@ impl App {
 
     fn scroll_content(&mut self, vertical: isize, horizontal: isize) {
         let row_count = self
-            .content_visual_rows(self.ui_regions.content_inner.width.max(1))
+            .content_visual_rows(self.content_render_width().max(1))
             .len();
         self.tab_mut().content.scroll = self.effective_content_scroll(row_count);
         self.tab_mut().content.scroll = self
@@ -5436,7 +6000,7 @@ impl App {
                     .ancestors()
                     .skip(1)
                     .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(false))
+                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(true))
             })
             .cloned()
             .collect();
@@ -6294,7 +6858,7 @@ impl App {
 
     fn current_navigation_entry(&self) -> Option<NavigationHistoryEntry> {
         let source = self.tab().content.navigation_source.as_ref()?;
-        let rows = self.content_visual_rows(self.ui_regions.content_inner.width.max(1));
+        let rows = self.content_visual_rows(self.content_render_width().max(1));
         let effective_scroll = self.effective_content_scroll(rows.len());
         let row = rows.get(effective_scroll);
         let viewport = ContentViewportRestore {
