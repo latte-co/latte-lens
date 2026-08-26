@@ -2217,7 +2217,7 @@ fn preview_wraps_long_lines_with_one_logical_line_number_and_exact_mouse_copy() 
     let fixture = TestRepo::new();
     fixture.write("long.txt", "abcdefghijklmnopqrstuvwxyz0123456789\nsecond\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    let backend = TestBackend::new(60, 12);
+    let backend = TestBackend::new(50, 12);
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
@@ -2266,7 +2266,7 @@ fn git_diff_wraps_long_lines_and_preserves_mouse_copy() {
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
 
-    let backend = TestBackend::new(60, 20);
+    let backend = TestBackend::new(50, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
@@ -3322,7 +3322,7 @@ fn divider_drag_resizes_tree_with_minimum_tree_and_content_widths() {
     app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
     app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, drag_row));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert_eq!(app.ui_regions.tree_body.width, 28);
+    assert_eq!(app.ui_regions.tree_body.width, 16);
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, drag_row));
 
     app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
@@ -3372,7 +3372,7 @@ fn divider_drag_resizes_right_docked_tree() {
     app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
     app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 99, drag_row));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert_eq!(app.ui_regions.tree_body.width, 28);
+    assert_eq!(app.ui_regions.tree_body.width, 16);
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 99, drag_row));
 
     // Dragging far left clamps to the maximum tree width (content minimum).

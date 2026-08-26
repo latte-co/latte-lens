@@ -105,7 +105,7 @@ fn file_entry_color_with_theme(entry: &FileEntry, theme: &Theme) -> Color {
     }
 }
 
-pub(crate) const MIN_TREE_WIDTH: u16 = 28;
+pub(crate) const MIN_TREE_WIDTH: u16 = 16;
 const MIN_CONTENT_WIDTH: u16 = 24;
 const DEFAULT_MAX_TREE_WIDTH: u16 = 36;
 
@@ -180,32 +180,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // between expanded and collapsed.
     {
         let full_tree_width = tree_panel_width(body.width, app.tab().panel_width);
-        if full_tree_width >= 32 {
-            let header_x = if app.tree_side() == crate::config::TreeSide::Right {
-                body.x.saturating_add(body.width.saturating_sub(full_tree_width))
-            } else {
-                body.x
-            };
-            let btn_width = 3u16;
-            let btn_x = header_x.saturating_add(full_tree_width.saturating_sub(btn_width));
-            let btn_rect = Rect::new(btn_x, body.y, btn_width, 1);
-            app.ui_regions.tree_hide_button = btn_rect;
-            app.ui_regions.tree_show_button = btn_rect;
-            // Shift search-button hit areas left so they match the rendered
-            // position (draw_tree shrinks the header by btn_width).
-            app.ui_regions.file_search_button.x =
-                app.ui_regions.file_search_button.x.saturating_sub(btn_width);
-            app.ui_regions.text_search_button.x =
-                app.ui_regions.text_search_button.x.saturating_sub(btn_width);
-            // When the tree is hidden, the show button occupies the far-right
-            // slot; shift external-open left so their hit areas don't overlap.
-            if tree_width == 0 {
-                app.ui_regions.external_open_button.x = app
-                    .ui_regions
-                    .external_open_button
-                    .x
-                    .saturating_sub(btn_width);
-            }
+        let header_x = if app.tree_side() == crate::config::TreeSide::Right {
+            body.x.saturating_add(body.width.saturating_sub(full_tree_width))
+        } else {
+            body.x
+        };
+        let btn_width = 3u16;
+        let btn_x = header_x.saturating_add(full_tree_width.saturating_sub(btn_width));
+        let btn_rect = Rect::new(btn_x, body.y, btn_width, 1);
+        app.ui_regions.tree_hide_button = btn_rect;
+        app.ui_regions.tree_show_button = btn_rect;
+        // Shift search-button hit areas left so they match the rendered
+        // position (draw_tree shrinks the header by btn_width).
+        app.ui_regions.file_search_button.x =
+            app.ui_regions.file_search_button.x.saturating_sub(btn_width);
+        app.ui_regions.text_search_button.x =
+            app.ui_regions.text_search_button.x.saturating_sub(btn_width);
+        // When the tree is hidden, the show button occupies the far-right
+        // slot; shift external-open left so their hit areas don't overlap.
+        if tree_width == 0 {
+            app.ui_regions.external_open_button.x = app
+                .ui_regions
+                .external_open_button
+                .x
+                .saturating_sub(btn_width);
         }
     }
     // Reposition the + button to follow the last tab, and shift the new-tab
@@ -1353,7 +1351,14 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         }
     };
     let entry_count = app.scope_entry_count();
-    let hide_btn_width = app.ui_regions.tree_hide_button.width;
+    // Only reserve space for the hide button when the header is wide enough;
+    // on narrow panels the button overlays the right edge without shrinking
+    // the heading area.
+    let hide_btn_width = if header.width >= 32 {
+        app.ui_regions.tree_hide_button.width
+    } else {
+        0
+    };
     // Search buttons sit left of the hide/show button at the far right.
     let adjusted_header = Rect::new(
         header.x,
@@ -3039,7 +3044,7 @@ mod tests {
         assert_eq!(tree_panel_width(80, None), 28);
         assert_eq!(tree_panel_width(200, None), 36);
         assert_eq!(tree_panel_width(100, Some(50)), 50);
-        assert_eq!(tree_panel_width(100, Some(0)), 28);
+        assert_eq!(tree_panel_width(100, Some(0)), 16);
         assert_eq!(tree_panel_width(100, Some(99)), 75);
         assert_eq!(tree_panel_width(32, Some(28)), 7);
     }
