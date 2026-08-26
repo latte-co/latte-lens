@@ -922,7 +922,7 @@ fn content_scrollbar_appears_when_content_overflows() {
     let mut has_track = false;
     for y in content.y..content.y + content.height {
         let symbol = buffer[(track_x, y)].symbol();
-        if symbol == "█" {
+        if symbol == "┃" {
             has_thumb = true;
         }
         if symbol == "│" {
@@ -934,13 +934,13 @@ fn content_scrollbar_appears_when_content_overflows() {
 
     // Scroll down and verify the thumb moves.
     let thumb_y_before = (content.y..content.y + content.height)
-        .find(|&y| buffer[(track_x, y)].symbol() == "█")
+        .find(|&y| buffer[(track_x, y)].symbol() == "┃")
         .unwrap();
     app.handle_key(key(KeyCode::PageDown));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let buffer = terminal.backend().buffer();
     let thumb_y_after = (content.y..content.y + content.height)
-        .find(|&y| buffer[(track_x, y)].symbol() == "█")
+        .find(|&y| buffer[(track_x, y)].symbol() == "┃")
         .unwrap();
     assert!(
         thumb_y_after > thumb_y_before,

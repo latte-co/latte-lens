@@ -2202,22 +2202,22 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         let scroll = app.effective_content_scroll(total);
         let track_x = rows.x + rows.width - 1;
         let track_y = render_area.y;
-        let thumb_size = (visible * visible / total).max(1).min(visible);
+        // Thumb size: proportional but capped so it doesn't dominate.
+        let raw_thumb = (visible * visible / total).max(1);
+        let thumb_size = raw_thumb.min(visible / 3).max(1);
         let max_scroll = total.saturating_sub(visible);
         let thumb_start = (scroll * (visible - thumb_size))
             .checked_div(max_scroll)
             .unwrap_or(0);
         let theme = Theme::current();
         let track_style = Style::default().fg(theme.text_subtle);
-        let thumb_style = Style::default()
-            .fg(theme.content_accent)
-            .add_modifier(Modifier::BOLD);
+        let thumb_style = Style::default().fg(theme.text_muted);
         let buffer = frame.buffer_mut();
         for row in 0..visible {
             let y = track_y + row as u16;
             let cell = &mut buffer[(track_x, y)];
             if row >= thumb_start && row < thumb_start + thumb_size {
-                cell.set_symbol("█").set_style(thumb_style);
+                cell.set_symbol("┃").set_style(thumb_style);
             } else {
                 cell.set_symbol("│").set_style(track_style);
             }
