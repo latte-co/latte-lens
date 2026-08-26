@@ -197,6 +197,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.ui_regions.file_search_button.x.saturating_sub(btn_width);
             app.ui_regions.text_search_button.x =
                 app.ui_regions.text_search_button.x.saturating_sub(btn_width);
+            // When the tree is hidden, the show button occupies the far-right
+            // slot; shift external-open left so their hit areas don't overlap.
+            if tree_width == 0 {
+                app.ui_regions.external_open_button.x = app
+                    .ui_regions
+                    .external_open_button
+                    .x
+                    .saturating_sub(btn_width);
+            }
         }
     }
     // Reposition the + button to follow the last tab, and shift the new-tab
