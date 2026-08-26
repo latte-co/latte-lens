@@ -1667,7 +1667,7 @@ impl App {
                 .expansion
                 .get(&entry.relative)
                 .copied()
-                .unwrap_or(false),
+                .unwrap_or(true),
             TreeScope::GitChanges => self
                 .selected_git_row()
                 .map(|row| self.git_row_is_expanded(row))
