@@ -758,6 +758,12 @@ pub struct UiRegions {
     pub tree_hide_button: Rect,
     /// Slim edge button shown when the tree is hidden; click to reveal.
     pub tree_show_button: Rect,
+    /// Content scrollbar track (1-column right edge of content rows).
+    pub content_scrollbar_track: Rect,
+    /// Thumb offset within the track (rows from track top).
+    pub content_scrollbar_thumb_start: usize,
+    /// Thumb height in rows.
+    pub content_scrollbar_thumb_size: usize,
     pub content_body: Rect,
     pub content_inner: Rect,
 }
@@ -1011,6 +1017,7 @@ pub struct App {
     pub last_error: Option<String>,
     pub ui_regions: UiRegions,
     tree_resize_dragging: bool,
+    content_scrollbar_dragging: bool,
     preview_registry: PreviewRegistry,
     repo_graph: Option<RepoGraph>,
     git_changes_selection: Option<GitRowIdentity>,
@@ -1387,6 +1394,7 @@ impl App {
             last_error: None,
             ui_regions: UiRegions::default(),
             tree_resize_dragging: false,
+            content_scrollbar_dragging: false,
             preview_registry,
             repo_graph: None,
             git_changes_selection: None,
@@ -2019,6 +2027,37 @@ impl App {
 
     pub(crate) fn effective_content_scroll(&self, row_count: usize) -> usize {
         self.tab().content.scroll.min(row_count.saturating_sub(1))
+    }
+
+    pub(crate) fn content_page_up(&mut self) {
+        self.scroll_content(-12, 0);
+    }
+
+    pub(crate) fn content_page_down(&mut self) {
+        self.scroll_content(12, 0);
+    }
+
+    fn drag_content_scrollbar(&mut self, mouse_row: u16) {
+        let track = self.ui_regions.content_scrollbar_track;
+        let thumb_size = self.ui_regions.content_scrollbar_thumb_size;
+        let visible = usize::from(track.height);
+        if visible == 0 || thumb_size == 0 || thumb_size >= visible {
+            return;
+        }
+        // Mouse row relative to track top; center the thumb on the cursor.
+        let click_row = usize::from(mouse_row.saturating_sub(track.y));
+        let new_thumb_start = click_row.saturating_sub(thumb_size / 2);
+        let new_thumb_start = new_thumb_start.min(visible - thumb_size);
+        // Map thumb position back to scroll offset.
+        let row_count = self.content_visual_rows(self.ui_regions.content_inner.width).len();
+        let max_scroll = row_count.saturating_sub(visible);
+        let scrollable = visible - thumb_size;
+        let new_scroll = if scrollable > 0 {
+            (new_thumb_start * max_scroll) / scrollable
+        } else {
+            0
+        };
+        self.tab_mut().content.scroll = new_scroll.min(max_scroll);
     }
 
     pub(crate) fn prepare_content_width(&mut self, width: u16) {
@@ -3515,6 +3554,22 @@ impl App {
                 if self.handle_search_mouse_down(mouse) {
                     return;
                 }
+                // Tree panel hide/show buttons (checked before external-open
+                // because they overlap when the tree is hidden).
+                if !self.tree_hidden
+                    && contains(self.ui_regions.tree_hide_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.toggle_tree_visibility();
+                    return;
+                }
+                if self.tree_hidden
+                    && contains(self.ui_regions.tree_show_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.toggle_tree_visibility();
+                    return;
+                }
                 if self.preview_find.is_none()
                     && contains(
                         self.ui_regions.external_open_button,
@@ -3540,24 +3595,29 @@ impl App {
                     self.request_refresh(self.tree_scope == TreeScope::GitChanges);
                     return;
                 }
-                // Tree panel hide/show buttons.
-                if !self.tree_hidden
-                    && contains(self.ui_regions.tree_hide_button, mouse.column, mouse.row)
-                {
-                    self.clear_content_selection();
-                    self.toggle_tree_visibility();
-                    return;
-                }
-                if self.tree_hidden
-                    && contains(self.ui_regions.tree_show_button, mouse.column, mouse.row)
-                {
-                    self.clear_content_selection();
-                    self.toggle_tree_visibility();
-                    return;
-                }
                 if contains(self.ui_regions.divider, mouse.column, mouse.row) {
                     self.clear_content_selection();
                     self.tree_resize_dragging = true;
+                    return;
+                }
+                // Content scrollbar: click thumb to drag, click above/below
+                // thumb to page up/down.
+                if contains(self.ui_regions.content_scrollbar_track, mouse.column, mouse.row) {
+                    self.clear_content_selection();
+                    let track = self.ui_regions.content_scrollbar_track;
+                    let thumb_start = self.ui_regions.content_scrollbar_thumb_start;
+                    let thumb_size = self.ui_regions.content_scrollbar_thumb_size;
+                    let click_row = usize::from(mouse.row - track.y);
+                    if click_row >= thumb_start && click_row < thumb_start + thumb_size {
+                        // Clicked on thumb: start dragging.
+                        self.content_scrollbar_dragging = true;
+                    } else if click_row < thumb_start {
+                        // Clicked above thumb: page up.
+                        self.content_page_up();
+                    } else {
+                        // Clicked below thumb: page down.
+                        self.content_page_down();
+                    }
                     return;
                 }
                 if contains(self.ui_regions.tree_inner, mouse.column, mouse.row) {
@@ -3641,6 +3701,8 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.tree_resize_dragging {
                     self.resize_tree_panel(mouse.column);
+                } else if self.content_scrollbar_dragging {
+                    self.drag_content_scrollbar(mouse.row);
                 } else {
                     self.drag_content_selection(mouse);
                 }
@@ -3649,6 +3711,9 @@ impl App {
                 if self.tree_resize_dragging {
                     self.resize_tree_panel(mouse.column);
                     self.tree_resize_dragging = false;
+                } else if self.content_scrollbar_dragging {
+                    self.drag_content_scrollbar(mouse.row);
+                    self.content_scrollbar_dragging = false;
                 } else {
                     self.finish_content_selection(mouse);
                 }

@@ -389,6 +389,9 @@ fn regions(areas: DrawAreas) -> UiRegions {
         divider,
         tree_hide_button: Rect::default(),
         tree_show_button: Rect::default(),
+        content_scrollbar_track: Rect::default(),
+        content_scrollbar_thumb_start: 0,
+        content_scrollbar_thumb_size: 0,
         content_body,
         content_inner: content_rows,
     }
@@ -2183,6 +2186,17 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                 cell.set_symbol("│").set_style(track_style);
             }
         }
+        // Save track + thumb geometry for mouse interaction.
+        app.ui_regions.content_scrollbar_track = Rect::new(
+            track_x,
+            track_y,
+            1,
+            render_area.height,
+        );
+        app.ui_regions.content_scrollbar_thumb_start = thumb_start;
+        app.ui_regions.content_scrollbar_thumb_size = thumb_size;
+    } else {
+        app.ui_regions.content_scrollbar_track = Rect::default();
     }
 }
 
