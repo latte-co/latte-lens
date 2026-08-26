@@ -2054,11 +2054,9 @@ impl App {
             .len();
         let max_scroll = row_count.saturating_sub(visible);
         let scrollable = visible - thumb_size;
-        let new_scroll = if scrollable > 0 {
-            (new_thumb_start * max_scroll) / scrollable
-        } else {
-            0
-        };
+        let new_scroll = (new_thumb_start * max_scroll)
+            .checked_div(scrollable)
+            .unwrap_or(0);
         self.tab_mut().content.scroll = new_scroll.min(max_scroll);
     }
 
