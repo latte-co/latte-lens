@@ -5997,7 +5997,7 @@ impl App {
                     .ancestors()
                     .skip(1)
                     .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(false))
+                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(true))
             })
             .cloned()
             .collect();
