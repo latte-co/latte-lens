@@ -784,6 +784,40 @@ fn right_click_opens_context_menu_and_actions_execute() {
 }
 
 #[test]
+fn context_menu_side_border_click_dismisses_without_executing() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+
+    // Right-click on the "src" directory row opens the context menu.
+    app.handle_mouse(mouse_right_down(tree_x, tree_y));
+    assert!(app.tree_context_menu.is_some());
+    let before = visible_paths(&app);
+
+    // Get the menu rect and click its left border (first column, item row).
+    let menu_rect = app
+        .tree_context_menu_rect()
+        .expect("menu rect must exist while open");
+    app.handle_mouse(mouse_down(menu_rect.x, menu_rect.y + 1));
+    // The menu should be dismissed.
+    assert!(app.tree_context_menu.is_none());
+    // No action should have been executed (directory not expanded).
+    assert_eq!(
+        visible_paths(&app),
+        before,
+        "side-border click must dismiss without executing an action"
+    );
+}
+
+#[test]
 fn context_menu_open_external_targets_clicked_row_not_content_pane() {
     let fixture = TestRepo::new();
     fixture.write("a.txt", "a\n");

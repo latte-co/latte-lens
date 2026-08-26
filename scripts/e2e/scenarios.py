@@ -1298,15 +1298,18 @@ def tab_shell(context: ScenarioContext) -> None:
     session.key(b"\x1b[A")  # Up → back to Files
     session.key(b"\r")  # Enter → Files
     session.wait_screen(("Files",), "Up clamp returns to the Files template")
+    # Give the TUI a moment to render the new tab in the tab bar before
+    # locating the + button by screen marker.
+    time.sleep(0.3)
 
     # --- Mouse: "+" button, menu item click, tab bar click, outside dismiss ---
-    session.click(118, 0)  # "+" button
+    _click_marker_on_line(session, "+")
     session.wait_screen(("Files", "Review", "Search"), "mouse + opens the new tab menu")
-    session.click(105, 3)  # Review menu item (row 3 → index 1)
+    _click_marker_on_line(session, "Review", alongside=("│",))  # Review menu item
     session.wait_screen(("Git changes",), "mouse menu click opens a Review tab")
     session.click(2, 0)  # first tab (Files) in the tab bar
     session.wait_screen(("Files",), "mouse tab bar click switches to the Files tab")
-    session.click(118, 0)  # "+" button
+    _click_marker_on_line(session, "+")
     session.wait_screen(("Files", "Review", "Search"), "mouse + reopens the menu")
     session.click(50, 10)  # outside the menu → dismiss
     session.wait_screen(
@@ -1912,7 +1915,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
         session.wait_screen(
             (
                 "Preview",
-                f"{repository_name}/caller.rs",
+                f"{repository_name} / caller.rs",
                 f"{repository_name.replace('-', '_')}!();",
             ),
             f"{repository_name} caller Preview opens",
@@ -1920,7 +1923,7 @@ def batch_shutdown_lsp(context: ScenarioContext) -> None:
         )
         session.key(b"\x04")
         session.wait_screen(
-            ("No definition found.", f"{repository_name}/caller.rs"),
+            ("No definition found.", f"{repository_name} / caller.rs"),
             f"{repository_name} keeps one ready stalled-session tree",
             absent=("Finding definition…",),
         )

@@ -3810,9 +3810,9 @@ impl App {
         // Only hit-test the inner item area, not the border. Clicking the
         // border dismisses the menu without executing an action.
         let inner = Rect::new(
-            rect.x,
+            rect.x + 1,
             rect.y + 1,
-            rect.width,
+            rect.width.saturating_sub(2),
             rect.height.saturating_sub(2),
         );
         if !contains(inner, column, row) {
