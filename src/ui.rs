@@ -176,19 +176,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_rows,
     });
     // Position the tree hide/show buttons. Both states use the same spot:
-    // the right edge of where the tree header sits, so the button never
-    // jumps between expanded and collapsed. Only shown when the panel is
-    // wide enough to avoid clipping the heading text.
+    // just left of the search buttons in the tree header, so the button
+    // never jumps between expanded and collapsed.
     {
         let full_tree_width = tree_panel_width(body.width, app.tab().panel_width);
         if full_tree_width >= 32 {
-            let header_x = if app.tree_side() == crate::config::TreeSide::Right {
-                body.x.saturating_add(body.width.saturating_sub(full_tree_width))
-            } else {
-                body.x
-            };
             let btn_width = 3u16;
-            let btn_x = header_x.saturating_add(full_tree_width.saturating_sub(btn_width));
+            let btn_x = app
+                .ui_regions
+                .file_search_button
+                .x
+                .saturating_sub(btn_width);
             let btn_rect = Rect::new(btn_x, body.y, btn_width, 1);
             app.ui_regions.tree_hide_button = btn_rect;
             app.ui_regions.tree_show_button = btn_rect;
