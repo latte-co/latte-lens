@@ -5229,3 +5229,39 @@ fn git_with_path(root: &Path, before: &[&str], path: &Path, after: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn tree_show_button_renders_when_hidden() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("file.txt"), "hello\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Right);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // Draw with tree visible: both buttons share the same position.
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let visible_pos = app.ui_regions.tree_hide_button;
+    assert!(visible_pos.width > 0);
+
+    // Hide tree and draw again: show button must be at the same position
+    // and must actually render the arrow glyph (not be overwritten by the
+    // content header).
+    app.set_tree_hidden(true);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let show = app.ui_regions.tree_show_button;
+    assert_eq!(show, visible_pos, "hide/show buttons must share one position");
+
+    let buffer = terminal.backend().buffer();
+    let mut found = false;
+    for x in show.x..show.x.saturating_add(show.width) {
+        for y in show.y..show.y.saturating_add(show.height) {
+            let symbol = buffer[(x, y)].symbol();
+            if symbol.contains('«') || symbol.contains('»') {
+                found = true;
+            }
+        }
+    }
+    assert!(found, "show button arrow should be rendered at {show:?}");
+}
