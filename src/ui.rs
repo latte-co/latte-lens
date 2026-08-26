@@ -191,6 +191,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let btn_rect = Rect::new(btn_x, body.y, btn_width, 1);
             app.ui_regions.tree_hide_button = btn_rect;
             app.ui_regions.tree_show_button = btn_rect;
+            // Shift search-button hit areas left so they match the rendered
+            // position (draw_tree shrinks the header by btn_width).
+            app.ui_regions.file_search_button.x =
+                app.ui_regions.file_search_button.x.saturating_sub(btn_width);
+            app.ui_regions.text_search_button.x =
+                app.ui_regions.text_search_button.x.saturating_sub(btn_width);
         }
     }
     // Reposition the + button to follow the last tab, and shift the new-tab

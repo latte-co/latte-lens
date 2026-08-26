@@ -5265,3 +5265,34 @@ fn tree_show_button_renders_when_hidden() {
     }
     assert!(found, "show button arrow should be rendered at {show:?}");
 }
+
+#[test]
+fn clicking_hide_button_does_not_trigger_search() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("file.txt"), "hello\n").unwrap();
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Right);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // Click the hide button
+    let btn = app.ui_regions.tree_hide_button;
+    assert!(btn.width > 0, "hide button should be positioned");
+    let click_x = btn.x + 1; // click inside the button
+    let click_y = btn.y;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), click_x, click_y));
+
+    // Tree should be hidden, search should NOT be open
+    assert!(
+        !app.search_is_active(),
+        "search should not open when clicking hide button"
+    );
+    // After hiding, the show button must be positioned (proves toggle ran).
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(
+        app.ui_regions.tree_show_button.width > 0,
+        "tree should be hidden after clicking hide button"
+    );
+}
