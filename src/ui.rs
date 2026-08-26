@@ -175,20 +175,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_header,
         content_rows,
     });
-    // Position the tree hide/show buttons. The hide button sits in the tree
-    // header just left of the search buttons (only when the header is wide
-    // enough to avoid clipping the heading); the show button is a slim edge
+    // Position the tree hide/show buttons. The hide button sits in the
+    // global header just left of Refresh; the show button is a slim edge
     // strip rendered only when the tree is collapsed.
     {
-        let hide_width = 3u16.min(tree_header.width);
-        if tree_header.width >= 32 {
+        if tree_width > 0 {
+            let hide_width = 3u16;
             let hide_x = app
                 .ui_regions
-                .file_search_button
+                .refresh_button
                 .x
                 .saturating_sub(hide_width);
             app.ui_regions.tree_hide_button =
-                Rect::new(hide_x, tree_header.y, hide_width, tree_header.height);
+                Rect::new(hide_x, header.y, hide_width, header.height);
         }
         if tree_width == 0 {
             let show_x = if app.tree_side() == crate::config::TreeSide::Right {
@@ -548,6 +547,22 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         title.push(Span::styled("  directory", Style::default().fg(muted())));
     }
     frame.render_widget(Paragraph::new(Line::from(title)), header_text);
+    // Tree panel hide button, just left of Refresh.
+    let hide_rect = app.ui_regions.tree_hide_button;
+    if hide_rect.width > 0 {
+        let hide_label = if app.tree_side() == crate::config::TreeSide::Right {
+            " »"
+        } else {
+            " «"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                hide_label,
+                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+            )),
+            hide_rect,
+        );
+    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1335,11 +1350,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     };
     let entry_count = app.scope_entry_count();
     let (file_button, text_button) = inactive_search_buttons(header);
-    let hide_width = app.ui_regions.tree_hide_button.width;
-    let available_width = file_button
-        .x
-        .saturating_sub(header.x)
-        .saturating_sub(hide_width) as usize;
+    let available_width = file_button.x.saturating_sub(header.x) as usize;
     let heading = if is_agents_scope(app) {
         "Agents"
     } else if app.tree_scope == TreeScope::GitChanges {
@@ -1410,11 +1421,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         format!("{entry_count} entries")
     };
-    let hide_rect = app.ui_regions.tree_hide_button;
-    let heading_width = file_button
-        .x
-        .saturating_sub(header.x)
-        .saturating_sub(if hide_rect.width > 0 { hide_rect.width } else { 0 });
+    let heading_width = file_button.x.saturating_sub(header.x);
     let tree_accent = if app.tree_scope == TreeScope::GitChanges {
         Theme::current().git_accent
     } else {
@@ -1428,22 +1435,6 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         focused,
         tree_accent,
     );
-    // Hide-panel button sits just left of the search buttons. Arrow points
-    // toward the edge the tree will collapse to.
-    if hide_rect.width > 0 {
-        let hide_label = if app.tree_side() == crate::config::TreeSide::Right {
-            " »"
-        } else {
-            " «"
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                hide_label,
-                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
-            )),
-            hide_rect,
-        );
-    }
     let full_labels = file_button.width >= 7;
     frame.render_widget(
         Paragraph::new(Span::styled(
