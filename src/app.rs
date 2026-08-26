@@ -2051,7 +2051,11 @@ impl App {
         // Map thumb position back to scroll offset. Use the same reduced
         // width as rendering (scrollbar reserves 1 column when visible).
         let render_width = self.ui_regions.content_inner.width.saturating_sub(
-            if self.ui_regions.content_scrollbar_track.width > 0 { 1 } else { 0 }
+            if self.ui_regions.content_scrollbar_track.width > 0 {
+                1
+            } else {
+                0
+            },
         );
         let row_count = self.content_visual_rows(render_width).len();
         let max_scroll = row_count.saturating_sub(visible);

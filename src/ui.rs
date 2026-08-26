@@ -2117,8 +2117,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     // When content overflows, reserve the last column for the scrollbar so
     // text isn't overwritten. All layout/scroll calculations use the same
     // reduced width for consistency.
-    let needs_scrollbar =
-        app.content_visual_rows(rows.width).len() > usize::from(rows.height);
+    let needs_scrollbar = app.content_visual_rows(rows.width).len() > usize::from(rows.height);
     let content_width = if needs_scrollbar {
         rows.width.saturating_sub(1)
     } else {
