@@ -316,7 +316,6 @@ fn e2e_content_modes_headless() {
 
     // Modify a file to make it changed.
     std::fs::write(repo.root().join("src/main.rs"), "fn changed() {}\n").unwrap();
-    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r'))); // refresh
     settle(&mut app);
 
@@ -353,7 +352,6 @@ fn e2e_refresh_headless() {
     repo.commit_all("add new file");
 
     // Refresh.
-    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
 
@@ -658,14 +656,12 @@ fn e2e_refresh_with_changes_headless() {
     // Add a new file and refresh.
     repo.write("new-file.txt", "new content\n");
     repo.commit_all("add new file");
-    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     assert!(app.all_entries.len() > initial_count);
 
     // Modify a file and refresh.
     std::fs::write(repo.root().join("src/main.rs"), "fn changed() {}\n").unwrap();
-    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
 
@@ -860,7 +856,6 @@ fn e2e_content_mode_cycle_headless() {
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
     // 'd' loads the diff.
-    app.handle_key(key(KeyCode::Char('l'))); // switch to Content focus
     app.handle_key(key(KeyCode::Char('d')));
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Diff);
