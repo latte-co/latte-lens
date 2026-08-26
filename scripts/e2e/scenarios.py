@@ -1305,7 +1305,12 @@ def tab_shell(context: ScenarioContext) -> None:
     # --- Mouse: "+" button, menu item click, tab bar click, outside dismiss ---
     _click_marker_on_line(session, "+")
     session.wait_screen(("Files", "Review", "Search"), "mouse + opens the new tab menu")
-    _click_marker_on_line(session, "Review", alongside=("│",))  # Review menu item
+    # Click the Review menu item by computing its position from the + button
+    # anchor (menu_width=20, right-aligned below the button). This avoids
+    # depending on border glyphs that render differently on macOS.
+    plus_x, plus_y = _marker_position_on_line(session, "+")
+    menu_x = plus_x + 3 - 20
+    session.click(menu_x + 3, plus_y + 3)  # inner col 2, item row 1 (Review)
     session.wait_screen(("Git changes",), "mouse menu click opens a Review tab")
     session.click(2, 0)  # first tab (Files) in the tab bar
     session.wait_screen(("Files",), "mouse tab bar click switches to the Files tab")
