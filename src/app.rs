@@ -1667,7 +1667,7 @@ impl App {
                 .expansion
                 .get(&entry.relative)
                 .copied()
-                .unwrap_or(true),
+                .unwrap_or_else(|| !self.unloaded_directories.contains(&entry.relative)),
             TreeScope::GitChanges => self
                 .selected_git_row()
                 .map(|row| self.git_row_is_expanded(row))
@@ -4930,12 +4930,12 @@ impl App {
         };
 
         let expanded = self
-            .tab_mut()
-            .files_mut()
+            .tab()
+            .files()
             .expansion
             .get(&relative)
             .copied()
-            .unwrap_or(true);
+            .unwrap_or_else(|| !self.unloaded_directories.contains(&relative));
         self.tab_mut()
             .files_mut()
             .expansion
@@ -5647,7 +5647,7 @@ impl App {
         let expanded_boundaries: Vec<PathBuf> = self
             .unloaded_directories
             .iter()
-            .filter(|path| files_expansion.get(*path).copied().unwrap_or(true))
+            .filter(|path| files_expansion.get(*path).copied().unwrap_or(false))
             .cloned()
             .collect();
         for directory in expanded_boundaries {
@@ -5957,6 +5957,7 @@ impl App {
             .iter()
             .filter(|entry| entry.is_dir)
             .map(|entry| entry.relative.clone())
+            .filter(|path| !self.unloaded_directories.contains(path))
             .collect();
         Self::reconcile_expansion_map(
             &mut self.tab_mut().files_mut().expansion,
@@ -5991,6 +5992,7 @@ impl App {
 
     fn rebuild_visible_rows(&mut self) {
         let files_expansion = self.tab().files().expansion.clone();
+        let unloaded = &self.unloaded_directories;
         let rows: Vec<FileEntry> = self
             .entries_for_scope(TreeScope::AllFiles)
             .iter()
@@ -6000,7 +6002,12 @@ impl App {
                     .ancestors()
                     .skip(1)
                     .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(true))
+                    .all(|ancestor| {
+                        files_expansion
+                            .get(ancestor)
+                            .copied()
+                            .unwrap_or_else(|| !unloaded.contains(ancestor))
+                    })
             })
             .cloned()
             .collect();

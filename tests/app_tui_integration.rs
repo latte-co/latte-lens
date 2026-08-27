@@ -171,18 +171,31 @@ fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand
     fs::write(workspace.join("one/two/deep.txt"), "deep\n").unwrap();
     fs::write(workspace.join("one/two/child/nested.txt"), "nested\n").unwrap();
 
-    let app = ready_app(workspace).unwrap();
+    let mut app = ready_app(workspace).unwrap();
     let initial_paths: Vec<_> = app
         .all_entries
         .iter()
         .map(|entry| entry.relative.clone())
         .collect();
     assert!(initial_paths.contains(&PathBuf::from("one/two")));
-    // Directories are expanded by default, so "one" and "one/two" are visible.
+    // The first two levels are visible: "one" defaults to expanded, and
+    // "one/two" is visible as a collapsed directory.
     assert!(visible_paths(&app).contains(&PathBuf::from("one")));
     assert!(visible_paths(&app).contains(&PathBuf::from("one/two")));
-    // Deeper content is loaded on expand.
-    assert!(initial_paths.contains(&PathBuf::from("one/two/deep.txt")));
+    // Deeper content is not loaded until the directory is expanded.
+    assert!(!initial_paths.contains(&PathBuf::from("one/two/deep.txt")));
+
+    // Expanding "one/two" loads its children.
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Down)); // select "one/two"
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    let expanded_paths: Vec<_> = app
+        .all_entries
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    assert!(expanded_paths.contains(&PathBuf::from("one/two/deep.txt")));
 }
 
 #[test]
@@ -392,8 +405,8 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
     fixture.write("src/nested/changed.rs", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Directories default to expanded, so the initial load descends into
-    // every directory and the All Files projection exposes the full tree.
+    // The scan stays within the first two levels; depth-2 directories are
+    // present but their children are not loaded until expanded.
     let raw_all_paths: Vec<_> = app
         .all_entries
         .iter()
@@ -401,13 +414,32 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
         .collect();
     assert!(raw_all_paths.contains(&PathBuf::from("docs/clean.md")));
     assert!(raw_all_paths.contains(&PathBuf::from("src/nested")));
-    assert!(raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
+    assert!(!raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
     assert!(
         app.all_entries
             .iter()
             .find(|entry| entry.relative == Path::new("src/nested"))
             .is_some_and(|entry| entry.contains_changes)
     );
+    // Depth-1 directories default to expanded; depth-2 directories default
+    // to collapsed until explicitly expanded.
+    assert_eq!(
+        visible_paths(&app),
+        [
+            PathBuf::from("docs"),
+            PathBuf::from("docs/clean.md"),
+            PathBuf::from("src"),
+            PathBuf::from("src/nested"),
+        ]
+    );
+
+    // Expanding the depth-2 directory loads its children.
+    app.handle_key(key(KeyCode::Home));
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down)); // docs → docs/clean.md → src → src/nested
+    }
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     assert_eq!(
         visible_paths(&app),
         [
@@ -420,8 +452,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
     );
 
     // Collapsing one parent hides its descendants; the other branches stay
-    // visible. The initial selection lands on the changed directory, so move
-    // back to the first row first.
+    // visible.
     app.handle_key(key(KeyCode::Home));
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
@@ -691,15 +722,13 @@ fn breadcrumbs_show_selected_path_and_click_navigates_to_parent() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Navigate to src/nested/main.rs using type-ahead + Enter.
-    // 's', 'n', 'm' are not globally bound, so they reach tree type-ahead.
-    app.handle_key(key(KeyCode::Char('s')));
-    app.handle_key(key(KeyCode::Enter)); // expand src
+    // Navigate to src/nested/main.rs. "src" defaults to expanded, so
+    // "src/nested" is visible but collapsed; expanding it loads main.rs.
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Down)); // src → src/nested
+    app.handle_key(key(KeyCode::Enter)); // expand src/nested (loads main.rs)
     settle(&mut app);
-    app.handle_key(key(KeyCode::Char('n')));
-    app.handle_key(key(KeyCode::Enter)); // expand nested
-    settle(&mut app);
-    app.handle_key(key(KeyCode::Char('m')));
+    app.handle_key(key(KeyCode::Down)); // src/nested → src/nested/main.rs
     app.handle_key(key(KeyCode::Enter)); // preview main.rs
     settle(&mut app);
     assert_eq!(
@@ -2781,9 +2810,7 @@ fn all_files_expands_a_directory_symlink_and_previews_a_file_inside_it() {
         .expect("the directory symlink is present in the tree");
     assert!(link_entry.is_dir, "a directory symlink must be expandable");
 
-    // Directories are expanded by default. The symlink target is lazy-loaded
-    // on first expand; toggle twice (collapse then expand) to trigger the load.
-    app.handle_key(key(KeyCode::Enter));
+    // The symlink target is lazy-loaded on first expand.
     app.handle_key(key(KeyCode::Enter));
     settle(&mut app);
 

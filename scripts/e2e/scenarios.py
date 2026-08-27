@@ -310,11 +310,12 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
         "production binary follows a sandboxed file symlink and previews its target content",
         absent=("Preview unavailable",),
     )
-    # A directory symlink is expanded by default; the inner file previews
-    # normally.
+    # A directory symlink is collapsed by default (lazy-loaded); expanding it
+    # reveals the file inside the target directory, which then previews normally.
+    _double_click_tree_row(session, "a-directory-link")
     session.wait_screen(
         ("a-directory-link", "inside.txt"),
-        "directory symlink is expanded by default",
+        "production binary expands a sandboxed directory symlink",
         absent=("Preview unavailable",),
     )
     _click_tree_row(session, "inside.txt")
@@ -534,8 +535,16 @@ def keyboard_controls(context: ScenarioContext) -> None:
     )
     session.key(b"\r")
     session.wait_screen(
-        ("▾ a-dir", "nested", "b-changed.rs"),
-        "Enter re-expands the directory with default-expanded nested children",
+        ("▾ a-dir", "nested"),
+        "Enter re-expands the directory",
+    )
+    # Depth-2 directories default to collapsed; expand "nested" to reveal
+    # the changed file inside.
+    session.key(b"j")  # Down to "nested"
+    session.key(b"\r")
+    session.wait_screen(
+        ("b-changed.rs",),
+        "expanding the nested directory reveals the changed file",
     )
 
     # Wheel-up is separate from wheel-down in Crossterm and must route to the
