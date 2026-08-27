@@ -31,7 +31,7 @@ use crate::agent::{
 
 use crate::{
     clipboard,
-    content_safety::FileFingerprint,
+    content_safety::{FileFingerprint, path_exists_without_following},
     diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
     folding::{FoldAnchor, FoldRegion, FoldSource, StructureSnapshot, SymbolId},
     git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
@@ -41,9 +41,9 @@ use crate::{
         ProtocolLocation,
     },
     navigation::{
-        AppOptions, DocumentVersion, NavigationFileTarget, NavigationOperation, NavigationSettings,
-        NavigationSource, NavigationTargetRange, SourcePosition, SourceRange,
-        lsp_uri_to_navigation_target,
+        AppOptions, DEPENDENCY_MANIFESTS, DocumentVersion, NavigationFileTarget,
+        NavigationOperation, NavigationSettings, NavigationSource, NavigationTargetRange,
+        SourcePosition, SourceRange, lsp_uri_to_navigation_target,
     },
     preview::{
         HighlightKind, HighlightSpan, PreviewKind, PreviewProvider, PreviewRegistry,
@@ -541,6 +541,10 @@ pub enum TreeContextAction {
     Preview,
     /// Expand or collapse the directory (same as Enter on a directory row).
     ToggleExpand,
+    /// Set the directory as the active tab's view root.
+    SetTabRoot,
+    /// Reset the active tab's view root to the workspace root.
+    ResetTabRoot,
     /// Copy the path relative to the workspace root.
     CopyRelative,
     /// Copy the absolute filesystem path.
@@ -554,6 +558,8 @@ impl TreeContextAction {
         match self {
             Self::Preview => "Preview",
             Self::ToggleExpand => "Expand / Collapse",
+            Self::SetTabRoot => "Set tab root",
+            Self::ResetTabRoot => "Reset tab root to workspace",
             Self::CopyRelative => "Copy relative path",
             Self::CopyAbsolute => "Copy absolute path",
             Self::OpenExternal => "Open externally",
@@ -579,8 +585,23 @@ impl TreeContextMenu {
         let mut actions = Vec::new();
         if is_container {
             actions.push(TreeContextAction::ToggleExpand);
+            // Re-rooting is only offered in the All Files scope, and only for
+            // real directories: a symlink directory's subtree is not scanned
+            // (no-follow), so it would show an empty tree.
+            if app.tree_scope == TreeScope::AllFiles {
+                let is_symlink = app
+                    .visible_entries()
+                    .get(row)
+                    .is_some_and(|entry| entry.symlink_target.is_some());
+                if !is_symlink {
+                    actions.push(TreeContextAction::SetTabRoot);
+                }
+            }
         } else if is_file {
             actions.push(TreeContextAction::Preview);
+        }
+        if app.tree_scope == TreeScope::AllFiles && app.tab().files().view_root.is_some() {
+            actions.push(TreeContextAction::ResetTabRoot);
         }
         actions.push(TreeContextAction::CopyRelative);
         actions.push(TreeContextAction::CopyAbsolute);
@@ -758,6 +779,10 @@ pub struct UiRegions {
     pub tree_hide_button: Rect,
     /// Slim edge button shown when the tree is hidden; click to reveal.
     pub tree_show_button: Rect,
+    /// Clickable breadcrumb segments in the tree header when the active tab
+    /// is re-rooted: `(workspace-relative path, rect)`. An empty path stands
+    /// for the workspace root (the `⌂` segment).
+    pub tree_breadcrumbs: Vec<(PathBuf, Rect)>,
     /// Content scrollbar track (1-column right edge of content rows).
     pub content_scrollbar_track: Rect,
     /// Thumb offset within the track (rows from track top).
@@ -932,6 +957,14 @@ pub struct FilesProjection {
     pub visible_rows: Vec<FileEntry>,
     pub visible_changed_entries: Vec<FileEntry>,
     pub truncated: bool,
+    /// When set, the tree shows only entries below this workspace-relative
+    /// directory. The tab treats it as the display root; the global scan,
+    /// runtimes, and repository graph stay rooted at the workspace root.
+    pub view_root: Option<PathBuf>,
+    /// Whether [`Self::view_root`] looks like a project boundary (contains
+    /// `.git` or a recognized language manifest), which lets it act as the
+    /// preferred LSP server root for documents opened in this tab.
+    pub view_root_is_project: bool,
 }
 
 impl FilesProjection {
@@ -942,6 +975,8 @@ impl FilesProjection {
             visible_rows: Vec::new(),
             visible_changed_entries: Vec::new(),
             truncated: false,
+            view_root: None,
+            view_root_is_project: false,
         }
     }
 }
@@ -1854,7 +1889,8 @@ impl App {
     /// Compute the path to copy for the selected entry.
     ///
     /// - `resolve=false`: relative path (the link path for symlinks), suitable
-    ///   for pasting relative to the workspace root.
+    ///   for pasting relative to the workspace root. When the active tab is
+    ///   re-rooted, the path is relative to the tab's view root instead.
     /// - `resolve=true`: the real/absolute path. All Files symlinks resolve to
     ///   their target on disk (canonicalize follows the link); everything else
     ///   — including Git Changes entries, which never carry a symlink target —
@@ -1866,6 +1902,12 @@ impl App {
         let entry = self.selected_entry()?;
         let relative = &entry.relative;
         if !resolve {
+            // In a re-rooted tab, "relative" means relative to the view root.
+            if let Some(view_root) = self.tab().files().view_root.as_ref()
+                && let Ok(stripped) = relative.strip_prefix(view_root)
+            {
+                return Some(stripped.to_path_buf());
+            }
             return Some(relative.clone());
         }
         let absolute = self.root.join(relative);
@@ -3580,6 +3622,26 @@ impl App {
                     self.toggle_tree_visibility();
                     return;
                 }
+                // Tree header breadcrumb: click `⌂` to reset the tab view
+                // root, or an intermediate segment to jump to that level.
+                if !self.tree_hidden
+                    && let Some((path, _)) = self
+                        .ui_regions
+                        .tree_breadcrumbs
+                        .iter()
+                        .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
+                        .cloned()
+                {
+                    self.clear_content_selection();
+                    self.last_tree_click = None;
+                    if path.as_os_str().is_empty() {
+                        self.reset_tab_root();
+                    } else {
+                        self.set_tab_root(path);
+                    }
+                    self.focused_pane = FocusPane::Tree;
+                    return;
+                }
                 if self.preview_find.is_none()
                     && contains(
                         self.ui_regions.external_open_button,
@@ -3646,13 +3708,6 @@ impl App {
                     if index < self.tree_row_count() {
                         let identity = self.tree_click_identity(index);
                         let container = self.tree_row_is_container(index);
-                        let depth = self.tree_row_depth(index);
-                        // The disclosure triangle sits after the 2-col selection
-                        // indicator and 2 cols per indent depth.
-                        let triangle_x = self.ui_regions.tree_inner.x + 2 + (depth as u16) * 2;
-                        let on_triangle = container
-                            && mouse.column >= triangle_x
-                            && mouse.column < triangle_x + 2;
                         let double_click = identity.as_ref().is_some_and(|identity| {
                             self.last_tree_click.as_ref().is_some_and(|(previous, at)| {
                                 previous == identity
@@ -3661,7 +3716,19 @@ impl App {
                             })
                         });
                         self.select(index);
-                        if on_triangle || (container && double_click) {
+                        if mouse.modifiers == KeyModifiers::ALT && container {
+                            // Alt+click on a directory re-roots the active
+                            // tab at it (the mouse equivalent of the context
+                            // menu action, for terminals where right-click is
+                            // hijacked by the terminal).
+                            self.last_tree_click = None;
+                            if let Some(entry) = self.selected_entry() {
+                                let relative = entry.relative.clone();
+                                self.set_tab_root(relative);
+                            }
+                        } else if container {
+                            // VS Code-style: a single click on a directory row
+                            // expands or collapses it.
                             self.last_tree_click = None;
                             self.toggle_selected_directory();
                         } else if !container && double_click {
@@ -3677,9 +3744,22 @@ impl App {
                     .find(|(_, rect)| contains(*rect, mouse.column, mouse.row))
                     .cloned()
                 {
-                    // Breadcrumb click: select the parent directory in the tree.
+                    // Breadcrumb click: select the parent directory in the
+                    // tree. When the segment sits above the tab's view root,
+                    // re-root to it so its contents become visible.
                     self.clear_content_selection();
                     self.last_tree_click = None;
+                    let outside_view_root =
+                        self.tab()
+                            .files()
+                            .view_root
+                            .as_ref()
+                            .is_some_and(|view_root| {
+                                path != *view_root && !path.starts_with(view_root)
+                            });
+                    if outside_view_root && !path.as_os_str().is_empty() {
+                        self.set_tab_root(path.clone());
+                    }
                     if self.select_relative_path(&path) {
                         self.focused_pane = FocusPane::Tree;
                     }
@@ -3855,21 +3935,6 @@ impl App {
         }
     }
 
-    fn tree_row_depth(&self, index: usize) -> usize {
-        match self.tree_scope {
-            TreeScope::AllFiles => self
-                .visible_entries()
-                .get(index)
-                .map_or(0, |entry| entry.depth),
-            TreeScope::GitChanges => self
-                .visible_git_rows()
-                .get(index)
-                .map_or(0, |row| row.depth),
-            #[cfg(feature = "agent-observability")]
-            TreeScope::Agents => 0,
-        }
-    }
-
     /// Resolve the currently hovered tree row index against the live scroll
     /// offset and region geometry. Returns `None` when the pointer is outside
     /// the tree, a modal overlay is active, or the tree is hidden.
@@ -3953,6 +4018,15 @@ impl App {
             }
             TreeContextAction::ToggleExpand => {
                 self.activate_selected_tree_entry();
+            }
+            TreeContextAction::SetTabRoot => {
+                if let Some(entry) = self.selected_entry() {
+                    let relative = entry.relative.clone();
+                    self.set_tab_root(relative);
+                }
+            }
+            TreeContextAction::ResetTabRoot => {
+                self.reset_tab_root();
             }
             TreeContextAction::CopyRelative => {
                 self.queue_selected_path_copy(false);
@@ -4675,7 +4749,14 @@ impl App {
                 self.focused_pane = FocusPane::Content;
             }
             (KeyCode::Backspace, KeyModifiers::NONE) => {
-                self.type_tree_ahead_backspace();
+                // Backspace edits the type-ahead prefix while it is fresh;
+                // otherwise it walks the tab view root up one level.
+                if self.tree_type_ahead_prefix().is_some() {
+                    self.type_tree_ahead_backspace();
+                } else {
+                    self.tree_type_ahead = None;
+                    self.tab_root_up();
+                }
             }
             (KeyCode::Char(c), KeyModifiers::NONE)
                 if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' =>
@@ -4945,6 +5026,172 @@ impl App {
         }
         self.rebuild_visible_rows();
         self.restore_visible_selection(Some(relative));
+    }
+
+    /// Re-root the active Files tab at `relative` (a workspace-relative
+    /// directory). The tab's tree then shows only entries below that
+    /// directory, which becomes the implicit top row. Global scan data,
+    /// runtimes, and the repository graph are untouched.
+    fn set_tab_root(&mut self, relative: PathBuf) {
+        if self.tree_scope != TreeScope::AllFiles {
+            return;
+        }
+        let Some(entry) = self
+            .all_entries
+            .iter()
+            .find(|entry| entry.relative == relative)
+        else {
+            return;
+        };
+        if !entry.is_dir || entry.symlink_target.is_some() {
+            return;
+        }
+        let absolute = self.root.join(&relative);
+        let is_project = Self::view_root_is_project_like(&absolute);
+        {
+            let files = self.tab_mut().files_mut();
+            files.view_root = Some(relative.clone());
+            files.view_root_is_project = is_project;
+        }
+        // A deep view root may not have been scanned yet; load its children
+        // on demand, mirroring directory expansion.
+        if self.unloaded_directories.contains(&relative) {
+            self.request_directory_load(relative.clone());
+        }
+        self.sync_tab_title();
+        self.rebuild_visible_rows();
+        self.restore_visible_selection(None);
+        self.clipboard_status = Some(format!("Tab root: {}", relative.display()));
+    }
+
+    /// Clear the active Files tab's view root, returning its tree to the
+    /// workspace root.
+    fn reset_tab_root(&mut self) {
+        if self.tree_scope != TreeScope::AllFiles {
+            return;
+        }
+        let changed = self.tab().files().view_root.is_some();
+        if !changed {
+            return;
+        }
+        {
+            let files = self.tab_mut().files_mut();
+            files.view_root = None;
+            files.view_root_is_project = false;
+        }
+        self.sync_tab_title();
+        self.rebuild_visible_rows();
+        self.restore_visible_selection(None);
+        self.clipboard_status = Some("Tab root reset to workspace".to_owned());
+    }
+
+    /// Move the active Files tab's view root up one level. At the workspace
+    /// root this is a no-op.
+    fn tab_root_up(&mut self) {
+        if self.tree_scope != TreeScope::AllFiles {
+            return;
+        }
+        let Some(current) = self.tab().files().view_root.clone() else {
+            return;
+        };
+        let Some(parent) = current.parent() else {
+            return;
+        };
+        if parent.as_os_str().is_empty() {
+            self.reset_tab_root();
+            return;
+        }
+        let parent = parent.to_path_buf();
+        let absolute = self.root.join(&parent);
+        let is_project = Self::view_root_is_project_like(&absolute);
+        {
+            let files = self.tab_mut().files_mut();
+            files.view_root = Some(parent.clone());
+            files.view_root_is_project = is_project;
+        }
+        if self.unloaded_directories.contains(&parent) {
+            self.request_directory_load(parent.clone());
+        }
+        self.sync_tab_title();
+        self.rebuild_visible_rows();
+        self.restore_visible_selection(None);
+        self.clipboard_status = Some(format!("Tab root: {}", parent.display()));
+    }
+
+    /// Recompute the active tab's title from its view root: a re-rooted tab
+    /// shows its workspace-relative path, otherwise the workspace name.
+    fn sync_tab_title(&mut self) {
+        if self.tab().kind != TabKind::Files {
+            return;
+        }
+        let title = match self.tab().files().view_root.clone() {
+            Some(view_root) => view_root.display().to_string(),
+            None => self
+                .root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| TabKind::Files.label().to_owned()),
+        };
+        self.tab_mut().title = title;
+    }
+
+    /// Whether a directory looks like a project boundary (contains `.git` or
+    /// a recognized language manifest), used to gate LSP server-root
+    /// preference. Checks are no-follow and bounded to direct children.
+    fn view_root_is_project_like(absolute: &Path) -> bool {
+        if path_exists_without_following(&absolute.join(".git")) {
+            return true;
+        }
+        DEPENDENCY_MANIFESTS
+            .iter()
+            .any(|manifest| path_exists_without_following(&absolute.join(manifest)))
+    }
+
+    /// After a refresh, validate the active tab's view root: reset it if the
+    /// directory was deleted, and re-request its children when the bounded
+    /// scan left them unloaded. Returns a status message when the view root
+    /// was reset (so the caller can surface it after content state settles).
+    fn reconcile_view_root_after_refresh(&mut self) -> Option<String> {
+        if self.tree_scope != TreeScope::AllFiles {
+            return None;
+        }
+        let view_root = self.tab().files().view_root.clone()?;
+        let absolute = self.root.join(&view_root);
+        if !path_exists_without_following(&absolute) {
+            // The view root was deleted (or is otherwise unreachable); fall
+            // back to the workspace root so the tree stays usable.
+            self.tab_mut().files_mut().view_root = None;
+            self.tab_mut().files_mut().view_root_is_project = false;
+            self.sync_tab_title();
+            return Some(format!(
+                "Tab root {} no longer exists; reset to workspace",
+                view_root.display()
+            ));
+        }
+        if self.unloaded_directories.contains(&view_root) {
+            self.request_directory_load(view_root);
+        }
+        None
+    }
+
+    /// Test-only: set the active Files tab's view root.
+    #[doc(hidden)]
+    pub fn set_tab_root_for_test(&mut self, path: PathBuf) {
+        self.set_tab_root(path);
+    }
+
+    /// Test-only: reset the active Files tab's view root.
+    #[doc(hidden)]
+    pub fn reset_tab_root_for_test(&mut self) {
+        self.reset_tab_root();
+    }
+
+    /// Test-only: reveal a path in the All Files tree, resetting the view
+    /// root when the path lives outside it.
+    #[doc(hidden)]
+    pub fn reveal_all_files_selection_for_test(&mut self, path: PathBuf) {
+        self.reveal_all_files_selection(path);
     }
 
     /// Dismiss (or restore) the discovery errors under the selected Git row.
@@ -5566,6 +5813,7 @@ impl App {
         self.all_entries = entries;
         self.unloaded_directories = unloaded_directories;
         self.changed_entries = changed_entries;
+        let view_root_reset_message = self.reconcile_view_root_after_refresh();
         if let Some(graph) = snapshot.graph {
             self.repo = graph
                 .repositories()
@@ -5711,6 +5959,11 @@ impl App {
                 search.selection_hint = hint;
             }
             self.rebuild_search_results();
+        }
+        // Surface the view-root reset after content state settles (content
+        // resets clear the transient status slot).
+        if let Some(message) = view_root_reset_message {
+            self.clipboard_status = Some(message);
         }
     }
 
@@ -5887,6 +6140,16 @@ impl App {
     }
 
     fn reveal_all_files_selection_inner(&mut self, path: PathBuf, load_content: bool) {
+        // A search/navigation result may live outside the tab's view root;
+        // reset the view root so the target row is visible.
+        if let Some(view_root) = self.tab().files().view_root.clone()
+            && path != view_root
+            && !path.starts_with(&view_root)
+        {
+            self.tab_mut().files_mut().view_root = None;
+            self.tab_mut().files_mut().view_root_is_project = false;
+            self.sync_tab_title();
+        }
         self.pending_all_scope_path = Some(path.clone());
         let mut parent = path.parent();
         while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
@@ -6001,15 +6264,31 @@ impl App {
     fn rebuild_visible_rows(&mut self) {
         let files_expansion = self.tab().files().expansion.clone();
         let unloaded = &self.unloaded_directories;
+        let view_root = self.tab().files().view_root.clone();
         let rows: Vec<FileEntry> = self
             .entries_for_scope(TreeScope::AllFiles)
             .iter()
             .filter(|entry| {
+                // With a tab view root, only entries strictly below it are
+                // visible; the view root itself is the implicit top.
+                if let Some(view_root) = &view_root
+                    && (entry.relative == *view_root || !entry.relative.starts_with(view_root))
+                {
+                    return false;
+                }
                 entry
                     .relative
                     .ancestors()
                     .skip(1)
                     .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                    // The view root and its ancestors are implicitly
+                    // expanded; only ancestors below it gate visibility.
+                    .filter(|ancestor| match &view_root {
+                        Some(view_root) => {
+                            ancestor.starts_with(view_root) && *ancestor != view_root
+                        }
+                        None => true,
+                    })
                     .all(|ancestor| {
                         files_expansion
                             .get(ancestor)
@@ -6530,7 +6809,12 @@ impl App {
             return;
         };
         if entry.is_dir {
-            self.load_selected_info();
+            // Directories no longer show an info page (VS Code-style): keep
+            // the current file preview if one is open, otherwise show a
+            // minimal hint.
+            if self.tab().content.identity.is_none() {
+                self.set_info(vec!["Select a file to preview its contents.".to_owned()]);
+            }
             return;
         }
         let relative = entry.relative.clone();
@@ -6849,9 +7133,13 @@ impl App {
     fn rebind_navigation_sources_after_refresh(&mut self) {
         let root = self.root.clone();
         let graph = self.repo_graph.clone();
+        let preferred = self.active_preferred_server_root();
         let current = self.tab().content.navigation_source.clone();
         let rebound = current.as_deref().and_then(|source| {
-            rebind_navigation_source(&root, graph.as_ref(), source).map(Arc::new)
+            rebind_navigation_source(&root, graph.as_ref(), source).map(|mut source| {
+                Self::apply_view_root_preference(&mut source, &root, preferred.as_deref());
+                Arc::new(source)
+            })
         });
         self.tab_mut().content.navigation_source = rebound;
         if let Some(search) = &mut self.search {
@@ -6866,9 +7154,43 @@ impl App {
     }
 
     fn rebind_content_snapshot_navigation(&self, snapshot: &mut ContentSnapshot) {
+        let preferred = self.active_preferred_server_root();
         snapshot.navigation_source = snapshot.navigation_source.as_ref().and_then(|source| {
-            rebind_navigation_source(&self.root, self.repo_graph.as_ref(), source)
+            rebind_navigation_source(&self.root, self.repo_graph.as_ref(), source).map(
+                |mut source| {
+                    Self::apply_view_root_preference(&mut source, &self.root, preferred.as_deref());
+                    source
+                },
+            )
         });
+    }
+
+    /// The active tab's preferred LSP server root: the tab's view root when
+    /// it looks like a project boundary. `None` falls back to the global
+    /// resolution (deepest nested repository, then the workspace root).
+    fn active_preferred_server_root(&self) -> Option<PathBuf> {
+        let files = self.tab().files();
+        let view_root = files.view_root.as_ref()?;
+        if !files.view_root_is_project {
+            return None;
+        }
+        Some(self.root.join(view_root))
+    }
+
+    /// Override a navigation source's server root with the tab's view-root
+    /// preference, but only when the global resolution fell back to the
+    /// workspace root and the preferred root actually contains the document.
+    fn apply_view_root_preference(
+        source: &mut NavigationSource,
+        app_root: &Path,
+        preferred: Option<&Path>,
+    ) {
+        let Some(preferred) = preferred else {
+            return;
+        };
+        if source.server_root == app_root && source.absolute_path.starts_with(preferred) {
+            source.server_root = preferred.to_path_buf();
+        }
     }
 
     fn current_navigation_entry(&self) -> Option<NavigationHistoryEntry> {
@@ -7415,7 +7737,11 @@ impl App {
         self.tab_mut().content.fold_source = snapshot.fold_source;
         self.tab_mut().content.fold_regions = snapshot.fold_regions;
         self.tab_mut().content.structure = snapshot.structure;
-        self.tab_mut().content.navigation_source = snapshot.navigation_source.map(Arc::new);
+        let preferred = self.active_preferred_server_root();
+        self.tab_mut().content.navigation_source = snapshot.navigation_source.map(|mut source| {
+            Self::apply_view_root_preference(&mut source, &self.root, preferred.as_deref());
+            Arc::new(source)
+        });
         let valid_anchors: HashSet<_> = self
             .tab_mut()
             .content
@@ -11614,6 +11940,61 @@ mod tests {
         });
         assert!(!stage_app.is_refreshing());
         assert!(!stage_app.is_content_loading());
+    }
+
+    #[test]
+    fn view_root_preference_overrides_server_root_only_for_contained_docs() {
+        let app_root = PathBuf::from("/workspace");
+        let preferred = app_root.join("subproject");
+        let doc_under = preferred.join("src/main.rs");
+        let doc_outside = app_root.join("other.rs");
+
+        // Document under the preferred root: server root moves to it.
+        let mut source = NavigationSource {
+            identity: ContentIdentity::Workspace(PathBuf::from("subproject/src/main.rs")),
+            absolute_path: doc_under.clone(),
+            content_root: app_root.clone(),
+            disk_raw_len: 0,
+            server_root: app_root.clone(),
+            language: crate::navigation::language_for_path(Path::new("main.rs")).unwrap(),
+            text: Arc::from(""),
+            line_index: Arc::new(crate::navigation::LineIndex::new(Arc::from("")).unwrap()),
+            structure: Arc::new(crate::folding::StructureSnapshot::unavailable()),
+        };
+        App::apply_view_root_preference(&mut source, &app_root, Some(&preferred));
+        assert_eq!(source.server_root, preferred);
+
+        // Document outside the preferred root: server root stays the app root.
+        let mut source = NavigationSource {
+            identity: ContentIdentity::Workspace(PathBuf::from("other.rs")),
+            absolute_path: doc_outside,
+            content_root: app_root.clone(),
+            disk_raw_len: 0,
+            server_root: app_root.clone(),
+            language: crate::navigation::language_for_path(Path::new("other.rs")).unwrap(),
+            text: Arc::from(""),
+            line_index: Arc::new(crate::navigation::LineIndex::new(Arc::from("")).unwrap()),
+            structure: Arc::new(crate::folding::StructureSnapshot::unavailable()),
+        };
+        App::apply_view_root_preference(&mut source, &app_root, Some(&preferred));
+        assert_eq!(source.server_root, app_root);
+
+        // A nested-repository server root (not the app root) is never
+        // overridden by the preference.
+        let nested = app_root.join("vendor/repo");
+        let mut source = NavigationSource {
+            identity: ContentIdentity::Workspace(PathBuf::from("vendor/repo/lib.rs")),
+            absolute_path: nested.join("lib.rs"),
+            content_root: app_root.clone(),
+            disk_raw_len: 0,
+            server_root: nested.clone(),
+            language: crate::navigation::language_for_path(Path::new("lib.rs")).unwrap(),
+            text: Arc::from(""),
+            line_index: Arc::new(crate::navigation::LineIndex::new(Arc::from("")).unwrap()),
+            structure: Arc::new(crate::folding::StructureSnapshot::unavailable()),
+        };
+        App::apply_view_root_preference(&mut source, &app_root, Some(&preferred));
+        assert_eq!(source.server_root, nested);
     }
 
     #[test]
