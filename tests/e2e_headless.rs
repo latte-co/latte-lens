@@ -81,11 +81,13 @@ fn fixture_repo() -> TestRepo {
     repo
 }
 
-/// Select a file in the tree by navigating Down/Right.
+/// Select the first Rust source file in the tree. Directories default to
+/// expanded, so one Down from `src` lands on `src/lib.rs`; Right then moves
+/// focus to the Content pane.
 fn select_file(app: &mut App) {
-    app.handle_key(key(KeyCode::Down)); // src/
-    app.handle_key(key(KeyCode::Right)); // expand
-    app.handle_key(key(KeyCode::Down)); // main.rs
+    app.handle_key(key(KeyCode::Down)); // src/lib.rs
+    app.handle_key(key(KeyCode::Right)); // focus Content
+    app.handle_key(key(KeyCode::Down)); // content scroll (no tree change)
     settle(app);
 }
 
@@ -372,18 +374,19 @@ fn e2e_folding_headless() {
     let repo = fixture_repo();
     let mut app = ready_app(repo.root().to_path_buf()).unwrap();
 
-    // Select main.rs.
+    // Select a Rust source file (src/lib.rs) with a foldable function body.
     select_file(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
-    // [ folds the current block.
+    // [ jumps to the current fold; Enter toggles it collapsed.
     app.handle_key(key(KeyCode::Char('[')));
+    app.handle_key(key(KeyCode::Enter));
     let rendered = render(&mut app);
-    // The fold marker should appear (or the content changed).
-    assert!(rendered.contains('▸') || rendered.contains("lines"));
+    // The collapsed fold marker should appear in the content.
+    assert!(rendered.contains('▸'));
 
-    // ] unfolds.
-    app.handle_key(key(KeyCode::Char(']')));
+    // Enter toggles it back open.
+    app.handle_key(key(KeyCode::Enter));
 }
 
 // ---------------------------------------------------------------------------

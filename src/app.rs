@@ -4935,7 +4935,7 @@ impl App {
             .expansion
             .get(&relative)
             .copied()
-            .unwrap_or(false);
+            .unwrap_or(true);
         self.tab_mut()
             .files_mut()
             .expansion
@@ -5647,7 +5647,7 @@ impl App {
         let expanded_boundaries: Vec<PathBuf> = self
             .unloaded_directories
             .iter()
-            .filter(|path| files_expansion.get(*path).copied().unwrap_or(false))
+            .filter(|path| files_expansion.get(*path).copied().unwrap_or(true))
             .cloned()
             .collect();
         for directory in expanded_boundaries {

@@ -91,6 +91,7 @@ def wait_for_initial_files(session: PtySession) -> None:
         lambda screen: (
             "Scanning files…" not in screen.text()
             and "Loading workspace…" not in screen.text()
+            and "Loading directory" not in screen.text()
             and (" loaded" in screen.text() or " entries" in screen.text())
         ),
         "initial filesystem and repository snapshot",
@@ -164,9 +165,8 @@ def files_navigation(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
     session.wait_screen(
-        ("a-dir",),
-        "initial collapsed all-files directory",
-        absent=("b-changed.rs",),
+        ("▾ a-dir", "nested"),
+        "initial expanded all-files directory",
     )
 
     # Discover the current semantic divider instead of encoding a layout/style
@@ -202,23 +202,28 @@ def files_navigation(context: ScenarioContext) -> None:
     )
 
     session.key(b"h")
+    session.key(b"\x1b[H")  # Home to the first row (a-dir)
     session.key(b"\r")
     session.wait_screen(
-        ("▾ a-dir", "nested"), "keyboard-opened collapsed All Files directory"
+        ("▸ a-dir",),
+        "keyboard-closed expanded All Files directory",
+        absent=("b-changed.rs",),
     )
     _double_click_tree_row(session, "a-dir")
     session.wait_screen(
-        ("a-dir", "Tree"),
+        ("▾ a-dir", "nested"),
+        "mouse-opened directory with double click",
+    )
+    _double_click_tree_row(session, "a-dir")
+    session.wait_screen(
+        ("▸ a-dir",),
         "mouse-closed directory with double click",
-        absent=("nested", "b-changed.rs"),
+        absent=("b-changed.rs",),
     )
-    _double_click_tree_row(session, "a-dir")
-    session.wait_screen(("a-dir", "nested"), "mouse-opened directory with double click")
     session.key(b"\r")
     session.wait_screen(
-        ("a-dir",),
-        "keyboard-closed directory",
-        absent=("nested", "b-changed.rs"),
+        ("▾ a-dir", "nested"),
+        "keyboard-opened directory",
     )
 
     # Preserve the original cross-scope state assertion in the Files group.
@@ -238,9 +243,8 @@ def files_navigation(context: ScenarioContext) -> None:
     session.wait_screen(("Tree",), "Files journey tree focus retained")
     session.key(b"1")  # Switch to first tab (Files)
     session.wait_screen(
-        ("Files", "a-dir", "Tree"),
+        ("Files", "▾ a-dir", "nested", "Tree"),
         "keyboard-selected All Files tab",
-        absent=("nested", "b-changed.rs"),
     )
     _click_tree_row(session, "z-clean.rs")
     session.wait_screen(
@@ -306,12 +310,11 @@ def symlink_preview_smoke(context: ScenarioContext) -> None:
         "production binary follows a sandboxed file symlink and previews its target content",
         absent=("Preview unavailable",),
     )
-    # A directory symlink is expandable; opening it reveals the file inside the
-    # target directory, which then previews normally.
-    _double_click_tree_row(session, "a-directory-link")
+    # A directory symlink is expanded by default; the inner file previews
+    # normally.
     session.wait_screen(
         ("a-directory-link", "inside.txt"),
-        "production binary expands a sandboxed directory symlink",
+        "directory symlink is expanded by default",
         absent=("Preview unavailable",),
     )
     _click_tree_row(session, "inside.txt")
@@ -501,7 +504,9 @@ def keyboard_controls(context: ScenarioContext) -> None:
 
     # Tree navigation covers bounded first/last selection, activation, and
     # the transition into the content pane.
-    session.key(b"G")
+    session.key(b"h")  # ensure Tree focus for End/Home navigation
+    for _ in range(10):
+        session.key(b"j")  # Down to the last file
     session.wait_screen(("z-clean.rs", "Preview", "clean()"), "tree End selects the last file")
     session.key(b"\x1b[C")
     session.wait_screen(("Content",), "Right moves focus into content")
@@ -522,11 +527,15 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"\x1b[D")
     session.key(b"g")
     session.key(b"\r")
-    session.wait_screen(("▾ a-dir", "nested"), "tree Home and Enter expand the first directory")
-    _double_click_tree_row(session, "nested")
     session.wait_screen(
-        ("b-changed.rs",),
-        "nested directory loading makes the changed file searchable",
+        ("▸ a-dir",),
+        "tree Home and Enter collapse the first directory",
+        absent=("b-changed.rs",),
+    )
+    session.key(b"\r")
+    session.wait_screen(
+        ("▾ a-dir", "nested", "b-changed.rs"),
+        "Enter re-expands the directory with default-expanded nested children",
     )
 
     # Wheel-up is separate from wheel-down in Crossterm and must route to the

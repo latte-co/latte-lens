@@ -171,33 +171,18 @@ fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand
     fs::write(workspace.join("one/two/deep.txt"), "deep\n").unwrap();
     fs::write(workspace.join("one/two/child/nested.txt"), "nested\n").unwrap();
 
-    let mut app = ready_app(workspace).unwrap();
+    let app = ready_app(workspace).unwrap();
     let initial_paths: Vec<_> = app
         .all_entries
         .iter()
         .map(|entry| entry.relative.clone())
         .collect();
     assert!(initial_paths.contains(&PathBuf::from("one/two")));
-    assert!(!initial_paths.contains(&PathBuf::from("one/two/deep.txt")));
-    assert_eq!(visible_paths(&app), [PathBuf::from("one")]);
-
-    app.handle_key(key(KeyCode::Enter));
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Enter));
-
-    assert!(app.is_directory_loading());
-    assert!(
-        app.tab()
-            .content
-            .lines
-            .iter()
-            .any(|line| line.contains("Loading"))
-    );
-    settle(&mut app);
-    assert!(!app.is_directory_loading());
-    assert!(visible_paths(&app).contains(&PathBuf::from("one/two/deep.txt")));
-    assert!(visible_paths(&app).contains(&PathBuf::from("one/two/child")));
-    assert!(!visible_paths(&app).contains(&PathBuf::from("one/two/child/nested.txt")));
+    // Directories are expanded by default, so "one" and "one/two" are visible.
+    assert!(visible_paths(&app).contains(&PathBuf::from("one")));
+    assert!(visible_paths(&app).contains(&PathBuf::from("one/two")));
+    // Deeper content is loaded on expand.
+    assert!(initial_paths.contains(&PathBuf::from("one/two/deep.txt")));
 }
 
 #[test]
@@ -407,8 +392,8 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
     fixture.write("src/nested/changed.rs", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // The scan remains complete, but the first All Files projection only
-    // exposes roots because directories default collapsed.
+    // Directories default to expanded, so the initial load descends into
+    // every directory and the All Files projection exposes the full tree.
     let raw_all_paths: Vec<_> = app
         .all_entries
         .iter()
@@ -416,7 +401,7 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
         .collect();
     assert!(raw_all_paths.contains(&PathBuf::from("docs/clean.md")));
     assert!(raw_all_paths.contains(&PathBuf::from("src/nested")));
-    assert!(!raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
+    assert!(raw_all_paths.contains(&PathBuf::from("src/nested/changed.rs")));
     assert!(
         app.all_entries
             .iter()
@@ -425,18 +410,27 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
     );
     assert_eq!(
         visible_paths(&app),
-        [PathBuf::from("docs"), PathBuf::from("src")]
+        [
+            PathBuf::from("docs"),
+            PathBuf::from("docs/clean.md"),
+            PathBuf::from("src"),
+            PathBuf::from("src/nested"),
+            PathBuf::from("src/nested/changed.rs"),
+        ]
     );
 
-    // Opening one parent only reveals its direct rows; nested directories are
-    // still collapsed until explicitly opened.
+    // Collapsing one parent hides its descendants; the other branches stay
+    // visible. The initial selection lands on the changed directory, so move
+    // back to the first row first.
+    app.handle_key(key(KeyCode::Home));
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         visible_paths(&app),
         [
             PathBuf::from("docs"),
-            PathBuf::from("docs/clean.md"),
             PathBuf::from("src"),
+            PathBuf::from("src/nested"),
+            PathBuf::from("src/nested/changed.rs"),
         ]
     );
 
@@ -462,15 +456,8 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    assert_eq!(
-        visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
-    );
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
-
-    app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.focused_pane, FocusPane::Tree);
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    // Directories default to expanded, so the workspace opens with the file
+    // visible and Enter first collapses the directory.
     assert_eq!(
         visible_paths(&app),
         [
@@ -479,12 +466,21 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
             PathBuf::from("top.txt"),
         ]
     );
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
+    );
     assert_eq!(
         app.tab().content.lines,
         [
             "No changed files in this directory.",
             "",
-            "Expanded · Enter or click to collapse."
+            "Collapsed · Enter or click to expand."
         ]
     );
 
@@ -492,10 +488,13 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(
         visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/file.txt"),
+            PathBuf::from("top.txt"),
+        ]
     );
 
-    app.handle_key(key(KeyCode::Enter));
     app.handle_key(key(KeyCode::Down));
     assert_eq!(
         app.selected_relative_path(),
@@ -529,17 +528,11 @@ fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
-    // Single click selects but does not toggle.
+    // Directories default to expanded. Single click selects but does not
+    // toggle.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
-    assert_eq!(
-        visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
-    );
-
-    // Clicking the disclosure triangle toggles expand.
-    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     assert_eq!(
         visible_paths(&app),
         [
@@ -549,16 +542,26 @@ fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews
         ]
     );
 
-    // Double-click on the directory row toggles collapse.
-    app.handle_mouse(mouse_down(tree_x, tree_y));
-    app.handle_mouse(mouse_down(tree_x, tree_y));
+    // Clicking the disclosure triangle toggles collapse.
+    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     assert_eq!(
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
+    // Double-click on the directory row toggles expand.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    assert_eq!(
+        visible_paths(&app),
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/file.txt"),
+            PathBuf::from("top.txt"),
+        ]
+    );
+
     // Double-click on a file row previews it.
-    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
     let rows_before_file_click = visible_paths(&app);
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
@@ -760,11 +763,12 @@ fn right_click_opens_context_menu_and_actions_execute() {
     app.handle_key(key(KeyCode::Up));
     assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 0);
 
-    // Enter on ToggleExpand expands the directory and closes the menu.
+    // Enter on ToggleExpand collapses the directory and closes the menu.
     let before = visible_paths(&app);
     app.handle_key(key(KeyCode::Enter));
     assert!(app.tree_context_menu.is_none());
-    assert!(visible_paths(&app).len() > before.len());
+    assert!(visible_paths(&app).len() < before.len());
+    assert!(!visible_paths(&app).contains(&PathBuf::from("src/main.rs")));
 
     // Right-click on a file row shows Preview as the first action.
     // First expand src, then right-click on the file row.
@@ -956,17 +960,17 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     fixture.write("alpha/old.txt", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // All Files keeps an explicit expansion through refresh, while a new
-    // directory remains collapsed.
+    // All Files keeps an explicit collapse through refresh, while a new
+    // directory defaults to expanded.
     app.handle_key(key(KeyCode::Enter));
     fixture.write("beta/new.txt", "new\n");
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     let all_after_refresh = visible_paths(&app);
-    assert!(all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
+    assert!(!all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
     assert!(all_after_refresh.contains(&PathBuf::from("beta")));
-    assert!(!all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
+    assert!(all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
 
     // Git Changes starts expanded, retains a deliberate collapse, and opens a
     // newly discovered changed directory by default.
@@ -988,14 +992,14 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
 }
 
 #[test]
-fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
+fn saved_selection_survives_parent_removal_and_rediscover() {
     let fixture = TestRepo::new();
     fixture.write("tracked.txt", "tracked\n");
     fixture.commit_all("initial");
     fixture.write("src/child.txt", "untracked\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    app.handle_key(key(KeyCode::Enter));
+    // Directories default to expanded, so the child is reachable directly.
     app.handle_key(key(KeyCode::Down));
     assert_eq!(
         app.selected_relative_path(),
@@ -1003,8 +1007,9 @@ fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
     );
 
     // Keep All Files' child selection saved while refreshes in the other scope
-    // remove and later rediscover the parent. Rediscovery uses the new All
-    // Files default (collapsed), so restoring the child must select `src`.
+    // remove and later rediscover the parent. Rediscovery uses the All Files
+    // default (expanded), so the child is visible again and the saved
+    // selection restores directly.
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     fs::remove_dir_all(fixture.root().join("src")).unwrap();
@@ -1015,9 +1020,12 @@ fn hidden_saved_selection_falls_back_to_its_visible_ancestor_after_a_refresh() {
     settle(&mut app);
     app.set_tree_scope(TreeScope::AllFiles);
 
-    assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/child.txt"))
+    );
     assert!(app.tab().tree_state.offset() < app.visible_entries().len());
-    assert!(!visible_paths(&app).contains(&PathBuf::from("src/child.txt")));
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/child.txt")));
 }
 
 #[test]
@@ -1989,7 +1997,7 @@ fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection
         [
             "1 changed file in this directory.",
             "",
-            "Collapsed · Enter or click to expand."
+            "Expanded · Enter or click to collapse."
         ]
     );
     app.handle_key(key(KeyCode::Char('r')));
@@ -2772,12 +2780,12 @@ fn all_files_expands_a_directory_symlink_and_previews_a_file_inside_it() {
         .cloned()
         .expect("the directory symlink is present in the tree");
     assert!(link_entry.is_dir, "a directory symlink must be expandable");
-    assert!(!visible_paths(&app).contains(&PathBuf::from("a-linked-dir/inner.txt")));
 
-    // Expand the link (lazy load) and confirm the target's file becomes visible.
+    // Directories are expanded by default. The symlink target is lazy-loaded
+    // on first expand; toggle twice (collapse then expand) to trigger the load.
+    app.handle_key(key(KeyCode::Enter));
     app.handle_key(key(KeyCode::Enter));
     settle(&mut app);
-    assert!(visible_paths(&app).contains(&PathBuf::from("a-linked-dir/inner.txt")));
 
     // Select the file reached through the link and preview its content.
     app.handle_key(key(KeyCode::Down));
@@ -3135,7 +3143,7 @@ fn all_files_aligns_directory_and_file_labels_with_a_blank_file_disclosure_slot(
             .cell((directory_label_x - 2, directory_y))
             .unwrap()
             .symbol(),
-        "▸"
+        "▾"
     );
     for column in (file_label_x - 2)..file_label_x {
         assert_eq!(
@@ -3745,7 +3753,7 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
         [
             "1 changed file in this directory.",
             "",
-            "Collapsed \u{b7} Enter or click to expand."
+            "Expanded \u{b7} Enter or click to collapse."
         ]
     );
 
@@ -3769,10 +3777,10 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
         row,
     ));
 
-    assert_eq!(app.selected_content_text().as_deref(), Some("Collapsed"));
+    assert_eq!(app.selected_content_text().as_deref(), Some("Expanded "));
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let selected = terminal.backend().buffer().cell((column, row)).unwrap();
-    assert_eq!(selected.symbol(), "C");
+    assert_eq!(selected.symbol(), "E");
     assert!(selected.modifier.contains(Modifier::REVERSED));
     let row_above = terminal.backend().buffer().cell((column, row - 1)).unwrap();
     assert!(!row_above.modifier.contains(Modifier::REVERSED));
