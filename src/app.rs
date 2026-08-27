@@ -5943,8 +5943,8 @@ impl App {
         self.rebuild_visible_rows();
     }
 
-    const fn default_directory_expansion(scope: TreeScope) -> bool {
-        matches!(scope, TreeScope::GitChanges)
+    const fn default_directory_expansion(_scope: TreeScope) -> bool {
+        true
     }
 
     fn reconcile_expansion_state(&mut self) {
