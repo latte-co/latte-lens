@@ -26,6 +26,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
+    terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
 
 /// See what your agents are changing.
@@ -149,6 +150,32 @@ fn run_hooks_command(hooks: HooksArgs) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort restoration of terminal state. Called from the panic hook so
+/// that a panic in the TUI loop doesn't leave the terminal in raw mode /
+/// alternate screen (which manifests as a frozen, "crashed" terminal).
+fn restore_terminal_after_panic() {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+    #[cfg(not(windows))]
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = execute!(stdout, DisableMouseCapture);
+}
+
+/// Install a panic hook that restores the terminal before delegating to the
+/// default hook (which prints the panic message). Only restores for main-
+/// thread panics; worker threads are already guarded by `catch_unwind`.
+fn install_terminal_panic_hook() {
+    let main_thread = std::thread::current().id();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == main_thread {
+            restore_terminal_after_panic();
+        }
+        default_hook(info);
+    }));
+}
+
 fn run_tui(path: PathBuf) -> Result<()> {
     let workspace = path
         .canonicalize()
@@ -156,6 +183,9 @@ fn run_tui(path: PathBuf) -> Result<()> {
     if !workspace.is_dir() {
         bail!("{} is not a directory", workspace.display());
     }
+    // Ensure any panic in the TUI loop restores the terminal instead of
+    // leaving it frozen in raw mode / alternate screen.
+    install_terminal_panic_hook();
     // Resolve startup configuration once before rendering; theme and navigation
     // failures remain isolated in the returned warnings.
     let loaded = load_user_configuration(&workspace);
