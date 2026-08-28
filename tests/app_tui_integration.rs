@@ -5268,6 +5268,7 @@ fn search_reveal_outside_view_root_resets_view_root() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn symlink_directory_cannot_be_tab_root() {
     use std::os::unix::fs::symlink;
