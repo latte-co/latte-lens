@@ -5178,10 +5178,13 @@ fn copy_relative_path_uses_view_root_when_re_rooted() {
     // Select src/main.rs and copy its relative path at the workspace root.
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Char('y')));
+    let expected_root_relative = Path::new("src").join("main.rs").display().to_string();
     assert!(
         app.clipboard_status
             .as_deref()
-            .is_some_and(|status| status.contains("src/main.rs"))
+            .is_some_and(|status| status.contains(&expected_root_relative)),
+        "expected clipboard status to contain {expected_root_relative}, got {:?}",
+        app.clipboard_status
     );
 
     // Re-root to src, then copy: the path is now relative to src.
@@ -5189,8 +5192,9 @@ fn copy_relative_path_uses_view_root_when_re_rooted() {
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Char('y')));
     let status = app.clipboard_status.as_deref().unwrap();
+    let src_prefix = format!("src{}", std::path::MAIN_SEPARATOR);
     assert!(
-        status.contains("main.rs") && !status.contains("src/"),
+        status.contains("main.rs") && !status.contains(&src_prefix),
         "expected view-root-relative path, got {status}"
     );
 }
