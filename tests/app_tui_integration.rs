@@ -557,10 +557,17 @@ fn single_click_toggles_directories_and_double_click_previews_files() {
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
-    // Single click on a directory row expands it (VS Code-style).
+    // Directories default to expanded; single click collapses it (VS Code-style).
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt")]
+    );
+
+    // Single click again expands it.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
         [
@@ -570,15 +577,7 @@ fn single_click_toggles_directories_and_double_click_previews_files() {
         ]
     );
 
-    // Single click again collapses it.
-    app.handle_mouse(mouse_down(tree_x, tree_y));
-    assert_eq!(
-        visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
-    );
-
-    // Re-expand, then double-click on a file row previews it.
-    app.handle_mouse(mouse_down(tree_x, tree_y));
+    // Double-click on a file row previews it.
     let rows_before_file_click = visible_paths(&app);
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
     app.handle_mouse(mouse_down(tree_x, tree_y + 1));
@@ -3786,8 +3785,8 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     // Open the file so the content pane has selectable text (directories no
-    // longer show an info preview).
-    app.handle_key(key(KeyCode::Enter));
+    // longer show an info preview). src defaults to expanded, so navigate
+    // directly to src/lib.rs.
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
     settle(&mut app);
@@ -5125,6 +5124,7 @@ fn set_tab_root_filters_tree_to_subdirectory_and_reset_restores() {
         visible_paths(&app),
         [
             PathBuf::from("docs"),
+            PathBuf::from("docs/readme.md"),
             PathBuf::from("src"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/main.rs"),
@@ -5141,9 +5141,7 @@ fn tab_root_up_walks_to_parent_and_workspace_root() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Expand src and src/deep.
-    app.handle_key(key(KeyCode::Enter));
-    settle(&mut app);
+    // src defaults to expanded; navigate to src/deep and expand it.
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
     settle(&mut app);
@@ -5173,7 +5171,8 @@ fn copy_relative_path_uses_view_root_when_re_rooted() {
     fixture.write("src/main.rs", "fn main() {}\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    app.handle_key(key(KeyCode::Enter));
+    // src defaults to expanded; navigate directly to src/main.rs.
+    app.handle_key(key(KeyCode::Down));
     settle(&mut app);
 
     // Select src/main.rs and copy its relative path at the workspace root.
