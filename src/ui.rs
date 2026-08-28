@@ -1304,6 +1304,15 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             Style::default().fg(Theme::current().success),
         )))]
     } else {
+        // When re-rooted, indent guides are relative to the view root so
+        // children start at depth 0 instead of the global workspace depth.
+        let root_depth = app
+            .tab()
+            .files()
+            .view_root
+            .as_ref()
+            .filter(|_| app.tree_scope == TreeScope::AllFiles)
+            .map_or(0, |root| root.components().count());
         match app.tree_scope {
             TreeScope::AllFiles => app
                 .visible_entries()
@@ -1317,6 +1326,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                             selected == Some(index),
                             focused,
                             rows.width,
+                            root_depth,
                         )),
                         hover_row == Some(index),
                         hover_style,
@@ -1726,6 +1736,7 @@ fn tree_line(
     selected: bool,
     focused: bool,
     width: u16,
+    root_depth: usize,
 ) -> Line<'static> {
     let disclosure = if entry.is_dir {
         if app.directory_is_loading(entry) {
@@ -1762,6 +1773,8 @@ fn tree_line(
         theme.text_muted
     };
     // Build indent guides: a muted vertical bar at each depth level.
+    // Depth is relative to the view root so re-rooted children start at 0.
+    let indent_depth = entry.depth.saturating_sub(root_depth);
     let mut spans = vec![Span::styled(
         if selected { "▌ " } else { "  " },
         Style::default().fg(if selected && focused {
@@ -1770,7 +1783,7 @@ fn tree_line(
             theme.text_subtle
         }),
     )];
-    for _ in 0..entry.depth {
+    for _ in 0..indent_depth {
         spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
     }
     spans.push(Span::styled(disclosure, Style::default().fg(icon_color)));
@@ -2596,7 +2609,8 @@ fn draw_tree_breadcrumb(
     // Drop leading segments that would overflow, keeping the tail.
     let mut skip = 0;
     while total > available && skip < segments.len() - 1 {
-        total -= UnicodeWidthStr::width(segments[skip].0.as_str()) + separator_width;
+        total = total
+            .saturating_sub(UnicodeWidthStr::width(segments[skip].0.as_str()) + separator_width);
         skip += 1;
     }
     let mut spans = vec![Span::styled(

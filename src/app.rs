@@ -6149,6 +6149,10 @@ impl App {
             self.tab_mut().files_mut().view_root = None;
             self.tab_mut().files_mut().view_root_is_project = false;
             self.sync_tab_title();
+            self.clipboard_status = Some(format!(
+                "Tab root {} reset: target is outside it",
+                view_root.display()
+            ));
         }
         self.pending_all_scope_path = Some(path.clone());
         let mut parent = path.parent();
