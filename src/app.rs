@@ -5952,16 +5952,21 @@ impl App {
         // filtered Git view. That preserves a Git-scope choice while its
         // directory is temporarily clean, but drops it once the directory is
         // genuinely gone or no longer a directory.
+        //
+        // Unloaded (lazy) directories stay in the map so that an explicit
+        // user expansion survives a refresh; only *new* unloaded directories
+        // default to collapsed.
         let directories: HashSet<PathBuf> = self
             .all_entries
             .iter()
             .filter(|entry| entry.is_dir)
             .map(|entry| entry.relative.clone())
-            .filter(|path| !self.unloaded_directories.contains(path))
             .collect();
+        let unloaded = self.unloaded_directories.clone();
         Self::reconcile_expansion_map(
             &mut self.tab_mut().files_mut().expansion,
             &directories,
+            &unloaded,
             Self::default_directory_expansion(TreeScope::AllFiles),
         );
         let git_containers: HashSet<GitRowIdentity> = self
@@ -5980,13 +5985,16 @@ impl App {
     fn reconcile_expansion_map(
         expansion: &mut HashMap<PathBuf, bool>,
         directories: &HashSet<PathBuf>,
+        unloaded: &HashSet<PathBuf>,
         default_expanded: bool,
     ) {
         expansion.retain(|path, _| directories.contains(path));
         for directory in directories {
-            expansion
-                .entry(directory.clone())
-                .or_insert(default_expanded);
+            // New unloaded (lazy) directories default to collapsed so the
+            // tree does not fan out loads on refresh; new loaded directories
+            // follow the scope default. Existing entries keep their value.
+            let entry_default = default_expanded && !unloaded.contains(directory);
+            expansion.entry(directory.clone()).or_insert(entry_default);
         }
     }
 
