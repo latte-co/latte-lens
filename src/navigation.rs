@@ -1526,7 +1526,10 @@ fn lsp_uri_to_file_path(uri: &lsp_types::Uri) -> Result<PathBuf> {
     Ok(path)
 }
 
-const DEPENDENCY_MANIFESTS: [&str; 5] = [
+/// Language manifests that mark a directory as a project boundary. Reused by
+/// the tab view-root feature to decide whether a re-rooted tab should prefer
+/// its own LSP server root.
+pub(crate) const DEPENDENCY_MANIFESTS: [&str; 5] = [
     "go.mod",
     "Cargo.toml",
     "package.json",

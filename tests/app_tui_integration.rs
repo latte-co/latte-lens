@@ -506,13 +506,11 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
         visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
+    // Directories no longer show an info preview (VS Code-style): the content
+    // pane keeps its minimal hint when no file is open.
     assert_eq!(
         app.tab().content.lines,
-        [
-            "No changed files in this directory.",
-            "",
-            "Collapsed · Enter or click to expand."
-        ]
+        ["Select a file to preview its contents."]
     );
 
     app.handle_key(key(KeyCode::Enter));
@@ -547,7 +545,7 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
 }
 
 #[test]
-fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews_files() {
+fn single_click_toggles_directories_and_double_click_previews_files() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "fixture\n");
     fixture.write("top.txt", "top\n");
@@ -559,29 +557,16 @@ fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
-    // Directories default to expanded. Single click selects but does not
-    // toggle.
+    // Directories default to expanded; single click collapses it (VS Code-style).
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
         visible_paths(&app),
-        [
-            PathBuf::from("src"),
-            PathBuf::from("src/file.txt"),
-            PathBuf::from("top.txt"),
-        ]
-    );
-
-    // Clicking the disclosure triangle toggles collapse.
-    app.handle_mouse(mouse_down(tree_x + 2, tree_y));
-    assert_eq!(
-        visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
-    // Double-click on the directory row toggles expand.
-    app.handle_mouse(mouse_down(tree_x, tree_y));
+    // Single click again expands it.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
@@ -610,7 +595,7 @@ fn mouse_triangle_and_double_click_toggles_directories_and_double_click_previews
 }
 
 #[test]
-fn mouse_triangle_and_double_click_toggles_git_changes_containers() {
+fn single_click_toggles_git_changes_containers() {
     let fixture = TestRepo::new();
     fixture.write("src/file.txt", "before\n");
     fixture.commit_all("initial");
@@ -629,16 +614,12 @@ fn mouse_triangle_and_double_click_toggles_git_changes_containers() {
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
 
-    // "src" directory sits below the repository row; its triangle column is
-    // derived from the rendered depth (2 cols selection + 2 cols per depth).
+    // "src" directory sits below the repository row.
     let directory_row = tree_y + 1;
-    let directory_depth = app.visible_git_rows()[1].depth;
-    let triangle_x = tree_x + 2 + u16::try_from(directory_depth).unwrap() * 2;
-    // Triangle click toggles.
-    app.handle_mouse(mouse_down(triangle_x, directory_row));
-    assert_eq!(visible_paths(&app), [PathBuf::from("src")]);
-    // Double-click toggles back.
+    // Single click toggles (VS Code-style).
     app.handle_mouse(mouse_down(tree_x, directory_row));
+    assert_eq!(visible_paths(&app), [PathBuf::from("src")]);
+    // Single click again toggles back.
     app.handle_mouse(mouse_down(tree_x, directory_row));
     assert_eq!(
         visible_paths(&app),
@@ -2021,13 +2002,11 @@ fn directory_selection_summarizes_nested_changes_and_refresh_preserves_selection
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
+    // Directories no longer show a change summary; the content pane keeps a
+    // minimal hint until a file is opened.
     assert_eq!(
         app.tab().content.lines,
-        [
-            "1 changed file in this directory.",
-            "",
-            "Expanded · Enter or click to collapse."
-        ]
+        ["Select a file to preview its contents."]
     );
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
@@ -2902,23 +2881,18 @@ fn all_files_treats_a_directory_symlink_as_an_expandable_directory() {
     );
     assert_ne!(app.tab().content.provider.as_deref(), Some("symlink"));
 
-    // Selecting the directory symlink shows its resolved real path in the info
-    // pane (directory links never enter Preview mode, so this is where the
-    // target surfaces).
+    // Selecting the directory symlink no longer shows an info pane (VS
+    // Code-style directories have no preview); the hint is shown instead.
+    // The resolved real path remains available via the `Y` copy action.
     assert_eq!(
         app.selected_relative_path(),
         Some(PathBuf::from("AspectCore-Framework"))
     );
     app.handle_key(key(KeyCode::Char('p')));
     settle(&mut app);
-    let info = app.tab().content.lines.join("\n");
-    assert!(
-        info.contains('↗'),
-        "info pane marks the resolved path with ↗"
-    );
-    assert!(
-        info.contains(&target.canonicalize().unwrap().display().to_string()),
-        "info pane shows the directory symlink's real path"
+    assert_eq!(
+        app.tab().content.lines,
+        ["Select a file to preview its contents."]
     );
 }
 
@@ -3379,6 +3353,43 @@ fn divider_drag_resizes_tree_with_minimum_tree_and_content_widths() {
 }
 
 #[test]
+fn divider_drag_with_view_root_set_does_not_panic() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    app.set_tab_root_for_test(PathBuf::from("src"));
+
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // Drag the divider across the full width while the view root is set.
+    let drag_row = app.ui_regions.divider.y + 2;
+    for column in [80u16, 60, 40, 20, 10, 50, 90] {
+        app.handle_mouse(mouse_down(app.ui_regions.divider.x, drag_row));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            column,
+            drag_row,
+        ));
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            drag_row,
+        ));
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    }
+    assert_eq!(app.tab().files().view_root, Some(PathBuf::from("src")));
+}
+
+#[test]
 fn divider_drag_resizes_right_docked_tree() {
     let fixture = TestRepo::new();
     fixture.write("file.txt", "hello\n");
@@ -3770,46 +3781,59 @@ fn y_key_copies_directory_path_with_trailing_slash() {
 #[test]
 fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     let fixture = TestRepo::new();
-    fixture.write("src/lib.rs", "before\n");
+    fixture.write("src/lib.rs", "pub fn first() {}\npub fn second() {}\n");
     fixture.commit_all("initial");
-    fixture.write("src/lib.rs", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    assert_eq!(app.tab().content.mode, ContentMode::Info);
-    assert_eq!(
-        app.tab().content.lines,
-        [
-            "1 changed file in this directory.",
-            "",
-            "Expanded \u{b7} Enter or click to collapse."
-        ]
-    );
+    // Open the file so the content pane has selectable text (directories no
+    // longer show an info preview). src defaults to expanded, so navigate
+    // directly to src/lib.rs.
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
 
     let column = app.ui_regions.content_inner.x;
-    // Info content is rendered one row below content_inner, so line index 2 is
-    // visible at y + 3 rather than y + 2.
-    let row = app.ui_regions.content_inner.y + 3;
+    // Content is rendered one row below content_inner, so line index 0 is
+    // visible at y + 1 rather than y. Drag across the first line past the
+    // line-number gutter.
+    let row = app.ui_regions.content_inner.y + 1;
+    let drag_column = column + 12;
     app.handle_mouse(mouse_down(column, row));
     app.handle_mouse(mouse(
         MouseEventKind::Drag(MouseButton::Left),
-        column + 8,
+        drag_column,
         row,
     ));
     app.handle_mouse(mouse(
         MouseEventKind::Up(MouseButton::Left),
-        column + 8,
+        drag_column,
         row,
     ));
 
-    assert_eq!(app.selected_content_text().as_deref(), Some("Expanded "));
+    let selected_text = app.selected_content_text();
+    assert!(
+        selected_text
+            .as_deref()
+            .is_some_and(|text| text.contains("pub")),
+        "expected selection to include the file's first line, got {selected_text:?}"
+    );
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    let selected = terminal.backend().buffer().cell((column, row)).unwrap();
-    assert_eq!(selected.symbol(), "E");
+    // The selected row carries the reversed modifier; the row above does not.
+    let selected = terminal
+        .backend()
+        .buffer()
+        .cell((drag_column, row))
+        .unwrap();
     assert!(selected.modifier.contains(Modifier::REVERSED));
-    let row_above = terminal.backend().buffer().cell((column, row - 1)).unwrap();
+    let row_above = terminal
+        .backend()
+        .buffer()
+        .cell((drag_column, row - 1))
+        .unwrap();
     assert!(!row_above.modifier.contains(Modifier::REVERSED));
 }
 
@@ -5064,6 +5088,222 @@ fn set_test_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
 fn remove_test_env(key: &str) {
     // SAFETY: paired with the serialized test-only mutation above.
     unsafe { std::env::remove_var(key) };
+}
+
+#[test]
+fn set_tab_root_filters_tree_to_subdirectory_and_reset_restores() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    fixture.write("docs/readme.md", "# docs\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // Expand src so its children are loaded.
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/main.rs")));
+
+    // Set the tab root to src via the context menu action.
+    app.set_tab_root_for_test(PathBuf::from("src"));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")]
+    );
+    assert_eq!(app.tab().title, "src");
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("src/lib.rs"))
+    );
+
+    // Reset restores the full tree.
+    app.reset_tab_root_for_test();
+    assert_eq!(
+        visible_paths(&app),
+        [
+            PathBuf::from("docs"),
+            PathBuf::from("docs/readme.md"),
+            PathBuf::from("src"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("top.txt"),
+        ]
+    );
+    assert_ne!(app.tab().title, "src");
+}
+
+#[test]
+fn tab_root_up_walks_to_parent_and_workspace_root() {
+    let fixture = TestRepo::new();
+    fixture.write("src/deep/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+
+    // src defaults to expanded; navigate to src/deep and expand it.
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    app.set_tab_root_for_test(PathBuf::from("src/deep"));
+    assert_eq!(visible_paths(&app), [PathBuf::from("src/deep/main.rs")]);
+
+    // Backspace (no type-ahead active) walks up to src.
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src/deep"), PathBuf::from("src/deep/main.rs")]
+    );
+    assert_eq!(app.tab().title, "src");
+
+    // Backspace again walks up to the workspace root.
+    app.handle_key(key(KeyCode::Backspace));
+    assert!(visible_paths(&app).contains(&PathBuf::from("src")));
+    assert!(
+        visible_paths(&app).contains(&PathBuf::from("top.txt")) || visible_paths(&app).len() > 2
+    );
+}
+
+#[test]
+fn copy_relative_path_uses_view_root_when_re_rooted() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // src defaults to expanded; navigate directly to src/main.rs.
+    app.handle_key(key(KeyCode::Down));
+    settle(&mut app);
+
+    // Select src/main.rs and copy its relative path at the workspace root.
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Char('y')));
+    let expected_root_relative = Path::new("src").join("main.rs").display().to_string();
+    assert!(
+        app.clipboard_status
+            .as_deref()
+            .is_some_and(|status| status.contains(&expected_root_relative)),
+        "expected clipboard status to contain {expected_root_relative}, got {:?}",
+        app.clipboard_status
+    );
+
+    // Re-root to src, then copy: the path is now relative to src.
+    app.set_tab_root_for_test(PathBuf::from("src"));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Char('y')));
+    let status = app.clipboard_status.as_deref().unwrap();
+    let src_prefix = format!("src{}", std::path::MAIN_SEPARATOR);
+    assert!(
+        status.contains("main.rs") && !status.contains(&src_prefix),
+        "expected view-root-relative path, got {status}"
+    );
+}
+
+#[test]
+fn alt_click_on_directory_sets_tab_root() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("top.txt", "top\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let tree_x = app.ui_regions.tree_inner.x;
+    let tree_y = app.ui_regions.tree_inner.y;
+    // Alt+click on the "src" directory row re-roots the tab.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: tree_x,
+        row: tree_y,
+        modifiers: KeyModifiers::ALT,
+    });
+    settle(&mut app);
+    assert_eq!(visible_paths(&app), [PathBuf::from("src/main.rs")]);
+    assert_eq!(app.tab().title, "src");
+}
+
+#[test]
+fn deleted_view_root_resets_to_workspace_after_refresh() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    app.set_tab_root_for_test(PathBuf::from("src"));
+    assert_eq!(app.tab().title, "src");
+
+    // Delete the view root directory, then refresh.
+    fs::remove_dir_all(fixture.root().join("src")).unwrap();
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+
+    assert_eq!(app.tab().files().view_root, None);
+    assert!(
+        app.clipboard_status
+            .as_deref()
+            .is_some_and(|status| status.contains("reset to workspace"))
+    );
+}
+
+#[test]
+fn search_reveal_outside_view_root_resets_view_root() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.write("other.txt", "other\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+
+    app.set_tab_root_for_test(PathBuf::from("src"));
+    settle(&mut app);
+    assert_eq!(app.tab().files().view_root, Some(PathBuf::from("src")));
+
+    // Revealing a file outside the view root resets it.
+    app.reveal_all_files_selection_for_test(PathBuf::from("other.txt"));
+    assert_eq!(app.tab().files().view_root, None);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("other.txt"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_directory_cannot_be_tab_root() {
+    use std::os::unix::fs::symlink;
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("file.txt"), "content\n").unwrap();
+    symlink(outside.path(), workspace.path().join("linkdir")).unwrap();
+
+    let mut app = ready_app(workspace.path().to_path_buf()).unwrap();
+    let before = visible_paths(&app);
+    // Attempting to set a symlink directory as tab root is a no-op.
+    app.set_tab_root_for_test(PathBuf::from("linkdir"));
+    assert_eq!(app.tab().files().view_root, None);
+    assert_eq!(visible_paths(&app), before);
+}
+
+#[test]
+fn new_files_tab_defaults_to_workspace_root() {
+    let fixture = TestRepo::new();
+    fixture.write("src/main.rs", "fn main() {}\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    app.set_tab_root_for_test(PathBuf::from("src"));
+    assert_eq!(app.tab().files().view_root, Some(PathBuf::from("src")));
+
+    // A new Files tab starts at the workspace root.
+    app.open_tab(TabKind::Files);
+    assert_eq!(app.tab().files().view_root, None);
+    assert!(visible_paths(&app).contains(&PathBuf::from("src")));
 }
 
 fn key(code: KeyCode) -> KeyEvent {

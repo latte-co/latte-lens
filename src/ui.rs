@@ -1,4 +1,7 @@
-use std::{ops::Range, path::Path};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use ratatui::{
     Frame,
@@ -410,6 +413,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
         divider,
         tree_hide_button: Rect::default(),
         tree_show_button: Rect::default(),
+        tree_breadcrumbs: Vec::new(),
         content_scrollbar_track: Rect::default(),
         content_scrollbar_thumb_start: 0,
         content_scrollbar_thumb_size: 0,
@@ -1289,6 +1293,7 @@ fn with_hover<'a>(item: ListItem<'a>, hovered: bool, style: Style) -> ListItem<'
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
+    app.ui_regions.tree_breadcrumbs.clear();
     let selected = app.tab_mut().tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
     let hover_row = app.tree_hover_row();
@@ -1299,6 +1304,15 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             Style::default().fg(Theme::current().success),
         )))]
     } else {
+        // When re-rooted, indent guides are relative to the view root so
+        // children start at depth 0 instead of the global workspace depth.
+        let root_depth = app
+            .tab()
+            .files()
+            .view_root
+            .as_ref()
+            .filter(|_| app.tree_scope == TreeScope::AllFiles)
+            .map_or(0, |root| root.components().count());
         match app.tree_scope {
             TreeScope::AllFiles => app
                 .visible_entries()
@@ -1312,6 +1326,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
                             selected == Some(index),
                             focused,
                             rows.width,
+                            root_depth,
                         )),
                         hover_row == Some(index),
                         hover_style,
@@ -1451,14 +1466,32 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         Theme::current().tree_accent
     };
-    draw_panel_heading(
-        frame,
-        Rect::new(header.x, header.y, heading_width, header.height),
-        heading,
-        &detail,
-        focused,
-        tree_accent,
-    );
+    let view_root = app
+        .tab()
+        .files()
+        .view_root
+        .clone()
+        .filter(|_| app.tree_scope == TreeScope::AllFiles);
+    if let Some(view_root) = view_root {
+        draw_tree_breadcrumb(
+            frame,
+            app,
+            Rect::new(header.x, header.y, heading_width, header.height),
+            &view_root,
+            &detail,
+            focused,
+            tree_accent,
+        );
+    } else {
+        draw_panel_heading(
+            frame,
+            Rect::new(header.x, header.y, heading_width, header.height),
+            heading,
+            &detail,
+            focused,
+            tree_accent,
+        );
+    }
     // Hide-panel button at the far right of the tree header.
     let hide_rect = app.ui_regions.tree_hide_button;
     if hide_rect.width > 0 {
@@ -1703,6 +1736,7 @@ fn tree_line(
     selected: bool,
     focused: bool,
     width: u16,
+    root_depth: usize,
 ) -> Line<'static> {
     let disclosure = if entry.is_dir {
         if app.directory_is_loading(entry) {
@@ -1739,6 +1773,8 @@ fn tree_line(
         theme.text_muted
     };
     // Build indent guides: a muted vertical bar at each depth level.
+    // Depth is relative to the view root so re-rooted children start at 0.
+    let indent_depth = entry.depth.saturating_sub(root_depth);
     let mut spans = vec![Span::styled(
         if selected { "▌ " } else { "  " },
         Style::default().fg(if selected && focused {
@@ -1747,7 +1783,7 @@ fn tree_line(
             theme.text_subtle
         }),
     )];
-    for _ in 0..entry.depth {
+    for _ in 0..indent_depth {
         spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
     }
     spans.push(Span::styled(disclosure, Style::default().fg(icon_color)));
@@ -2524,6 +2560,99 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ])
     };
     frame.render_widget(Paragraph::new(content), area);
+}
+
+/// Render the tree header as a clickable breadcrumb when the active Files tab
+/// is re-rooted: `⌂ / seg1 / seg2  <detail>`. The `⌂` segment resets the tab
+/// to the workspace root; intermediate segments jump to that level. Hit
+/// regions are stored in [`UiRegions::tree_breadcrumbs`].
+fn draw_tree_breadcrumb(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    view_root: &Path,
+    detail: &str,
+    focused: bool,
+    accent: Color,
+) {
+    let theme = Theme::current();
+    let segment_style = if focused {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.text_subtle)
+            .add_modifier(Modifier::BOLD)
+    };
+    // Build clickable segments: home (workspace root) + each path component.
+    let mut segments: Vec<(String, PathBuf)> = vec![("⌂".to_owned(), PathBuf::new())];
+    let mut cumulative = PathBuf::new();
+    for component in view_root.components() {
+        cumulative.push(component);
+        segments.push((
+            component.as_os_str().to_string_lossy().into_owned(),
+            cumulative.clone(),
+        ));
+    }
+    let overhead = 2usize; // "● "
+    let detail_width = if detail.is_empty() {
+        0
+    } else {
+        2 + UnicodeWidthStr::width(detail)
+    };
+    let available = area.width.saturating_sub((overhead + detail_width) as u16) as usize;
+    let separator_width = 3usize; // " / "
+    let mut total: usize = segments
+        .iter()
+        .map(|(name, _)| UnicodeWidthStr::width(name.as_str()))
+        .sum::<usize>()
+        + (segments.len() - 1) * separator_width;
+    // Drop leading segments that would overflow, keeping the tail.
+    let mut skip = 0;
+    while total > available && skip < segments.len() - 1 {
+        total = total
+            .saturating_sub(UnicodeWidthStr::width(segments[skip].0.as_str()) + separator_width);
+        skip += 1;
+    }
+    let mut spans = vec![Span::styled(
+        if focused { "● " } else { "  " },
+        Style::default().fg(if focused { accent } else { theme.text_subtle }),
+    )];
+    let mut x = area.x.saturating_add(overhead as u16);
+    if skip > 0 {
+        spans.push(Span::styled("… / ", Style::default().fg(theme.text_subtle)));
+        x = x.saturating_add(UnicodeWidthStr::width("… / ") as u16);
+    }
+    for (i, (name, path)) in segments.iter().enumerate().skip(skip) {
+        if i > skip {
+            spans.push(Span::styled(" / ", Style::default().fg(theme.text_subtle)));
+            x = x.saturating_add(separator_width as u16);
+        }
+        let seg_width = UnicodeWidthStr::width(name.as_str()) as u16;
+        let is_last = i == segments.len() - 1;
+        if is_last {
+            // The current view root is shown but not clickable.
+            spans.push(Span::styled(
+                name.clone(),
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(name.clone(), segment_style));
+            app.ui_regions
+                .tree_breadcrumbs
+                .push((path.clone(), Rect::new(x, area.y, seg_width, 1)));
+        }
+        x = x.saturating_add(seg_width);
+    }
+    if !detail.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            detail.to_owned(),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_panel_heading(
