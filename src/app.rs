@@ -1667,7 +1667,7 @@ impl App {
                 .expansion
                 .get(&entry.relative)
                 .copied()
-                .unwrap_or(true),
+                .unwrap_or_else(|| !self.unloaded_directories.contains(&entry.relative)),
             TreeScope::GitChanges => self
                 .selected_git_row()
                 .map(|row| self.git_row_is_expanded(row))
@@ -4930,12 +4930,12 @@ impl App {
         };
 
         let expanded = self
-            .tab_mut()
-            .files_mut()
+            .tab()
+            .files()
             .expansion
             .get(&relative)
             .copied()
-            .unwrap_or(false);
+            .unwrap_or_else(|| !self.unloaded_directories.contains(&relative));
         self.tab_mut()
             .files_mut()
             .expansion
@@ -5943,8 +5943,8 @@ impl App {
         self.rebuild_visible_rows();
     }
 
-    const fn default_directory_expansion(scope: TreeScope) -> bool {
-        matches!(scope, TreeScope::GitChanges)
+    const fn default_directory_expansion(_scope: TreeScope) -> bool {
+        true
     }
 
     fn reconcile_expansion_state(&mut self) {
@@ -5952,15 +5952,21 @@ impl App {
         // filtered Git view. That preserves a Git-scope choice while its
         // directory is temporarily clean, but drops it once the directory is
         // genuinely gone or no longer a directory.
+        //
+        // Unloaded (lazy) directories stay in the map so that an explicit
+        // user expansion survives a refresh; only *new* unloaded directories
+        // default to collapsed.
         let directories: HashSet<PathBuf> = self
             .all_entries
             .iter()
             .filter(|entry| entry.is_dir)
             .map(|entry| entry.relative.clone())
             .collect();
+        let unloaded = self.unloaded_directories.clone();
         Self::reconcile_expansion_map(
             &mut self.tab_mut().files_mut().expansion,
             &directories,
+            &unloaded,
             Self::default_directory_expansion(TreeScope::AllFiles),
         );
         let git_containers: HashSet<GitRowIdentity> = self
@@ -5979,18 +5985,22 @@ impl App {
     fn reconcile_expansion_map(
         expansion: &mut HashMap<PathBuf, bool>,
         directories: &HashSet<PathBuf>,
+        unloaded: &HashSet<PathBuf>,
         default_expanded: bool,
     ) {
         expansion.retain(|path, _| directories.contains(path));
         for directory in directories {
-            expansion
-                .entry(directory.clone())
-                .or_insert(default_expanded);
+            // New unloaded (lazy) directories default to collapsed so the
+            // tree does not fan out loads on refresh; new loaded directories
+            // follow the scope default. Existing entries keep their value.
+            let entry_default = default_expanded && !unloaded.contains(directory);
+            expansion.entry(directory.clone()).or_insert(entry_default);
         }
     }
 
     fn rebuild_visible_rows(&mut self) {
         let files_expansion = self.tab().files().expansion.clone();
+        let unloaded = &self.unloaded_directories;
         let rows: Vec<FileEntry> = self
             .entries_for_scope(TreeScope::AllFiles)
             .iter()
@@ -6000,7 +6010,12 @@ impl App {
                     .ancestors()
                     .skip(1)
                     .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                    .all(|ancestor| files_expansion.get(ancestor).copied().unwrap_or(true))
+                    .all(|ancestor| {
+                        files_expansion
+                            .get(ancestor)
+                            .copied()
+                            .unwrap_or_else(|| !unloaded.contains(ancestor))
+                    })
             })
             .cloned()
             .collect();
