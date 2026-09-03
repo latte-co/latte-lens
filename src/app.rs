@@ -783,6 +783,11 @@ pub struct UiRegions {
     /// is re-rooted: `(workspace-relative path, rect)`. An empty path stands
     /// for the workspace root (the `⌂` segment).
     pub tree_breadcrumbs: Vec<(PathBuf, Rect)>,
+    /// Hit region of the `…` ellipsis in the tree header breadcrumb. When the
+    /// re-rooted path is too deep for the panel, leading segments are squeezed
+    /// into this ellipsis, which doubles as the "up one level" button (mirrors
+    /// the Backspace shortcut). Zero-width when no segments were dropped.
+    pub tree_root_up_button: Rect,
     /// Content scrollbar track (1-column right edge of content rows).
     pub content_scrollbar_track: Rect,
     /// Thumb offset within the track (rows from track top).
@@ -3620,6 +3625,19 @@ impl App {
                 {
                     self.clear_content_selection();
                     self.toggle_tree_visibility();
+                    return;
+                }
+                // Tree header ellipsis: when the re-rooted path is too deep,
+                // the `…` that replaces the squeezed-out parent segments acts
+                // as the "up one level" button (same as Backspace).
+                if !self.tree_hidden
+                    && self.ui_regions.tree_root_up_button.width > 0
+                    && contains(self.ui_regions.tree_root_up_button, mouse.column, mouse.row)
+                {
+                    self.clear_content_selection();
+                    self.last_tree_click = None;
+                    self.tab_root_up();
+                    self.focused_pane = FocusPane::Tree;
                     return;
                 }
                 // Tree header breadcrumb: click `⌂` to reset the tab view
