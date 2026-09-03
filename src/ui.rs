@@ -414,6 +414,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
         tree_hide_button: Rect::default(),
         tree_show_button: Rect::default(),
         tree_breadcrumbs: Vec::new(),
+        tree_root_up_button: Rect::default(),
         content_scrollbar_track: Rect::default(),
         content_scrollbar_thumb_start: 0,
         content_scrollbar_thumb_size: 0,
@@ -1294,6 +1295,7 @@ fn with_hover<'a>(item: ListItem<'a>, hovered: bool, style: Style) -> ListItem<'
 
 fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     app.ui_regions.tree_breadcrumbs.clear();
+    app.ui_regions.tree_root_up_button = Rect::default();
     let selected = app.tab_mut().tree_state.selected();
     let focused = app.focused_pane == FocusPane::Tree;
     let hover_row = app.tree_hover_row();
@@ -2564,8 +2566,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the tree header as a clickable breadcrumb when the active Files tab
 /// is re-rooted: `⌂ / seg1 / seg2  <detail>`. The `⌂` segment resets the tab
-/// to the workspace root; intermediate segments jump to that level. Hit
-/// regions are stored in [`UiRegions::tree_breadcrumbs`].
+/// to the workspace root; intermediate segments jump to that level. When the
+/// path is too deep for the panel, leading segments are squeezed into a `…`
+/// ellipsis that acts as the "up one level" button (mirrors Backspace) so the
+/// way back is never lost. Hit regions are stored in
+/// [`UiRegions::tree_breadcrumbs`] and [`UiRegions::tree_root_up_button`].
 fn draw_tree_breadcrumb(
     frame: &mut Frame,
     app: &mut App,
@@ -2619,8 +2624,23 @@ fn draw_tree_breadcrumb(
     )];
     let mut x = area.x.saturating_add(overhead as u16);
     if skip > 0 {
-        spans.push(Span::styled("… / ", Style::default().fg(theme.text_subtle)));
-        x = x.saturating_add(UnicodeWidthStr::width("… / ") as u16);
+        let ellipsis = "…";
+        let ellipsis_width = UnicodeWidthStr::width(ellipsis) as u16;
+        let separator = " / ";
+        let separator_width = UnicodeWidthStr::width(separator) as u16;
+        // Leading segments were squeezed out. The ellipsis doubles as the
+        // "up one level" button so the way back survives narrow panels; the
+        // hit region covers the ellipsis and its separator for an easy click.
+        app.ui_regions.tree_root_up_button =
+            Rect::new(x, area.y, ellipsis_width.saturating_add(separator_width), 1);
+        spans.push(Span::styled(ellipsis, segment_style));
+        spans.push(Span::styled(
+            separator,
+            Style::default().fg(theme.text_subtle),
+        ));
+        x = x
+            .saturating_add(ellipsis_width)
+            .saturating_add(separator_width);
     }
     for (i, (name, path)) in segments.iter().enumerate().skip(skip) {
         if i > skip {

@@ -5166,6 +5166,71 @@ fn tab_root_up_walks_to_parent_and_workspace_root() {
 }
 
 #[test]
+fn tree_breadcrumb_ellipsis_acts_as_up_one_level_button() {
+    let fixture = TestRepo::new();
+    fixture.write("alpha/beta/file.txt", "fixture\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Left);
+
+    // Re-root to a depth-2 directory; startup enumerates the first two path
+    // components, so `alpha/beta` is already present in the tree.
+    app.set_tab_root_for_test(PathBuf::from("alpha/beta"));
+    settle(&mut app);
+    assert_eq!(
+        app.tab().files().view_root,
+        Some(PathBuf::from("alpha/beta"))
+    );
+
+    // Render on a terminal narrow enough that the parent segments are
+    // squeezed into the `…` ellipsis.
+    let backend = TestBackend::new(60, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // The ellipsis must be an active "up one level" button.
+    let up = app.ui_regions.tree_root_up_button;
+    assert!(
+        up.width > 0,
+        "ellipsis up button should be active when parent segments are squeezed out"
+    );
+
+    // Clicking it walks the view root up one level.
+    app.handle_mouse(mouse_down(up.x, up.y));
+    assert_eq!(app.tab().files().view_root, Some(PathBuf::from("alpha")));
+}
+
+#[test]
+fn tree_breadcrumb_has_no_up_button_when_path_fits() {
+    let fixture = TestRepo::new();
+    fixture.write("alpha/beta/file.txt", "fixture\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_side(TreeSide::Left);
+
+    // Re-root to a shallow directory whose breadcrumb (`⌂ / alpha`) fits
+    // even in the capped 36-column tree header.
+    app.set_tab_root_for_test(PathBuf::from("alpha"));
+    settle(&mut app);
+
+    let backend = TestBackend::new(200, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    assert_eq!(
+        app.ui_regions.tree_root_up_button.width, 0,
+        "ellipsis up button must be inactive when the full breadcrumb fits"
+    );
+    // The `⌂` home segment remains clickable instead (empty path = root).
+    assert!(
+        app.ui_regions
+            .tree_breadcrumbs
+            .iter()
+            .any(|(path, _)| path.as_os_str().is_empty())
+    );
+}
+
+#[test]
 fn copy_relative_path_uses_view_root_when_re_rooted() {
     let fixture = TestRepo::new();
     fixture.write("src/main.rs", "fn main() {}\n");
