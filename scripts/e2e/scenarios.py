@@ -2297,11 +2297,12 @@ def edit_mode(context: ScenarioContext) -> None:
         "redo re-applies the edit",
     )
 
-    # Save with Ctrl+S: edit mode exits and the file on disk changes.
+    # Save with Ctrl+S: stays in edit mode, file on disk changes.
     session.key(b"\x13")  # Ctrl+S
-    session.wait_until(
-        lambda screen: "Esc exit" not in screen.text(),
-        "edit mode exits after save",
+    session.wait_screen(
+        ("EDIT",),
+        "edit mode stays active after save",
+        absent=("unsaved",),
     )
     session.drain()
     saved = notes.read_text(encoding="utf-8")
@@ -2310,6 +2311,13 @@ def edit_mode(context: ScenarioContext) -> None:
     )
     # Bless the explicit edit-mode save so the read-only oracle passes.
     context.oracle.record_driver_write(notes)
+
+    # Esc exits after save (not dirty → no confirmation needed).
+    session.key(b"\x1b")
+    session.wait_until(
+        lambda screen: "Esc exit" not in screen.text(),
+        "edit mode exits after save + Esc",
+    )
 
 
 CASES = (

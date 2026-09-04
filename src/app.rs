@@ -3053,7 +3053,12 @@ impl App {
                     self.edit_escape_pending = true;
                     self.tab_mut().content.edit = Some(edit);
                 }
+            } else if edit.saved {
+                // 已保存：快照是旧的，退出后重载预览
+                self.tab_mut().content.edit = Some(edit);
+                self.exit_edit_mode_after_save();
             } else {
+                // 未修改：恢复快照即可
                 self.tab_mut().content.edit = Some(edit);
                 self.exit_edit_mode_without_save();
             }
@@ -3102,10 +3107,31 @@ impl App {
         self.edit_escape_pending = false;
     }
 
-    /// 保存编辑会话并退出。
+    /// 已保存后退出编辑模式：丢弃快照，重载预览以反映磁盘内容。
+    fn exit_edit_mode_after_save(&mut self) {
+        let (target, label, review_path) = {
+            let tab = self.tab();
+            (
+                tab.content.source_target.clone(),
+                tab.content
+                    .identity
+                    .as_ref()
+                    .map(|id| id.display_label().to_string()),
+                tab.content.current_diff_path.clone(),
+            )
+        };
+        self.tab_mut().content.edit = None;
+        self.edit_escape_pending = false;
+        self.cache_current_folds();
+        if let (Some(target), Some(label)) = (target, label) {
+            self.request_content_with_review_path(ContentKind::Preview, label, target, review_path);
+        }
+    }
+
+    /// 保存编辑会话（不退出编辑模式）。
     fn save_edit_session(&mut self) {
-        // 第一阶段：收集保存所需信息（不可变借用）
-        let (absolute, lines, target, label, review_path) = {
+        // 收集保存所需信息（不可变借用）
+        let (absolute, lines) = {
             let tab = self.tab();
             if tab.content.edit.is_none() {
                 return;
@@ -3117,19 +3143,10 @@ impl App {
                 return;
             };
             let absolute = self.root.join(workspace_path);
-            let target = tab.content.source_target.clone();
-            let label = identity.display_label().to_string();
-            let review_path = tab.content.current_diff_path.clone();
-            (
-                absolute,
-                tab.content.lines.clone(),
-                target,
-                label,
-                review_path,
-            )
+            (absolute, tab.content.lines.clone())
         };
 
-        // 第二阶段：执行保存（可变借用，save 需要 &mut self 清 dirty）
+        // 执行保存（可变借用，save 需要 &mut self 清 dirty + 更新 original_bytes）
         let save_result = {
             let tab = self.tab_mut();
             let edit = tab.content.edit.as_mut().unwrap();
@@ -3138,22 +3155,9 @@ impl App {
 
         match save_result {
             Ok(()) => {
-                // 保存成功：退出编辑模式，重载预览
-                self.tab_mut().content.edit = None;
+                // 保存成功：留在编辑模式，清 escape pending，显示状态
                 self.edit_escape_pending = false;
-
-                // 缓存折叠状态
-                self.cache_current_folds();
-
-                // 重载预览
-                if let Some(target) = target {
-                    self.request_content_with_review_path(
-                        ContentKind::Preview,
-                        label,
-                        target,
-                        review_path,
-                    );
-                }
+                self.last_error = Some("Saved".to_string());
             }
             Err(e) => {
                 self.last_error = Some(format!("Save failed: {e}"));

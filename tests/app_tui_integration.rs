@@ -5506,14 +5506,22 @@ fn edit_mode_save_writes_file_to_disk() {
 
     app.handle_key(key(KeyCode::End));
     app.handle_key(key(KeyCode::Char('!')));
-    // Ctrl+S 保存
+    // Ctrl+S 保存（不退出编辑模式）
     app.handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
-    // 保存后应退出编辑模式
-    assert!(!app.edit_is_active(), "edit mode should exit after save");
+    // 保存后应留在编辑模式
+    assert!(
+        app.edit_is_active(),
+        "edit mode should stay active after save"
+    );
+    assert!(!app.edit_is_dirty(), "edit should not be dirty after save");
     // 文件内容应已写入
     let saved = fs::read_to_string(&file_path).unwrap();
     assert_eq!(saved, "hello!\n");
+
+    // Esc 退出（已保存，直接退出，无需确认）
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active(), "Esc should exit after save");
 }
 
 #[test]

@@ -128,6 +128,8 @@ pub(crate) struct EditSession {
     undo_stack: Vec<EditDelta>,
     redo_stack: Vec<EditDelta>,
     pub(crate) dirty: bool,
+    /// 是否已保存到磁盘（区分"未修改"和"已保存"，决定退出时恢复快照还是重载）。
+    pub(crate) saved: bool,
     /// debounce 重高亮到期时间。
     pub(crate) highlight_due: Option<Instant>,
     /// 大文件标记（跳过重高亮）。
@@ -168,6 +170,7 @@ impl EditSession {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             dirty: false,
+            saved: false,
             highlight_due: None,
             large_file,
         })
@@ -759,6 +762,7 @@ impl EditSession {
         // 更新基线
         self.original_bytes = join_lines(lines, self.newline_style).into_bytes();
         self.dirty = false;
+        self.saved = true;
         Ok(())
     }
 
@@ -805,9 +809,10 @@ impl EditSession {
 
     // -- 内部 -----------------------------------------------------------------
 
-    /// 编辑后公共处理：标记 dirty、调度重高亮、清空 redo 栈。
+    /// 编辑后公共处理：标记 dirty、调度重高亮、清空 redo 栈、重置 saved。
     fn after_edit(&mut self) {
         self.dirty = true;
+        self.saved = false;
         self.redo_stack.clear();
         self.schedule_highlight();
     }
@@ -1033,6 +1038,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             dirty: false,
+            saved: false,
             highlight_due: None,
             large_file: false,
         };
@@ -1500,6 +1506,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             dirty: true,
+            saved: false,
             highlight_due: None,
             large_file: false,
         };
