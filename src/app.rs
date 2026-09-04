@@ -6941,7 +6941,7 @@ impl App {
     }
 
     const fn default_directory_expansion(_scope: TreeScope) -> bool {
-        true
+        false
     }
 
     fn reconcile_expansion_state(&mut self) {

@@ -178,8 +178,9 @@ fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand
         .map(|entry| entry.relative.clone())
         .collect();
     assert!(initial_paths.contains(&PathBuf::from("one/two")));
-    // The first two levels are visible: "one" defaults to expanded, and
-    // "one/two" is visible as a collapsed directory.
+    // Directories default to collapsed; expanding "one" reveals "one/two".
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     assert!(visible_paths(&app).contains(&PathBuf::from("one")));
     assert!(visible_paths(&app).contains(&PathBuf::from("one/two")));
     // Deeper content is not loaded until the directory is expanded.
@@ -421,8 +422,20 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
             .find(|entry| entry.relative == Path::new("src/nested"))
             .is_some_and(|entry| entry.contains_changes)
     );
-    // Depth-1 directories default to expanded; depth-2 directories default
-    // to collapsed until explicitly expanded.
+    // All directories default to collapsed; only top-level entries are visible.
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("docs"), PathBuf::from("src"),]
+    );
+
+    // Expanding "docs" and "src" reveals their children.
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Enter)); // expand docs
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // docs → docs/clean.md
+    app.handle_key(key(KeyCode::Down)); // docs/clean.md → src
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
     assert_eq!(
         visible_paths(&app),
         [
@@ -487,15 +500,11 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Directories default to expanded, so the workspace opens with the file
-    // visible and Enter first collapses the directory.
+    // Directories default to collapsed, so the workspace opens with only
+    // top-level entries visible and Enter first expands the directory.
     assert_eq!(
         visible_paths(&app),
-        [
-            PathBuf::from("src"),
-            PathBuf::from("src/file.txt"),
-            PathBuf::from("top.txt"),
-        ]
+        [PathBuf::from("src"), PathBuf::from("top.txt"),]
     );
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
 
@@ -504,7 +513,11 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
         visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/file.txt"),
+            PathBuf::from("top.txt"),
+        ]
     );
     // Directories no longer show an info preview (VS Code-style): the content
     // pane keeps its minimal hint when no file is open.
@@ -515,6 +528,13 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt"),]
+    );
+
+    // Re-expand so the file row is reachable.
+    app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         visible_paths(&app),
         [
@@ -557,16 +577,27 @@ fn single_click_toggles_directories_and_double_click_previews_files() {
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
-    // Directories default to expanded; single click collapses it (VS Code-style).
+    // Directories default to collapsed; single click expands it (VS Code-style).
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
         visible_paths(&app),
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/file.txt"),
+            PathBuf::from("top.txt"),
+        ]
+    );
+
+    // Single click again collapses it.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    assert_eq!(
+        visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
-    // Single click again expands it.
+    // Re-expand so the file row is reachable for the double-click preview.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
@@ -703,9 +734,11 @@ fn breadcrumbs_show_selected_path_and_click_navigates_to_parent() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Navigate to src/nested/main.rs. "src" defaults to expanded, so
-    // "src/nested" is visible but collapsed; expanding it loads main.rs.
+    // Navigate to src/nested/main.rs. "src" defaults to collapsed, so
+    // expand it first; "src/nested" is then visible but collapsed.
     app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
     app.handle_key(key(KeyCode::Down)); // src → src/nested
     app.handle_key(key(KeyCode::Enter)); // expand src/nested (loads main.rs)
     settle(&mut app);
@@ -773,18 +806,16 @@ fn right_click_opens_context_menu_and_actions_execute() {
     app.handle_key(key(KeyCode::Up));
     assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 0);
 
-    // Enter on ToggleExpand collapses the directory and closes the menu.
+    // Enter on ToggleExpand expands the directory (default is collapsed)
+    // and closes the menu.
     let before = visible_paths(&app);
     app.handle_key(key(KeyCode::Enter));
     assert!(app.tree_context_menu.is_none());
-    assert!(visible_paths(&app).len() < before.len());
-    assert!(!visible_paths(&app).contains(&PathBuf::from("src/main.rs")));
+    assert!(visible_paths(&app).len() > before.len());
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/main.rs")));
 
     // Right-click on a file row shows Preview as the first action.
-    // First expand src, then right-click on the file row.
-    app.handle_key(key(KeyCode::Char('s')));
-    app.handle_key(key(KeyCode::Enter));
-    settle(&mut app);
+    // src is now expanded, so the file row is directly below.
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     // Find the file row (src/main.rs).
     let file_row = tree_y + 1; // src is row 0, src/main.rs is row 1
@@ -970,17 +1001,17 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     fixture.write("alpha/old.txt", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // All Files keeps an explicit collapse through refresh, while a new
-    // directory defaults to expanded.
-    app.handle_key(key(KeyCode::Enter));
+    // All Files keeps an explicit expansion through refresh, while a new
+    // directory defaults to collapsed.
+    app.handle_key(key(KeyCode::Enter)); // expand alpha (default collapsed)
     fixture.write("beta/new.txt", "new\n");
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     let all_after_refresh = visible_paths(&app);
-    assert!(!all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
+    assert!(all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
     assert!(all_after_refresh.contains(&PathBuf::from("beta")));
-    assert!(all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
+    assert!(!all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
 
     // Git Changes starts expanded, retains a deliberate collapse, and opens a
     // newly discovered changed directory by default.
@@ -1009,7 +1040,9 @@ fn saved_selection_survives_parent_removal_and_rediscover() {
     fixture.write("src/child.txt", "untracked\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Directories default to expanded, so the child is reachable directly.
+    // Directories default to collapsed; expand "src" to reach the child.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     app.handle_key(key(KeyCode::Down));
     assert_eq!(
         app.selected_relative_path(),
@@ -1018,8 +1051,8 @@ fn saved_selection_survives_parent_removal_and_rediscover() {
 
     // Keep All Files' child selection saved while refreshes in the other scope
     // remove and later rediscover the parent. Rediscovery uses the All Files
-    // default (expanded), so the child is visible again and the saved
-    // selection restores directly.
+    // default (collapsed), so expand "src" again to restore the saved
+    // selection visibility.
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     fs::remove_dir_all(fixture.root().join("src")).unwrap();
@@ -1029,6 +1062,10 @@ fn saved_selection_survives_parent_removal_and_rediscover() {
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.set_tree_scope(TreeScope::AllFiles);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Enter)); // expand src (default collapsed)
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/child.txt
 
     assert_eq!(
         app.selected_relative_path(),
@@ -3105,6 +3142,9 @@ fn all_files_aligns_directory_and_file_labels_with_a_blank_file_disclosure_slot(
     fixture.write("plain.txt", "plain\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // Expand "folder" so its child is visible for the alignment check.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -3785,10 +3825,12 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     // Open the file so the content pane has selectable text (directories no
-    // longer show an info preview). src defaults to expanded, so navigate
-    // directly to src/lib.rs.
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Enter));
+    // longer show an info preview). src defaults to collapsed, so expand it
+    // first, then navigate to src/lib.rs.
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/lib.rs
+    app.handle_key(key(KeyCode::Enter)); // preview lib.rs
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
@@ -5118,13 +5160,13 @@ fn set_tab_root_filters_tree_to_subdirectory_and_reset_restores() {
         Some(PathBuf::from("src/lib.rs"))
     );
 
-    // Reset restores the full tree.
+    // Reset restores the full tree. "src" stays expanded from the view-root
+    // implicit expansion; "docs" follows the collapsed default.
     app.reset_tab_root_for_test();
     assert_eq!(
         visible_paths(&app),
         [
             PathBuf::from("docs"),
-            PathBuf::from("docs/readme.md"),
             PathBuf::from("src"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/main.rs"),
@@ -5141,9 +5183,12 @@ fn tab_root_up_walks_to_parent_and_workspace_root() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // src defaults to expanded; navigate to src/deep and expand it.
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Enter));
+    // src defaults to collapsed; expand it, then navigate to src/deep and
+    // expand it.
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/deep
+    app.handle_key(key(KeyCode::Enter)); // expand src/deep
     settle(&mut app);
 
     app.set_tab_root_for_test(PathBuf::from("src/deep"));
@@ -5236,8 +5281,10 @@ fn copy_relative_path_uses_view_root_when_re_rooted() {
     fixture.write("src/main.rs", "fn main() {}\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    // src defaults to expanded; navigate directly to src/main.rs.
-    app.handle_key(key(KeyCode::Down));
+    // src defaults to collapsed; expand it, then navigate to src/main.rs.
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/main.rs
     settle(&mut app);
 
     // Select src/main.rs and copy its relative path at the workspace root.

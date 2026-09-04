@@ -166,8 +166,8 @@ def files_navigation(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
     session.wait_screen(
-        ("▾ a-dir", "nested"),
-        "initial expanded all-files directory",
+        ("▸ a-dir",),
+        "initial collapsed all-files directory",
     )
 
     # Discover the current semantic divider instead of encoding a layout/style
@@ -206,14 +206,8 @@ def files_navigation(context: ScenarioContext) -> None:
     session.key(b"\x1b[H")  # Home to the first row (a-dir)
     session.key(b"\r")
     session.wait_screen(
-        ("▸ a-dir",),
-        "keyboard-closed expanded All Files directory",
-        absent=("b-changed.rs",),
-    )
-    _click_tree_row(session, "a-dir")
-    session.wait_screen(
         ("▾ a-dir", "nested"),
-        "mouse-opened directory with single click",
+        "keyboard-opened collapsed All Files directory",
     )
     _click_tree_row(session, "a-dir")
     session.wait_screen(
@@ -221,10 +215,21 @@ def files_navigation(context: ScenarioContext) -> None:
         "mouse-closed directory with single click",
         absent=("b-changed.rs",),
     )
+    _click_tree_row(session, "a-dir")
+    session.wait_screen(
+        ("▾ a-dir", "nested"),
+        "mouse-opened directory with single click",
+    )
+    session.key(b"\r")
+    session.wait_screen(
+        ("▸ a-dir",),
+        "keyboard-closed directory",
+        absent=("nested",),
+    )
     session.key(b"\r")
     session.wait_screen(
         ("▾ a-dir", "nested"),
-        "keyboard-opened directory",
+        "keyboard-reopened directory",
     )
 
     # Preserve the original cross-scope state assertion in the Files group.
@@ -530,9 +535,14 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"g")
     session.key(b"\r")
     session.wait_screen(
+        ("▾ a-dir", "nested"),
+        "tree Home and Enter expand the first directory",
+    )
+    session.key(b"\r")
+    session.wait_screen(
         ("▸ a-dir",),
-        "tree Home and Enter collapse the first directory",
-        absent=("b-changed.rs",),
+        "Enter re-collapses the directory",
+        absent=("nested",),
     )
     session.key(b"\r")
     session.wait_screen(
