@@ -193,6 +193,17 @@ pub enum FocusPane {
     Content,
 }
 
+/// 编辑模式 caret 移动方向。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaretDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchMode {
     Files,
@@ -490,9 +501,9 @@ struct PendingNavigationStage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NavigationCaret {
-    point: SourcePosition,
-    preferred_display_column: usize,
+pub(crate) struct NavigationCaret {
+    pub(crate) point: SourcePosition,
+    pub(crate) preferred_display_column: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -701,18 +712,18 @@ impl ContentMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ContentPoint {
-    line: usize,
-    byte: usize,
+pub(crate) struct ContentPoint {
+    pub(crate) line: usize,
+    pub(crate) byte: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ContentSelection {
-    anchor_before: ContentPoint,
-    anchor_after: ContentPoint,
-    head: ContentPoint,
-    dragging: bool,
-    dragged: bool,
+pub(crate) struct ContentSelection {
+    pub(crate) anchor_before: ContentPoint,
+    pub(crate) anchor_after: ContentPoint,
+    pub(crate) head: ContentPoint,
+    pub(crate) dragging: bool,
+    pub(crate) dragged: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -735,7 +746,7 @@ pub(crate) enum FoldVisualMarker {
 }
 
 impl ContentSelection {
-    fn normalized(self) -> (ContentPoint, ContentPoint) {
+    pub(crate) fn normalized(self) -> (ContentPoint, ContentPoint) {
         if self.head >= self.anchor_before {
             (self.anchor_before, self.head)
         } else {
@@ -861,6 +872,8 @@ pub struct ContentState {
     /// tabs do not discard each other's completions (a global gate would
     /// let tab B's request invalidate tab A's in-flight completion).
     content_requests: RequestGeneration,
+    /// 编辑会话（per-tab），进入编辑模式时创建，退出时丢弃。
+    pub(crate) edit: Option<crate::edit::EditSession>,
 }
 
 impl Default for ContentState {
@@ -897,6 +910,7 @@ impl Default for ContentState {
             pending_diff_path: None,
             pending_navigation_stage: None,
             content_requests: RequestGeneration::default(),
+            edit: None,
         }
     }
 }
@@ -1114,6 +1128,10 @@ pub struct App {
     last_refresh_error: Option<String>,
     has_refresh_snapshot: bool,
     quit_confirmation: Option<QuitConfirmation>,
+    /// 编辑模式 Esc 二次确认（dirty 时第一次 Esc 进入 pending，第二次 Esc 退出）
+    edit_escape_pending: bool,
+    /// 编辑模式双击检测：(点击位置, 时间)
+    last_edit_click: Option<(ContentPoint, Instant)>,
     pending_terminal_image_preview: Option<PendingTerminalImagePreview>,
     pending_external_open_confirmation: Option<PendingExternalOpenConfirmation>,
     terminal_truecolor_supported: bool,
@@ -1263,6 +1281,16 @@ impl App {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
         };
+        // dirty 防护：有未保存编辑时拒绝关闭
+        if self.tabs[index]
+            .content
+            .edit
+            .as_ref()
+            .is_some_and(|e| e.dirty())
+        {
+            self.last_error = Some("Exit edit mode (Esc) before closing this tab".to_string());
+            return false;
+        }
         self.tabs.remove(index);
         if self.active_tab == id {
             let new_index = index.min(self.tabs.len() - 1);
@@ -1476,6 +1504,8 @@ impl App {
             last_refresh_error: None,
             has_refresh_snapshot: false,
             quit_confirmation: None,
+            edit_escape_pending: false,
+            last_edit_click: None,
             pending_terminal_image_preview: None,
             pending_external_open_confirmation: None,
             terminal_truecolor_supported: crate::system_preview::terminal_truecolor_supported(),
@@ -1559,7 +1589,7 @@ impl App {
             self.poll_background();
             terminal.draw(|frame| ui::draw(frame, self))?;
 
-            let poll_interval = if self.search.is_some() {
+            let poll_interval = if self.search.is_some() || self.tab().content.edit.is_some() {
                 Duration::from_millis(50)
             } else {
                 Duration::from_millis(250)
@@ -1573,6 +1603,9 @@ impl App {
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse);
                         self.flush_clipboard_request();
+                    }
+                    Event::Paste(text) => {
+                        self.handle_edit_paste(text);
                     }
                     _ => {}
                 }
@@ -1984,6 +2017,48 @@ impl App {
         Some(start_byte.min(content.len())..end_byte.min(content.len()))
     }
 
+    /// 编辑态选区范围（镜像 content_selection_range，但读 edit.selection）。
+    pub fn edit_selection_range(&self, line: usize) -> Option<Range<usize>> {
+        let edit = self.tab().content.edit.as_ref()?;
+        let selection = edit.selection?;
+        let (start, end) = selection.normalized();
+        if start == end || line < start.line || line > end.line {
+            return None;
+        }
+        let content = self.tab().content.lines.get(line)?;
+        let start_byte = if line == start.line { start.byte } else { 0 };
+        let end_byte = if line == end.line {
+            end.byte
+        } else {
+            content.len()
+        };
+        Some(start_byte.min(content.len())..end_byte.min(content.len()))
+    }
+
+    /// 编辑态是否活跃。
+    pub fn edit_is_active(&self) -> bool {
+        self.tab().content.edit.is_some()
+    }
+
+    /// 编辑态 caret 位置（`(line, byte)`），供集成测试断言。
+    pub fn edit_caret_position(&self) -> Option<(usize, usize)> {
+        self.tab()
+            .content
+            .edit
+            .as_ref()
+            .map(|e| (e.caret.line, e.caret.byte))
+    }
+
+    /// 编辑态是否有未保存修改。
+    pub fn edit_is_dirty(&self) -> bool {
+        self.tab().content.edit.as_ref().is_some_and(|e| e.dirty)
+    }
+
+    /// 编辑态 caret 位置。
+    pub(crate) fn edit_caret(&self) -> Option<ContentPoint> {
+        self.tab().content.edit.as_ref().map(|e| e.caret)
+    }
+
     pub(crate) fn content_visual_rows(&self, width: u16) -> Vec<ContentVisualRow> {
         let wrap_content = self.content_wraps_lines();
         let gutter_width = self.content_gutter_width();
@@ -2178,7 +2253,8 @@ impl App {
         }
     }
 
-    pub(crate) fn content_gutter_width(&self) -> usize {
+    /// 内容区行号槽宽度（显示度量，公开供集成测试换算鼠标坐标）。
+    pub fn content_gutter_width(&self) -> usize {
         if !self.tab().content.show_line_numbers {
             return 0;
         }
@@ -2285,6 +2361,12 @@ impl App {
             self.handle_preview_find_key(key);
             return;
         }
+        // 编辑模态：拦截所有键，不泄漏到全局 match
+        if self.tab().content.edit.is_some() {
+            self.quit_confirmation = None;
+            self.handle_edit_key(key);
+            return;
+        }
         if self.search.is_some() {
             self.quit_confirmation = None;
             self.handle_search_key(key);
@@ -2349,7 +2431,15 @@ impl App {
                 self.request_external_open(ExternalOpenTrigger::ExplicitConfirm);
             }
             (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                self.confirm_terminal_image_preview();
+                // 图片预览：i 确认/提示终端渲染；文本预览：i 进入编辑模式
+                // pending 优先（Esc 重载后 preview_kind 可能已变），preview_kind 兜底
+                if self.pending_terminal_image_preview.is_some()
+                    || matches!(self.tab().content.preview_kind, PreviewKind::Image(_))
+                {
+                    self.confirm_terminal_image_preview();
+                } else {
+                    self.try_enter_edit_mode();
+                }
             }
             (KeyCode::Tab, _) => self.cycle_tab(true),
             (KeyCode::BackTab, _) => self.cycle_tab(false),
@@ -2410,6 +2500,25 @@ impl App {
     }
 
     fn request_quit(&mut self, key: QuitKey) {
+        // dirty 防护：有未保存编辑时走二次确认
+        if self.has_dirty_edit() {
+            let now = Instant::now();
+            if self
+                .quit_confirmation
+                .is_some_and(|confirmation| confirmation.key == key && now <= confirmation.deadline)
+            {
+                self.should_quit = true;
+                self.quit_confirmation = None;
+                return;
+            }
+            self.quit_confirmation = Some(QuitConfirmation {
+                key,
+                deadline: now + QUIT_CONFIRM_WINDOW,
+            });
+            self.last_error =
+                Some("Unsaved changes in edit mode · Press again to quit".to_string());
+            return;
+        }
         let now = Instant::now();
         if self
             .quit_confirmation
@@ -2775,6 +2884,592 @@ impl App {
                 self.rebuild_preview_find();
             }
             _ => {}
+        }
+    }
+
+    // -- 编辑模式 ---------------------------------------------------------------
+
+    /// 尝试进入编辑模式（i 键）。检查所有准入条件，失败时设置状态栏提示。
+    fn try_enter_edit_mode(&mut self) {
+        use crate::edit::EditSession;
+
+        // 门控条件
+        if self.focused_pane != FocusPane::Content {
+            return;
+        }
+        let tab = self.tab();
+        if tab.content.mode != ContentMode::Preview {
+            return;
+        }
+        if tab.content.preview_kind != PreviewKind::Text {
+            return;
+        }
+        if tab.content.provider.as_deref() != Some("text") {
+            return;
+        }
+        if tab.content.edit.is_some() {
+            return;
+        }
+        let Some(identity) = tab.content.identity.as_ref() else {
+            return;
+        };
+        let Some(workspace_path) = identity.workspace_path() else {
+            return;
+        };
+        let absolute = self.root.join(workspace_path);
+
+        // 非符号链接 + regular file
+        let metadata = match std::fs::symlink_metadata(&absolute) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if metadata.file_type().is_symlink() {
+            self.last_error = Some("Cannot edit symlinks".to_string());
+            return;
+        }
+        if !metadata.is_file() {
+            return;
+        }
+
+        // 捕获预览快照（lines 是截断的预览，begin 会替换为完整文件）
+        let snapshot = crate::edit::PreviewSnapshot {
+            lines: tab.content.lines.clone(),
+            highlights: tab.content.highlights.clone(),
+            scroll: tab.content.scroll,
+            horizontal_scroll: tab.content.horizontal_scroll,
+            collapsed_folds: tab.content.collapsed_folds.clone(),
+            cursor_line: tab.content.cursor_line,
+            selection: tab.content.selection,
+            navigation_caret: tab.content.navigation_caret,
+        };
+
+        // 创建 EditSession（begin 内部完整读入 + UTF-8 校验 + newline 探测）
+        let mut session = match EditSession::begin(&absolute, snapshot) {
+            Ok(s) => s,
+            Err(e) => {
+                self.last_error = Some(format!("Cannot edit file: {e}"));
+                return;
+            }
+        };
+
+        // 作废在飞 content 请求
+        self.invalidate_active_tab_content_request();
+
+        // swap 完整文件进 content.lines，截断预览进 session.preview_snapshot.lines
+        let tab = self.tab_mut();
+        std::mem::swap(&mut tab.content.lines, &mut session.preview_snapshot.lines);
+        tab.content.edit = Some(session);
+
+        // 展开所有折叠
+        self.expand_all_folds();
+
+        // caret 定位到当前可视区首行
+        let rows = self.content_visual_rows(self.content_render_width());
+        let effective_scroll = self.effective_content_scroll(rows.len());
+        let caret_line = rows
+            .get(effective_scroll)
+            .map(|row| row.line_index)
+            .unwrap_or(0);
+        if let Some(edit) = self.tab_mut().content.edit.as_mut() {
+            edit.caret = ContentPoint {
+                line: caret_line,
+                byte: 0,
+            };
+            edit.preferred_column = 0;
+        }
+
+        self.edit_escape_pending = false;
+        self.ensure_cursor_visible();
+        self.ensure_caret_visible_horizontal();
+    }
+
+    /// 编辑模式键盘处理。拦截所有键，不泄漏到全局 match。
+    fn handle_edit_key(&mut self, key: KeyEvent) {
+        // 先重置 escape pending（除非按的是 Esc）
+        if key.code != KeyCode::Esc {
+            self.edit_escape_pending = false;
+        }
+
+        let mut edit = match self.tab_mut().content.edit.take() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // 分类处理：编辑操作需要 &mut lines，caret 移动只需要 &[String]
+        // 注意 Ctrl+S 不能落入此类（否则被吞掉，到不了保存分支）
+        let is_edit_op = match (key.code, key.modifiers) {
+            (KeyCode::Char(_), m)
+                if !m.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                ) =>
+            {
+                true
+            }
+            (KeyCode::Enter, _) | (KeyCode::Backspace, _) | (KeyCode::Delete, _) => true,
+            (KeyCode::Char('z' | 'Z' | 'y' | 'Y'), KeyModifiers::CONTROL) => true,
+            _ => false,
+        };
+
+        if is_edit_op {
+            let lines = &mut self.tab_mut().content.lines;
+            match (key.code, key.modifiers) {
+                (KeyCode::Char(ch), modifiers)
+                    if !modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                    ) =>
+                {
+                    edit.insert_char(lines, ch);
+                }
+                (KeyCode::Enter, _) => edit.insert_newline(lines),
+                (KeyCode::Backspace, _) => edit.backspace(lines),
+                (KeyCode::Delete, _) => edit.delete(lines),
+                (KeyCode::Char('z' | 'Z'), KeyModifiers::CONTROL) => edit.undo(lines),
+                (KeyCode::Char('y' | 'Y'), KeyModifiers::CONTROL) => edit.redo(lines),
+                _ => {}
+            }
+            self.tab_mut().content.edit = Some(edit);
+            self.ensure_cursor_visible();
+            self.ensure_caret_visible_horizontal();
+            return;
+        }
+
+        // Ctrl+S save
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('s' | 'S'), KeyModifiers::CONTROL)
+        ) {
+            self.tab_mut().content.edit = Some(edit);
+            self.save_edit_session();
+            return;
+        }
+
+        // Esc 退出
+        if key.code == KeyCode::Esc {
+            if edit.dirty {
+                if self.edit_escape_pending {
+                    self.tab_mut().content.edit = Some(edit);
+                    self.exit_edit_mode_without_save();
+                } else {
+                    self.edit_escape_pending = true;
+                    self.tab_mut().content.edit = Some(edit);
+                }
+            } else if edit.saved {
+                // 已保存：快照是旧的，退出后重载预览
+                self.tab_mut().content.edit = Some(edit);
+                self.exit_edit_mode_after_save();
+            } else {
+                // 未修改：恢复快照即可
+                self.tab_mut().content.edit = Some(edit);
+                self.exit_edit_mode_without_save();
+            }
+            return;
+        }
+
+        // caret 移动（只读 lines，不持有可变借用）
+        let direction = match (key.code, key.modifiers) {
+            (KeyCode::Left, _) => Some(CaretDirection::Left),
+            (KeyCode::Right, _) => Some(CaretDirection::Right),
+            (KeyCode::Up, _) => Some(CaretDirection::Up),
+            (KeyCode::Down, _) => Some(CaretDirection::Down),
+            (KeyCode::Home, _) => Some(CaretDirection::Home),
+            (KeyCode::End, _) => Some(CaretDirection::End),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            let lines = &self.tab().content.lines;
+            self.move_edit_caret(&mut edit, lines, direction, extend);
+            self.tab_mut().content.edit = Some(edit);
+            self.ensure_cursor_visible();
+            self.ensure_caret_visible_horizontal();
+        } else {
+            // 其他键忽略
+            self.tab_mut().content.edit = Some(edit);
+        }
+    }
+
+    /// 不保存退出编辑模式，恢复预览快照。
+    fn exit_edit_mode_without_save(&mut self) {
+        {
+            let tab = self.tab_mut();
+            if let Some(edit) = tab.content.edit.take() {
+                // 恢复预览快照
+                tab.content.lines = edit.preview_snapshot.lines.clone();
+                tab.content.highlights = edit.preview_snapshot.highlights.clone();
+                tab.content.scroll = edit.preview_snapshot.scroll;
+                tab.content.horizontal_scroll = edit.preview_snapshot.horizontal_scroll;
+                tab.content.collapsed_folds = edit.preview_snapshot.collapsed_folds.clone();
+                tab.content.cursor_line = edit.preview_snapshot.cursor_line;
+                tab.content.selection = edit.preview_snapshot.selection;
+                tab.content.navigation_caret = edit.preview_snapshot.navigation_caret;
+            }
+        }
+        self.edit_escape_pending = false;
+    }
+
+    /// 已保存后退出编辑模式：丢弃快照，重载预览以反映磁盘内容。
+    fn exit_edit_mode_after_save(&mut self) {
+        let (target, label, review_path) = {
+            let tab = self.tab();
+            (
+                tab.content.source_target.clone(),
+                tab.content
+                    .identity
+                    .as_ref()
+                    .map(|id| id.display_label().to_string()),
+                tab.content.current_diff_path.clone(),
+            )
+        };
+        self.tab_mut().content.edit = None;
+        self.edit_escape_pending = false;
+        self.cache_current_folds();
+        if let (Some(target), Some(label)) = (target, label) {
+            self.request_content_with_review_path(ContentKind::Preview, label, target, review_path);
+        }
+    }
+
+    /// 保存编辑会话（不退出编辑模式）。
+    fn save_edit_session(&mut self) {
+        // 收集保存所需信息（不可变借用）
+        let (absolute, lines) = {
+            let tab = self.tab();
+            if tab.content.edit.is_none() {
+                return;
+            }
+            let Some(identity) = tab.content.identity.as_ref() else {
+                return;
+            };
+            let Some(workspace_path) = identity.workspace_path() else {
+                return;
+            };
+            let absolute = self.root.join(workspace_path);
+            (absolute, tab.content.lines.clone())
+        };
+
+        // 执行保存（可变借用，save 需要 &mut self 清 dirty + 更新 original_bytes）
+        let save_result = {
+            let tab = self.tab_mut();
+            let edit = tab.content.edit.as_mut().unwrap();
+            edit.save(&absolute, &lines)
+        };
+
+        match save_result {
+            Ok(()) => {
+                // 保存成功：留在编辑模式，清 escape pending，显示状态
+                self.edit_escape_pending = false;
+                self.last_error = Some("Saved".to_string());
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Save failed: {e}"));
+            }
+        }
+    }
+
+    /// 水平滚动跟随：确保 caret 在可视区内。
+    fn ensure_caret_visible_horizontal(&mut self) {
+        let tab = self.tab();
+        let Some(edit) = tab.content.edit.as_ref() else {
+            return;
+        };
+        let caret_line = edit.caret.line;
+        let caret_byte = edit.caret.byte;
+        let line = &tab.content.lines[caret_line.min(tab.content.lines.len() - 1)];
+
+        // 计算 caret 的显示列
+        let display_col =
+            crate::text_layout::expand_tabs(&line[..caret_byte.min(line.len())], 0, 0).1;
+
+        let text_width = self.content_render_width() as usize;
+        let gutter = self.content_gutter_width();
+        let available = text_width.saturating_sub(gutter);
+        // 尚未渲染（ui_regions 为零宽）时无可视区概念，跳过跟随。
+        if available == 0 {
+            return;
+        }
+
+        let tab = self.tab_mut();
+        if display_col < tab.content.horizontal_scroll {
+            tab.content.horizontal_scroll = display_col;
+        } else if display_col >= tab.content.horizontal_scroll + available {
+            tab.content.horizontal_scroll = display_col.saturating_sub(available - 1);
+        }
+    }
+
+    /// caret 移动（编辑模式）。
+    fn move_edit_caret(
+        &self,
+        edit: &mut crate::edit::EditSession,
+        lines: &[String],
+        direction: CaretDirection,
+        extend_selection: bool,
+    ) {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let caret = edit.caret;
+        let line = caret.line;
+        let byte = caret.byte;
+        let line_len = lines[line].len();
+
+        let new_caret = match direction {
+            CaretDirection::Left => {
+                if byte > 0 {
+                    let prev = lines[line][..byte]
+                        .grapheme_indices(true)
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    ContentPoint { line, byte: prev }
+                } else if line > 0 {
+                    ContentPoint {
+                        line: line - 1,
+                        byte: lines[line - 1].len(),
+                    }
+                } else {
+                    caret
+                }
+            }
+            CaretDirection::Right => {
+                if byte < line_len {
+                    let next = lines[line][byte..]
+                        .grapheme_indices(true)
+                        .nth(1)
+                        .map(|(i, _)| byte + i)
+                        .unwrap_or(line_len);
+                    ContentPoint { line, byte: next }
+                } else if line + 1 < lines.len() {
+                    ContentPoint {
+                        line: line + 1,
+                        byte: 0,
+                    }
+                } else {
+                    caret
+                }
+            }
+            CaretDirection::Up => {
+                if line > 0 {
+                    let target_line = line - 1;
+                    let target_byte =
+                        self.byte_at_display_column(&lines[target_line], edit.preferred_column);
+                    ContentPoint {
+                        line: target_line,
+                        byte: target_byte,
+                    }
+                } else {
+                    caret
+                }
+            }
+            CaretDirection::Down => {
+                if line + 1 < lines.len() {
+                    let target_line = line + 1;
+                    let target_byte =
+                        self.byte_at_display_column(&lines[target_line], edit.preferred_column);
+                    ContentPoint {
+                        line: target_line,
+                        byte: target_byte,
+                    }
+                } else {
+                    caret
+                }
+            }
+            CaretDirection::Home => {
+                edit.preferred_column = 0;
+                ContentPoint { line, byte: 0 }
+            }
+            CaretDirection::End => {
+                let col = crate::text_layout::expand_tabs(&lines[line], 0, 0).1;
+                edit.preferred_column = col;
+                ContentPoint {
+                    line,
+                    byte: line_len,
+                }
+            }
+        };
+
+        // 更新 preferred_column（用于 Up/Down）
+        if direction != CaretDirection::Up && direction != CaretDirection::Down {
+            edit.preferred_column =
+                crate::text_layout::expand_tabs(&lines[new_caret.line][..new_caret.byte], 0, 0).1;
+        }
+
+        // 选区扩展
+        if extend_selection {
+            let sel = edit.selection.get_or_insert(ContentSelection {
+                anchor_before: caret,
+                anchor_after: caret,
+                head: caret,
+                dragging: false,
+                dragged: false,
+            });
+            sel.head = new_caret;
+            sel.anchor_after = new_caret;
+        } else {
+            edit.selection = None;
+        }
+
+        edit.caret = new_caret;
+    }
+
+    /// 计算显示列对应的字节偏移。
+    fn byte_at_display_column(&self, line: &str, display_col: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut col = 0;
+        for (i, g) in line.grapheme_indices(true) {
+            if col >= display_col {
+                return i;
+            }
+            col += g.chars().count().max(1);
+        }
+        line.len()
+    }
+
+    /// 编辑模式粘贴。
+    fn handle_edit_paste(&mut self, text: String) {
+        let mut edit = match self.tab_mut().content.edit.take() {
+            Some(e) => e,
+            None => return,
+        };
+        let lines = &mut self.tab_mut().content.lines;
+        edit.insert_text(lines, &text);
+        self.tab_mut().content.edit = Some(edit);
+        self.ensure_cursor_visible();
+        self.ensure_caret_visible_horizontal();
+    }
+
+    /// 编辑模式鼠标处理。
+    fn handle_edit_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((before, _)) = self.content_point_bounds(mouse) {
+                    // 双击检测：同一位置 400ms 内第二次点击
+                    let is_double_click = self.last_edit_click.take().is_some_and(|(pos, time)| {
+                        pos == before && time.elapsed().as_millis() <= 400
+                    });
+
+                    let tab = self.tab_mut();
+                    if let Some(edit) = tab.content.edit.as_mut() {
+                        if is_double_click {
+                            // 双击：选中词
+                            let line = &tab.content.lines[before.line];
+                            let word = crate::edit::EditSession::word_bounds_at(line, before.byte);
+                            if word.start < word.end {
+                                edit.selection = Some(ContentSelection {
+                                    anchor_before: ContentPoint {
+                                        line: before.line,
+                                        byte: word.start,
+                                    },
+                                    anchor_after: ContentPoint {
+                                        line: before.line,
+                                        byte: word.end,
+                                    },
+                                    head: ContentPoint {
+                                        line: before.line,
+                                        byte: word.end,
+                                    },
+                                    dragging: false,
+                                    dragged: false,
+                                });
+                            }
+                            edit.caret = before;
+                        } else {
+                            // 单击：定位 caret，清除选区
+                            edit.caret = before;
+                            edit.selection = None;
+                        }
+                        edit.preferred_column = crate::text_layout::expand_tabs(
+                            &tab.content.lines[before.line][..before.byte],
+                            0,
+                            0,
+                        )
+                        .1;
+                    }
+                    self.edit_escape_pending = false;
+                    if !is_double_click {
+                        self.last_edit_click = Some((before, Instant::now()));
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // 拖拽：扩展选区
+                if let Some((before, _)) = self.content_point_bounds(mouse) {
+                    let tab = self.tab_mut();
+                    if let Some(edit) = tab.content.edit.as_mut() {
+                        let caret = edit.caret;
+                        let sel = edit.selection.get_or_insert(ContentSelection {
+                            anchor_before: caret,
+                            anchor_after: caret,
+                            head: caret,
+                            dragging: true,
+                            dragged: true,
+                        });
+                        sel.head = before;
+                        sel.anchor_after = before;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // 结束拖拽
+                let tab = self.tab_mut();
+                if let Some(edit) = tab.content.edit.as_mut()
+                    && let Some(sel) = edit.selection.as_mut()
+                {
+                    sel.dragging = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 编辑模式 debounce 重高亮。
+    fn dispatch_edit_highlight_if_due(&mut self) {
+        let tab = self.tab();
+        let Some(edit) = tab.content.edit.as_ref() else {
+            return;
+        };
+        if edit.large_file {
+            return;
+        }
+        let Some(due) = edit.highlight_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+
+        // 同步重高亮
+        let tab = self.tab();
+        let Some(identity) = tab.content.identity.as_ref() else {
+            return;
+        };
+        let Some(workspace_path) = identity.workspace_path() else {
+            return;
+        };
+        let absolute = self.root.join(workspace_path);
+        let highlights = crate::preview::syntax_highlights(&absolute, &tab.content.lines);
+
+        let tab = self.tab_mut();
+        tab.content.highlights = highlights.unwrap_or_default();
+        if let Some(edit) = tab.content.edit.as_mut() {
+            edit.highlight_due = None;
+        }
+    }
+
+    /// 检查是否有任何 tab 的编辑会话有未保存修改。
+    fn has_dirty_edit(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.content.edit.as_ref().is_some_and(|e| e.dirty))
+    }
+
+    /// 编辑模式 footer 提示。
+    pub(crate) fn edit_footer_hint(&self) -> Option<&'static str> {
+        let tab = self.tab();
+        tab.content.edit.as_ref()?;
+        if self.edit_escape_pending {
+            Some("Unsaved changes · Esc again to discard · ^S save · any key to continue")
+        } else if tab.content.edit.as_ref().is_some_and(|e| e.dirty) {
+            Some("EDIT (unsaved) · Esc exit · ^S save · ^Z undo · ^Y redo · click/drag select")
+        } else {
+            Some("EDIT · Esc exit · ^S save · ^Z undo · ^Y redo · click/drag select")
         }
     }
 
@@ -3500,6 +4195,26 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.quit_confirmation = None;
         self.tab_mut().content.navigation_hover_highlight = None;
+
+        // 编辑模式鼠标分支：优先于 Moved/Alt+hover 导航
+        if self.tab().content.edit.is_some() {
+            // 滚轮保持滚动
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.handle_mouse_scroll(mouse, -3);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.handle_mouse_scroll(mouse, 3);
+                    return;
+                }
+                _ => {}
+            }
+            // 其他鼠标事件走编辑处理
+            self.handle_edit_mouse(mouse);
+            return;
+        }
+
         if mouse.kind == MouseEventKind::Moved {
             if mouse.modifiers == KeyModifiers::ALT
                 && self.navigation_picker.is_none()
@@ -5612,6 +6327,7 @@ impl App {
             self.navigation_status = None;
         }
         self.dispatch_search_if_due();
+        self.dispatch_edit_highlight_if_due();
         let (refresh, directories, content, external_open) = self.runtime.take_completions();
         if let Some(completion) = refresh {
             self.apply_refresh_completion(completion);
@@ -6229,7 +6945,7 @@ impl App {
     }
 
     const fn default_directory_expansion(_scope: TreeScope) -> bool {
-        true
+        false
     }
 
     fn reconcile_expansion_state(&mut self) {
@@ -8291,6 +9007,12 @@ impl App {
             purpose,
             result,
         } = completion;
+        // 编辑态守卫：目标 tab 有活跃编辑会话时丢弃 completion（防 stale 覆盖编辑缓冲）
+        if let Some(tab) = self.tabs.iter().find(|t| t.id == TabId(tab_id))
+            && tab.content.edit.is_some()
+        {
+            return;
+        }
         if let ContentPurpose::NavigationPreview {
             navigation_generation,
         } = purpose
@@ -8867,7 +9589,11 @@ fn fold_summary(hidden_lines: usize, text_width: usize) -> String {
     }
 }
 
-fn visual_row_contains_byte(row: &ContentVisualRow, byte: usize, line_len: usize) -> bool {
+pub(crate) fn visual_row_contains_byte(
+    row: &ContentVisualRow,
+    byte: usize,
+    line_len: usize,
+) -> bool {
     row.byte_range.start <= byte
         && (byte < row.byte_range.end || (byte == line_len && row.byte_range.end == line_len))
 }

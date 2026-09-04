@@ -5,6 +5,7 @@ mod clipboard;
 pub mod config;
 mod content_safety;
 mod diff;
+mod edit;
 mod folding;
 pub mod git;
 mod lsp;

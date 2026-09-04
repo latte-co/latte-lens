@@ -127,6 +127,16 @@ def create_navigation_fixture(root: Path, environment: dict[str, str]) -> None:
     nested_file.write_text("nested changed\n", encoding="utf-8")
 
 
+def create_edit_mode_fixture(root: Path, environment: dict[str, str]) -> None:
+    """A committed text file for the edit-mode journey."""
+
+    init_repository(root, environment)
+    notes = root / "notes.txt"
+    notes.write_text("hello world\n", encoding="utf-8")
+    run("git", "add", "notes.txt", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "fixture", cwd=root, environment=environment)
+
+
 def create_symlink_preview_fixture(root: Path, environment: dict[str, str]) -> None:
     del environment
     # A directory symlink that points outside the workspace, with a file inside

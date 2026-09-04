@@ -178,8 +178,9 @@ fn every_workspace_starts_with_two_levels_and_loads_deeper_directories_on_expand
         .map(|entry| entry.relative.clone())
         .collect();
     assert!(initial_paths.contains(&PathBuf::from("one/two")));
-    // The first two levels are visible: "one" defaults to expanded, and
-    // "one/two" is visible as a collapsed directory.
+    // Directories default to collapsed; expanding "one" reveals "one/two".
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     assert!(visible_paths(&app).contains(&PathBuf::from("one")));
     assert!(visible_paths(&app).contains(&PathBuf::from("one/two")));
     // Deeper content is not loaded until the directory is expanded.
@@ -421,8 +422,20 @@ fn visible_rows_keep_raw_datasets_canonical_and_apply_scope_defaults() {
             .find(|entry| entry.relative == Path::new("src/nested"))
             .is_some_and(|entry| entry.contains_changes)
     );
-    // Depth-1 directories default to expanded; depth-2 directories default
-    // to collapsed until explicitly expanded.
+    // All directories default to collapsed; only top-level entries are visible.
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("docs"), PathBuf::from("src"),]
+    );
+
+    // Expanding "docs" and "src" reveals their children.
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Enter)); // expand docs
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // docs → docs/clean.md
+    app.handle_key(key(KeyCode::Down)); // docs/clean.md → src
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
     assert_eq!(
         visible_paths(&app),
         [
@@ -487,15 +500,11 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Directories default to expanded, so the workspace opens with the file
-    // visible and Enter first collapses the directory.
+    // Directories default to collapsed, so the workspace opens with only
+    // top-level entries visible and Enter first expands the directory.
     assert_eq!(
         visible_paths(&app),
-        [
-            PathBuf::from("src"),
-            PathBuf::from("src/file.txt"),
-            PathBuf::from("top.txt"),
-        ]
+        [PathBuf::from("src"), PathBuf::from("top.txt"),]
     );
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
 
@@ -504,7 +513,11 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
         visible_paths(&app),
-        [PathBuf::from("src"), PathBuf::from("top.txt")]
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/file.txt"),
+            PathBuf::from("top.txt"),
+        ]
     );
     // Directories no longer show an info preview (VS Code-style): the content
     // pane keeps its minimal hint when no file is open.
@@ -515,6 +528,13 @@ fn enter_toggles_directories_and_previews_files_in_lens() {
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.focused_pane, FocusPane::Tree);
+    assert_eq!(
+        visible_paths(&app),
+        [PathBuf::from("src"), PathBuf::from("top.txt"),]
+    );
+
+    // Re-expand so the file row is reachable.
+    app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         visible_paths(&app),
         [
@@ -557,16 +577,27 @@ fn single_click_toggles_directories_and_double_click_previews_files() {
 
     let tree_x = app.ui_regions.tree_inner.x;
     let tree_y = app.ui_regions.tree_inner.y;
-    // Directories default to expanded; single click collapses it (VS Code-style).
+    // Directories default to collapsed; single click expands it (VS Code-style).
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(app.focused_pane, FocusPane::Tree);
     assert_eq!(app.selected_relative_path(), Some(PathBuf::from("src")));
     assert_eq!(
         visible_paths(&app),
+        [
+            PathBuf::from("src"),
+            PathBuf::from("src/file.txt"),
+            PathBuf::from("top.txt"),
+        ]
+    );
+
+    // Single click again collapses it.
+    app.handle_mouse(mouse_down(tree_x, tree_y));
+    assert_eq!(
+        visible_paths(&app),
         [PathBuf::from("src"), PathBuf::from("top.txt")]
     );
 
-    // Single click again expands it.
+    // Re-expand so the file row is reachable for the double-click preview.
     app.handle_mouse(mouse_down(tree_x, tree_y));
     assert_eq!(
         visible_paths(&app),
@@ -703,9 +734,11 @@ fn breadcrumbs_show_selected_path_and_click_navigates_to_parent() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Navigate to src/nested/main.rs. "src" defaults to expanded, so
-    // "src/nested" is visible but collapsed; expanding it loads main.rs.
+    // Navigate to src/nested/main.rs. "src" defaults to collapsed, so
+    // expand it first; "src/nested" is then visible but collapsed.
     app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
     app.handle_key(key(KeyCode::Down)); // src → src/nested
     app.handle_key(key(KeyCode::Enter)); // expand src/nested (loads main.rs)
     settle(&mut app);
@@ -773,18 +806,16 @@ fn right_click_opens_context_menu_and_actions_execute() {
     app.handle_key(key(KeyCode::Up));
     assert_eq!(app.tree_context_menu.as_ref().unwrap().selected, 0);
 
-    // Enter on ToggleExpand collapses the directory and closes the menu.
+    // Enter on ToggleExpand expands the directory (default is collapsed)
+    // and closes the menu.
     let before = visible_paths(&app);
     app.handle_key(key(KeyCode::Enter));
     assert!(app.tree_context_menu.is_none());
-    assert!(visible_paths(&app).len() < before.len());
-    assert!(!visible_paths(&app).contains(&PathBuf::from("src/main.rs")));
+    assert!(visible_paths(&app).len() > before.len());
+    assert!(visible_paths(&app).contains(&PathBuf::from("src/main.rs")));
 
     // Right-click on a file row shows Preview as the first action.
-    // First expand src, then right-click on the file row.
-    app.handle_key(key(KeyCode::Char('s')));
-    app.handle_key(key(KeyCode::Enter));
-    settle(&mut app);
+    // src is now expanded, so the file row is directly below.
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     // Find the file row (src/main.rs).
     let file_row = tree_y + 1; // src is row 0, src/main.rs is row 1
@@ -970,17 +1001,17 @@ fn refresh_preserves_scope_choices_and_defaults_new_directories() {
     fixture.write("alpha/old.txt", "after\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // All Files keeps an explicit collapse through refresh, while a new
-    // directory defaults to expanded.
-    app.handle_key(key(KeyCode::Enter));
+    // All Files keeps an explicit expansion through refresh, while a new
+    // directory defaults to collapsed.
+    app.handle_key(key(KeyCode::Enter)); // expand alpha (default collapsed)
     fixture.write("beta/new.txt", "new\n");
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.handle_key(key(KeyCode::Char('h'))); // back to Tree for navigation
     let all_after_refresh = visible_paths(&app);
-    assert!(!all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
+    assert!(all_after_refresh.contains(&PathBuf::from("alpha/old.txt")));
     assert!(all_after_refresh.contains(&PathBuf::from("beta")));
-    assert!(all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
+    assert!(!all_after_refresh.contains(&PathBuf::from("beta/new.txt")));
 
     // Git Changes starts expanded, retains a deliberate collapse, and opens a
     // newly discovered changed directory by default.
@@ -1009,7 +1040,9 @@ fn saved_selection_survives_parent_removal_and_rediscover() {
     fixture.write("src/child.txt", "untracked\n");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // Directories default to expanded, so the child is reachable directly.
+    // Directories default to collapsed; expand "src" to reach the child.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     app.handle_key(key(KeyCode::Down));
     assert_eq!(
         app.selected_relative_path(),
@@ -1018,8 +1051,8 @@ fn saved_selection_survives_parent_removal_and_rediscover() {
 
     // Keep All Files' child selection saved while refreshes in the other scope
     // remove and later rediscover the parent. Rediscovery uses the All Files
-    // default (expanded), so the child is visible again and the saved
-    // selection restores directly.
+    // default (collapsed), so expand "src" again to restore the saved
+    // selection visibility.
     app.set_tree_scope(TreeScope::GitChanges);
     settle(&mut app);
     fs::remove_dir_all(fixture.root().join("src")).unwrap();
@@ -1029,6 +1062,10 @@ fn saved_selection_survives_parent_removal_and_rediscover() {
     app.handle_key(key(KeyCode::Char('r')));
     settle(&mut app);
     app.set_tree_scope(TreeScope::AllFiles);
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Enter)); // expand src (default collapsed)
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/child.txt
 
     assert_eq!(
         app.selected_relative_path(),
@@ -3105,6 +3142,9 @@ fn all_files_aligns_directory_and_file_labels_with_a_blank_file_disclosure_slot(
     fixture.write("plain.txt", "plain\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    // Expand "folder" so its child is visible for the alignment check.
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -3785,10 +3825,12 @@ fn info_mouse_selection_maps_the_visual_inset_to_the_exact_content_row() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
     // Open the file so the content pane has selectable text (directories no
-    // longer show an info preview). src defaults to expanded, so navigate
-    // directly to src/lib.rs.
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Enter));
+    // longer show an info preview). src defaults to collapsed, so expand it
+    // first, then navigate to src/lib.rs.
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/lib.rs
+    app.handle_key(key(KeyCode::Enter)); // preview lib.rs
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
@@ -5118,13 +5160,13 @@ fn set_tab_root_filters_tree_to_subdirectory_and_reset_restores() {
         Some(PathBuf::from("src/lib.rs"))
     );
 
-    // Reset restores the full tree.
+    // Reset restores the full tree. "src" stays expanded from the view-root
+    // implicit expansion; "docs" follows the collapsed default.
     app.reset_tab_root_for_test();
     assert_eq!(
         visible_paths(&app),
         [
             PathBuf::from("docs"),
-            PathBuf::from("docs/readme.md"),
             PathBuf::from("src"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/main.rs"),
@@ -5141,9 +5183,12 @@ fn tab_root_up_walks_to_parent_and_workspace_root() {
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
 
-    // src defaults to expanded; navigate to src/deep and expand it.
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Enter));
+    // src defaults to collapsed; expand it, then navigate to src/deep and
+    // expand it.
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/deep
+    app.handle_key(key(KeyCode::Enter)); // expand src/deep
     settle(&mut app);
 
     app.set_tab_root_for_test(PathBuf::from("src/deep"));
@@ -5236,8 +5281,10 @@ fn copy_relative_path_uses_view_root_when_re_rooted() {
     fixture.write("src/main.rs", "fn main() {}\n");
     fixture.commit_all("initial");
     let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    // src defaults to expanded; navigate directly to src/main.rs.
-    app.handle_key(key(KeyCode::Down));
+    // src defaults to collapsed; expand it, then navigate to src/main.rs.
+    app.handle_key(key(KeyCode::Enter)); // expand src
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Down)); // src → src/main.rs
     settle(&mut app);
 
     // Select src/main.rs and copy its relative path at the workspace root.
@@ -5369,6 +5416,267 @@ fn new_files_tab_defaults_to_workspace_root() {
     app.open_tab(TabKind::Files);
     assert_eq!(app.tab().files().view_root, None);
     assert!(visible_paths(&app).contains(&PathBuf::from("src")));
+}
+
+// ===========================================================================
+// Edit mode integration tests
+// ===========================================================================
+
+/// 创建一个含文本文件的临时目录，返回 (directory, file_path)。
+fn edit_fixture(content: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let file_path = directory.path().join("edit.txt");
+    fs::write(&file_path, content).unwrap();
+    (directory, file_path)
+}
+
+/// 准备好编辑模式的 app：选中文本文件、Content 焦点、按 i 进入编辑。
+fn ready_edit_app(content: &str) -> (tempfile::TempDir, App) {
+    let (directory, _) = edit_fixture(content);
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    // 选中第一个文件并聚焦 Content
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    // 进入编辑模式
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(
+        app.edit_is_active(),
+        "edit mode should be active after pressing i"
+    );
+    (directory, app)
+}
+
+#[test]
+fn edit_mode_enters_with_i_key() {
+    let (_dir, app) = ready_edit_app("hello\nworld\n");
+    assert_eq!(app.edit_caret_position(), Some((0, 0)));
+    assert!(!app.edit_is_dirty());
+    // 完整文件应已换入 content.lines（尾部换行保留空尾行，与编辑器一致）
+    assert_eq!(app.tab().content.lines, vec!["hello", "world", ""]);
+}
+
+#[test]
+fn edit_mode_inserts_character_at_caret() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    // 移到行尾
+    app.handle_key(key(KeyCode::End));
+    // 插入字符
+    app.handle_key(key(KeyCode::Char('!')));
+    assert_eq!(app.tab().content.lines[0], "hello!");
+    assert!(app.edit_is_dirty());
+}
+
+#[test]
+fn edit_mode_backspace_removes_character() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.tab().content.lines[0], "hell");
+}
+
+#[test]
+fn edit_mode_enter_inserts_newline() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('w')));
+    assert_eq!(app.tab().content.lines, vec!["hello", "w", ""]);
+}
+
+#[test]
+fn edit_mode_undo_redo_via_ctrl_z_y() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+    assert_eq!(app.tab().content.lines[0], "hello!");
+
+    // undo
+    app.handle_key(modified_key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(app.tab().content.lines[0], "hello");
+
+    // redo
+    app.handle_key(modified_key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(app.tab().content.lines[0], "hello!");
+}
+
+#[test]
+fn edit_mode_save_writes_file_to_disk() {
+    let (dir, mut app) = ready_edit_app("hello\n");
+    let file_path = dir.path().join("edit.txt");
+
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+    // Ctrl+S 保存（不退出编辑模式）
+    app.handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+    // 保存后应留在编辑模式
+    assert!(
+        app.edit_is_active(),
+        "edit mode should stay active after save"
+    );
+    assert!(!app.edit_is_dirty(), "edit should not be dirty after save");
+    // 文件内容应已写入
+    let saved = fs::read_to_string(&file_path).unwrap();
+    assert_eq!(saved, "hello!\n");
+
+    // Esc 退出（已保存，直接退出，无需确认）
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active(), "Esc should exit after save");
+}
+
+#[test]
+fn edit_mode_esc_exits_when_not_dirty() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active());
+}
+
+#[test]
+fn edit_mode_esc_requires_confirmation_when_dirty() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+
+    // 第一次 Esc：进入确认状态，不退出
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.edit_is_active(), "first Esc should not exit when dirty");
+
+    // 第二次 Esc：放弃修改并退出
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active());
+    // 内容应恢复为原始预览
+    assert_eq!(app.tab().content.lines, vec!["hello"]);
+}
+
+#[test]
+fn edit_mode_close_tab_blocked_when_dirty() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+
+    let tab_count = app.tabs().len();
+    app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.tabs().len(),
+        tab_count,
+        "Ctrl+W should be blocked when edit session is dirty"
+    );
+}
+
+#[test]
+fn edit_mode_mouse_click_positions_caret() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    // 渲染一帧以填充 ui_regions
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    // 点击第 0 行第 3 个字符位置（gutter 后）
+    let gutter = app.content_gutter_width() as u16;
+    let x = app.ui_regions.content_inner.x + gutter + 3;
+    let y = app.ui_regions.content_inner.y;
+    app.handle_mouse(mouse_down(x, y));
+    let (line, byte) = app.edit_caret_position().expect("edit still active");
+    assert_eq!(line, 0);
+    // 点击第 3 列，caret 应落在第 3 个字节附近
+    assert!(
+        byte <= 3,
+        "caret byte should be at or near click position, got {byte}"
+    );
+}
+
+#[test]
+fn edit_mode_mouse_drag_selects_range() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let gutter = app.content_gutter_width() as u16;
+    let x0 = app.ui_regions.content_inner.x + gutter;
+    let y = app.ui_regions.content_inner.y;
+
+    // Down 在第 1 列，Drag 到第 5 列，Up
+    app.handle_mouse(mouse_down(x0 + 1, y));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x0 + 5, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x0 + 5, y));
+
+    let range = app
+        .edit_selection_range(0)
+        .expect("drag should create a selection");
+    assert_eq!(range, 1..5);
+}
+
+#[test]
+fn edit_mode_mouse_double_click_selects_word() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let gutter = app.content_gutter_width() as u16;
+    // 点击 "hello" 中间（第 2 列）
+    let x = app.ui_regions.content_inner.x + gutter + 2;
+    let y = app.ui_regions.content_inner.y;
+
+    // 400ms 内同位置双击
+    app.handle_mouse(mouse_down(x, y));
+    app.handle_mouse(mouse_down(x, y));
+
+    let range = app
+        .edit_selection_range(0)
+        .expect("double-click should select the word");
+    assert_eq!(range, 0..5, "should select 'hello'");
+}
+
+#[test]
+fn edit_mode_loads_full_file_beyond_preview_truncation() {
+    // 预览截断上限为 10000 行；编辑模式必须独立读入完整文件。
+    let directory = tempfile::tempdir().unwrap();
+    let file_path = directory.path().join("long.txt");
+    let mut content = String::new();
+    for i in 0..10005 {
+        use std::fmt::Write;
+        writeln!(content, "line {i}").unwrap();
+    }
+    fs::write(&file_path, &content).unwrap();
+
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('l')));
+    // 预览应被截断（10000 行 + 哨兵行）
+    assert!(
+        app.tab().content.lines.len() <= 10001,
+        "preview should be truncated, got {} lines",
+        app.tab().content.lines.len()
+    );
+
+    // 进入编辑模式：完整文件换入
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(app.edit_is_active());
+    assert_eq!(
+        app.tab().content.lines.len(),
+        10006, // 10005 行内容 + 尾部换行产生的空尾行
+        "edit mode should load the full untruncated file"
+    );
+    assert_eq!(app.tab().content.lines[0], "line 0");
+    assert_eq!(app.tab().content.lines[10004], "line 10004");
+}
+
+#[test]
+fn edit_mode_footer_shows_edit_hints() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    // footer 应包含编辑模式提示
+    assert!(
+        rendered.contains("EDIT") || rendered.contains("Esc"),
+        "footer should show edit mode hints, got: {}",
+        rendered
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 fn key(code: KeyCode) -> KeyEvent {

@@ -21,6 +21,7 @@ from .fixtures import (
     create_descendant_lsp_fixture,
     create_directory_product_config_fixture,
     create_disabled_product_config_fixture,
+    create_edit_mode_fixture,
     create_fold_mouse_navigation_fixture,
     create_git_matrix_fixture,
     create_image_preview_fixture,
@@ -165,8 +166,8 @@ def files_navigation(context: ScenarioContext) -> None:
     session = context.session
     wait_for_initial_files(session)
     session.wait_screen(
-        ("▾ a-dir", "nested"),
-        "initial expanded all-files directory",
+        ("▸ a-dir",),
+        "initial collapsed all-files directory",
     )
 
     # Discover the current semantic divider instead of encoding a layout/style
@@ -205,14 +206,8 @@ def files_navigation(context: ScenarioContext) -> None:
     session.key(b"\x1b[H")  # Home to the first row (a-dir)
     session.key(b"\r")
     session.wait_screen(
-        ("▸ a-dir",),
-        "keyboard-closed expanded All Files directory",
-        absent=("b-changed.rs",),
-    )
-    _click_tree_row(session, "a-dir")
-    session.wait_screen(
         ("▾ a-dir", "nested"),
-        "mouse-opened directory with single click",
+        "keyboard-opened collapsed All Files directory",
     )
     _click_tree_row(session, "a-dir")
     session.wait_screen(
@@ -220,10 +215,21 @@ def files_navigation(context: ScenarioContext) -> None:
         "mouse-closed directory with single click",
         absent=("b-changed.rs",),
     )
+    _click_tree_row(session, "a-dir")
+    session.wait_screen(
+        ("▾ a-dir", "nested"),
+        "mouse-opened directory with single click",
+    )
+    session.key(b"\r")
+    session.wait_screen(
+        ("▸ a-dir",),
+        "keyboard-closed directory",
+        absent=("nested",),
+    )
     session.key(b"\r")
     session.wait_screen(
         ("▾ a-dir", "nested"),
-        "keyboard-opened directory",
+        "keyboard-reopened directory",
     )
 
     # Preserve the original cross-scope state assertion in the Files group.
@@ -529,9 +535,14 @@ def keyboard_controls(context: ScenarioContext) -> None:
     session.key(b"g")
     session.key(b"\r")
     session.wait_screen(
+        ("▾ a-dir", "nested"),
+        "tree Home and Enter expand the first directory",
+    )
+    session.key(b"\r")
+    session.wait_screen(
         ("▸ a-dir",),
-        "tree Home and Enter collapse the first directory",
-        absent=("b-changed.rs",),
+        "Enter re-collapses the directory",
+        absent=("nested",),
     )
     session.key(b"\r")
     session.wait_screen(
@@ -2210,6 +2221,105 @@ def code_navigation_without_lsp(context: ScenarioContext) -> None:
     )
 
 
+def edit_mode(context: ScenarioContext) -> None:
+    """Edit a text file in the preview: discard, undo/redo, save.
+
+    The discard journey runs first because it exits via PreviewSnapshot
+    restore (no async reload), so edit mode can be re-entered immediately.
+    The save journey runs last because it triggers an async content reload
+    during which the edit-mode entry gates are temporarily unsatisfied.
+    """
+
+    session = context.session
+    notes = context.repository / "notes.txt"
+    wait_for_initial_files(session)
+
+    # Open the committed text file in preview.
+    _click_tree_row(session, "notes.txt")
+    session.wait_screen(
+        ("notes.txt", "hello world"),
+        "text file previews its content",
+    )
+
+    # Focus Content and enter edit mode.
+    session.key(b"l")
+    session.key(b"i")
+    session.wait_screen(
+        ("EDIT", "Esc exit", "save"),
+        "edit mode activates with edit footer hints",
+    )
+
+    # --- Discard journey: dirty edit, Esc+Esc discards, file unchanged ---
+    session.key(b"DISCARD")
+    session.wait_screen(("DISCARD",), "dirty edit is visible")
+    session.key(b"\x1b")  # Esc → dirty confirmation
+    session.wait_screen(
+        ("Unsaved changes", "Esc again to discard"),
+        "dirty edit requires confirmation to exit",
+    )
+    session.key(b"\x1b")  # Esc again → discard and exit
+    session.wait_screen(
+        ("hello world",),
+        "discard restores the original preview",
+        absent=("Esc exit", "DISCARD"),
+    )
+    session.drain()
+    assert notes.read_text(encoding="utf-8") == "hello world\n", (
+        "discarded edit must not change the file on disk"
+    )
+
+    # --- Save journey: re-enter, type, undo/redo, save, file changed ---
+    # Discard restores the snapshot synchronously (no reload), so the
+    # content state is immediately eligible for edit-mode re-entry.
+    session.key(b"i")
+    session.wait_screen(
+        ("EDIT", "Esc exit", "save"),
+        "edit mode re-activates after discard",
+    )
+
+    # Type at the caret (start of file): prefix the first line.
+    session.key(b"EDITED ")
+    session.wait_screen(
+        ("EDITED hello world",),
+        "typed text appears in the preview",
+    )
+
+    # Undo removes the typed prefix; redo brings it back.
+    session.key(b"\x1a")  # Ctrl+Z
+    session.wait_screen(
+        ("hello world",),
+        "undo restores original content",
+        absent=("EDITED hello world",),
+    )
+    session.key(b"\x19")  # Ctrl+Y
+    session.wait_screen(
+        ("EDITED hello world",),
+        "redo re-applies the edit",
+    )
+
+    # Save with Ctrl+S: stays in edit mode, file on disk changes.
+    session.key(b"\x13")  # Ctrl+S
+    session.wait_screen(
+        ("EDIT",),
+        "edit mode stays active after save",
+        absent=("unsaved",),
+    )
+    session.drain()
+    saved = notes.read_text(encoding="utf-8")
+    assert saved == "EDITED hello world\n", (
+        f"file on disk should reflect the saved edit, got {saved!r}"
+    )
+    # Bless the explicit edit-mode save so the read-only oracle passes.
+    context.oracle.record_driver_write(notes)
+
+    # Esc exits after save (not dirty → no confirmation needed).
+    session.key(b"\x1b")
+    session.wait_until(
+        lambda screen: "Esc exit" not in screen.text(),
+        "edit mode exits after save + Esc",
+    )
+
+
 CASES = (
     ScenarioCase("files-navigation", "files", create_navigation_fixture, files_navigation),
     ScenarioCase("files-refresh", "files", create_navigation_fixture, files_refresh),
@@ -2238,6 +2348,7 @@ CASES = (
         create_symlink_preview_fixture,
         symlink_copy_path,
     ),
+    ScenarioCase("edit-mode", "files", create_edit_mode_fixture, edit_mode),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
     ScenarioCase("git-review-state", "git-changes", create_git_matrix_fixture, git_review_state),
