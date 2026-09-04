@@ -5371,6 +5371,259 @@ fn new_files_tab_defaults_to_workspace_root() {
     assert!(visible_paths(&app).contains(&PathBuf::from("src")));
 }
 
+// ===========================================================================
+// Edit mode integration tests
+// ===========================================================================
+
+/// 创建一个含文本文件的临时目录，返回 (directory, file_path)。
+fn edit_fixture(content: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let file_path = directory.path().join("edit.txt");
+    fs::write(&file_path, content).unwrap();
+    (directory, file_path)
+}
+
+/// 准备好编辑模式的 app：选中文本文件、Content 焦点、按 i 进入编辑。
+fn ready_edit_app(content: &str) -> (tempfile::TempDir, App) {
+    let (directory, _) = edit_fixture(content);
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    // 选中第一个文件并聚焦 Content
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.focused_pane, FocusPane::Content);
+    // 进入编辑模式
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(
+        app.edit_is_active(),
+        "edit mode should be active after pressing i"
+    );
+    (directory, app)
+}
+
+#[test]
+fn edit_mode_enters_with_i_key() {
+    let (_dir, app) = ready_edit_app("hello\nworld\n");
+    assert_eq!(app.edit_caret_position(), Some((0, 0)));
+    assert!(!app.edit_is_dirty());
+    // 完整文件应已换入 content.lines（尾部换行保留空尾行，与编辑器一致）
+    assert_eq!(app.tab().content.lines, vec!["hello", "world", ""]);
+}
+
+#[test]
+fn edit_mode_inserts_character_at_caret() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    // 移到行尾
+    app.handle_key(key(KeyCode::End));
+    // 插入字符
+    app.handle_key(key(KeyCode::Char('!')));
+    assert_eq!(app.tab().content.lines[0], "hello!");
+    assert!(app.edit_is_dirty());
+}
+
+#[test]
+fn edit_mode_backspace_removes_character() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.tab().content.lines[0], "hell");
+}
+
+#[test]
+fn edit_mode_enter_inserts_newline() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('w')));
+    assert_eq!(app.tab().content.lines, vec!["hello", "w", ""]);
+}
+
+#[test]
+fn edit_mode_undo_redo_via_ctrl_z_y() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+    assert_eq!(app.tab().content.lines[0], "hello!");
+
+    // undo
+    app.handle_key(modified_key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(app.tab().content.lines[0], "hello");
+
+    // redo
+    app.handle_key(modified_key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(app.tab().content.lines[0], "hello!");
+}
+
+#[test]
+fn edit_mode_save_writes_file_to_disk() {
+    let (dir, mut app) = ready_edit_app("hello\n");
+    let file_path = dir.path().join("edit.txt");
+
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+    // Ctrl+S 保存
+    app.handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+    // 保存后应退出编辑模式
+    assert!(!app.edit_is_active(), "edit mode should exit after save");
+    // 文件内容应已写入
+    let saved = fs::read_to_string(&file_path).unwrap();
+    assert_eq!(saved, "hello!\n");
+}
+
+#[test]
+fn edit_mode_esc_exits_when_not_dirty() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active());
+}
+
+#[test]
+fn edit_mode_esc_requires_confirmation_when_dirty() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+
+    // 第一次 Esc：进入确认状态，不退出
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.edit_is_active(), "first Esc should not exit when dirty");
+
+    // 第二次 Esc：放弃修改并退出
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active());
+    // 内容应恢复为原始预览
+    assert_eq!(app.tab().content.lines, vec!["hello"]);
+}
+
+#[test]
+fn edit_mode_close_tab_blocked_when_dirty() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+
+    let tab_count = app.tabs().len();
+    app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.tabs().len(),
+        tab_count,
+        "Ctrl+W should be blocked when edit session is dirty"
+    );
+}
+
+#[test]
+fn edit_mode_mouse_click_positions_caret() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    // 渲染一帧以填充 ui_regions
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    // 点击第 0 行第 3 个字符位置（gutter 后）
+    let gutter = app.content_gutter_width() as u16;
+    let x = app.ui_regions.content_inner.x + gutter + 3;
+    let y = app.ui_regions.content_inner.y;
+    app.handle_mouse(mouse_down(x, y));
+    let (line, byte) = app.edit_caret_position().expect("edit still active");
+    assert_eq!(line, 0);
+    // 点击第 3 列，caret 应落在第 3 个字节附近
+    assert!(
+        byte <= 3,
+        "caret byte should be at or near click position, got {byte}"
+    );
+}
+
+#[test]
+fn edit_mode_mouse_drag_selects_range() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let gutter = app.content_gutter_width() as u16;
+    let x0 = app.ui_regions.content_inner.x + gutter;
+    let y = app.ui_regions.content_inner.y;
+
+    // Down 在第 1 列，Drag 到第 5 列，Up
+    app.handle_mouse(mouse_down(x0 + 1, y));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x0 + 5, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x0 + 5, y));
+
+    let range = app
+        .edit_selection_range(0)
+        .expect("drag should create a selection");
+    assert_eq!(range, 1..5);
+}
+
+#[test]
+fn edit_mode_mouse_double_click_selects_word() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let gutter = app.content_gutter_width() as u16;
+    // 点击 "hello" 中间（第 2 列）
+    let x = app.ui_regions.content_inner.x + gutter + 2;
+    let y = app.ui_regions.content_inner.y;
+
+    // 400ms 内同位置双击
+    app.handle_mouse(mouse_down(x, y));
+    app.handle_mouse(mouse_down(x, y));
+
+    let range = app
+        .edit_selection_range(0)
+        .expect("double-click should select the word");
+    assert_eq!(range, 0..5, "should select 'hello'");
+}
+
+#[test]
+fn edit_mode_loads_full_file_beyond_preview_truncation() {
+    // 预览截断上限为 10000 行；编辑模式必须独立读入完整文件。
+    let directory = tempfile::tempdir().unwrap();
+    let file_path = directory.path().join("long.txt");
+    let mut content = String::new();
+    for i in 0..10005 {
+        use std::fmt::Write;
+        writeln!(content, "line {i}").unwrap();
+    }
+    fs::write(&file_path, &content).unwrap();
+
+    let mut app = ready_app(directory.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('l')));
+    // 预览应被截断（10000 行 + 哨兵行）
+    assert!(
+        app.tab().content.lines.len() <= 10001,
+        "preview should be truncated, got {} lines",
+        app.tab().content.lines.len()
+    );
+
+    // 进入编辑模式：完整文件换入
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(app.edit_is_active());
+    assert_eq!(
+        app.tab().content.lines.len(),
+        10006, // 10005 行内容 + 尾部换行产生的空尾行
+        "edit mode should load the full untruncated file"
+    );
+    assert_eq!(app.tab().content.lines[0], "line 0");
+    assert_eq!(app.tab().content.lines[10004], "line 10004");
+}
+
+#[test]
+fn edit_mode_footer_shows_edit_hints() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    // footer 应包含编辑模式提示
+    assert!(
+        rendered.contains("EDIT") || rendered.contains("Esc"),
+        "footer should show edit mode hints, got: {}",
+        rendered
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }

@@ -535,7 +535,7 @@ impl PreviewProvider for TextPreviewProvider {
     }
 }
 
-fn syntax_highlights(path: &Path, lines: &[String]) -> Option<Vec<Vec<HighlightSpan>>> {
+pub(crate) fn syntax_highlights(path: &Path, lines: &[String]) -> Option<Vec<Vec<HighlightSpan>>> {
     if lines
         .iter()
         .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)

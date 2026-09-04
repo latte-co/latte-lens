@@ -4,7 +4,11 @@
 
 Latte Lens is a read-only terminal repository viewer. It may inspect files and
 invoke read-only Git commands, but it must not stage, reset, discard, or rewrite
-the user's worktree.
+the user's worktree. The sole exception is **edit mode** (`i` in the preview
+pane): an explicit, opt-in modal that lets the user edit the focused text file
+and save it back to disk with an atomic write. Edit mode never stages, resets,
+or rewrites anything other than the single file the user explicitly chose to
+edit, and only after an explicit save (`Ctrl+S`).
 
 - Package: `latte-lens` `0.2.0` (`Cargo.toml` is the version source of truth).
 - Language: Rust 2024 edition on stable Rust, with MSRV 1.88.
@@ -195,6 +199,9 @@ ordering, ownership, truncation, or fallback semantics that callers must obey.
 
 - Preserve the read-only product boundary and route product Git operations
   through the system Git CLI in `src/git.rs` with optional locks disabled.
+  Edit mode (`src/edit.rs`) is the only write path: it writes exactly one file
+  via atomic rename (temp + fsync + permissions + rename), after content-based
+  conflict detection, and never touches Git state.
 - Keep slow filesystem, Git, search, and preview work in the background runtime;
   reject stale results by generation/epoch before mutating application state.
 - Bound traversal and content work. Surface truncation/partial results instead
@@ -224,7 +231,9 @@ ordering, ownership, truncation, or fallback semantics that callers must obey.
 ### 🚫 Never do
 
 - Stage, reset, checkout, clean, discard, rewrite, or otherwise modify the
-  viewed user's repository from Latte Lens runtime code.
+  viewed user's repository from Latte Lens runtime code. The explicit edit-mode
+  save (`Ctrl+S` in edit mode) is the sole exception: it atomically overwrites
+  only the single file the user chose to edit, after conflict detection.
 - Follow symlinks/reparse points or open FIFOs, sockets, devices, directories,
   or paths outside the selected content root for preview/search reads.
 - Perform filesystem I/O or spawn subprocesses from `src/ui.rs` rendering.
