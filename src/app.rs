@@ -3033,11 +3033,12 @@ impl App {
             return;
         }
 
-        // Ctrl+S save
-        if matches!(
-            (key.code, key.modifiers),
-            (KeyCode::Char('s' | 'S'), KeyModifiers::CONTROL)
-        ) {
+        // Ctrl+S / Cmd+S save（Mac 上 Cmd 是 SUPER，部分终端会透传）
+        if matches!(key.code, KeyCode::Char('s' | 'S'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
             self.tab_mut().content.edit = Some(edit);
             self.save_edit_session();
             return;
