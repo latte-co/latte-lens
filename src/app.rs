@@ -202,6 +202,10 @@ enum CaretDirection {
     Down,
     Home,
     End,
+    WordLeft,
+    WordRight,
+    DocStart,
+    DocEnd,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3068,10 +3072,20 @@ impl App {
 
         // caret 移动（只读 lines，不持有可变借用）
         let direction = match (key.code, key.modifiers) {
+            (KeyCode::Left, m) if m.contains(KeyModifiers::CONTROL) => {
+                Some(CaretDirection::WordLeft)
+            }
+            (KeyCode::Right, m) if m.contains(KeyModifiers::CONTROL) => {
+                Some(CaretDirection::WordRight)
+            }
             (KeyCode::Left, _) => Some(CaretDirection::Left),
             (KeyCode::Right, _) => Some(CaretDirection::Right),
             (KeyCode::Up, _) => Some(CaretDirection::Up),
             (KeyCode::Down, _) => Some(CaretDirection::Down),
+            (KeyCode::Home, m) if m.contains(KeyModifiers::CONTROL) => {
+                Some(CaretDirection::DocStart)
+            }
+            (KeyCode::End, m) if m.contains(KeyModifiers::CONTROL) => Some(CaretDirection::DocEnd),
             (KeyCode::Home, _) => Some(CaretDirection::Home),
             (KeyCode::End, _) => Some(CaretDirection::End),
             _ => None,
@@ -3083,10 +3097,50 @@ impl App {
             self.tab_mut().content.edit = Some(edit);
             self.ensure_cursor_visible();
             self.ensure_caret_visible_horizontal();
-        } else {
-            // 其他键忽略
-            self.tab_mut().content.edit = Some(edit);
+            return;
         }
+
+        // Ctrl+A 全选
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('a' | 'A'), KeyModifiers::CONTROL)
+        ) {
+            let lines = &self.tab().content.lines;
+            let last_line = lines.len() - 1;
+            let last_byte = lines[last_line].len();
+            edit.selection = Some(ContentSelection {
+                anchor_before: ContentPoint { line: 0, byte: 0 },
+                anchor_after: ContentPoint { line: 0, byte: 0 },
+                head: ContentPoint {
+                    line: last_line,
+                    byte: last_byte,
+                },
+                dragging: false,
+                dragged: false,
+            });
+            edit.caret = ContentPoint {
+                line: last_line,
+                byte: last_byte,
+            };
+            self.tab_mut().content.edit = Some(edit);
+            self.ensure_cursor_visible();
+            self.ensure_caret_visible_horizontal();
+            return;
+        }
+
+        // Tab / Shift+Tab 缩进/反缩进
+        if key.code == KeyCode::Tab {
+            let outdent = key.modifiers.contains(KeyModifiers::SHIFT);
+            let lines = &mut self.tab_mut().content.lines;
+            edit.indent_or_outdent(lines, outdent);
+            self.tab_mut().content.edit = Some(edit);
+            self.ensure_cursor_visible();
+            self.ensure_caret_visible_horizontal();
+            return;
+        }
+
+        // 其他键忽略
+        self.tab_mut().content.edit = Some(edit);
     }
 
     /// 不保存退出编辑模式，恢复预览快照。
@@ -3282,6 +3336,60 @@ impl App {
                 ContentPoint {
                     line,
                     byte: line_len,
+                }
+            }
+            CaretDirection::WordRight => {
+                use unicode_segmentation::UnicodeSegmentation;
+                if byte < line_len {
+                    let rest = &lines[line][byte..];
+                    let mut next = line_len;
+                    for (i, seg) in rest.split_word_bound_indices().skip(1) {
+                        if seg.chars().any(|c| c.is_alphanumeric() || c == '_') {
+                            next = byte + i;
+                            break;
+                        }
+                    }
+                    ContentPoint { line, byte: next }
+                } else if line + 1 < lines.len() {
+                    ContentPoint {
+                        line: line + 1,
+                        byte: 0,
+                    }
+                } else {
+                    caret
+                }
+            }
+            CaretDirection::WordLeft => {
+                use unicode_segmentation::UnicodeSegmentation;
+                if byte > 0 {
+                    let before = &lines[line][..byte];
+                    let mut prev = 0;
+                    for (i, seg) in before.split_word_bound_indices() {
+                        if seg.chars().any(|c| c.is_alphanumeric() || c == '_') {
+                            prev = i;
+                        }
+                    }
+                    ContentPoint { line, byte: prev }
+                } else if line > 0 {
+                    ContentPoint {
+                        line: line - 1,
+                        byte: lines[line - 1].len(),
+                    }
+                } else {
+                    caret
+                }
+            }
+            CaretDirection::DocStart => {
+                edit.preferred_column = 0;
+                ContentPoint { line: 0, byte: 0 }
+            }
+            CaretDirection::DocEnd => {
+                let last = lines.len() - 1;
+                let col = crate::text_layout::expand_tabs(&lines[last], 0, 0).1;
+                edit.preferred_column = col;
+                ContentPoint {
+                    line: last,
+                    byte: lines[last].len(),
                 }
             }
         };

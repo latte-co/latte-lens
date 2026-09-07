@@ -743,6 +743,83 @@ impl EditSession {
         self.schedule_highlight();
     }
 
+    // -- 缩进 -----------------------------------------------------------------
+
+    /// Tab 缩进 / Shift+Tab 反缩进。有选区时作用于所有选中行。
+    pub(crate) fn indent_or_outdent(&mut self, lines: &mut Vec<String>, outdent: bool) {
+        let caret_before = self.caret;
+
+        // 确定受影响的行范围
+        let (start_line, end_line) = if let Some(sel) = &self.selection {
+            let (a, b) = if sel.anchor_before.line <= sel.head.line {
+                (sel.anchor_before.line, sel.head.line)
+            } else {
+                (sel.head.line, sel.anchor_before.line)
+            };
+            (a, b)
+        } else {
+            (self.caret.line, self.caret.line)
+        };
+
+        let old_lines: Vec<String> = lines[start_line..=end_line].to_vec();
+        let mut new_lines = old_lines.clone();
+
+        for line in &mut new_lines {
+            if outdent {
+                // 移除一个前导 tab 或最多 4 个空格
+                if let Some(rest) = line.strip_prefix('\t') {
+                    *line = rest.to_string();
+                } else {
+                    let spaces = line.bytes().take_while(|&b| b == b' ').take(4).count();
+                    if spaces > 0 {
+                        line.drain(..spaces);
+                    }
+                }
+            } else {
+                line.insert(0, '\t');
+            }
+        }
+
+        // 应用变更
+        lines.splice(start_line..=end_line, new_lines.iter().cloned());
+
+        // 计算 caret 新位置
+        let caret_after = if self.selection.is_some() {
+            // 有选区时保持 caret 在选区末尾
+            self.caret
+        } else if outdent {
+            // 无选区反缩进：caret 左移（不超过行首）
+            let removed = old_lines[0]
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .take(1)
+                .count();
+            ContentPoint {
+                line: self.caret.line,
+                byte: self.caret.byte.saturating_sub(removed),
+            }
+        } else {
+            // 无选区缩进：caret 右移 1
+            ContentPoint {
+                line: self.caret.line,
+                byte: self.caret.byte + 1,
+            }
+        };
+
+        self.push_delta(EditDelta {
+            line_range: start_line..end_line + 1,
+            old_lines,
+            new_lines,
+            caret_before,
+            caret_after,
+            timestamp: Instant::now(),
+            coalescible: false,
+        });
+
+        self.caret = caret_after;
+        self.after_edit();
+    }
+
     // -- 保存 -----------------------------------------------------------------
 
     /// 冲突检测 + 原子写。成功后更新 original_bytes 并清除 dirty。
