@@ -1977,7 +1977,7 @@ mod tests {
         let mut s = EditSession::begin(&path, snapshot).unwrap();
         // 外部修改文件
         std::fs::write(&path, "modified externally\n").unwrap();
-        let mut lines = vec!["edited".to_string()];
+        let lines = vec!["edited".to_string()];
         assert!(s.save(&path, &lines).is_err());
     }
 
