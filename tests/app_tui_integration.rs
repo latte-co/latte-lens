@@ -5826,6 +5826,117 @@ fn edit_mode_shift_click_extends_selection() {
 }
 
 #[test]
+fn edit_mode_shift_up_selects_backward_range() {
+    // 反向选区（head 在 anchor 之前）曾因 anchor_after 跟随 head 而塌缩成点
+    let (_dir, mut app) = ready_edit_app("aaa\nbbb\nccc\n");
+    // caret 移到第 3 行
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.edit_caret_position(), Some((2, 0)));
+    // Shift+Up 反向选中第 2 行
+    app.handle_key(modified_key(KeyCode::Up, KeyModifiers::SHIFT));
+    assert_eq!(
+        app.edit_selection_range(1),
+        Some(0..3),
+        "backward selection should cover line 1 fully"
+    );
+    assert_eq!(app.edit_selection_range(0), None);
+    // end 行 byte=0：app 版 range 返回空区间（与预览选区一致，渲染/删除均无害）
+    assert_eq!(app.edit_selection_range(2), Some(0..0));
+    // 输入替换选区内容
+    app.handle_key(key(KeyCode::Char('X')));
+    assert_eq!(
+        app.tab().content.lines,
+        vec!["aaa", "Xccc", ""],
+        "typing should replace the backward selection"
+    );
+}
+
+#[test]
+fn edit_mode_shift_left_selects_backward_on_line() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    // caret 移到行尾，Shift+Left 反向选中 " world"
+    app.handle_key(key(KeyCode::End));
+    for _ in 0..6 {
+        app.handle_key(modified_key(KeyCode::Left, KeyModifiers::SHIFT));
+    }
+    assert_eq!(
+        app.edit_selection_range(0),
+        Some(5..11),
+        "backward selection should cover bytes 5..11"
+    );
+    // 输入替换
+    app.handle_key(key(KeyCode::Char('X')));
+    assert_eq!(app.tab().content.lines, vec!["helloX", ""]);
+}
+
+#[test]
+fn edit_mode_backspace_deletes_backward_selection() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    app.handle_key(key(KeyCode::End));
+    for _ in 0..6 {
+        app.handle_key(modified_key(KeyCode::Left, KeyModifiers::SHIFT));
+    }
+    assert_eq!(app.edit_selection_range(0), Some(5..11));
+    // Backspace 删除反向选区
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(
+        app.tab().content.lines,
+        vec!["hello", ""],
+        "backspace should delete the backward selection"
+    );
+    assert_eq!(app.edit_caret_position(), Some((0, 5)));
+}
+
+#[test]
+fn edit_mode_reverse_drag_selects_range() {
+    let (_dir, mut app) = ready_edit_app("aaa\nbbb\nccc\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let gutter = app.content_gutter_width() as u16;
+    let x0 = app.ui_regions.content_inner.x + gutter;
+    let y = app.ui_regions.content_inner.y;
+
+    // 从第 3 行向上拖拽到第 1 行（反向）
+    app.handle_mouse(mouse_down(x0 + 1, y + 2));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x0 + 1, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x0 + 1, y));
+
+    // anchor=(2,1), head=(0,1)，归一化应为 ((0,1),(2,1))
+    assert_eq!(app.edit_selection_range(0), Some(1..3), "line 0 tail");
+    assert_eq!(app.edit_selection_range(1), Some(0..3), "line 1 full");
+    assert_eq!(app.edit_selection_range(2), Some(0..1), "line 2 head");
+}
+
+#[test]
+fn edit_mode_shift_click_reverse_extends_selection() {
+    let (_dir, mut app) = ready_edit_app("aaa\nbbb\nccc\n");
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let gutter = app.content_gutter_width() as u16;
+    let x0 = app.ui_regions.content_inner.x + gutter;
+    let y = app.ui_regions.content_inner.y;
+
+    // 先点击第 3 行定位 caret
+    app.handle_mouse(mouse_down(x0, y + 2));
+    assert_eq!(app.edit_caret_position(), Some((2, 0)));
+    // Shift+click 第 1 行（反向）
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x0,
+        row: y,
+        modifiers: KeyModifiers::SHIFT,
+    });
+    // anchor=(2,0), head=(0,0)，归一化应为 ((0,0),(2,0))
+    assert_eq!(app.edit_selection_range(0), Some(0..3));
+    assert_eq!(app.edit_selection_range(1), Some(0..3));
+    // end 行 byte=0：空区间（与预览选区行为一致）
+    assert_eq!(app.edit_selection_range(2), Some(0..0));
+}
+
+#[test]
 fn edit_mode_save_stays_active_and_esc_exits() {
     let (dir, mut app) = ready_edit_app("hello\n");
     let file_path = dir.path().join("edit.txt");

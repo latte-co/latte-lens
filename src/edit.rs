@@ -1782,6 +1782,81 @@ mod tests {
     }
 
     #[test]
+    fn selected_text_backward_selection() {
+        // 反向选区：anchor 固定在 (0,11)，head 活动到 (0,5)。
+        // anchor_after 必须等于 anchor（而非跟随 head），否则归一化塌缩成点。
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 11),
+            anchor_after: cp(0, 11),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        assert_eq!(
+            s.selected_text(&s.preview_snapshot.lines),
+            Some(" world".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_text_backward_multi_line() {
+        let mut s = make_session(vec![
+            "aaa".to_string(),
+            "bbb".to_string(),
+            "ccc".to_string(),
+        ]);
+        // anchor 在第 3 行开头，head 在第 1 行开头
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(2, 0),
+            anchor_after: cp(2, 0),
+            head: cp(0, 0),
+            dragging: false,
+            dragged: false,
+        });
+        assert_eq!(
+            s.selected_text(&s.preview_snapshot.lines),
+            Some("aaa\nbbb\n".to_string())
+        );
+    }
+
+    #[test]
+    fn cut_selection_backward() {
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 11),
+            anchor_after: cp(0, 11),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        let text = s.cut_selection(&mut lines);
+        assert_eq!(text, Some(" world".to_string()));
+        assert_eq!(lines, vec!["hello".to_string()]);
+        assert_eq!(s.caret, cp(0, 5));
+        assert!(s.selection.is_none());
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn backward_selection_undo_restores_text() {
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 11),
+            anchor_after: cp(0, 11),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.cut_selection(&mut lines);
+        assert_eq!(lines, vec!["hello".to_string()]);
+        s.undo(&mut lines);
+        assert_eq!(lines, vec!["hello world".to_string()]);
+    }
+
+    #[test]
     fn indent_adds_tab() {
         let mut s = make_session(vec!["hello".to_string()]);
         let mut lines = s.preview_snapshot.lines.clone();

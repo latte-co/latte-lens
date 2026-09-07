@@ -3456,6 +3456,10 @@ impl App {
         }
 
         // 选区扩展
+        // 结构语义：anchor_before/anchor_after 是固定锚点（编辑态锚点是点，
+        // 二者相等），head 是活动端。normalized() 反向分支返回
+        // (head, anchor_after)，所以 anchor_after 绝不能跟随 head 更新，
+        // 否则反向选区会塌缩成一个点。
         if extend_selection {
             let sel = edit.selection.get_or_insert(ContentSelection {
                 anchor_before: caret,
@@ -3465,7 +3469,6 @@ impl App {
                 dragged: false,
             });
             sel.head = new_caret;
-            sel.anchor_after = new_caret;
         } else {
             edit.selection = None;
         }
@@ -3504,20 +3507,18 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((before, _)) = self.content_point_bounds(mouse) {
-                    // Shift+click：从当前 caret 扩展选区到点击点
+                    // Shift+click：从当前选区锚点（固定端）扩展到点击点
                     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                         let tab = self.tab_mut();
                         if let Some(edit) = tab.content.edit.as_mut() {
-                            let anchor = edit.selection.as_ref().map_or(edit.caret, |s| {
-                                if s.anchor_before <= s.head {
-                                    s.anchor_before
-                                } else {
-                                    s.head
-                                }
-                            });
+                            // anchor_before 始终是固定锚点；head 是活动端
+                            let anchor = edit
+                                .selection
+                                .as_ref()
+                                .map_or(edit.caret, |s| s.anchor_before);
                             edit.selection = Some(ContentSelection {
                                 anchor_before: anchor,
-                                anchor_after: before,
+                                anchor_after: anchor,
                                 head: before,
                                 dragging: false,
                                 dragged: false,
@@ -3583,7 +3584,7 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                // 拖拽：扩展选区
+                // 拖拽：扩展选区（anchor_after 保持锚点，不跟随 head）
                 if let Some((before, _)) = self.content_point_bounds(mouse) {
                     let tab = self.tab_mut();
                     if let Some(edit) = tab.content.edit.as_mut() {
@@ -3596,7 +3597,6 @@ impl App {
                             dragged: true,
                         });
                         sel.head = before;
-                        sel.anchor_after = before;
                     }
                 }
             }
