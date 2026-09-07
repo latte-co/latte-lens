@@ -381,6 +381,8 @@ impl EditSession {
 
             if self.try_coalesce(line, lines, caret_before, caret_after) {
                 self.caret = caret_after;
+                self.dirty = true;
+                self.saved = false;
                 return;
             }
 
@@ -621,6 +623,8 @@ impl EditSession {
 
             if self.try_coalesce(line, lines, caret_before, caret_after) {
                 self.caret = caret_after;
+                self.dirty = true;
+                self.saved = false;
                 return;
             }
 
@@ -700,6 +704,8 @@ impl EditSession {
 
             if self.try_coalesce(line, lines, caret_before, caret_after) {
                 self.caret = caret_after;
+                self.dirty = true;
+                self.saved = false;
                 return;
             }
 
@@ -1701,5 +1707,365 @@ mod tests {
         let s = make_session(vec!["full".to_string()]);
         let snapshot = s.into_preview_snapshot();
         assert_eq!(snapshot.lines, vec!["full".to_string()]);
+    }
+
+    #[test]
+    fn selected_text_single_line() {
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 0),
+            anchor_after: cp(0, 5),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        assert_eq!(
+            s.selected_text(&s.preview_snapshot.lines),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_text_multi_line() {
+        let mut s = make_session(vec!["aaa".to_string(), "bbb".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 1),
+            anchor_after: cp(1, 2),
+            head: cp(1, 2),
+            dragging: false,
+            dragged: false,
+        });
+        assert_eq!(
+            s.selected_text(&s.preview_snapshot.lines),
+            Some("aa\nbb".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_text_none_without_selection() {
+        let s = make_session(vec!["hello".to_string()]);
+        assert_eq!(s.selected_text(&s.preview_snapshot.lines), None);
+    }
+
+    #[test]
+    fn cut_selection_removes_text() {
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 0),
+            anchor_after: cp(0, 5),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        let text = s.cut_selection(&mut lines);
+        assert_eq!(text, Some("hello".to_string()));
+        assert_eq!(lines, vec![" world".to_string()]);
+        assert!(s.dirty);
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn cut_selection_multi_line_merges() {
+        let mut s = make_session(vec!["aaa".to_string(), "bbb".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 0),
+            anchor_after: cp(1, 3),
+            head: cp(1, 3),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        let text = s.cut_selection(&mut lines);
+        assert_eq!(text, Some("aaa\nbbb".to_string()));
+        assert_eq!(lines, vec!["".to_string()]);
+    }
+
+    #[test]
+    fn indent_adds_tab() {
+        let mut s = make_session(vec!["hello".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.indent_or_outdent(&mut lines, false);
+        assert_eq!(lines, vec!["\thello".to_string()]);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn outdent_removes_tab() {
+        let mut s = make_session(vec!["\thello".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.indent_or_outdent(&mut lines, true);
+        assert_eq!(lines, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn outdent_removes_spaces() {
+        let mut s = make_session(vec!["    hello".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.indent_or_outdent(&mut lines, true);
+        assert_eq!(lines, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn indent_selected_lines() {
+        let mut s = make_session(vec![
+            "aaa".to_string(),
+            "bbb".to_string(),
+            "ccc".to_string(),
+        ]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 0),
+            anchor_after: cp(1, 3),
+            head: cp(1, 3),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.indent_or_outdent(&mut lines, false);
+        assert_eq!(lines[0], "\taaa");
+        assert_eq!(lines[1], "\tbbb");
+        assert_eq!(lines[2], "ccc"); // not selected
+    }
+
+    #[test]
+    fn undo_restores_after_cut() {
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 0),
+            anchor_after: cp(0, 5),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.cut_selection(&mut lines);
+        assert_eq!(lines, vec![" world".to_string()]);
+        // undo 恢复
+        s.undo(&mut lines);
+        assert_eq!(lines, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn undo_empty_stack_noop() {
+        let mut s = make_session(vec!["hello".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.undo(&mut lines);
+        assert_eq!(lines, vec!["hello".to_string()]);
+        assert!(!s.dirty);
+    }
+
+    #[test]
+    fn redo_empty_stack_noop() {
+        let mut s = make_session(vec!["hello".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.redo(&mut lines);
+        assert_eq!(lines, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn insert_char_replaces_selection() {
+        let mut s = make_session(vec!["hello world".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 0),
+            anchor_after: cp(0, 5),
+            head: cp(0, 5),
+            dragging: false,
+            dragged: false,
+        });
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.insert_char(&mut lines, 'X');
+        assert_eq!(lines, vec!["X world".to_string()]);
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn backspace_at_line_start_merges_with_previous() {
+        let mut s = make_session(vec!["aaa".to_string(), "bbb".to_string()]);
+        s.caret = cp(1, 0);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.backspace(&mut lines);
+        assert_eq!(lines, vec!["aaabbb".to_string()]);
+    }
+
+    #[test]
+    fn delete_at_line_end_merges_with_next() {
+        let mut s = make_session(vec!["aaa".to_string(), "bbb".to_string()]);
+        s.caret = cp(0, 3);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.delete(&mut lines);
+        assert_eq!(lines, vec!["aaabbb".to_string()]);
+    }
+
+    #[test]
+    fn backspace_at_start_noop() {
+        let mut s = make_session(vec!["hello".to_string()]);
+        s.caret = cp(0, 0);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.backspace(&mut lines);
+        assert_eq!(lines, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn insert_newline_splits_line() {
+        let mut s = make_session(vec!["hello".to_string()]);
+        s.caret = cp(0, 3);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.insert_newline(&mut lines);
+        assert_eq!(lines, vec!["hel".to_string(), "lo".to_string()]);
+        assert_eq!(s.caret, cp(1, 0));
+    }
+
+    #[test]
+    fn begin_rejects_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.txt");
+        std::fs::write(&path, vec![0xFF, 0xFE]).unwrap();
+        let snapshot = PreviewSnapshot {
+            lines: vec![],
+            highlights: vec![],
+            scroll: 0,
+            horizontal_scroll: 0,
+            collapsed_folds: HashSet::new(),
+            cursor_line: 0,
+            selection: None,
+            navigation_caret: NavigationCaret {
+                point: crate::navigation::SourcePosition { line: 0, byte: 0 },
+                preferred_display_column: 0,
+            },
+        };
+        assert!(EditSession::begin(&path, snapshot).is_err());
+    }
+
+    #[test]
+    fn begin_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.txt");
+        let snapshot = PreviewSnapshot {
+            lines: vec![],
+            highlights: vec![],
+            scroll: 0,
+            horizontal_scroll: 0,
+            collapsed_folds: HashSet::new(),
+            cursor_line: 0,
+            selection: None,
+            navigation_caret: NavigationCaret {
+                point: crate::navigation::SourcePosition { line: 0, byte: 0 },
+                preferred_display_column: 0,
+            },
+        };
+        assert!(EditSession::begin(&path, snapshot).is_err());
+    }
+
+    #[test]
+    fn save_rejects_when_file_changed_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "original\n").unwrap();
+        let snapshot = PreviewSnapshot {
+            lines: vec!["original".to_string()],
+            highlights: vec![],
+            scroll: 0,
+            horizontal_scroll: 0,
+            collapsed_folds: HashSet::new(),
+            cursor_line: 0,
+            selection: None,
+            navigation_caret: NavigationCaret {
+                point: crate::navigation::SourcePosition { line: 0, byte: 0 },
+                preferred_display_column: 0,
+            },
+        };
+        let mut s = EditSession::begin(&path, snapshot).unwrap();
+        // 外部修改文件
+        std::fs::write(&path, "modified externally\n").unwrap();
+        let mut lines = vec!["edited".to_string()];
+        assert!(s.save(&path, &lines).is_err());
+    }
+
+    #[test]
+    fn save_clears_dirty_and_sets_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+        let snapshot = PreviewSnapshot {
+            lines: vec!["hello".to_string()],
+            highlights: vec![],
+            scroll: 0,
+            horizontal_scroll: 0,
+            collapsed_folds: HashSet::new(),
+            cursor_line: 0,
+            selection: None,
+            navigation_caret: NavigationCaret {
+                point: crate::navigation::SourcePosition { line: 0, byte: 0 },
+                preferred_display_column: 0,
+            },
+        };
+        let mut s = EditSession::begin(&path, snapshot).unwrap();
+        let mut lines = vec!["hello!".to_string()];
+        s.insert_char(&mut lines, '!');
+        assert!(s.dirty);
+        assert!(!s.saved);
+        s.save(&path, &lines).unwrap();
+        assert!(!s.dirty);
+        assert!(s.saved);
+    }
+
+    #[test]
+    fn edit_after_save_clears_saved_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+        let snapshot = PreviewSnapshot {
+            lines: vec!["hello".to_string()],
+            highlights: vec![],
+            scroll: 0,
+            horizontal_scroll: 0,
+            collapsed_folds: HashSet::new(),
+            cursor_line: 0,
+            selection: None,
+            navigation_caret: NavigationCaret {
+                point: crate::navigation::SourcePosition { line: 0, byte: 0 },
+                preferred_display_column: 0,
+            },
+        };
+        let mut s = EditSession::begin(&path, snapshot).unwrap();
+        let mut lines = vec!["hello!".to_string()];
+        s.insert_char(&mut lines, '!');
+        s.save(&path, &lines).unwrap();
+        assert!(s.saved);
+        // 再次编辑
+        s.insert_char(&mut lines, '?');
+        assert!(!s.saved);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn indent_empty_line() {
+        let mut s = make_session(vec!["".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.indent_or_outdent(&mut lines, false);
+        assert_eq!(lines, vec!["\t".to_string()]);
+    }
+
+    #[test]
+    fn outdent_no_indent_noop() {
+        let mut s = make_session(vec!["hello".to_string()]);
+        let mut lines = s.preview_snapshot.lines.clone();
+        s.indent_or_outdent(&mut lines, true);
+        assert_eq!(lines, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn word_bounds_at_end_of_line() {
+        assert_eq!(EditSession::word_bounds_at("hello", 5), 0..5);
+    }
+
+    #[test]
+    fn word_bounds_at_start_of_word() {
+        assert_eq!(EditSession::word_bounds_at("hello world", 0), 0..5);
+    }
+
+    #[test]
+    fn word_bounds_whitespace_only() {
+        assert_eq!(EditSession::word_bounds_at("   ", 1), 1..1);
     }
 }
