@@ -743,6 +743,67 @@ impl EditSession {
         self.schedule_highlight();
     }
 
+    // -- 剪贴板 ---------------------------------------------------------------
+
+    /// 提取选中文本（无选区返回 None）。
+    pub(crate) fn selected_text(&self, lines: &[String]) -> Option<String> {
+        let sel = self.selection?;
+        let (start, end) = sel.normalized();
+        if start == end {
+            return None;
+        }
+        let mut text = String::new();
+        for line_index in start.line..=end.line {
+            let line = lines.get(line_index)?;
+            let s = if line_index == start.line {
+                start.byte.min(line.len())
+            } else {
+                0
+            };
+            let e = if line_index == end.line {
+                end.byte.min(line.len())
+            } else {
+                line.len()
+            };
+            text.push_str(line.get(s..e)?);
+            if line_index < end.line {
+                text.push('\n');
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// 剪切选区：提取文本并删除选区内容，返回文本。记录 undo delta。
+    pub(crate) fn cut_selection(&mut self, lines: &mut Vec<String>) -> Option<String> {
+        let text = self.selected_text(lines)?;
+        let sel = self.selection?;
+        let caret_before = self.caret;
+        let (start, _) = sel.normalized();
+
+        let (line_range, old_lines, new_lines) = delete_selection(lines, sel);
+        lines.splice(line_range.clone(), new_lines.iter().cloned());
+
+        let caret_after = ContentPoint {
+            line: start.line,
+            byte: start.byte,
+        };
+
+        self.push_delta(EditDelta {
+            line_range,
+            old_lines,
+            new_lines,
+            caret_before,
+            caret_after,
+            timestamp: Instant::now(),
+            coalescible: false,
+        });
+
+        self.caret = caret_after;
+        self.selection = None;
+        self.after_edit();
+        Some(text)
+    }
+
     // -- 缩进 -----------------------------------------------------------------
 
     /// Tab 缩进 / Shift+Tab 反缩进。有选区时作用于所有选中行。

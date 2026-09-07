@@ -3048,6 +3048,63 @@ impl App {
             return;
         }
 
+        // Ctrl+C / Cmd+C 复制选区
+        if matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            let text = {
+                let tab = self.tab();
+                let edit = tab.content.edit.as_ref().unwrap();
+                edit.selected_text(&tab.content.lines)
+            };
+            if let Some(text) = text {
+                let count = text.chars().count();
+                self.pending_clipboard_text = Some(text);
+                self.clipboard_status = Some(format!(
+                    "Copied {count} character{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+            self.tab_mut().content.edit = Some(edit);
+            return;
+        }
+
+        // Ctrl+X 剪切选区
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('x' | 'X'), KeyModifiers::CONTROL)
+        ) {
+            let text = {
+                let tab = self.tab_mut();
+                let edit = tab.content.edit.as_mut().unwrap();
+                edit.cut_selection(&mut tab.content.lines)
+            };
+            if let Some(text) = text {
+                let count = text.chars().count();
+                self.pending_clipboard_text = Some(text);
+                self.clipboard_status = Some(format!(
+                    "Cut {count} character{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+                self.ensure_cursor_visible();
+                self.ensure_caret_visible_horizontal();
+            }
+            self.tab_mut().content.edit = Some(edit);
+            return;
+        }
+
+        // Ctrl+F 编辑态查找（复用 preview find，操作同一份 content.lines）
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('f' | 'F'), KeyModifiers::CONTROL)
+        ) {
+            self.tab_mut().content.edit = Some(edit);
+            self.open_preview_find();
+            return;
+        }
+
         // Esc 退出
         if key.code == KeyCode::Esc {
             if edit.dirty {
@@ -3449,6 +3506,36 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((before, _)) = self.content_point_bounds(mouse) {
+                    // Shift+click：从当前 caret 扩展选区到点击点
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        let tab = self.tab_mut();
+                        if let Some(edit) = tab.content.edit.as_mut() {
+                            let anchor = edit.selection.as_ref().map_or(edit.caret, |s| {
+                                if s.anchor_before <= s.head {
+                                    s.anchor_before
+                                } else {
+                                    s.head
+                                }
+                            });
+                            edit.selection = Some(ContentSelection {
+                                anchor_before: anchor,
+                                anchor_after: before,
+                                head: before,
+                                dragging: false,
+                                dragged: false,
+                            });
+                            edit.caret = before;
+                            edit.preferred_column = crate::text_layout::expand_tabs(
+                                &tab.content.lines[before.line][..before.byte],
+                                0,
+                                0,
+                            )
+                            .1;
+                        }
+                        self.edit_escape_pending = false;
+                        return;
+                    }
+
                     // 双击检测：同一位置 400ms 内第二次点击
                     let is_double_click = self.last_edit_click.take().is_some_and(|(pos, time)| {
                         pos == before && time.elapsed().as_millis() <= 400
@@ -3632,6 +3719,37 @@ impl App {
             (find.selected + count - delta.unsigned_abs() % count) % count
         };
         self.scroll_to_preview_find_match();
+        // 编辑模式下把 caret 移到匹配位置并选中匹配文本
+        let found_match = self
+            .preview_find
+            .as_ref()
+            .and_then(|find| find.matches.get(find.selected))
+            .map(|found| (found.line, found.range.start, found.range.end));
+        if let Some((line, start_byte, end_byte)) = found_match {
+            let tab = self.tab_mut();
+            if let Some(edit) = tab.content.edit.as_mut() {
+                let start = ContentPoint {
+                    line,
+                    byte: start_byte,
+                };
+                let end = ContentPoint {
+                    line,
+                    byte: end_byte,
+                };
+                edit.caret = end;
+                edit.selection = Some(ContentSelection {
+                    anchor_before: start,
+                    anchor_after: end,
+                    head: end,
+                    dragging: false,
+                    dragged: false,
+                });
+                edit.preferred_column =
+                    crate::text_layout::expand_tabs(&tab.content.lines[line][..end_byte], 0, 0).1;
+            }
+            self.ensure_cursor_visible();
+            self.ensure_caret_visible_horizontal();
+        }
     }
 
     fn scroll_to_preview_find_match(&mut self) {
