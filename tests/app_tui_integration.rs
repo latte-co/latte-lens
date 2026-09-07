@@ -5679,6 +5679,172 @@ fn edit_mode_footer_shows_edit_hints() {
     );
 }
 
+#[test]
+fn edit_mode_ctrl_arrows_word_navigation() {
+    let (_dir, mut app) = ready_edit_app("hello world foo bar\n");
+    // Ctrl+Right 跳到下一个词开头
+    app.handle_key(modified_key(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(app.edit_caret_position(), Some((0, 6)));
+    app.handle_key(modified_key(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(app.edit_caret_position(), Some((0, 12)));
+    // Ctrl+Left 跳回上一个词开头
+    app.handle_key(modified_key(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(app.edit_caret_position(), Some((0, 6)));
+}
+
+#[test]
+fn edit_mode_ctrl_home_end_document_navigation() {
+    let (_dir, mut app) = ready_edit_app("first\nsecond\nthird\n");
+    // 移到文档末尾
+    app.handle_key(modified_key(KeyCode::End, KeyModifiers::CONTROL));
+    assert_eq!(app.edit_caret_position(), Some((3, 0)));
+    // 移到文档开头
+    app.handle_key(modified_key(KeyCode::Home, KeyModifiers::CONTROL));
+    assert_eq!(app.edit_caret_position(), Some((0, 0)));
+}
+
+#[test]
+fn edit_mode_ctrl_a_selects_all() {
+    let (_dir, mut app) = ready_edit_app("hello\nworld\n");
+    app.handle_key(modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    let sel = app.edit_selection_range(0).unwrap();
+    assert_eq!(sel, 0..5);
+    let sel2 = app.edit_selection_range(1).unwrap();
+    assert_eq!(sel2, 0..5);
+}
+
+#[test]
+fn edit_mode_tab_indents_line() {
+    let (_dir, mut app) = ready_edit_app("hello\n");
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.tab().content.lines[0], "\thello");
+    assert!(app.edit_is_dirty());
+}
+
+#[test]
+fn edit_mode_shift_tab_outdents_line() {
+    let (_dir, mut app) = ready_edit_app("\thello\n");
+    app.handle_key(modified_key(KeyCode::Tab, KeyModifiers::SHIFT));
+    assert_eq!(app.tab().content.lines[0], "hello");
+}
+
+#[test]
+fn edit_mode_tab_indents_selected_lines() {
+    let (_dir, mut app) = ready_edit_app("aaa\nbbb\nccc\n");
+    // 选中前两行
+    app.handle_key(modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    // 缩小选区到两行（用 Shift+Down 不行，直接用 Ctrl+A 后 Tab）
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.tab().content.lines[0], "\taaa");
+    assert_eq!(app.tab().content.lines[1], "\tbbb");
+    assert_eq!(app.tab().content.lines[2], "\tccc");
+}
+
+#[test]
+fn edit_mode_ctrl_c_copies_selection() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    // 选中 "hello"
+    app.handle_key(modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    // 全选后 Ctrl+C
+    app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    // 剪贴板状态应显示复制了字符
+    assert!(
+        app.clipboard_status
+            .as_deref()
+            .is_some_and(|s| s.contains("Copied")),
+        "clipboard status should show copied, got {:?}",
+        app.clipboard_status
+    );
+}
+
+#[test]
+fn edit_mode_ctrl_x_cuts_selection() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    // 全选
+    app.handle_key(modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    // Ctrl+X 剪切
+    app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    // 内容应被删除（多行选区合并为一行空行）
+    assert_eq!(app.tab().content.lines, vec![""]);
+    assert!(app.edit_is_dirty());
+    // 剪贴板状态应显示剪切了字符
+    assert!(
+        app.clipboard_status
+            .as_deref()
+            .is_some_and(|s| s.contains("Cut")),
+        "clipboard status should show cut, got {:?}",
+        app.clipboard_status
+    );
+}
+
+#[test]
+fn edit_mode_ctrl_f_finds_text() {
+    let (_dir, mut app) = ready_edit_app("hello world\nhello there\n");
+    // Ctrl+F 打开查找
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(
+        app.preview_find_is_active(),
+        "find should be active after Ctrl+F"
+    );
+    // 输入查找词
+    app.handle_key(key(KeyCode::Char('h')));
+    app.handle_key(key(KeyCode::Char('e')));
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('o')));
+    // Enter 跳转到下一个匹配（第二个 "hello"）
+    app.handle_key(key(KeyCode::Enter));
+    // caret 应在第二个 "hello" 的末尾
+    assert_eq!(app.edit_caret_position(), Some((1, 5)));
+    // Esc 关闭查找，回到编辑模式
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.preview_find_is_active());
+    assert!(
+        app.edit_is_active(),
+        "should still be in edit mode after find close"
+    );
+}
+
+#[test]
+fn edit_mode_shift_click_extends_selection() {
+    let (_dir, mut app) = ready_edit_app("hello world\n");
+    let gutter = app.content_gutter_width() as u16;
+    let x = app.ui_regions.content_inner.x + gutter + 2;
+    let y = app.ui_regions.content_inner.y + 1;
+    // 先点击定位 caret 到开头
+    app.handle_mouse(mouse_down(app.ui_regions.content_inner.x + gutter, y));
+    // Shift+click 扩展选区
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::SHIFT,
+    });
+    // 应有选区
+    let sel = app.edit_selection_range(0);
+    assert!(sel.is_some(), "shift+click should create selection");
+}
+
+#[test]
+fn edit_mode_save_stays_active_and_esc_exits() {
+    let (dir, mut app) = ready_edit_app("hello\n");
+    let file_path = dir.path().join("edit.txt");
+
+    // 编辑并保存
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+    app.handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+    // 保存后仍在编辑模式
+    assert!(app.edit_is_active());
+    assert!(!app.edit_is_dirty());
+    assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello!\n");
+
+    // Esc 退出（已保存，直接退出）
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.edit_is_active());
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }

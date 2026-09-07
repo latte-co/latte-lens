@@ -2344,6 +2344,17 @@ impl App {
             self.handle_tree_context_menu_key(key);
             return;
         }
+        if self.preview_find.is_some() {
+            self.quit_confirmation = None;
+            self.handle_preview_find_key(key);
+            return;
+        }
+        // 编辑模态：拦截所有键（包括 Ctrl+C/X），不泄漏到全局 match
+        if self.tab().content.edit.is_some() {
+            self.quit_confirmation = None;
+            self.handle_edit_key(key);
+            return;
+        }
         let copy_key = matches!(key.code, KeyCode::Char('c' | 'C'));
         if copy_key && key.modifiers.contains(KeyModifiers::SUPER) {
             self.quit_confirmation = None;
@@ -2358,17 +2369,6 @@ impl App {
             } else {
                 self.should_quit = true;
             }
-            return;
-        }
-        if self.preview_find.is_some() {
-            self.quit_confirmation = None;
-            self.handle_preview_find_key(key);
-            return;
-        }
-        // 编辑模态：拦截所有键，不泄漏到全局 match
-        if self.tab().content.edit.is_some() {
-            self.quit_confirmation = None;
-            self.handle_edit_key(key);
             return;
         }
         if self.search.is_some() {
@@ -3055,9 +3055,8 @@ impl App {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
             let text = {
-                let tab = self.tab();
-                let edit = tab.content.edit.as_ref().unwrap();
-                edit.selected_text(&tab.content.lines)
+                let lines = &self.tab().content.lines;
+                edit.selected_text(lines)
             };
             if let Some(text) = text {
                 let count = text.chars().count();
@@ -3077,9 +3076,8 @@ impl App {
             (KeyCode::Char('x' | 'X'), KeyModifiers::CONTROL)
         ) {
             let text = {
-                let tab = self.tab_mut();
-                let edit = tab.content.edit.as_mut().unwrap();
-                edit.cut_selection(&mut tab.content.lines)
+                let lines = &mut self.tab_mut().content.lines;
+                edit.cut_selection(lines)
             };
             if let Some(text) = text {
                 let count = text.chars().count();
