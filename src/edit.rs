@@ -411,11 +411,13 @@ impl EditSession {
 
         // 先删选区
         if let Some(sel) = self.selection.take() {
+            let (start, _) = sel.normalized();
             let (line_range, old_lines, new_lines) = delete_selection(lines, sel);
             lines.splice(line_range.clone(), new_lines.iter().cloned());
+            // 跨行删除合并后，拼接交界点就是原起点字节偏移（不是合并行尾）
             let caret_after = ContentPoint {
                 line: line_range.start,
-                byte: new_lines.first().map(|l| l.len()).unwrap_or(0),
+                byte: start.byte,
             };
             // 把删除选区的 delta 先压栈，再压粘贴 delta
             self.push_delta(EditDelta {
@@ -510,11 +512,13 @@ impl EditSession {
 
         // 先删选区
         if let Some(sel) = self.selection.take() {
+            let (start, _) = sel.normalized();
             let (line_range, old_lines, new_lines) = delete_selection(lines, sel);
             lines.splice(line_range.clone(), new_lines.iter().cloned());
+            // 跨行删除合并后，换行点应在拼接交界点（原起点字节偏移），而非合并行尾
             let caret_after = ContentPoint {
                 line: line_range.start,
-                byte: new_lines.first().map(|l| l.len()).unwrap_or(0),
+                byte: start.byte,
             };
             self.push_delta(EditDelta {
                 line_range,
@@ -1380,6 +1384,55 @@ mod tests {
         let (mut s, mut lines) = session_with_lines(vec!["".to_string()]);
         s.insert_text(&mut lines, "a\r\nb");
         assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn paste_after_multiline_selection_inserts_at_junction() {
+        // 跨行选区删除合并后，粘贴点必须在拼接交界点（start.byte），而非合并行尾
+        let (mut s, mut lines) =
+            session_with_lines(vec!["abcdef".to_string(), "ghijkl".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 2),
+            anchor_after: cp(0, 2),
+            head: cp(1, 2),
+            dragging: false,
+            dragged: false,
+        });
+        s.insert_text(&mut lines, "X");
+        assert_eq!(lines, vec!["abXijkl".to_string()]);
+        assert_eq!(s.caret, cp(0, 3));
+    }
+
+    #[test]
+    fn paste_multiline_after_multiline_selection_splits_at_junction() {
+        let (mut s, mut lines) =
+            session_with_lines(vec!["abcdef".to_string(), "ghijkl".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 2),
+            anchor_after: cp(0, 2),
+            head: cp(1, 2),
+            dragging: false,
+            dragged: false,
+        });
+        s.insert_text(&mut lines, "x\ny");
+        assert_eq!(lines, vec!["abx".to_string(), "yijkl".to_string()]);
+        assert_eq!(s.caret, cp(1, 1));
+    }
+
+    #[test]
+    fn enter_after_multiline_selection_splits_at_junction() {
+        let (mut s, mut lines) =
+            session_with_lines(vec!["abcdef".to_string(), "ghijkl".to_string()]);
+        s.selection = Some(ContentSelection {
+            anchor_before: cp(0, 2),
+            anchor_after: cp(0, 2),
+            head: cp(1, 2),
+            dragging: false,
+            dragged: false,
+        });
+        s.insert_newline(&mut lines);
+        assert_eq!(lines, vec!["ab".to_string(), "ijkl".to_string()]);
+        assert_eq!(s.caret, cp(1, 0));
     }
 
     #[test]
