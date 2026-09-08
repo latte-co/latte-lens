@@ -5,7 +5,7 @@ use std::{
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
@@ -2243,6 +2243,44 @@ fn draw_content(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     }
     frame.render_widget(paragraph, render_area);
 
+    // Edit-mode caret: fake REVERSED block + real terminal cursor.
+    // Ratatui 0.30 hides the cursor each frame unless set_cursor_position is
+    // called, so we must call it every frame while edit mode is active.
+    if app.edit_is_active()
+        && let Some(caret) = app.edit_caret()
+    {
+        let content = &app.tab().content;
+        let line_len = content.lines.get(caret.line).map(|l| l.len()).unwrap_or(0);
+        let gutter_width = app.content_gutter_width();
+        let h_scroll = app.effective_content_horizontal_scroll();
+        for (i, visual_row) in visual_rows[start..end].iter().enumerate() {
+            if visual_row.line_index != caret.line
+                || !crate::app::visual_row_contains_byte(visual_row, caret.byte, line_len)
+            {
+                continue;
+            }
+            let screen_y = render_area.y + i as u16;
+            // Calculate the caret's display column within this visual row.
+            let line = &content.lines[caret.line];
+            let caret_end = caret.byte.min(line.len());
+            let before_caret = &line[visual_row.byte_range.start..caret_end];
+            let (_, display_col) = expand_tabs(before_caret, 0, visual_row.tab_origin);
+            let screen_x =
+                render_area.x + gutter_width as u16 + display_col as u16 - h_scroll as u16;
+            // Fake caret: REVERSED on the cell at the caret position.
+            let buffer = frame.buffer_mut();
+            if let Some(cell) = buffer.cell_mut((screen_x, screen_y)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+            // Real terminal cursor.
+            frame.set_cursor_position(Position {
+                x: screen_x,
+                y: screen_y,
+            });
+            break;
+        }
+    }
+
     // Content scrollbar: a 1-column indicator on the right edge of the
     // content area, shown only when the content overflows the viewport.
     // The track sits on the last column of the full rows rect (which was
@@ -2379,6 +2417,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(help, Style::default().fg(muted())),
+            ])),
+            area,
+        );
+        return;
+    }
+    if app.edit_is_active() {
+        let hint = app.edit_footer_hint().unwrap_or("EDIT");
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Edit ",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(hint, Style::default().fg(muted())),
             ])),
             area,
         );
@@ -2826,7 +2878,12 @@ fn visual_row_selection(app: &App, visual_row: &ContentVisualRow) -> Option<Rang
     if visual_row.synthetic {
         return None;
     }
-    let selection = app.content_selection_range(visual_row.line_index)?;
+    // 编辑态用 edit.selection，否则用 content.selection
+    let selection = if app.edit_is_active() {
+        app.edit_selection_range(visual_row.line_index)?
+    } else {
+        app.content_selection_range(visual_row.line_index)?
+    };
     let start = selection.start.max(visual_row.byte_range.start);
     let end = selection.end.min(visual_row.byte_range.end);
     (start < end).then_some(

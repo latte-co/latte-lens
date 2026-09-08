@@ -27,6 +27,7 @@ Latte Lens 的快捷键按"作用域"分组设计，而不是混用不同 IDE �
 | 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件、`x` 忽略错误 |
 | 历史方向 | `Alt` + 方向键 | 导航历史回退与前进 | `Alt+Left` Back、`Alt+Right` Forward |
 | 鼠标语义提示 | `Alt` + 鼠标 | 鼠标悬停 token 高亮与点击跳转 | `Alt+Moved` token 下划线、`Alt+左键` Definition |
+| 编辑模态 | 无修饰单键 / `Ctrl` + 助记 | 预览区文本编辑（`i` 进入） | `i` 进入编辑、`Ctrl+S` 保存、`Ctrl+Z` undo、`Ctrl+Y` redo、`Esc` 退出 |
 
 全局命令与代码语义命令均使用 `Ctrl` + 助记字母，但二者在不同的焦点与视图状态下生效：
 全局命令在任意焦点可用；代码语义命令只在 Content 焦点、`ContentMode::Preview`、无
@@ -101,6 +102,30 @@ Search/Find/navigation results popup 时生效。
 | `Alt` + 鼠标移动 | 在精确命中可导航 token 时给整个 token 加下划线 |
 | `Alt` + 左键 | 在精确鼠标 point 请求 Definition |
 
+### 3.7 编辑模态
+
+编辑模态通过 `i` 在 Content 焦点、Preview 模式、文本 provider 下进入。进入后拦截所有按键，
+全局命令与语义命令挂起，直到退出编辑。
+
+| 按键 | 功能 |
+| --- | --- |
+| `i` | 进入编辑模式（仅文本 Preview；图片 Preview 下 `i` 仍为确认终端渲染） |
+| 可打印字符 | 在 caret 处插入（有选区时替换选区） |
+| `Enter` | 插入换行 |
+| `Backspace` / `Delete` | 向后 / 向前删除 |
+| `←` / `→` / `↑` / `↓` | caret 移动（`Shift` 扩展选区） |
+| `Home` / `End` | 行首 / 行尾 |
+| `PageUp` / `PageDown` | 翻页 |
+| `Ctrl+Z` | undo（连续单字符插入 2s 内合并） |
+| `Ctrl+Y` | redo |
+| `Ctrl+S` | 保存（原子写 + 冲突检测）；**编辑模式下覆盖 Document Symbols 绑定** |
+| `Esc` | 退出编辑；dirty 时二次确认（再按 `Esc` 放弃 / `s` 保存退出） |
+| 鼠标单击 | 定位 caret |
+| 鼠标拖拽 | 扩展选区 |
+| 鼠标双击 | 选中词（UAX#29 词边界） |
+| 滚轮 | 滚动 |
+| 粘贴 | bracketed paste 多行插入 |
+
 ## 4. 设计规范
 
 ### 4.1 `Ctrl` + 助记字母规范
@@ -149,7 +174,8 @@ Footer help text 按以下优先级展示，高优先级状态覆盖低优先级
 1. 退出确认消息（`quit_confirmation_message`）
 2. 错误消息（`last_error`）
 3. 加载状态（refreshing / directory loading / content loading）
-4. 正常帮助文本
+4. 编辑模态帮助（`edit.is_some()` 时早退，显示编辑键位）
+5. 正常帮助文本
 
 正常帮助文本根据视口宽度和当前内容模式选择不同密度：
 
@@ -181,7 +207,7 @@ Footer 只展示当前上下文可操作的快捷键，不列出全部清单；�
 当需要新增快捷键时，按以下清单逐项检查：
 
 - [ ] 属于哪个作用域？（全局命令 / 代码语义命令 / 面板树视口移动 / 当前视图操作 /
-      历史方向 / 鼠标语义提示）
+      历史方向 / 鼠标语义提示 / 编辑模态）
 - [ ] 修饰符是否符合该作用域的约定？（全局/语义用 `Ctrl`，移动无修饰，视图操作用
       小写单键，历史用 `Alt`+方向，鼠标用 `Alt`+鼠标）
 - [ ] 键位是否已被占用？（在同一焦点/视图状态下不能与现有按键冲突）

@@ -24,7 +24,7 @@ use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
@@ -277,7 +277,7 @@ struct TerminalInputGuard {
 impl TerminalInputGuard {
     fn enable() -> io::Result<Self> {
         let mut stdout = io::stdout();
-        execute!(stdout, EnableMouseCapture)?;
+        execute!(stdout, EnableMouseCapture, EnableBracketedPaste)?;
         #[cfg(not(windows))]
         let keyboard_enhanced = execute!(
             stdout,
@@ -298,6 +298,6 @@ impl Drop for TerminalInputGuard {
         if self.keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
-        let _ = execute!(stdout, DisableMouseCapture);
+        let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
     }
 }

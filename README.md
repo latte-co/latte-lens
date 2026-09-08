@@ -129,7 +129,7 @@ Inside the TUI:
 | `ctrl-d` | In focused Preview content, go to the definition; one result jumps directly and multiple results open the navigation popup |
 | `ctrl-r` | Find references in the navigation popup, including when there is only one result |
 | `ctrl-o` | Find implementations in the navigation popup, including when there is only one result |
-| `ctrl-s` | Open bounded document symbols for the current Preview |
+| `ctrl-s` | In edit mode, save the file (atomic write with conflict detection); otherwise, open bounded document symbols for the current Preview |
 | `alt-←` / `alt-→` | Move backward or forward through successful navigation locations |
 | `alt` + mouse move / left click | Underline the complete navigable token under the pointer, or request its definition |
 | `[` / `]` | In focused Preview content, jump to the previous or next visible fold marker |
@@ -138,7 +138,8 @@ Inside the TUI:
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
 | `o` | Safely open the current Tree/Content file with the system default app; confirm an unknown non-executable file only after Lens explicitly asks |
-| `i` | Only after Lens reports that no system app is available for a verified image, confirm a bounded TrueColor terminal preview |
+| `i` | In a text Preview, enter edit mode; for a verified image with no system app, confirm a bounded TrueColor terminal preview |
+| `ctrl-z` / `ctrl-y` | In edit mode, undo / redo |
 | `y` / `Y` | Copy the selected path: `y` copies the relative path (the link path for symlinks), `Y` copies the real/absolute path (resolved target for symlinks in All Files scope); directories get a trailing `/` |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
 | `x` | In the Review tree, dismiss (or restore) discovery errors under the selected issue, repository, or directory group |
@@ -165,6 +166,7 @@ Mouse controls:
 - In a supported built-in source Preview, hold `Alt` while moving the mouse to underline a complete navigable token, then `Alt`-click to request its definition. Keyboard navigation uses the same `Ctrl` + mnemonic style as search: `Ctrl+D` definition, `Ctrl+R` references, `Ctrl+O` implementations, and `Ctrl+S` document symbols. References and implementations always open a file-grouped results popup; on wide terminals it previews the selected location without replacing the main Content pane. Press `Enter` or click a location to commit its jump; file-group headers only expand or collapse their locations. A safe external result inside a recognized dependency package (`go.mod`, `Cargo.toml`, `package.json`, `pyproject.toml`, or `setup.py`) opens a read-only `Dependency Source` view without adding it to the workspace Tree or Git scopes; use `Alt`+`←` to return. Other external results are rejected. Semantic navigation never falls back to a same-name AST/workspace guess: when no supported language server is available it reports the unavailable state and leaves the current view unchanged.
 - In Git Changes, selecting a file keeps its owning-repository diff in Content. Click a container's disclosure triangle or double-click it to expand/collapse, use `Enter` or file double-click to open the working-tree file in Lens Preview, and use `o` or `[Open]` when you explicitly want the system default app.
 - Click a pane to focus it, or use the wheel over either pane to navigate it.
+- In edit mode (`i` in a text Preview), click to position the caret, drag to select text, or double-click to select a word (UAX#29 word boundaries). `Esc` exits edit mode (press twice to discard unsaved changes, or `s` to save and exit).
 - Drag the vertical divider to resize Tree and Preview/Diff. Tree keeps a 28-column minimum and the content pane keeps 24 columns.
 
 All Files remains bounded by the selected workspace, includes dotfiles and
