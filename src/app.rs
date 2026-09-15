@@ -46,8 +46,8 @@ use crate::{
         SourcePosition, SourceRange, lsp_uri_to_navigation_target,
     },
     preview::{
-        HighlightKind, HighlightSpan, PreviewKind, PreviewProvider, PreviewRegistry,
-        TerminalImageSize,
+        HighlightKind, HighlightSpan, MarkdownPresentation, PreviewKind, PreviewProvider,
+        PreviewRegistry, TerminalImageSize,
     },
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
@@ -843,6 +843,10 @@ pub struct ContentState {
     pub provider: Option<String>,
     preview_kind: PreviewKind,
     source_target: Option<ContentTarget>,
+    /// Requested presentation for Markdown documents (rendered typeset view by
+    /// default, raw source after `m`). Persists across `reset_content` and
+    /// d/p toggles for the same file; a different file resets to rendered.
+    markdown_presentation: MarkdownPresentation,
     pub show_line_numbers: bool,
     pub(crate) diff_lines: Vec<DiffLineAnnotation>,
     identity: Option<ContentIdentity>,
@@ -892,6 +896,7 @@ impl Default for ContentState {
             provider: None,
             preview_kind: PreviewKind::Text,
             source_target: None,
+            markdown_presentation: MarkdownPresentation::Rendered,
             show_line_numbers: false,
             diff_lines: Vec::new(),
             identity: None,
@@ -2441,6 +2446,11 @@ impl App {
                     || matches!(self.tab().content.preview_kind, PreviewKind::Image(_))
                 {
                     self.confirm_terminal_image_preview();
+                } else if self.tab().content.provider.as_deref() == Some("markdown") {
+                    // Rendered Markdown is not editable; guide the user to the
+                    // source view where edit mode is available.
+                    self.last_error =
+                        Some("Press m for the Markdown source view before editing.".to_owned());
                 } else {
                     self.try_enter_edit_mode();
                 }
@@ -2476,6 +2486,7 @@ impl App {
                 self.request_refresh(self.tree_scope == TreeScope::GitChanges);
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
+            (KeyCode::Char('m'), KeyModifiers::NONE) => self.toggle_markdown_presentation(),
             (KeyCode::Char('d'), KeyModifiers::NONE) => self.load_selected_diff(),
             (KeyCode::Char(' '), KeyModifiers::NONE)
                 if self.tab_mut().content.mode == ContentMode::Diff =>
@@ -4226,10 +4237,20 @@ impl App {
             return;
         }
         self.remember_recent_file(&result.path);
-        let generation = self.request_content(
+        // Search carries source line/byte coordinates, so Markdown results
+        // must open in source view or the match highlight lands on the wrong
+        // rendered line.
+        let presentation = if is_markdown_relative(&result.path) {
+            MarkdownPresentation::Source
+        } else {
+            MarkdownPresentation::Rendered
+        };
+        let generation = self.dispatch_content_request(
             ContentKind::Preview,
             display_workspace_path(&result.path),
             ContentTarget::Workspace(result.path.clone()),
+            None,
+            presentation,
         );
         self.search_preview_target =
             result
@@ -4276,10 +4297,19 @@ impl App {
         } else {
             self.focused_pane = FocusPane::Content;
             self.remember_recent_file(&result.path);
-            let generation = self.request_content(
+            // Source coordinates from the text search require the source view
+            // for Markdown results (see preview_search_selection).
+            let presentation = if is_markdown_relative(&result.path) {
+                MarkdownPresentation::Source
+            } else {
+                MarkdownPresentation::Rendered
+            };
+            let generation = self.dispatch_content_request(
                 ContentKind::Preview,
                 display_workspace_path(&result.path),
                 ContentTarget::Workspace(result.path.clone()),
+                None,
+                presentation,
             );
             self.search_preview_target = result.line_number.zip(result.source_match_range).map(
                 |(line_number, byte_range)| SearchPreviewTarget {
@@ -7958,6 +7988,7 @@ impl App {
                 .saturating_sub(7)
                 .max(1),
         };
+        let markdown_presentation = self.tab().content.markdown_presentation;
         self.cancel_pending_navigation();
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
@@ -7975,11 +8006,73 @@ impl App {
             purpose: ContentPurpose::Display,
             target: pending.target,
             terminal_image_size: Some(terminal_image_size),
+            markdown_presentation,
         });
     }
 
     fn request_content(&mut self, kind: ContentKind, label: String, target: ContentTarget) -> u64 {
         self.request_content_with_review_path(kind, label, target, None)
+    }
+
+    /// Toggle the focused Markdown document between rendered and raw source
+    /// presentation (`m`). No-op outside a successful Markdown preview.
+    fn toggle_markdown_presentation(&mut self) {
+        let pending_toggle = {
+            let content = &self.tab().content;
+            if content.mode != ContentMode::Preview || content.edit.is_some() || !content.successful
+            {
+                None
+            } else {
+                // Gate on the loaded identity's extension, not the resolved
+                // provider: a Markdown file that fell back to source (NUL/UTF-8
+                // or parser budget) must still allow toggling back.
+                let is_markdown = content
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| is_markdown_relative(identity.path()));
+                let target = if is_markdown {
+                    content.source_target.clone()
+                } else {
+                    None
+                };
+                target.map(|target| {
+                    let label = content
+                        .identity
+                        .as_ref()
+                        .map_or_else(|| "Markdown".to_owned(), ContentIdentity::display_label);
+                    (
+                        target,
+                        label,
+                        content.current_diff_path.clone(),
+                        content.markdown_presentation.opposite(),
+                    )
+                })
+            }
+        };
+        let Some((target, label, review_path, next)) = pending_toggle else {
+            return;
+        };
+        self.dispatch_content_request(ContentKind::Preview, label, target, review_path, next);
+    }
+
+    /// Footer hint for the `m` toggle, shown only for a loaded Markdown
+    /// document outside edit mode.
+    pub(crate) fn markdown_presentation_hint(&self) -> Option<&'static str> {
+        let content = &self.tab().content;
+        if content.mode != ContentMode::Preview || content.edit.is_some() {
+            return None;
+        }
+        let is_markdown = content
+            .identity
+            .as_ref()
+            .is_some_and(|identity| is_markdown_relative(identity.path()));
+        if !is_markdown {
+            return None;
+        }
+        Some(match content.markdown_presentation {
+            MarkdownPresentation::Rendered => "m source",
+            MarkdownPresentation::Source => "m render",
+        })
     }
 
     fn request_reviewable_diff(
@@ -7998,6 +8091,36 @@ impl App {
         target: ContentTarget,
         review_path: Option<RepoPath>,
     ) -> u64 {
+        let presentation = self.presentation_for_new_request(&target);
+        self.dispatch_content_request(kind, label, target, review_path, presentation)
+    }
+
+    /// Decide the Markdown presentation for a fresh file request: stay in
+    /// source view only when the request re-opens the exact same document that
+    /// is currently shown in source view; every other (new) document opens in
+    /// the rendered default. Non-Markdown files ignore the value.
+    fn presentation_for_new_request(&self, target: &ContentTarget) -> MarkdownPresentation {
+        let content = &self.tab().content;
+        if content.markdown_presentation == MarkdownPresentation::Source
+            && content
+                .identity
+                .as_ref()
+                .is_some_and(|identity| target_matches_identity(target, identity))
+        {
+            MarkdownPresentation::Source
+        } else {
+            MarkdownPresentation::Rendered
+        }
+    }
+
+    fn dispatch_content_request(
+        &mut self,
+        kind: ContentKind,
+        label: String,
+        target: ContentTarget,
+        review_path: Option<RepoPath>,
+        presentation: MarkdownPresentation,
+    ) -> u64 {
         self.cancel_pending_navigation();
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
@@ -8008,6 +8131,10 @@ impl App {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         });
+        // reset_content deliberately preserves markdown_presentation; write the
+        // resolved presentation after it so toggle/search/navigation requests
+        // take effect.
+        self.tab_mut().content.markdown_presentation = presentation;
         self.tab_mut().content.pending_diff_path = review_path.map(|path| (generation, path));
         self.tab_mut().content.lines = vec![format!("Loading {label}…")];
         self.runtime.request_content(ContentRequest {
@@ -8017,6 +8144,7 @@ impl App {
             purpose: ContentPurpose::Display,
             target,
             terminal_image_size: None,
+            markdown_presentation: presentation,
         });
         generation
     }
@@ -8569,6 +8697,11 @@ impl App {
             return;
         }
         let content_generation = self.begin_active_tab_content_request();
+        // Semantic navigation carries source coordinates and installs a source
+        // navigation snapshot, so Markdown targets must load in source view.
+        if is_markdown_relative(target.document.path()) {
+            self.tab_mut().content.markdown_presentation = MarkdownPresentation::Source;
+        }
         self.runtime.request_content(ContentRequest {
             generation: content_generation,
             tab_id: self.active_tab.value(),
@@ -8578,6 +8711,7 @@ impl App {
             },
             target: content_target_for_navigation(&target.document),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
         self.tab_mut().content.pending_navigation_stage = Some(PendingNavigationStage {
             invocation,
@@ -9124,6 +9258,7 @@ impl App {
             },
             target: content_target_for_navigation(&target.document),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
     }
 
@@ -9616,6 +9751,37 @@ fn content_target_for_navigation(document: &ContentIdentity) -> ContentTarget {
             server_root: server_root.clone(),
         },
     }
+}
+
+/// Whether a new content target addresses the exact same document as the
+/// currently loaded identity. Used to preserve (but not widen) the source-view
+/// preference across d/p toggles and post-edit reloads.
+fn target_matches_identity(target: &ContentTarget, identity: &ContentIdentity) -> bool {
+    match (target, identity) {
+        // Workspace and repository-change reads both resolve inside the same
+        // workspace root, so they share the Workspace identity space.
+        (ContentTarget::Workspace(path), ContentIdentity::Workspace(current)) => path == current,
+        (ContentTarget::Repository(change), ContentIdentity::Workspace(current)) => {
+            change.path.relative == *current
+        }
+        (
+            ContentTarget::Dependency { root, relative, .. },
+            ContentIdentity::Dependency {
+                root: current_root,
+                relative: current_relative,
+                ..
+            },
+        ) => root == current_root && relative == current_relative,
+        _ => false,
+    }
+}
+
+/// Whether a path identifies a Markdown document by extension (case
+/// insensitive), mirroring the built-in markdown provider's detection.
+fn is_markdown_relative(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
 }
 
 fn navigation_picker_groups(results: &[NavigationPickerItem]) -> Vec<NavigationPickerGroup> {

@@ -2470,6 +2470,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         ""
     };
+    let md_hint = app
+        .markdown_presentation_hint()
+        .map_or_else(String::new, |hint| format!("  {hint}"));
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
             "  ↑↓  {tab_keys}  ^C quit  Enter preview  o open  y path{ignore_hint}  ^B tree  q×2"
@@ -2480,7 +2483,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓  ^C quit  [/] folds  ^D/R/O nav  ^S symbols  ^F find  {tab_keys}  y path Y real  ^B tree  q×2"
+            "  ↑↓  ^C quit  [/] folds  ^D/R/O nav  ^S symbols  ^F find{md_hint}  {tab_keys}  y path Y real  ^B tree  q×2"
         )
     } else if area.width < 96 {
         format!(
@@ -2488,7 +2491,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓  ^C quit  [/] folds  Enter toggle  ^D/R/O nav  ^S symbols  Alt+click def  Alt+←/→ hist  ^F find  {tab_keys}  y copy Y real  ^B tree  q×2"
+            "  ↑↓  ^C quit  [/] folds  Enter toggle  ^D/R/O nav  ^S symbols  Alt+click def  Alt+←/→ hist  ^F find{md_hint}  {tab_keys}  y copy Y real  ^B tree  q×2"
         )
     } else if app.tab().content.mode == ContentMode::Diff {
         format!(
