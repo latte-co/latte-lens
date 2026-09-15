@@ -8131,11 +8131,46 @@ impl App {
             .content
             .markdown_source_identity
             .as_ref()
-            .is_some_and(|identity| target_matches_identity(target, identity));
+            .is_some_and(|identity| self.target_matches_identity(target, identity));
         if pinned_source {
             MarkdownPresentation::Source
         } else {
             MarkdownPresentation::Rendered
+        }
+    }
+
+    /// Whether a new content target addresses the exact same document as a
+    /// pinned identity. Repository targets resolve through their owning
+    /// repository worktree before re-rooting at the workspace, so a change in a
+    /// nested repository (`change.path.relative = README.md`) matches the
+    /// workspace-scoped identity (`child/README.md`) instead of comparing two
+    /// paths with different bases.
+    fn target_matches_identity(&self, target: &ContentTarget, identity: &ContentIdentity) -> bool {
+        match (target, identity) {
+            (ContentTarget::Workspace(path), ContentIdentity::Workspace(current)) => {
+                path == current
+            }
+            (ContentTarget::Repository(change), ContentIdentity::Workspace(current)) => {
+                let Some(graph) = self.repo_graph.as_ref() else {
+                    return false;
+                };
+                let Some(snapshot) = graph.repository(&change.path.repo_id) else {
+                    return false;
+                };
+                let absolute = snapshot.node.worktree.join(&change.path.relative);
+                ContentIdentity::from_absolute(&self.root, &absolute)
+                    .and_then(|resolved| resolved.workspace_path().map(|path| path == current))
+                    .unwrap_or(false)
+            }
+            (
+                ContentTarget::Dependency { root, relative, .. },
+                ContentIdentity::Dependency {
+                    root: current_root,
+                    relative: current_relative,
+                    ..
+                },
+            ) => root == current_root && relative == current_relative,
+            _ => false,
         }
     }
 
@@ -8857,6 +8892,21 @@ impl App {
         self.tab_mut().content.highlights = snapshot.highlights;
         self.tab_mut().content.show_line_numbers = snapshot.show_line_numbers;
         self.tab_mut().content.identity = snapshot.identity;
+        // Semantic navigation always installs source-coordinate content (the
+        // stage request forces MarkdownPresentation::Source). Keep the anchor
+        // in sync with the same rule as the normal completion path so that a
+        // later Preview request for the navigated-to Markdown document keeps
+        // the source view instead of treating it as a new file.
+        let pin_source = self.tab().content.markdown_presentation == MarkdownPresentation::Source
+            && self
+                .tab()
+                .content
+                .identity
+                .as_ref()
+                .is_some_and(|identity| is_markdown_relative(identity.path()));
+        self.tab_mut().content.markdown_source_identity = pin_source
+            .then(|| self.tab().content.identity.clone())
+            .flatten();
         self.tab_mut().content.fold_source = snapshot.fold_source;
         self.tab_mut().content.fold_regions = snapshot.fold_regions;
         self.tab_mut().content.structure = snapshot.structure;
@@ -9794,29 +9844,6 @@ fn content_target_for_navigation(document: &ContentIdentity) -> ContentTarget {
             relative: relative.clone(),
             server_root: server_root.clone(),
         },
-    }
-}
-
-/// Whether a new content target addresses the exact same document as the
-/// currently loaded identity. Used to preserve (but not widen) the source-view
-/// preference across d/p toggles and post-edit reloads.
-fn target_matches_identity(target: &ContentTarget, identity: &ContentIdentity) -> bool {
-    match (target, identity) {
-        // Workspace and repository-change reads both resolve inside the same
-        // workspace root, so they share the Workspace identity space.
-        (ContentTarget::Workspace(path), ContentIdentity::Workspace(current)) => path == current,
-        (ContentTarget::Repository(change), ContentIdentity::Workspace(current)) => {
-            change.path.relative == *current
-        }
-        (
-            ContentTarget::Dependency { root, relative, .. },
-            ContentIdentity::Dependency {
-                root: current_root,
-                relative: current_relative,
-                ..
-            },
-        ) => root == current_root && relative == current_relative,
-        _ => false,
     }
 }
 
@@ -14581,6 +14608,77 @@ mod tests {
                 .iter()
                 .flatten()
                 .any(|highlight| { matches!(highlight.kind, HighlightKind::ImagePixel { .. }) })
+        );
+    }
+
+    #[test]
+    fn navigation_snapshot_syncs_markdown_source_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a.md"), "# A\n").unwrap();
+        fs::write(
+            directory.path().join("b.md"),
+            "# Navigated\n\nnav body marker\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("c.rs"), "fn c() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Simulate a cross-document semantic-navigation stage landing on
+        // b.md: stages always request source presentation and then install the
+        // loaded source snapshot.
+        app.tab_mut().content.markdown_presentation = MarkdownPresentation::Source;
+        app.install_navigation_snapshot(ContentSnapshot {
+            provider: Some("text".to_owned()),
+            lines: vec![
+                "# Navigated".to_owned(),
+                String::new(),
+                "nav body marker".to_owned(),
+            ],
+            highlights: vec![Vec::new(), Vec::new(), Vec::new()],
+            show_line_numbers: true,
+            identity: Some(ContentIdentity::Workspace(PathBuf::from("b.md"))),
+            fold_source: FoldSource::BuiltinText,
+            fold_regions: Vec::new(),
+            structure: StructureSnapshot::unavailable(),
+            navigation_source: None,
+            preview_kind: PreviewKind::Text,
+            source_target: Some(ContentTarget::Workspace(PathBuf::from("b.md"))),
+        });
+        assert_eq!(
+            app.tab().content.markdown_source_identity,
+            Some(ContentIdentity::Workspace(PathBuf::from("b.md")))
+        );
+
+        // A subsequent Preview request for b.md (e.g. pressing p) keeps source.
+        app.request_content(
+            ContentKind::Preview,
+            "b.md".to_owned(),
+            ContentTarget::Workspace(PathBuf::from("b.md")),
+        );
+        app.wait_for_background();
+        assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+        assert!(app.tab().content.show_line_numbers);
+
+        // Navigating on to a non-Markdown document releases the pin, so a
+        // later request for b.md reopens in the rendered default.
+        app.install_navigation_snapshot(ContentSnapshot {
+            provider: Some("text".to_owned()),
+            lines: vec!["fn c() {}".to_owned()],
+            highlights: vec![Vec::new()],
+            show_line_numbers: true,
+            identity: Some(ContentIdentity::Workspace(PathBuf::from("c.rs"))),
+            fold_source: FoldSource::BuiltinText,
+            fold_regions: Vec::new(),
+            structure: StructureSnapshot::unavailable(),
+            navigation_source: None,
+            preview_kind: PreviewKind::Text,
+            source_target: Some(ContentTarget::Workspace(PathBuf::from("c.rs"))),
+        });
+        assert_eq!(app.tab().content.markdown_source_identity, None);
+        assert_eq!(
+            app.presentation_for_new_request(&ContentTarget::Workspace(PathBuf::from("b.md"))),
+            MarkdownPresentation::Rendered
         );
     }
 

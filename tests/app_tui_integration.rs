@@ -6482,3 +6482,85 @@ fn file_name_search_opens_markdown_rendered_but_content_search_opens_source() {
     assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
     assert!(app.tab().content.show_line_numbers);
 }
+
+#[test]
+fn nested_repository_git_change_keeps_markdown_source_across_p_and_d() {
+    // A Markdown change inside a nested repository: the RepoChange target uses
+    // a path relative to the nested repo, while the loaded identity is
+    // workspace-relative. The source pin must survive Preview reloads and
+    // d -> p despite the differing path bases.
+    let fixture = TestRepo::new();
+    fixture.write("root.txt", "root body\n");
+    fixture.commit_all("root initial");
+
+    let nested = fixture.root().join("vendor/nested");
+    init_repo(&nested);
+    write_file(&nested, "docs/guide.md", "# Guide\n\nold body\n");
+    git(&nested, &["add", "--all"]);
+    git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
+    write_file(&nested, "docs/guide.md", "# Guide\n\nnested md marker\n");
+
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    // Make sure the nested change is the active selection.
+    for _ in 0..5 {
+        if app
+            .tab()
+            .content
+            .lines
+            .iter()
+            .any(|line| line.contains("nested md marker"))
+        {
+            break;
+        }
+        app.handle_key(key(KeyCode::Char('n')));
+        settle(&mut app);
+    }
+    assert!(
+        app.tab()
+            .content
+            .lines
+            .iter()
+            .any(|line| line.contains("nested md marker")),
+        "the nested repository change must be selected"
+    );
+
+    // Preview opens the rendered Markdown view.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+
+    // Pin source with m.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
+    // A plain Preview reload of the nested change keeps source.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(
+        app.tab().content.provider.as_deref(),
+        Some("text"),
+        "reloading a nested-repo Markdown change must retain source"
+    );
+    assert!(app.tab().content.show_line_numbers);
+
+    // d -> p must also retain the source choice.
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Diff);
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(
+        app.tab().content.provider.as_deref(),
+        Some("text"),
+        "d -> p on a nested-repo Markdown change must retain source"
+    );
+    assert!(app.tab().content.show_line_numbers);
+}
