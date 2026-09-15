@@ -15,6 +15,7 @@ pub mod preview;
 pub mod repo_graph;
 mod runtime;
 mod search;
+pub mod send_agent;
 mod system_preview;
 mod text_layout;
 pub mod theme;
