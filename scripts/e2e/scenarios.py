@@ -1669,6 +1669,15 @@ def structure_navigation(context: ScenarioContext) -> None:
             f"{filename} Preview loads before structure navigation",
             absent=("Open File",),
         )
+        if filename.endswith(".md"):
+            # File-name search honors the rendered Markdown default; document
+            # symbols and folds are source-coordinate features, so switch to the
+            # raw source view with `m` before driving structure navigation.
+            session.key(b"m")
+            session.wait_screen(
+                ("m render", "# Guide Root"),
+                f"{filename} switches to source before structure navigation",
+            )
         session.key(b"l")
         session.key(b"\x13")
         session.wait_screen(
