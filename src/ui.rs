@@ -3005,6 +3005,27 @@ fn highlight_style_with_theme(kind: HighlightKind, theme: &Theme) -> Style {
             .bg(theme.nav_target)
             .add_modifier(Modifier::BOLD),
         HighlightKind::NavigationHover => Style::default().add_modifier(Modifier::UNDERLINED),
+        HighlightKind::MdHeading => Style::default()
+            .fg(theme.md_heading)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::MdStrong => Style::default()
+            .fg(theme.md_strong)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::MdEmphasis => Style::default()
+            .fg(theme.md_emphasis)
+            .add_modifier(Modifier::ITALIC),
+        HighlightKind::MdStrikethrough => Style::default()
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::CROSSED_OUT),
+        HighlightKind::MdCode => Style::default().fg(theme.md_code),
+        HighlightKind::MdCodeBlock => Style::default().fg(theme.md_code_block),
+        HighlightKind::MdLink => Style::default()
+            .fg(theme.md_link)
+            .add_modifier(Modifier::UNDERLINED),
+        HighlightKind::MdQuote => Style::default().fg(theme.md_quote),
+        HighlightKind::MdListMarker => Style::default().fg(theme.md_list_marker),
+        HighlightKind::MdRule => Style::default().fg(theme.md_rule),
+        HighlightKind::MdRaw => Style::default().fg(theme.md_raw),
         HighlightKind::ImagePixel {
             foreground,
             background,

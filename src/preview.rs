@@ -8,6 +8,7 @@ mod common;
 mod common_files;
 mod docx_preview;
 mod image_preview;
+mod markdown_render;
 mod pdf_preview;
 
 use std::{
@@ -50,6 +51,18 @@ pub enum HighlightKind {
     Search,
     NavigationTarget,
     NavigationHover,
+    // Rendered Markdown semantics (emitted by the built-in markdown provider).
+    MdHeading,
+    MdStrong,
+    MdEmphasis,
+    MdStrikethrough,
+    MdCode,
+    MdCodeBlock,
+    MdLink,
+    MdQuote,
+    MdListMarker,
+    MdRule,
+    MdRaw,
     /// One terminal half-block cell. The foreground colors the upper pixel and
     /// the background colors the lower pixel; `None` preserves the inherited
     /// terminal color for transparent pixels.
@@ -96,6 +109,34 @@ pub struct TerminalImageSize {
     pub rows: u16,
 }
 
+/// How a Markdown document is presented in the preview pane.
+///
+/// [`Source`](Self::Source) shows the raw text with line numbers, syntax
+/// highlighting, structural folds, and code navigation.
+/// [`Rendered`](Self::Rendered) typesets the document for reading (markup
+/// hidden, headings/lists/quotes/code blocks laid out) without line numbers,
+/// folds, or navigation. Only the built-in Markdown provider renders; it
+/// declines non-Markdown paths and every [`Source`](Self::Source) request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MarkdownPresentation {
+    /// Raw source view (the historical default for every provider).
+    #[default]
+    Source,
+    /// Typeset, reader-oriented Markdown rendering.
+    Rendered,
+}
+
+impl MarkdownPresentation {
+    /// The opposite presentation, used by the `m` toggle.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Source => Self::Rendered,
+            Self::Rendered => Self::Source,
+        }
+    }
+}
+
 /// A syntax-highlighted byte range within one logical preview line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HighlightSpan {
@@ -122,6 +163,7 @@ pub struct PreviewRequest<'a> {
     pub max_bytes: usize,
     pub max_lines: usize,
     terminal_image_size: Option<TerminalImageSize>,
+    markdown_presentation: MarkdownPresentation,
 }
 
 impl<'a> PreviewRequest<'a> {
@@ -134,6 +176,7 @@ impl<'a> PreviewRequest<'a> {
             max_bytes: DEFAULT_MAX_BYTES,
             max_lines: DEFAULT_MAX_LINES,
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         }
     }
 
@@ -165,6 +208,18 @@ impl<'a> PreviewRequest<'a> {
 
     pub const fn terminal_image_size(&self) -> Option<TerminalImageSize> {
         self.terminal_image_size
+    }
+
+    /// Request either raw source or typeset rendering for Markdown documents.
+    /// Non-Markdown providers ignore this. Defaults to
+    /// [`MarkdownPresentation::Source`].
+    pub fn with_markdown_presentation(mut self, presentation: MarkdownPresentation) -> Self {
+        self.markdown_presentation = presentation;
+        self
+    }
+
+    pub const fn markdown_presentation(&self) -> MarkdownPresentation {
+        self.markdown_presentation
     }
 
     /// Open the selected object only when it is still a real regular file.
@@ -337,6 +392,13 @@ impl PreviewRegistry {
         });
         registry.providers.push(ProviderEntry {
             provider: Arc::new(common_files::CommonFilePreviewProvider::default()),
+            fold_source: FoldSource::None,
+        });
+        // Pushed last so it is queried first (reverse registration order).
+        // It declines everything unless the request opts into rendered
+        // Markdown, falling through to the common-file and text providers.
+        registry.providers.push(ProviderEntry {
+            provider: Arc::new(markdown_render::MarkdownRenderProvider),
             fold_source: FoldSource::None,
         });
         registry
