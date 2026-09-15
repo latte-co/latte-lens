@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::send_agent::{AgentTarget, AgentTargetProvider};
 use crate::{
     content_safety::{
         FileFingerprint, ensure_beneath, path_exists_without_following, resolves_to_directory,
@@ -238,6 +239,42 @@ pub(crate) struct ExternalOpenCompletion {
     pub result: Result<ExternalOpenOutcome, String>,
 }
 
+/// Discover the agent panes reachable through the terminal workspace manager.
+#[derive(Debug)]
+pub(crate) struct AgentDiscoverRequest {
+    pub generation: u64,
+}
+
+/// Deliver a selection draft to one agent pane without submitting it.
+#[derive(Debug)]
+pub(crate) struct AgentSendRequest {
+    pub generation: u64,
+    pub pane_id: String,
+    pub agent: String,
+    pub payload: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentDiscoveryCompletion {
+    pub generation: u64,
+    pub result: Result<Vec<AgentTarget>, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentSendOutcome {
+    pub pane_id: String,
+    pub agent: String,
+    pub chars: usize,
+    /// Focus switching is best-effort: a failed focus never fails delivery.
+    pub focus_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentSendCompletion {
+    pub generation: u64,
+    pub result: Result<AgentSendOutcome, String>,
+}
+
 #[derive(Debug)]
 struct RequestSlot<T> {
     active: bool,
@@ -413,10 +450,14 @@ struct SharedState {
     directory: DirectoryQueue,
     content: ContentQueue,
     external_open: RequestSlot<ExternalOpenRequest>,
+    agent_discover: RequestSlot<AgentDiscoverRequest>,
+    agent_send: RequestSlot<AgentSendRequest>,
     completed_refresh: Option<RefreshCompletion>,
     completed_directories: VecDeque<DirectoryCompletion>,
     completed_content: VecDeque<ContentCompletion>,
     completed_external_open: Option<ExternalOpenCompletion>,
+    completed_agent_discovery: Option<AgentDiscoveryCompletion>,
+    completed_agent_send: Option<AgentSendCompletion>,
     preview_registry_update: Option<PreviewRegistry>,
     /// Test-only gate: when true the worker leaves content requests pending
     /// instead of processing them, so queue assertions are deterministic.
@@ -433,6 +474,20 @@ impl SharedState {
     #[cfg(not(test))]
     const fn content_suspended(&self) -> bool {
         false
+    }
+
+    fn agent_has_work(&self) -> bool {
+        self.agent_discover.has_work() || self.agent_send.has_work()
+    }
+
+    fn agent_has_completion(&self) -> bool {
+        self.completed_agent_discovery.is_some() || self.completed_agent_send.is_some()
+    }
+
+    /// No queued agent work (the worker wait predicate only inspects pending
+    /// slots; active work is about to notify on completion).
+    fn agent_slots_idle(&self) -> bool {
+        self.agent_discover.pending.is_none() && self.agent_send.pending.is_none()
     }
 }
 
@@ -451,6 +506,7 @@ impl WorkerRuntime {
         root: PathBuf,
         preview_registry: PreviewRegistry,
         system_open_adapter: SystemOpenAdapter,
+        agent_provider: std::sync::Arc<dyn AgentTargetProvider>,
     ) -> Result<Self> {
         // Content paths come from the canonical repository graph, so keep the
         // worker boundary in the same representation on every platform.
@@ -465,7 +521,13 @@ impl WorkerRuntime {
         let worker = thread::Builder::new()
             .name("latte-lens-io".to_owned())
             .spawn(move || {
-                worker_loop(worker_shared, root, preview_registry, system_open_adapter)
+                worker_loop(
+                    worker_shared,
+                    root,
+                    preview_registry,
+                    system_open_adapter,
+                    agent_provider,
+                )
             })?;
         Ok(Self {
             shared,
@@ -494,6 +556,20 @@ impl WorkerRuntime {
     pub fn request_external_open(&self, request: ExternalOpenRequest) {
         let mut state = self.lock_state();
         state.external_open.submit(request);
+        self.shared.changed.notify_one();
+    }
+
+    /// Queue an agent-pane discovery for the send-to-agent picker.
+    pub fn request_agent_discover(&self, request: AgentDiscoverRequest) {
+        let mut state = self.lock_state();
+        state.agent_discover.submit(request);
+        self.shared.changed.notify_one();
+    }
+
+    /// Queue a selection draft delivery to one agent pane.
+    pub fn request_agent_send(&self, request: AgentSendRequest) {
+        let mut state = self.lock_state();
+        state.agent_send.submit(request);
         self.shared.changed.notify_one();
     }
 
@@ -567,6 +643,20 @@ impl WorkerRuntime {
         )
     }
 
+    /// Drain send-to-agent completions separately so the existing
+    /// completion tuple keeps its shape.
+    pub fn take_agent_completions(
+        &self,
+    ) -> (
+        Option<AgentDiscoveryCompletion>,
+        Option<AgentSendCompletion>,
+    ) {
+        let mut state = self.lock_state();
+        (
+            state.completed_agent_discovery.take(),
+            state.completed_agent_send.take(),
+        )
+    }
     /// Wait for a result without polling. This is used during startup and by
     /// deterministic tests, never by the interactive event loop.
     pub fn wait_for_completion(&self) -> bool {
@@ -576,10 +666,12 @@ impl WorkerRuntime {
             && state.completed_directories.is_empty()
             && state.completed_content.is_empty()
             && state.completed_external_open.is_none()
+            && !state.agent_has_completion()
             && (state.refresh.has_work()
                 || state.directory.has_work()
                 || state.content.has_work()
-                || state.external_open.has_work())
+                || state.external_open.has_work()
+                || state.agent_has_work())
         {
             state = self
                 .shared
@@ -591,6 +683,7 @@ impl WorkerRuntime {
             || !state.completed_directories.is_empty()
             || !state.completed_content.is_empty()
             || state.completed_external_open.is_some()
+            || state.agent_has_completion()
     }
 
     fn lock_state(&self) -> MutexGuard<'_, SharedState> {
@@ -610,6 +703,8 @@ impl Drop for WorkerRuntime {
             state.directory.cancel_pending();
             state.content.cancel_pending();
             state.external_open.cancel_pending();
+            state.agent_discover.cancel_pending();
+            state.agent_send.cancel_pending();
             self.shared.changed.notify_all();
         }
         if let Some(worker) = self.worker.take() {
@@ -623,6 +718,8 @@ enum Work {
     Directory(DirectoryRequest),
     Content(ContentRequest),
     ExternalOpen(ExternalOpenRequest),
+    AgentDiscover(AgentDiscoverRequest),
+    AgentSend(AgentSendRequest),
 }
 
 fn worker_loop(
@@ -630,6 +727,7 @@ fn worker_loop(
     root: PathBuf,
     mut preview_registry: PreviewRegistry,
     system_open_adapter: SystemOpenAdapter,
+    agent_provider: std::sync::Arc<dyn AgentTargetProvider>,
 ) {
     let mut graph = None;
     let mut statuses = StatusMap::new();
@@ -644,6 +742,7 @@ fn worker_loop(
                 && state.directory.pending.is_empty()
                 && (state.content.pending.is_empty() || state.content_suspended())
                 && state.external_open.pending.is_none()
+                && state.agent_slots_idle()
                 && state.preview_registry_update.is_none()
             {
                 state = shared
@@ -738,6 +837,45 @@ fn worker_loop(
                 });
                 shared.changed.notify_all();
             }
+            Work::AgentDiscover(request) => {
+                let generation = request.generation;
+                let result = catch_worker_error(|| {
+                    agent_provider
+                        .discover(&root)
+                        .map(|discovery| discovery.targets)
+                });
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.agent_discover.complete();
+                state.completed_agent_discovery =
+                    Some(AgentDiscoveryCompletion { generation, result });
+                shared.changed.notify_all();
+            }
+            Work::AgentSend(request) => {
+                let generation = request.generation;
+                let result = catch_worker_error(|| {
+                    agent_provider.send_draft(&request.pane_id, &request.payload)?;
+                    let focus_error = agent_provider
+                        .focus_pane(&request.pane_id)
+                        .err()
+                        .map(|error| format!("{error:#}"));
+                    Ok(AgentSendOutcome {
+                        pane_id: request.pane_id,
+                        agent: request.agent,
+                        chars: request.payload.chars().count(),
+                        focus_error,
+                    })
+                });
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.agent_send.complete();
+                state.completed_agent_send = Some(AgentSendCompletion { generation, result });
+                shared.changed.notify_all();
+            }
         }
     }
 }
@@ -754,7 +892,16 @@ fn take_next_work(state: &mut SharedState) -> Option<Work> {
     {
         return Some(Work::Content(request));
     }
-    state.external_open.start_next().map(Work::ExternalOpen)
+    if let Some(request) = state.external_open.start_next() {
+        return Some(Work::ExternalOpen(request));
+    }
+    if let Some(request) = state.agent_discover.start_next() {
+        return Some(Work::AgentDiscover(request));
+    }
+    if let Some(request) = state.agent_send.start_next() {
+        return Some(Work::AgentSend(request));
+    }
+    None
 }
 
 struct ExecutedRefresh {

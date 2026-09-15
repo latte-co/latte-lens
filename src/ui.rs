@@ -294,6 +294,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.navigation_picker.is_some() {
         dim_underlay(frame);
         draw_navigation_picker(frame, app);
+    } else if app.send_to_agent.is_open() {
+        dim_underlay(frame);
+        draw_send_to_agent_picker(frame, app);
     } else if app.search_is_active() {
         dim_underlay(frame);
         draw_search_popup(frame, app);
@@ -420,6 +423,8 @@ fn regions(areas: DrawAreas) -> UiRegions {
         content_scrollbar_thumb_size: 0,
         content_body,
         content_inner: content_rows,
+        send_agent_popup: Rect::default(),
+        send_agent_rows: Vec::new(),
     }
 }
 
@@ -1060,6 +1065,108 @@ fn navigation_picker_item(
             ListItem::new(Line::from(spans))
         }
     }
+}
+
+fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
+    let popup = search_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+
+    let chars = app.send_to_agent.payload_chars();
+    let truncated = if app.send_to_agent.truncated {
+        " (truncated)"
+    } else {
+        ""
+    };
+    let title = format!(" Send selection to… ({chars} chars{truncated}) ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent()))
+        .title(Span::styled(
+            title,
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+    let inner = inset_horizontal(block.inner(popup), 1);
+    frame.render_widget(block, popup);
+    let [body, help] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    app.ui_regions.send_agent_popup = popup;
+    app.ui_regions.send_agent_rows.clear();
+
+    let discovering = matches!(
+        app.send_to_agent.phase,
+        crate::send_agent::SendPhase::Discovering
+    );
+
+    if discovering {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Discovering agents…",
+                Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+            )),
+            body,
+        );
+    } else if app.send_to_agent.targets.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "No active agent sessions detected.",
+                Style::default().fg(muted()),
+            )),
+            body,
+        );
+    } else {
+        let visible = body.height as usize;
+        let targets = app.send_to_agent.targets.clone();
+        let selected = app.send_to_agent.selected;
+        let row_rects = Layout::vertical(
+            targets
+                .iter()
+                .take(visible)
+                .map(|_| Constraint::Length(1))
+                .chain(std::iter::once(Constraint::Min(0)))
+                .collect::<Vec<_>>(),
+        )
+        .split(body);
+
+        for (index, target) in targets.iter().take(visible).enumerate() {
+            let rect = row_rects[index];
+            app.ui_regions.send_agent_rows.push(rect);
+            let is_selected = index == selected;
+            let base = if !target.selectable {
+                Style::default().fg(muted()).add_modifier(Modifier::DIM)
+            } else if is_selected {
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let marker = if is_selected { "● " } else { "  " };
+            let title: String = target.title.chars().take(48).collect();
+            let line = Line::from(vec![
+                Span::styled(marker, base),
+                Span::styled(format!("{:<8} ", target.agent), base),
+                Span::styled(format!("{:<7} ", target.status.label()), {
+                    if matches!(target.status, crate::send_agent::AgentLifecycle::Blocked) {
+                        Style::default().fg(muted()).add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(subtle())
+                    }
+                }),
+                Span::styled(title, base),
+                Span::styled(
+                    format!("  {}", target.pane_id),
+                    Style::default().fg(subtle()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), rect);
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "↑↓ select · Enter send draft · Esc close",
+            Style::default().fg(muted()),
+        )),
+        help,
+    );
 }
 
 fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPickerState) {
@@ -2388,6 +2495,22 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.send_to_agent.is_open() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Send to agent ",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  ↑↓ select  Enter send draft  Esc close",
+                    Style::default().fg(muted()),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
     if app.navigation_picker.is_some() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -2473,7 +2596,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let md_hint = app
         .markdown_presentation_hint()
         .map_or_else(String::new, |hint| format!("  {hint}"));
-    let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
+    let mut help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
             "  ↑↓  {tab_keys}  ^C quit  Enter preview  o open  y path{ignore_hint}  ^B tree  q×2"
         )
@@ -2502,6 +2625,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "  ↑↓  ←→ focus  drag copy  ^C quit  S+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy Y real  ^B tree  q×2"
         )
     };
+    if app.send_agent_footer_active() {
+        help.push_str("  ^E send to agent");
+    }
     let content = if let Some(message) = app.quit_confirmation_message() {
         Line::from(vec![
             Span::styled(
@@ -2579,6 +2705,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 format!("Configuration: {warning}"),
                 Style::default().fg(Theme::current().missing),
+            ),
+        ])
+    } else if app.content_selection_send_armed() {
+        Line::from(vec![
+            Span::styled(
+                " Send ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "Release: send selection to agent · press Ctrl again to cancel",
+                Style::default()
+                    .fg(Theme::current().success)
+                    .add_modifier(Modifier::BOLD),
             ),
         ])
     } else if let Some(status) = &app.clipboard_status {

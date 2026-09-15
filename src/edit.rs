@@ -296,6 +296,8 @@ impl EditSession {
                         head: target,
                         dragging: false,
                         dragged: true,
+                        send_armed: false,
+                        ctrl_was_down: false,
                     });
                 }
             }
@@ -1397,6 +1399,8 @@ mod tests {
             head: cp(1, 2),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         s.insert_text(&mut lines, "X");
         assert_eq!(lines, vec!["abXijkl".to_string()]);
@@ -1413,6 +1417,8 @@ mod tests {
             head: cp(1, 2),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         s.insert_text(&mut lines, "x\ny");
         assert_eq!(lines, vec!["abx".to_string(), "yijkl".to_string()]);
@@ -1429,6 +1435,8 @@ mod tests {
             head: cp(1, 2),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         s.insert_newline(&mut lines);
         assert_eq!(lines, vec!["ab".to_string(), "ijkl".to_string()]);
@@ -1446,6 +1454,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         s.insert_char(&mut lines, 'X');
         assert_eq!(lines, vec!["X world".to_string()]);
@@ -1468,6 +1478,8 @@ mod tests {
             head: cp(2, 1),
             dragging: false,
             dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         s.backspace(&mut lines);
         assert_eq!(lines, vec!["ahi".to_string()]);
@@ -1540,6 +1552,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(s.selection_byte_range(0, 10), Some(2..5));
         assert_eq!(s.selection_byte_range(1, 10), None);
@@ -1554,6 +1568,8 @@ mod tests {
             head: cp(2, 3),
             dragging: false,
             dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(s.selection_byte_range(0, 5), Some(2..5));
         assert_eq!(s.selection_byte_range(1, 5), Some(0..5));
@@ -1771,6 +1787,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(
             s.selected_text(&s.preview_snapshot.lines),
@@ -1787,6 +1805,8 @@ mod tests {
             head: cp(1, 2),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(
             s.selected_text(&s.preview_snapshot.lines),
@@ -1809,6 +1829,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         let text = s.cut_selection(&mut lines);
@@ -1827,6 +1849,8 @@ mod tests {
             head: cp(1, 3),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         let text = s.cut_selection(&mut lines);
@@ -1845,6 +1869,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(
             s.selected_text(&s.preview_snapshot.lines),
@@ -1866,6 +1892,8 @@ mod tests {
             head: cp(0, 0),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(
             s.selected_text(&s.preview_snapshot.lines),
@@ -1882,6 +1910,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         let text = s.cut_selection(&mut lines);
@@ -1901,6 +1931,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         s.cut_selection(&mut lines);
@@ -1947,6 +1979,8 @@ mod tests {
             head: cp(1, 3),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         s.indent_or_outdent(&mut lines, false);
@@ -1964,6 +1998,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         s.cut_selection(&mut lines);
@@ -1999,6 +2035,8 @@ mod tests {
             head: cp(0, 5),
             dragging: false,
             dragged: false,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         let mut lines = s.preview_snapshot.lines.clone();
         s.insert_char(&mut lines, 'X');

@@ -730,6 +730,12 @@ pub(crate) struct ContentSelection {
     pub(crate) head: ContentPoint,
     pub(crate) dragging: bool,
     pub(crate) dragged: bool,
+    /// Sticky "send to agent" arming toggled by tapping Ctrl mid-drag. Read
+    /// only on a plain mouse-up (Ctrl-modified ups are swallowed by some
+    /// terminals, e.g. iTerm2); see `docs/design/send-to-agent.md`.
+    pub(crate) send_armed: bool,
+    /// Previous drag motion event's Ctrl state, for rising-edge detection.
+    pub(crate) ctrl_was_down: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -813,6 +819,10 @@ pub struct UiRegions {
     pub content_scrollbar_thumb_size: usize,
     pub content_body: Rect,
     pub content_inner: Rect,
+    /// Send-to-agent picker popup rect.
+    pub send_agent_popup: Rect,
+    /// Per-row hit regions inside the send-to-agent picker, in list order.
+    pub send_agent_rows: Vec<Rect>,
 }
 
 impl UiRegions {
@@ -1176,6 +1186,11 @@ pub struct App {
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
+    /// Outbound send-selection-to-agent backend (terminal workspace manager).
+    agent_provider: std::sync::Arc<dyn crate::send_agent::AgentTargetProvider>,
+    /// Picker/delivery view model for send-to-agent.
+    pub send_to_agent: crate::send_agent::SendToAgentState,
+    send_to_agent_requests: RequestGeneration,
 }
 
 impl App {
@@ -1357,6 +1372,10 @@ impl App {
         Self::with_options(path, preview_registry, AppOptions::default())
     }
 
+    fn default_agent_provider() -> std::sync::Arc<dyn crate::send_agent::AgentTargetProvider> {
+        std::sync::Arc::new(crate::send_agent::HerdrProvider::from_environment())
+    }
+
     pub fn with_options(
         path: PathBuf,
         preview_registry: PreviewRegistry,
@@ -1372,6 +1391,7 @@ impl App {
             } else {
                 SystemOpenAdapter::Host
             },
+            Self::default_agent_provider(),
         )
     }
 
@@ -1394,6 +1414,23 @@ impl App {
             tree::DEFAULT_MAX_ENTRIES,
             AppOptions::default(),
             SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
+            Self::default_agent_provider(),
+        )
+    }
+
+    /// Test-only: install a fake send-to-agent backend.
+    #[doc(hidden)]
+    pub fn with_agent_provider(
+        path: PathBuf,
+        provider: std::sync::Arc<dyn crate::send_agent::AgentTargetProvider>,
+    ) -> Result<Self> {
+        Self::with_preview_registry_scan_limit_and_options(
+            path,
+            PreviewRegistry::with_builtins(),
+            tree::DEFAULT_MAX_ENTRIES,
+            AppOptions::default(),
+            SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
+            provider,
         )
     }
 
@@ -1409,6 +1446,7 @@ impl App {
             scan_entry_limit,
             AppOptions::default(),
             SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
+            Self::default_agent_provider(),
         )
     }
 
@@ -1418,6 +1456,7 @@ impl App {
         scan_entry_limit: usize,
         mut options: AppOptions,
         system_open_adapter: SystemOpenAdapter,
+        agent_provider: std::sync::Arc<dyn crate::send_agent::AgentTargetProvider>,
     ) -> Result<Self> {
         let requested_root = path
             .canonicalize()
@@ -1436,8 +1475,12 @@ impl App {
             options.navigation_config_warning = Some(format!("{error:#}"));
         }
 
-        let runtime =
-            WorkerRuntime::start(root.clone(), preview_registry.clone(), system_open_adapter)?;
+        let runtime = WorkerRuntime::start(
+            root.clone(),
+            preview_registry.clone(),
+            system_open_adapter,
+            std::sync::Arc::clone(&agent_provider),
+        )?;
         let search_runtime = SearchRuntime::start(root.clone())?;
         let navigation_runtime =
             NavigationRuntime::start(root.clone(), options.navigation.clone())?;
@@ -1549,6 +1592,9 @@ impl App {
             navigation_status: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
+            agent_provider,
+            send_to_agent: crate::send_agent::SendToAgentState::default(),
+            send_to_agent_requests: RequestGeneration::default(),
         };
         app.request_refresh(false);
         Ok(app)
@@ -2348,6 +2394,11 @@ impl App {
             self.handle_tab_palette_key(key);
             return;
         }
+        if self.send_to_agent.is_open() {
+            self.quit_confirmation = None;
+            self.handle_send_to_agent_picker_key(key);
+            return;
+        }
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
@@ -2383,6 +2434,19 @@ impl App {
             } else {
                 self.should_quit = true;
             }
+            return;
+        }
+        // Send selection to agent. Ctrl is the canonical binding on every
+        // platform; Cmd/SUPER is accepted too when the terminal forwards it
+        // (mirrors the copy/save bindings).
+        if matches!(key.code, KeyCode::Char('e' | 'E'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && self.send_to_agent_entry_active()
+        {
+            self.quit_confirmation = None;
+            self.open_send_to_agent_picker();
             return;
         }
         if self.search.is_some() {
@@ -3194,6 +3258,8 @@ impl App {
                 },
                 dragging: false,
                 dragged: false,
+                send_armed: false,
+                ctrl_was_down: false,
             });
             edit.caret = ContentPoint {
                 line: last_line,
@@ -3489,6 +3555,8 @@ impl App {
                 head: caret,
                 dragging: false,
                 dragged: false,
+                send_armed: false,
+                ctrl_was_down: false,
             });
             sel.head = new_caret;
         } else {
@@ -3544,6 +3612,8 @@ impl App {
                                 head: before,
                                 dragging: false,
                                 dragged: false,
+                                send_armed: false,
+                                ctrl_was_down: false,
                             });
                             edit.caret = before;
                             edit.preferred_column = crate::text_layout::expand_tabs(
@@ -3584,6 +3654,8 @@ impl App {
                                     },
                                     dragging: false,
                                     dragged: false,
+                                    send_armed: false,
+                                    ctrl_was_down: false,
                                 });
                             }
                             edit.caret = before;
@@ -3617,6 +3689,8 @@ impl App {
                             head: caret,
                             dragging: true,
                             dragged: true,
+                            send_armed: false,
+                            ctrl_was_down: false,
                         });
                         sel.head = before;
                     }
@@ -3763,6 +3837,8 @@ impl App {
                     head: end,
                     dragging: false,
                     dragged: false,
+                    send_armed: false,
+                    ctrl_was_down: false,
                 });
                 edit.preferred_column =
                     crate::text_layout::expand_tabs(&tab.content.lines[line][..end_byte], 0, 0).1;
@@ -4517,6 +4593,23 @@ impl App {
             };
             return;
         }
+        if self.send_to_agent.is_open() {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                let hit = self
+                    .ui_regions
+                    .send_agent_rows
+                    .iter()
+                    .position(|rect| contains(*rect, mouse.column, mouse.row));
+                if let Some(index) = hit {
+                    if self.send_to_agent.select_index(index) {
+                        self.accept_send_to_agent_selection();
+                    }
+                } else if !contains(self.ui_regions.send_agent_popup, mouse.column, mouse.row) {
+                    self.close_send_to_agent_picker();
+                }
+            }
+            return;
+        }
         if self.navigation_picker.is_some() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -5226,6 +5319,9 @@ impl App {
             head: before,
             dragging: true,
             dragged: false,
+            send_armed: false,
+            // Ctrl already held at mouse-down must not arm on the first move.
+            ctrl_was_down: mouse.modifiers.contains(KeyModifiers::CONTROL),
         });
     }
 
@@ -5285,9 +5381,20 @@ impl App {
         } else {
             before
         };
+        let ctrl_down = mouse.modifiers.contains(KeyModifiers::CONTROL);
+        // Toggle arming on the Ctrl rising edge of a drag motion. The state
+        // is sticky and is consumed by the plain mouse-up, so terminals that
+        // swallow Ctrl-modified release events still work.
+        let send_armed = if ctrl_down && !selection.ctrl_was_down {
+            !selection.send_armed
+        } else {
+            selection.send_armed
+        };
         self.tab_mut().content.selection = Some(ContentSelection {
             head,
             dragged: true,
+            send_armed,
+            ctrl_was_down: ctrl_down,
             ..selection
         });
     }
@@ -5308,11 +5415,28 @@ impl App {
             selection.dragging = false;
         }
         if selection.dragged {
-            // Terminal workspace managers may reserve Ctrl+C while still
-            // forwarding mouse input to the pane. Copying on release matches
-            // native terminal selection and keeps Ctrl+C as an explicit
-            // repeat-copy shortcut.
-            self.queue_selected_preview_copy();
+            // Re-read after the final drag update: the rising-edge toggle
+            // runs inside `drag_content_selection`.
+            let armed = self
+                .tab()
+                .content
+                .selection
+                .is_some_and(|selection| selection.send_armed);
+            if let Some(selection) = self.tab_mut().content.selection.as_mut() {
+                selection.send_armed = false;
+                selection.ctrl_was_down = false;
+            }
+            if armed && self.send_to_agent_available() && self.selected_content_text().is_some() {
+                // Sticky-armed release: skip the copy-on-release default and
+                // open the agent picker instead.
+                self.open_send_to_agent_picker();
+            } else {
+                // Terminal workspace managers may reserve Ctrl+C while still
+                // forwarding mouse input to the pane. Copying on release
+                // matches native terminal selection and keeps Ctrl+C as an
+                // explicit repeat-copy shortcut.
+                self.queue_selected_preview_copy();
+            }
         }
     }
 
@@ -6626,6 +6750,13 @@ impl App {
         for completion in self.navigation_runtime.take_symbol_completions() {
             self.apply_document_symbol_completion(completion);
         }
+        let (agent_discovery, agent_send) = self.runtime.take_agent_completions();
+        if let Some(completion) = agent_discovery {
+            self.apply_agent_discovery_completion(completion);
+        }
+        if let Some(completion) = agent_send {
+            self.apply_agent_send_completion(completion);
+        }
         self.apply_search_events();
         #[cfg(feature = "agent-observability")]
         self.poll_agent_background();
@@ -7850,6 +7981,165 @@ impl App {
             relative.display().to_string(),
             ContentTarget::Workspace(relative),
         );
+    }
+
+    /// Test-only: block until any background work item completes.
+    #[doc(hidden)]
+    pub fn wait_background_once(&self) -> bool {
+        self.runtime.wait_for_completion()
+    }
+
+    // ------------------------------------------------------------------
+    // Send selection to agent (terminal workspace manager integration)
+    // ------------------------------------------------------------------
+
+    fn send_to_agent_available(&self) -> bool {
+        self.agent_provider.available()
+    }
+
+    /// Whether the footer should advertise `^E send to agent` right now.
+    pub fn send_agent_footer_active(&self) -> bool {
+        self.agent_provider.available()
+            && self.tab().content.edit.is_none()
+            && self.tab().content.mode == ContentMode::Preview
+            && self.selected_content_text().is_some()
+    }
+
+    /// Live mid-drag arming state for the footer release hint.
+    pub fn content_selection_send_armed(&self) -> bool {
+        self.tab()
+            .content
+            .selection
+            .is_some_and(|selection| selection.send_armed)
+    }
+
+    /// Gating shared by the keyboard entry and the mid-drag Ctrl arm gesture.
+    fn send_to_agent_entry_active(&self) -> bool {
+        self.send_to_agent_available()
+            && !self.send_to_agent.is_open()
+            && self.tab().content.edit.is_none()
+            && self.tab().content.mode == ContentMode::Preview
+            && self.focused_pane == FocusPane::Content
+            && self.selected_content_text().is_some()
+    }
+
+    fn open_send_to_agent_picker(&mut self) {
+        if !self.send_to_agent_entry_active() {
+            return;
+        }
+        let Some(text) = self.selected_content_text() else {
+            return;
+        };
+        let (payload, truncated) =
+            crate::send_agent::truncate_payload(&text, crate::send_agent::MAX_SEND_BYTES);
+        let generation = self.send_to_agent_requests.begin();
+        self.send_to_agent
+            .begin_discover(generation, payload, truncated);
+        self.runtime
+            .request_agent_discover(crate::runtime::AgentDiscoverRequest { generation });
+    }
+
+    fn close_send_to_agent_picker(&mut self) {
+        self.send_to_agent.close();
+        self.send_to_agent_requests.invalidate();
+    }
+
+    fn handle_send_to_agent_picker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_send_to_agent_picker(),
+            (KeyCode::Down | KeyCode::Char('j'), _) => self.send_to_agent.move_selection(1),
+            (KeyCode::Up | KeyCode::Char('k'), _) => self.send_to_agent.move_selection(-1),
+            (KeyCode::Enter, _) => self.accept_send_to_agent_selection(),
+            _ => {}
+        }
+    }
+
+    fn accept_send_to_agent_selection(&mut self) {
+        if !matches!(
+            self.send_to_agent.phase,
+            crate::send_agent::SendPhase::Picking
+        ) {
+            return;
+        }
+        let Some(target) = self.send_to_agent.selected_target().cloned() else {
+            return;
+        };
+        let payload = self.send_to_agent.payload.clone();
+        let generation = self.send_to_agent_requests.begin();
+        self.send_to_agent.begin_sending(generation);
+        self.set_navigation_status(NavigationStatusLevel::Info, "Sending selection…");
+        self.runtime
+            .request_agent_send(crate::runtime::AgentSendRequest {
+                generation,
+                pane_id: target.pane_id,
+                agent: target.agent,
+                payload,
+            });
+    }
+
+    fn apply_agent_discovery_completion(
+        &mut self,
+        completion: crate::runtime::AgentDiscoveryCompletion,
+    ) {
+        if completion.generation != self.send_to_agent.generation {
+            return;
+        }
+        match completion.result {
+            Ok(targets) => {
+                let has_selectable = targets.iter().any(|target| target.selectable);
+                if targets.is_empty() || !has_selectable {
+                    self.send_to_agent.close();
+                    self.set_navigation_status(
+                        NavigationStatusLevel::Info,
+                        if targets.is_empty() {
+                            "No active agent sessions detected."
+                        } else {
+                            "Every agent session is blocked; resolve its prompt first."
+                        },
+                    );
+                    return;
+                }
+                self.send_to_agent
+                    .apply_discovery(completion.generation, targets);
+            }
+            Err(error) => {
+                self.send_to_agent.fail_discovery(completion.generation);
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("Agent discovery failed: {error}"),
+                );
+            }
+        }
+    }
+
+    fn apply_agent_send_completion(&mut self, completion: crate::runtime::AgentSendCompletion) {
+        if completion.generation != self.send_to_agent.generation {
+            return;
+        }
+        match completion.result {
+            Ok(outcome) => {
+                self.send_to_agent.close();
+                self.clear_content_selection();
+                let message = match outcome.focus_error {
+                    None => format!(
+                        "Sent {} chars to {} · {}",
+                        outcome.chars, outcome.agent, outcome.pane_id
+                    ),
+                    Some(focus_error) => format!(
+                        "Sent {} chars to {} · {} (focus: {focus_error})",
+                        outcome.chars, outcome.agent, outcome.pane_id
+                    ),
+                };
+                self.set_navigation_status(NavigationStatusLevel::Info, message);
+            }
+            Err(error) => {
+                self.send_to_agent.close();
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("Send failed: {error}"),
+                );
+            }
+        }
     }
 
     fn request_external_open(&mut self, trigger: ExternalOpenTrigger) {
@@ -10978,6 +11268,8 @@ mod tests {
             head: ContentPoint { line: 3, byte: 4 },
             dragging: false,
             dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(
             app.selected_content_text().as_deref(),
