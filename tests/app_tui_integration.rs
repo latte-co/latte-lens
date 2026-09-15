@@ -6232,3 +6232,140 @@ fn clicking_hide_button_does_not_trigger_search() {
         "tree should be hidden after clicking hide button"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rendered Markdown preview (default rendering + m source toggle)
+// ---------------------------------------------------------------------------
+
+const MD_DOC: &str = "# Heading One\n\n- alpha\n- beta\n\n> a quote line\n";
+
+fn md_fixture(files: &[(&str, &str)]) -> PathBuf {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, body) in files {
+        fs::write(directory.path().join(name), body).unwrap();
+    }
+    directory.keep()
+}
+
+#[test]
+fn markdown_opens_rendered_by_default_without_line_numbers_or_folds() {
+    let root = md_fixture(&[("a.md", MD_DOC), ("z.txt", "x\n")]);
+    let app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+    let joined = app.tab().content.lines.join("\n");
+    assert!(joined.contains("Heading One"));
+    assert!(joined.contains("• alpha"));
+    assert!(joined.contains("┃ a quote line"));
+    assert!(!joined.contains('#'));
+    assert!(!joined.contains('>'));
+}
+
+#[test]
+fn m_toggles_between_rendered_and_source_roundtrip() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Rendered -> source.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+    assert!(app.tab().content.lines.join("\n").contains('#'));
+
+    // Source -> rendered.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn m_is_a_noop_for_plain_text_files() {
+    let root = md_fixture(&[("a.md", MD_DOC), ("z.txt", "plain body\n")]);
+    let mut app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Move down to the text file.
+    app.handle_key(key(KeyCode::Down));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn switching_to_a_different_markdown_file_reopens_rendered() {
+    let root = md_fixture(&[("a.md", "# A\n\n- a\n"), ("b.md", "# B\n\n- b\n")]);
+    let mut app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Prefer source for the first file.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+
+    // Select the next markdown file; it must default back to rendered.
+    app.handle_key(key(KeyCode::Down));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+    assert!(app.tab().content.lines.join("\n").contains("• b"));
+}
+
+#[test]
+fn reloading_preview_keeps_source_presentation() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+
+    // p reloads the preview of the same document; the source choice persists.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn find_searches_rendered_text_not_raw_markup() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+
+    // A rendered-only token matches.
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "alpha".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.preview_find_position().map(|(_, count)| count), Some(1));
+    app.handle_key(key(KeyCode::Esc));
+
+    // The raw heading marker never appears in rendered output.
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Char('#')));
+    assert_eq!(app.preview_find_position().map(|(_, count)| count), Some(0));
+}
+
+#[test]
+fn edit_mode_is_blocked_in_rendered_view_but_works_after_source_toggle() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+    app.handle_key(key(KeyCode::Char('l')));
+
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(!app.edit_is_active());
+
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(
+        app.edit_is_active(),
+        "edit mode must be available in the source view"
+    );
+}

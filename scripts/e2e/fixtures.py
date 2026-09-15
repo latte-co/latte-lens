@@ -1249,3 +1249,24 @@ class ReadOnlyOracle:
             "git_metadata_entries": len(git_after),
             "worktree_entries": len(worktree_after),
         }
+
+
+def create_markdown_fixture(root: Path, environment: dict[str, str]) -> None:
+    init_repository(root, environment)
+    document = (
+        "# Rendered Heading Alpha\n"
+        "\n"
+        "Intro paragraph with a [uniquelinklabel](https://example.invalid/x).\n"
+        "\n"
+        "- uniquemdbullet one\n"
+        "- uniquemdbullet two\n"
+        "\n"
+        "> uniquequote line\n"
+        "\n"
+        "```rust\n"
+        "let unique_md_code = 7;\n"
+        "```\n"
+    )
+    root.joinpath("doc.md").write_text(document, encoding="utf-8")
+    run("git", "add", "doc.md", cwd=root, environment=environment)
+    run("git", "commit", "-q", "-m", "markdown fixture", cwd=root, environment=environment)

@@ -757,6 +757,15 @@ fn e2e_folding_markdown_headless() {
     settle(&mut app);
     assert_eq!(app.tab().content.mode, ContentMode::Preview);
 
+    // Markdown opens in the rendered (typeset) view by default.
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Folding is a source-view feature: press m to switch to source first.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
     // [ folds the current section.
     app.handle_key(key(KeyCode::Char('[')));
     settle(&mut app);
