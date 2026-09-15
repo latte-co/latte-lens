@@ -6369,3 +6369,116 @@ fn edit_mode_is_blocked_in_rendered_view_but_works_after_source_toggle() {
         "edit mode must be available in the source view"
     );
 }
+
+#[test]
+fn m_then_diff_then_preview_keeps_source_presentation() {
+    // Real uncommitted change so `d` loads a genuine diff snapshot (which has
+    // no content identity); returning to Preview with `p` must still remember
+    // the source choice pinned via `m`.
+    let fixture = TestRepo::new();
+    fixture.write("a.md", "# Heading\n\n- alpha\n");
+    fixture.commit_all("initial");
+    fixture.write("a.md", "# Heading\n\n- alpha changed\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Pin source with `m`.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
+    // Inspect the diff: a patch is shown without a preview identity.
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Diff);
+    assert!(
+        app.tab().content.lines.join("\n").contains("alpha changed"),
+        "the diff view must show the modified patch hunk"
+    );
+
+    // Back to Preview: the independent anchor keeps the source view.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(
+        app.tab().content.show_line_numbers,
+        "d -> p must retain the source presentation for the same file"
+    );
+}
+
+#[test]
+fn escaping_text_search_restores_rendered_view_and_first_m_opens_source() {
+    let fixture = TestRepo::new();
+    fixture.write("a.md", "# Heading\n\nzzmarkertoken body\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // A content hit carries source coordinates and previews Markdown in source.
+    app.handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+    for character in "zzmarkertoken".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
+    // Cancel: the pre-search rendered content and preference are restored
+    // together, so the footer hint and the actual view agree.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.search_is_active());
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+
+    // One `m` must now move rendered -> source exactly once.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(
+        app.tab().content.provider.as_deref(),
+        Some("text"),
+        "the first m after restoring a rendered view must open source"
+    );
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn file_name_search_opens_markdown_rendered_but_content_search_opens_source() {
+    let fixture = TestRepo::new();
+    fixture.write("uniqdoc.md", "# Heading\n\n- zzmarkertoken line\n");
+
+    // File-name search (`/`) has no source coordinates: follow the normal open
+    // policy, so a new Markdown document opens rendered.
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('/')));
+    assert_eq!(app.search_mode(), Some(SearchMode::Files));
+    for character in "uniqdoc".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    assert_eq!(app.search_results()[0].line_number, None);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert!(!app.search_is_active());
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+
+    // Content text search (Ctrl+T) carries line/byte coordinates and forces
+    // the source view so the match highlight lands correctly.
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    for character in "zzmarkertoken".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    assert!(app.search_results()[0].line_number.is_some());
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+}
