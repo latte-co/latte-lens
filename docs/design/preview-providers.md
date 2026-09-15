@@ -65,9 +65,9 @@ common-file 与文本 Provider。它与文本 Provider 使用完全相同的读�
   记录字节范围；`highlights.len()` 必须等于 `lines.len()`。
 - 不联网、不解释 HTML：链接只保留文本（丢弃 URL/title），图片输出 `[image]` +
   alt，块/行内 HTML 以净化文本按 `MdRaw` 显示。
-- App 侧通过 `m` 键与默认策略（Markdown 默认渲染、切换文件重置、同文件 d/p/保存
-  重载保留源码选择）在 `ContentRequest.markdown_presentation` 上传入选择；语义导航
-  与跨文件文本搜索因依赖源码坐标而显式请求 `Source`。
+- App 侧通过 `m` 键与默认策略（Markdown 默认源码、切换文件重置为源码、同文件
+  d/p/保存重载保留当前选择）在 `ContentRequest.markdown_presentation` 上传入选择；
+  语义导航与跨文件文本搜索也显式请求 `Source`。
 
 ## 内置常见文件 Provider
 

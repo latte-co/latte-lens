@@ -80,7 +80,7 @@ Search/Find/navigation results popup 时生效。
 | --- | --- |
 | `p` | 在右窗格显示 Preview |
 | `d` | 在右窗格显示 Diff |
-| `m` | Markdown Preview 中在排版渲染视图与原始编号源码视图间切换；打开另一个 Markdown 文件重置为渲染视图。仅当前文档为 `.md`/`.markdown` 时生效，其他视图/模态下为 no-op |
+| `m` | Markdown Preview 中在原始编号源码视图与排版渲染视图间切换；Markdown 默认以源码视图打开，打开另一个 Markdown 文件重置为源码视图。仅当前文档为 `.md`/`.markdown` 时生效，其他视图/模态下为 no-op |
 | `r` | 刷新仓库状态 |
 | `q` | 1.5 秒内按两次退出；`Esc` 先关闭活动搜索 |
 | `y` | 复制选定路径的相对路径（符号链接取 link path）；目录加尾部 `/` |
@@ -111,7 +111,7 @@ Search/Find/navigation results popup 时生效。
 
 | 按键 | 功能 |
 | --- | --- |
-| `i` | 进入编辑模式（仅文本源码 Preview；图片 Preview 下 `i` 仍为确认终端渲染；排版渲染的 Markdown 需先按 `m` 回到源码视图，footer 会提示） |
+| `i` | 进入编辑模式（仅文本源码 Preview；Markdown 默认即源码视图；若手动切到排版渲染视图，需先按 `m` 回到源码，footer 会提示；图片 Preview 下 `i` 仍为确认终端渲染） |
 | 可打印字符 | 在 caret 处插入（有选区时替换选区） |
 | `Enter` | 插入换行 |
 | `Backspace` / `Delete` | 向后 / 向前删除 |
