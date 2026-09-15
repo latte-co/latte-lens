@@ -21,7 +21,7 @@ Latte Lens 的快捷键按"作用域"分组设计，而不是混用不同 IDE �
 
 | 作用域 | 修饰符约定 | 适用场景 | 现有示例 |
 | --- | --- | --- | --- |
-| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索、`Ctrl+B` 折叠/展开 Tree |
+| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索、`Ctrl+B` 折叠/展开 Tree、`Ctrl+E` 发送选区到 agent |
 | 代码语义命令 | `Ctrl` + 助记字母 | 基于语言服务器的语义导航 | `Ctrl+D` Definition、`Ctrl+R` References、`Ctrl+O` Implementations、`Ctrl+S` Document Symbols |
 | 面板/树/视口移动 | 无修饰方向键或 TUI 单键 | 焦点移动、滚动、树展开折叠 | `↑/↓/←/→`、`j/k`、`h/l`、`Tab`、`Enter`、`[/]`、`{/}` |
 | 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件、`x` 忽略错误 |
@@ -47,6 +47,7 @@ Search/Find/navigation results popup 时生效。
 | `Ctrl+F` | 在当前 Preview 或 Diff 中查找 |
 | `Ctrl+Shift+F` / `Ctrl+T` | 打开工作区文本搜索 popup；`Ctrl+T` 用于无法区分 `Ctrl+Shift+F` 与 `Ctrl+F` 的终端 |
 | `Ctrl+C` | 无内容选择时立即退出；有选择时复制当前选择 |
+| `Ctrl+E` | 内容预览区存在选区且终端 workspace manager（如 Herdr）可用时，打开「发送选区到 agent」选择器；把选区原文预填进目标 agent 输入框但不提交（另可在拖拽选区途中轻点 `Ctrl` 武装，松开鼠标即打开选择器） |
 
 ### 3.2 代码语义命令
 
@@ -196,8 +197,10 @@ Footer 只展示当前上下文可操作的快捷键，不列出全部清单；�
 1. **不用 `Ctrl+D` 兼任翻页**：`Ctrl+D` 专用于 Definition；翻页保留 `PageDown`、`PageUp`
    和鼠标滚轮。
 2. **不用两段 chord**：不引入 `g d`、`Ctrl+K` 等需要两段输入的组合。
-3. **不依赖 Command/Super 键**：macOS Command 键和 Super 键在终端环境无法稳定上报，
-   不纳入 canonical keymap。
+3. **不依赖 Command/Super 键**：macOS Command 键和 Super 键在终端环境无法稳定上报。
+   例外：当终端确实透传 SUPER 时，复制（`Ctrl+C`/`Cmd+C`）、保存（`Ctrl+S`/`Cmd+S`）、
+   发送选区（`Ctrl+E`/`Cmd+E`）接受同字母 Cmd 别名；canonical 主路径在三平台上始终是 `Ctrl`，
+   文档与 README 不以 Cmd 作为承诺。
 4. **不用 `Ctrl+I`**：`Ctrl+I` 与 `Tab` 在传统终端编码相同，无法稳定区分；
    Implementations 使用 `Ctrl+O`。
 5. **不在多个作用域定义同一按键的不同行为**：每个按键在同一焦点/视图状态下只能有
