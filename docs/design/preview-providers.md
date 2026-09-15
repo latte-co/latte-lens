@@ -21,6 +21,9 @@ Provider 必须遵守以下规则：
    `request.absolute_path`。
 8. 只有用户确认的终端图片 fallback 才会设置 `request.terminal_image_size()`；第三方
    Provider 可以忽略它，但不得据此绕过 bytes/lines 或分配预算。
+9. `request.markdown_presentation()` 是内置 Markdown 排版渲染的选择位（`Source`/
+   `Rendered`，默认 `Source`）。只有内置 markdown Provider 在 `Rendered` 且扩展名为
+   `.md`/`.markdown` 时受理；第三方 Provider 应忽略该字段。
 
 Registry 按注册顺序的逆序查询 Provider。专用 Provider 应注册在内置实现之后，
 以便优先处理对应格式。
@@ -40,6 +43,31 @@ Registry 有两种符号链接策略，由请求上的 `following_symlinks` 决�
 
 两种策略下，FIFO、socket、device、目录（在 no-follow 分支）和 Windows reparse
 point 都不会交给 Provider。
+
+## 内置 Markdown 排版 Provider
+
+内置 `markdown` Provider（`src/preview/markdown_render.rs`）在 `with_builtins()`
+中最后注册，因此最先被查询；它只在 `request.markdown_presentation() == Rendered`
+且扩展名（小写）为 `md`/`markdown` 时受理，其他情况一律 `Ok(None)` 回退到
+common-file 与文本 Provider。它与文本 Provider 使用完全相同的读盘路径
+（`open_regular()`、NUL/坏 UTF-8 拒绝、char-boundary 截断、去 BOM），但
+`FoldSource::None`：渲染视图不产出折叠区域、语义导航或行号，UI 仍只按
+`show_line_numbers=false` 的普通文本路径绘制，零特殊分派。
+
+- 使用既有依赖 pulldown-cmark（`Options::all()`）消费事件流，输出"逻辑行 +
+  逐行 `HighlightSpan`"。标题/强调/删除线/行内代码/代码块/链接/引用/列表 marker/
+  分隔线/原始 HTML 分别映射到新的 `HighlightKind::Md*` 变体与 `md_*` 主题 token，
+  全部仅前景色 + modifier，不涂背景。
+- 有界且 fail-closed：事件数（50 000）或协作式 5 秒 deadline 超限时返回
+  `Ok(None)`，静默回退源码视图；输出同时受 `max_bytes`/`max_lines` 约束并设置
+  `truncated`（输入字节截断也计入）。
+- span 对齐安全：所有用户文本先按 `\n` 切片段、逐片段做终端控制/bidi 净化，再
+  记录字节范围；`highlights.len()` 必须等于 `lines.len()`。
+- 不联网、不解释 HTML：链接只保留文本（丢弃 URL/title），图片输出 `[image]` +
+  alt，块/行内 HTML 以净化文本按 `MdRaw` 显示。
+- App 侧通过 `m` 键与默认策略（Markdown 默认渲染、切换文件重置、同文件 d/p/保存
+  重载保留源码选择）在 `ContentRequest.markdown_presentation` 上传入选择；语义导航
+  与跨文件文本搜索因依赖源码坐标而显式请求 `Source`。
 
 ## 内置常见文件 Provider
 

@@ -46,8 +46,8 @@ use crate::{
         SourcePosition, SourceRange, lsp_uri_to_navigation_target,
     },
     preview::{
-        HighlightKind, HighlightSpan, PreviewKind, PreviewProvider, PreviewRegistry,
-        TerminalImageSize,
+        HighlightKind, HighlightSpan, MarkdownPresentation, PreviewKind, PreviewProvider,
+        PreviewRegistry, TerminalImageSize,
     },
     repo_graph::{
         DiscoveryError, DiscoveryTruncation, RepoChange, RepoGraph, RepoId, RepoKind, RepoPath,
@@ -264,6 +264,8 @@ struct SearchRestore {
     content_show_line_numbers: bool,
     content_diff_lines: Vec<DiffLineAnnotation>,
     content_identity: Option<ContentIdentity>,
+    content_markdown_presentation: MarkdownPresentation,
+    content_markdown_source_identity: Option<ContentIdentity>,
     content_fold_source: FoldSource,
     content_fold_regions: Vec<FoldRegion>,
     content_structure: StructureSnapshot,
@@ -843,6 +845,16 @@ pub struct ContentState {
     pub provider: Option<String>,
     preview_kind: PreviewKind,
     source_target: Option<ContentTarget>,
+    /// Requested presentation for Markdown documents (rendered typeset view by
+    /// default, raw source after `m`). Persists across `reset_content` and
+    /// d/p toggles for the same file; a different file resets to rendered.
+    markdown_presentation: MarkdownPresentation,
+    /// The document pinned to raw Markdown source by the user (`m`) or by a
+    /// source-coordinate entry point. Held independently of the loaded
+    /// snapshot because a Diff view clears `identity`; keeping the anchor here
+    /// lets a later Preview for the same file remember the source choice.
+    /// Only populated for successful Markdown previews requested as source.
+    markdown_source_identity: Option<ContentIdentity>,
     pub show_line_numbers: bool,
     pub(crate) diff_lines: Vec<DiffLineAnnotation>,
     identity: Option<ContentIdentity>,
@@ -892,6 +904,8 @@ impl Default for ContentState {
             provider: None,
             preview_kind: PreviewKind::Text,
             source_target: None,
+            markdown_presentation: MarkdownPresentation::Rendered,
+            markdown_source_identity: None,
             show_line_numbers: false,
             diff_lines: Vec::new(),
             identity: None,
@@ -2441,6 +2455,11 @@ impl App {
                     || matches!(self.tab().content.preview_kind, PreviewKind::Image(_))
                 {
                     self.confirm_terminal_image_preview();
+                } else if self.tab().content.provider.as_deref() == Some("markdown") {
+                    // Rendered Markdown is not editable; guide the user to the
+                    // source view where edit mode is available.
+                    self.last_error =
+                        Some("Press m for the Markdown source view before editing.".to_owned());
                 } else {
                     self.try_enter_edit_mode();
                 }
@@ -2476,6 +2495,7 @@ impl App {
                 self.request_refresh(self.tree_scope == TreeScope::GitChanges);
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.load_selected_preview(),
+            (KeyCode::Char('m'), KeyModifiers::NONE) => self.toggle_markdown_presentation(),
             (KeyCode::Char('d'), KeyModifiers::NONE) => self.load_selected_diff(),
             (KeyCode::Char(' '), KeyModifiers::NONE)
                 if self.tab_mut().content.mode == ContentMode::Diff =>
@@ -2595,6 +2615,8 @@ impl App {
             content_show_line_numbers: self.tab().content.show_line_numbers,
             content_diff_lines: self.tab().content.diff_lines.clone(),
             content_identity: self.tab().content.identity.clone(),
+            content_markdown_presentation: self.tab().content.markdown_presentation,
+            content_markdown_source_identity: self.tab().content.markdown_source_identity.clone(),
             content_fold_source: self.tab().content.fold_source,
             content_fold_regions: self.tab().content.fold_regions.clone(),
             content_structure: self.tab().content.structure.clone(),
@@ -4200,6 +4222,21 @@ impl App {
         }
     }
 
+    /// Presentation for a search result preview/open. Content (text) hits
+    /// carry source line/byte coordinates and must open Markdown in source so
+    /// the match highlight lands correctly; file-name and recent-file results
+    /// have no coordinates and follow the normal open policy (rendered by
+    /// default, source retained for the pinned document).
+    fn presentation_for_search_result(&self, result: &SearchResult) -> MarkdownPresentation {
+        let has_source_coordinates =
+            result.line_number.is_some() && result.source_match_range.is_some();
+        if has_source_coordinates && is_markdown_relative(&result.path) {
+            MarkdownPresentation::Source
+        } else {
+            self.presentation_for_new_request(&ContentTarget::Workspace(result.path.clone()))
+        }
+    }
+
     fn move_search_selection(&mut self, delta: isize) {
         let count = self
             .search
@@ -4226,10 +4263,15 @@ impl App {
             return;
         }
         self.remember_recent_file(&result.path);
-        let generation = self.request_content(
+        // Content hits carry source coordinates and force source view;
+        // file-name results follow the normal open policy.
+        let presentation = self.presentation_for_search_result(&result);
+        let generation = self.dispatch_content_request(
             ContentKind::Preview,
             display_workspace_path(&result.path),
             ContentTarget::Workspace(result.path.clone()),
+            None,
+            presentation,
         );
         self.search_preview_target =
             result
@@ -4276,10 +4318,16 @@ impl App {
         } else {
             self.focused_pane = FocusPane::Content;
             self.remember_recent_file(&result.path);
-            let generation = self.request_content(
+            // Source coordinates from a content hit require the source view
+            // for Markdown; file-name results use the normal open policy (see
+            // presentation_for_search_result).
+            let presentation = self.presentation_for_search_result(&result);
+            let generation = self.dispatch_content_request(
                 ContentKind::Preview,
                 display_workspace_path(&result.path),
                 ContentTarget::Workspace(result.path.clone()),
+                None,
+                presentation,
             );
             self.search_preview_target = result.line_number.zip(result.source_match_range).map(
                 |(line_number, byte_range)| SearchPreviewTarget {
@@ -4328,6 +4376,12 @@ impl App {
             self.tab_mut().content.show_line_numbers = restore.content_show_line_numbers;
             self.tab_mut().content.diff_lines = restore.content_diff_lines;
             self.tab_mut().content.identity = restore.content_identity;
+            // Restore the presentation preference and its independent anchor so
+            // the restored rendered/source content agrees with the footer hint
+            // and the first `m` press.
+            self.tab_mut().content.markdown_presentation = restore.content_markdown_presentation;
+            self.tab_mut().content.markdown_source_identity =
+                restore.content_markdown_source_identity;
             self.tab_mut().content.fold_source = restore.content_fold_source;
             self.tab_mut().content.fold_regions = restore.content_fold_regions;
             self.tab_mut().content.structure = restore.content_structure;
@@ -7958,6 +8012,7 @@ impl App {
                 .saturating_sub(7)
                 .max(1),
         };
+        let markdown_presentation = self.tab().content.markdown_presentation;
         self.cancel_pending_navigation();
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
@@ -7975,11 +8030,73 @@ impl App {
             purpose: ContentPurpose::Display,
             target: pending.target,
             terminal_image_size: Some(terminal_image_size),
+            markdown_presentation,
         });
     }
 
     fn request_content(&mut self, kind: ContentKind, label: String, target: ContentTarget) -> u64 {
         self.request_content_with_review_path(kind, label, target, None)
+    }
+
+    /// Toggle the focused Markdown document between rendered and raw source
+    /// presentation (`m`). No-op outside a successful Markdown preview.
+    fn toggle_markdown_presentation(&mut self) {
+        let pending_toggle = {
+            let content = &self.tab().content;
+            if content.mode != ContentMode::Preview || content.edit.is_some() || !content.successful
+            {
+                None
+            } else {
+                // Gate on the loaded identity's extension, not the resolved
+                // provider: a Markdown file that fell back to source (NUL/UTF-8
+                // or parser budget) must still allow toggling back.
+                let is_markdown = content
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| is_markdown_relative(identity.path()));
+                let target = if is_markdown {
+                    content.source_target.clone()
+                } else {
+                    None
+                };
+                target.map(|target| {
+                    let label = content
+                        .identity
+                        .as_ref()
+                        .map_or_else(|| "Markdown".to_owned(), ContentIdentity::display_label);
+                    (
+                        target,
+                        label,
+                        content.current_diff_path.clone(),
+                        content.markdown_presentation.opposite(),
+                    )
+                })
+            }
+        };
+        let Some((target, label, review_path, next)) = pending_toggle else {
+            return;
+        };
+        self.dispatch_content_request(ContentKind::Preview, label, target, review_path, next);
+    }
+
+    /// Footer hint for the `m` toggle, shown only for a loaded Markdown
+    /// document outside edit mode.
+    pub(crate) fn markdown_presentation_hint(&self) -> Option<&'static str> {
+        let content = &self.tab().content;
+        if content.mode != ContentMode::Preview || content.edit.is_some() {
+            return None;
+        }
+        let is_markdown = content
+            .identity
+            .as_ref()
+            .is_some_and(|identity| is_markdown_relative(identity.path()));
+        if !is_markdown {
+            return None;
+        }
+        Some(match content.markdown_presentation {
+            MarkdownPresentation::Rendered => "m source",
+            MarkdownPresentation::Source => "m render",
+        })
     }
 
     fn request_reviewable_diff(
@@ -7998,6 +8115,73 @@ impl App {
         target: ContentTarget,
         review_path: Option<RepoPath>,
     ) -> u64 {
+        let presentation = self.presentation_for_new_request(&target);
+        self.dispatch_content_request(kind, label, target, review_path, presentation)
+    }
+
+    /// Decide the Markdown presentation for a fresh file request: stay in
+    /// source view only when the request re-opens the exact document pinned to
+    /// source (`m` or a source-coordinate entry point). The anchor survives a
+    /// Diff view (which clears the loaded `identity`), so `d → p` remembers the
+    /// choice. Every other (new) document opens in the rendered default.
+    /// Non-Markdown files ignore the value.
+    fn presentation_for_new_request(&self, target: &ContentTarget) -> MarkdownPresentation {
+        let pinned_source = self
+            .tab()
+            .content
+            .markdown_source_identity
+            .as_ref()
+            .is_some_and(|identity| self.target_matches_identity(target, identity));
+        if pinned_source {
+            MarkdownPresentation::Source
+        } else {
+            MarkdownPresentation::Rendered
+        }
+    }
+
+    /// Whether a new content target addresses the exact same document as a
+    /// pinned identity. Repository targets resolve through their owning
+    /// repository worktree before re-rooting at the workspace, so a change in a
+    /// nested repository (`change.path.relative = README.md`) matches the
+    /// workspace-scoped identity (`child/README.md`) instead of comparing two
+    /// paths with different bases.
+    fn target_matches_identity(&self, target: &ContentTarget, identity: &ContentIdentity) -> bool {
+        match (target, identity) {
+            (ContentTarget::Workspace(path), ContentIdentity::Workspace(current)) => {
+                path == current
+            }
+            (ContentTarget::Repository(change), ContentIdentity::Workspace(current)) => {
+                let Some(graph) = self.repo_graph.as_ref() else {
+                    return false;
+                };
+                let Some(snapshot) = graph.repository(&change.path.repo_id) else {
+                    return false;
+                };
+                let absolute = snapshot.node.worktree.join(&change.path.relative);
+                ContentIdentity::from_absolute(&self.root, &absolute)
+                    .and_then(|resolved| resolved.workspace_path().map(|path| path == current))
+                    .unwrap_or(false)
+            }
+            (
+                ContentTarget::Dependency { root, relative, .. },
+                ContentIdentity::Dependency {
+                    root: current_root,
+                    relative: current_relative,
+                    ..
+                },
+            ) => root == current_root && relative == current_relative,
+            _ => false,
+        }
+    }
+
+    fn dispatch_content_request(
+        &mut self,
+        kind: ContentKind,
+        label: String,
+        target: ContentTarget,
+        review_path: Option<RepoPath>,
+        presentation: MarkdownPresentation,
+    ) -> u64 {
         self.cancel_pending_navigation();
         self.navigation_picker = None;
         self.tab_mut().content.navigation_target_highlight = None;
@@ -8008,6 +8192,10 @@ impl App {
             ContentKind::Diff => ContentMode::Diff,
             ContentKind::Preview => ContentMode::Preview,
         });
+        // reset_content deliberately preserves markdown_presentation; write the
+        // resolved presentation after it so toggle/search/navigation requests
+        // take effect.
+        self.tab_mut().content.markdown_presentation = presentation;
         self.tab_mut().content.pending_diff_path = review_path.map(|path| (generation, path));
         self.tab_mut().content.lines = vec![format!("Loading {label}…")];
         self.runtime.request_content(ContentRequest {
@@ -8017,6 +8205,7 @@ impl App {
             purpose: ContentPurpose::Display,
             target,
             terminal_image_size: None,
+            markdown_presentation: presentation,
         });
         generation
     }
@@ -8569,6 +8758,11 @@ impl App {
             return;
         }
         let content_generation = self.begin_active_tab_content_request();
+        // Semantic navigation carries source coordinates and installs a source
+        // navigation snapshot, so Markdown targets must load in source view.
+        if is_markdown_relative(target.document.path()) {
+            self.tab_mut().content.markdown_presentation = MarkdownPresentation::Source;
+        }
         self.runtime.request_content(ContentRequest {
             generation: content_generation,
             tab_id: self.active_tab.value(),
@@ -8578,6 +8772,7 @@ impl App {
             },
             target: content_target_for_navigation(&target.document),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
         self.tab_mut().content.pending_navigation_stage = Some(PendingNavigationStage {
             invocation,
@@ -8697,6 +8892,21 @@ impl App {
         self.tab_mut().content.highlights = snapshot.highlights;
         self.tab_mut().content.show_line_numbers = snapshot.show_line_numbers;
         self.tab_mut().content.identity = snapshot.identity;
+        // Semantic navigation always installs source-coordinate content (the
+        // stage request forces MarkdownPresentation::Source). Keep the anchor
+        // in sync with the same rule as the normal completion path so that a
+        // later Preview request for the navigated-to Markdown document keeps
+        // the source view instead of treating it as a new file.
+        let pin_source = self.tab().content.markdown_presentation == MarkdownPresentation::Source
+            && self
+                .tab()
+                .content
+                .identity
+                .as_ref()
+                .is_some_and(|identity| is_markdown_relative(identity.path()));
+        self.tab_mut().content.markdown_source_identity = pin_source
+            .then(|| self.tab().content.identity.clone())
+            .flatten();
         self.tab_mut().content.fold_source = snapshot.fold_source;
         self.tab_mut().content.fold_regions = snapshot.fold_regions;
         self.tab_mut().content.structure = snapshot.structure;
@@ -9124,6 +9334,7 @@ impl App {
             },
             target: content_target_for_navigation(&target.document),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
     }
 
@@ -9300,6 +9511,24 @@ impl App {
                 self.tab_mut().content.highlights = snapshot.highlights;
                 self.tab_mut().content.identity = snapshot.identity;
                 self.tab_mut().content.fold_source = snapshot.fold_source;
+                // Pin/clear the independent Markdown source anchor so the
+                // choice survives a later Diff view (which loads with no
+                // identity). Only successful Markdown previews requested as
+                // source are pinned; rendered results (including opening a
+                // different document) release it.
+                if mode == ContentMode::Preview {
+                    let pin_source = self.tab().content.markdown_presentation
+                        == MarkdownPresentation::Source
+                        && self
+                            .tab()
+                            .content
+                            .identity
+                            .as_ref()
+                            .is_some_and(|identity| is_markdown_relative(identity.path()));
+                    self.tab_mut().content.markdown_source_identity = pin_source
+                        .then(|| self.tab().content.identity.clone())
+                        .flatten();
+                }
                 self.tab_mut().content.fold_regions = snapshot.fold_regions;
                 self.tab_mut().content.structure = snapshot.structure;
                 self.tab_mut().content.navigation_source = snapshot.navigation_source.map(Arc::new);
@@ -9616,6 +9845,14 @@ fn content_target_for_navigation(document: &ContentIdentity) -> ContentTarget {
             server_root: server_root.clone(),
         },
     }
+}
+
+/// Whether a path identifies a Markdown document by extension (case
+/// insensitive), mirroring the built-in markdown provider's detection.
+fn is_markdown_relative(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
 }
 
 fn navigation_picker_groups(results: &[NavigationPickerItem]) -> Vec<NavigationPickerGroup> {
@@ -14371,6 +14608,77 @@ mod tests {
                 .iter()
                 .flatten()
                 .any(|highlight| { matches!(highlight.kind, HighlightKind::ImagePixel { .. }) })
+        );
+    }
+
+    #[test]
+    fn navigation_snapshot_syncs_markdown_source_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a.md"), "# A\n").unwrap();
+        fs::write(
+            directory.path().join("b.md"),
+            "# Navigated\n\nnav body marker\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("c.rs"), "fn c() {}\n").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        // Simulate a cross-document semantic-navigation stage landing on
+        // b.md: stages always request source presentation and then install the
+        // loaded source snapshot.
+        app.tab_mut().content.markdown_presentation = MarkdownPresentation::Source;
+        app.install_navigation_snapshot(ContentSnapshot {
+            provider: Some("text".to_owned()),
+            lines: vec![
+                "# Navigated".to_owned(),
+                String::new(),
+                "nav body marker".to_owned(),
+            ],
+            highlights: vec![Vec::new(), Vec::new(), Vec::new()],
+            show_line_numbers: true,
+            identity: Some(ContentIdentity::Workspace(PathBuf::from("b.md"))),
+            fold_source: FoldSource::BuiltinText,
+            fold_regions: Vec::new(),
+            structure: StructureSnapshot::unavailable(),
+            navigation_source: None,
+            preview_kind: PreviewKind::Text,
+            source_target: Some(ContentTarget::Workspace(PathBuf::from("b.md"))),
+        });
+        assert_eq!(
+            app.tab().content.markdown_source_identity,
+            Some(ContentIdentity::Workspace(PathBuf::from("b.md")))
+        );
+
+        // A subsequent Preview request for b.md (e.g. pressing p) keeps source.
+        app.request_content(
+            ContentKind::Preview,
+            "b.md".to_owned(),
+            ContentTarget::Workspace(PathBuf::from("b.md")),
+        );
+        app.wait_for_background();
+        assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+        assert!(app.tab().content.show_line_numbers);
+
+        // Navigating on to a non-Markdown document releases the pin, so a
+        // later request for b.md reopens in the rendered default.
+        app.install_navigation_snapshot(ContentSnapshot {
+            provider: Some("text".to_owned()),
+            lines: vec!["fn c() {}".to_owned()],
+            highlights: vec![Vec::new()],
+            show_line_numbers: true,
+            identity: Some(ContentIdentity::Workspace(PathBuf::from("c.rs"))),
+            fold_source: FoldSource::BuiltinText,
+            fold_regions: Vec::new(),
+            structure: StructureSnapshot::unavailable(),
+            navigation_source: None,
+            preview_kind: PreviewKind::Text,
+            source_target: Some(ContentTarget::Workspace(PathBuf::from("c.rs"))),
+        });
+        assert_eq!(app.tab().content.markdown_source_identity, None);
+        assert_eq!(
+            app.presentation_for_new_request(&ContentTarget::Workspace(PathBuf::from("b.md"))),
+            MarkdownPresentation::Rendered
         );
     }
 

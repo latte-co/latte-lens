@@ -29,6 +29,7 @@ from .fixtures import (
     create_invalid_theme_config_fixture,
     create_invalid_product_config_fixture,
     create_lsp_document_symbol_fixture,
+    create_markdown_fixture,
     create_missing_product_config_fixture,
     create_navigation_fixture,
     create_repository_relation_fixture,
@@ -369,6 +370,42 @@ def image_preview_fallback(context: ScenarioContext) -> None:
     session.wait_screen(
         ("Terminal preview", "press o for the system default app", "▀"),
         "confirmed terminal preview uses half-block pixels",
+    )
+
+
+def markdown_render_and_toggle(context: ScenarioContext) -> None:
+    session = context.session
+    wait_for_initial_files(session)
+    _click_tree_row(session, "doc.md")
+    session.key(b"l")  # focus the content pane so its footer hints show
+    # Default: typeset rendering with markup hidden and the m-source footer hint.
+    session.wait_screen(
+        (
+            "doc.md",
+            "Preview",
+            "Rendered Heading Alpha",
+            "uniquemdbullet one",
+            "uniquequote line",
+            "m source",
+        ),
+        "markdown opens in the rendered (typeset) view by default",
+        absent=("https://", "```", "# Rendered Heading"),
+    )
+
+    # m switches to the raw source view: heading marker, line numbers, footer.
+    session.key(b"m")
+    session.wait_screen(
+        ("# Rendered Heading Alpha", "m render"),
+        "m switches markdown to the numbered source view",
+        absent=("m source",),
+    )
+
+    # m switches back to rendering.
+    session.key(b"m")
+    session.wait_screen(
+        ("Rendered Heading Alpha", "• uniquemdbullet one", "m source"),
+        "m toggles markdown back to the rendered view",
+        absent=("# Rendered Heading", "m render"),
     )
 
 
@@ -1632,6 +1669,15 @@ def structure_navigation(context: ScenarioContext) -> None:
             f"{filename} Preview loads before structure navigation",
             absent=("Open File",),
         )
+        if filename.endswith(".md"):
+            # File-name search honors the rendered Markdown default; document
+            # symbols and folds are source-coordinate features, so switch to the
+            # raw source view with `m` before driving structure navigation.
+            session.key(b"m")
+            session.wait_screen(
+                ("m render", "# Guide Root"),
+                f"{filename} switches to source before structure navigation",
+            )
         session.key(b"l")
         session.key(b"\x13")
         session.wait_screen(
@@ -2349,6 +2395,12 @@ CASES = (
         symlink_copy_path,
     ),
     ScenarioCase("edit-mode", "files", create_edit_mode_fixture, edit_mode),
+    ScenarioCase(
+        "markdown-render",
+        "files",
+        create_markdown_fixture,
+        markdown_render_and_toggle,
+    ),
     ScenarioCase("git-navigation", "git-changes", create_navigation_fixture, git_navigation),
     ScenarioCase("git-status-matrix", "git-changes", create_git_matrix_fixture, git_status_matrix),
     ScenarioCase("git-review-state", "git-changes", create_git_matrix_fixture, git_review_state),

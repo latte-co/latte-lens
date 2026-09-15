@@ -17,8 +17,8 @@ use crate::{
     git::StatusMap,
     navigation::{LineIndex, NavigationSource, language_for_path},
     preview::{
-        HighlightSpan, PreviewKind, PreviewRegistry, PreviewRequest, PreviewResolution,
-        TerminalImageSize,
+        HighlightSpan, MarkdownPresentation, PreviewKind, PreviewRegistry, PreviewRequest,
+        PreviewResolution, TerminalImageSize,
     },
     repo_graph::{DiscoveryOptions, RepoChange, RepoGraph},
     system_preview::{self, ExternalOpenOutcome, SystemOpenAdapter},
@@ -57,6 +57,7 @@ pub(crate) struct ContentRequest {
     pub purpose: ContentPurpose,
     pub target: ContentTarget,
     pub terminal_image_size: Option<TerminalImageSize>,
+    pub markdown_presentation: MarkdownPresentation,
 }
 
 #[derive(Debug)]
@@ -984,7 +985,8 @@ fn execute_content(
             let mut preview_request = PreviewRequest::new(&absolute, &display_path)
                 .within_root(&content_root)
                 .following_symlinks(resolved.follow_symlinks)
-                .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES);
+                .with_limits(PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES)
+                .with_markdown_presentation(request.markdown_presentation);
             if let Some(size) = request.terminal_image_size {
                 preview_request = preview_request.with_terminal_image_size(size.columns, size.rows);
             }
@@ -1268,6 +1270,7 @@ mod tests {
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
         assert_eq!(slot.start_next().unwrap().generation, 1);
 
@@ -1279,6 +1282,7 @@ mod tests {
                 purpose: ContentPurpose::Display,
                 target: ContentTarget::Workspace(PathBuf::from(format!("{generation}.txt"))),
                 terminal_image_size: None,
+                markdown_presentation: MarkdownPresentation::Source,
             });
         }
         slot.complete();
@@ -1303,6 +1307,7 @@ mod tests {
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("tab-a.txt")),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
         queue.submit(ContentRequest {
             generation: 1,
@@ -1311,6 +1316,7 @@ mod tests {
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("tab-b.txt")),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
 
         // Both requests coexist — neither overwrites the other.
@@ -1334,6 +1340,7 @@ mod tests {
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("old.txt")),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
         queue.submit(ContentRequest {
             generation: 2,
@@ -1342,6 +1349,7 @@ mod tests {
             purpose: ContentPurpose::Display,
             target: ContentTarget::Workspace(PathBuf::from("new.txt")),
             terminal_image_size: None,
+            markdown_presentation: MarkdownPresentation::Source,
         });
 
         // Same tab: only the latest request survives.

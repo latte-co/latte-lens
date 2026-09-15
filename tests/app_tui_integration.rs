@@ -6232,3 +6232,335 @@ fn clicking_hide_button_does_not_trigger_search() {
         "tree should be hidden after clicking hide button"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rendered Markdown preview (default rendering + m source toggle)
+// ---------------------------------------------------------------------------
+
+const MD_DOC: &str = "# Heading One\n\n- alpha\n- beta\n\n> a quote line\n";
+
+fn md_fixture(files: &[(&str, &str)]) -> PathBuf {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, body) in files {
+        fs::write(directory.path().join(name), body).unwrap();
+    }
+    directory.keep()
+}
+
+#[test]
+fn markdown_opens_rendered_by_default_without_line_numbers_or_folds() {
+    let root = md_fixture(&[("a.md", MD_DOC), ("z.txt", "x\n")]);
+    let app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+    let joined = app.tab().content.lines.join("\n");
+    assert!(joined.contains("Heading One"));
+    assert!(joined.contains("• alpha"));
+    assert!(joined.contains("┃ a quote line"));
+    assert!(!joined.contains('#'));
+    assert!(!joined.contains('>'));
+}
+
+#[test]
+fn m_toggles_between_rendered_and_source_roundtrip() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Rendered -> source.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+    assert!(app.tab().content.lines.join("\n").contains('#'));
+
+    // Source -> rendered.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn m_is_a_noop_for_plain_text_files() {
+    let root = md_fixture(&[("a.md", MD_DOC), ("z.txt", "plain body\n")]);
+    let mut app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Move down to the text file.
+    app.handle_key(key(KeyCode::Down));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn switching_to_a_different_markdown_file_reopens_rendered() {
+    let root = md_fixture(&[("a.md", "# A\n\n- a\n"), ("b.md", "# B\n\n- b\n")]);
+    let mut app = ready_app(root).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Prefer source for the first file.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+
+    // Select the next markdown file; it must default back to rendered.
+    app.handle_key(key(KeyCode::Down));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+    assert!(app.tab().content.lines.join("\n").contains("• b"));
+}
+
+#[test]
+fn reloading_preview_keeps_source_presentation() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+
+    // p reloads the preview of the same document; the source choice persists.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn find_searches_rendered_text_not_raw_markup() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+
+    // A rendered-only token matches.
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    for character in "alpha".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.preview_find_position().map(|(_, count)| count), Some(1));
+    app.handle_key(key(KeyCode::Esc));
+
+    // The raw heading marker never appears in rendered output.
+    app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Char('#')));
+    assert_eq!(app.preview_find_position().map(|(_, count)| count), Some(0));
+}
+
+#[test]
+fn edit_mode_is_blocked_in_rendered_view_but_works_after_source_toggle() {
+    let root = md_fixture(&[("a.md", MD_DOC)]);
+    let mut app = ready_app(root).unwrap();
+    app.handle_key(key(KeyCode::Char('l')));
+
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(!app.edit_is_active());
+
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(
+        app.edit_is_active(),
+        "edit mode must be available in the source view"
+    );
+}
+
+#[test]
+fn m_then_diff_then_preview_keeps_source_presentation() {
+    // Real uncommitted change so `d` loads a genuine diff snapshot (which has
+    // no content identity); returning to Preview with `p` must still remember
+    // the source choice pinned via `m`.
+    let fixture = TestRepo::new();
+    fixture.write("a.md", "# Heading\n\n- alpha\n");
+    fixture.commit_all("initial");
+    fixture.write("a.md", "# Heading\n\n- alpha changed\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // Pin source with `m`.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
+    // Inspect the diff: a patch is shown without a preview identity.
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Diff);
+    assert!(
+        app.tab().content.lines.join("\n").contains("alpha changed"),
+        "the diff view must show the modified patch hunk"
+    );
+
+    // Back to Preview: the independent anchor keeps the source view.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(
+        app.tab().content.show_line_numbers,
+        "d -> p must retain the source presentation for the same file"
+    );
+}
+
+#[test]
+fn escaping_text_search_restores_rendered_view_and_first_m_opens_source() {
+    let fixture = TestRepo::new();
+    fixture.write("a.md", "# Heading\n\nzzmarkertoken body\n");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+
+    // A content hit carries source coordinates and previews Markdown in source.
+    app.handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    assert_eq!(app.search_mode(), Some(SearchMode::Text));
+    for character in "zzmarkertoken".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
+    // Cancel: the pre-search rendered content and preference are restored
+    // together, so the footer hint and the actual view agree.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.search_is_active());
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+
+    // One `m` must now move rendered -> source exactly once.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(
+        app.tab().content.provider.as_deref(),
+        Some("text"),
+        "the first m after restoring a rendered view must open source"
+    );
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn file_name_search_opens_markdown_rendered_but_content_search_opens_source() {
+    let fixture = TestRepo::new();
+    fixture.write("uniqdoc.md", "# Heading\n\n- zzmarkertoken line\n");
+
+    // File-name search (`/`) has no source coordinates: follow the normal open
+    // policy, so a new Markdown document opens rendered.
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('/')));
+    assert_eq!(app.search_mode(), Some(SearchMode::Files));
+    for character in "uniqdoc".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    assert_eq!(app.search_results()[0].line_number, None);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+    app.handle_key(key(KeyCode::Enter));
+    settle(&mut app);
+    assert!(!app.search_is_active());
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+
+    // Content text search (Ctrl+T) carries line/byte coordinates and forces
+    // the source view so the match highlight lands correctly.
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    for character in "zzmarkertoken".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    settle(&mut app);
+    assert_eq!(app.search_results().len(), 1);
+    assert!(app.search_results()[0].line_number.is_some());
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+}
+
+#[test]
+fn nested_repository_git_change_keeps_markdown_source_across_p_and_d() {
+    // A Markdown change inside a nested repository: the RepoChange target uses
+    // a path relative to the nested repo, while the loaded identity is
+    // workspace-relative. The source pin must survive Preview reloads and
+    // d -> p despite the differing path bases.
+    let fixture = TestRepo::new();
+    fixture.write("root.txt", "root body\n");
+    fixture.commit_all("root initial");
+
+    let nested = fixture.root().join("vendor/nested");
+    init_repo(&nested);
+    write_file(&nested, "docs/guide.md", "# Guide\n\nold body\n");
+    git(&nested, &["add", "--all"]);
+    git(&nested, &["commit", "--quiet", "-m", "nested initial"]);
+    write_file(&nested, "docs/guide.md", "# Guide\n\nnested md marker\n");
+
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    app.set_tree_scope(TreeScope::GitChanges);
+    settle(&mut app);
+
+    // Make sure the nested change is the active selection.
+    for _ in 0..5 {
+        if app
+            .tab()
+            .content
+            .lines
+            .iter()
+            .any(|line| line.contains("nested md marker"))
+        {
+            break;
+        }
+        app.handle_key(key(KeyCode::Char('n')));
+        settle(&mut app);
+    }
+    assert!(
+        app.tab()
+            .content
+            .lines
+            .iter()
+            .any(|line| line.contains("nested md marker")),
+        "the nested repository change must be selected"
+    );
+
+    // Preview opens the rendered Markdown view.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("markdown"));
+    assert!(!app.tab().content.show_line_numbers);
+
+    // Pin source with m.
+    app.handle_key(key(KeyCode::Char('m')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
+    assert!(app.tab().content.show_line_numbers);
+
+    // A plain Preview reload of the nested change keeps source.
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(
+        app.tab().content.provider.as_deref(),
+        Some("text"),
+        "reloading a nested-repo Markdown change must retain source"
+    );
+    assert!(app.tab().content.show_line_numbers);
+
+    // d -> p must also retain the source choice.
+    app.handle_key(key(KeyCode::Char('d')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Diff);
+    app.handle_key(key(KeyCode::Char('p')));
+    settle(&mut app);
+    assert_eq!(app.tab().content.mode, ContentMode::Preview);
+    assert_eq!(
+        app.tab().content.provider.as_deref(),
+        Some("text"),
+        "d -> p on a nested-repo Markdown change must retain source"
+    );
+    assert!(app.tab().content.show_line_numbers);
+}

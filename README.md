@@ -137,8 +137,9 @@ Inside the TUI:
 | `{` / `}` | In focused Preview content, collapse or expand all folds |
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
+| `m` | In a Markdown Preview, switch between the rendered (typeset) view and the raw numbered source; opening another Markdown file resets to rendered |
 | `o` | Safely open the current Tree/Content file with the system default app; confirm an unknown non-executable file only after Lens explicitly asks |
-| `i` | In a text Preview, enter edit mode; for a verified image with no system app, confirm a bounded TrueColor terminal preview |
+| `i` | In a text source Preview, enter edit mode (press `m` first to edit rendered Markdown); for a verified image with no system app, confirm a bounded TrueColor terminal preview |
 | `ctrl-z` / `ctrl-y` | In edit mode, undo / redo |
 | `y` / `Y` | Copy the selected path: `y` copies the relative path (the link path for symlinks), `Y` copies the real/absolute path (resolved target for symlinks in All Files scope); directories get a trailing `/` |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
@@ -153,7 +154,7 @@ Mouse controls:
 - Click a tab in the tab bar to switch to it; click `+` to open the new-tab menu (Files / Review / Search / Chat). Each tab owns its own projection (left pane) and content (right pane).
 - Click `Refresh` in the header (or press `r`) to re-scan the repository without leaving the current view.
 - Click a tree row to select it. Click the `▸`/`▾` disclosure triangle (or double-click a directory row) to expand or collapse it; double-click a file row to preview it. Moving the pointer over a row highlights it.
-- When the Tree is focused, type a letter to jump to the first visible entry whose name starts with it (case-insensitive). Continue typing to narrow the prefix; `Backspace` deletes the last character. The prefix shows in the Tree heading and resets after a short idle gap or any navigation key. Characters already bound to global shortcuts (`r`, `d`, `p`, `o`, `y`, `q`, `/`, `h`, `l`, digits) or vim navigation (`j`, `k`, `g`, `G`) are not captured by type-ahead.
+- When the Tree is focused, type a letter to jump to the first visible entry whose name starts with it (case-insensitive). Continue typing to narrow the prefix; `Backspace` deletes the last character. The prefix shows in the Tree heading and resets after a short idle gap or any navigation key. Characters already bound to global shortcuts (`r`, `d`, `p`, `m`, `o`, `y`, `q`, `/`, `h`, `l`, digits) or vim navigation (`j`, `k`, `g`, `G`) are not captured by type-ahead.
 - The Content heading shows the selected file's path as clickable breadcrumbs (`src / main.rs`). Click a parent segment to select that directory in the Tree.
 - Right-click a tree row to open a context menu with row-appropriate actions: expand/collapse or preview, copy relative/absolute path, and open externally. Navigate with `↑`/`↓` or `j`/`k`, `Enter` to execute, `Esc` to dismiss.
 - A scrollbar appears on the right edge of the Content area when the content overflows, with the thumb position tracking the scroll offset.
@@ -381,6 +382,22 @@ repository reads keep the strict policy, rendering a tracked symlink as its
 bounded target-path text without opening the target. Every read still declines
 FIFOs, sockets, devices, and Windows reparse points, and applies the same
 non-blocking, byte-and-line-bounded I/O to a link's target.
+
+Markdown files (`.md`/`.markdown`, case-insensitive extension) open in a
+**rendered reader view** by default: heading `#`, emphasis `*`/`**`/`~~`,
+code, and link markup is hidden, while headings, paragraphs, lists (`•`,
+numbered, `☐`/`☑` tasks), block quotes (`┃`), fenced code blocks, tables,
+and rules (`─`) are typeset and colored with dedicated foreground styles.
+Link URLs are not shown and nothing is fetched; images render as an
+`[image]` marker with their alt text, and raw HTML is displayed as sanitized
+text. The rendered view has no line numbers, folds, code navigation, or edit
+mode. Press `m` to switch to the raw numbered source (where folding, `i`
+editing, and navigation work), and `m` again to return; opening another
+Markdown file always resets to the rendered view. Rendering is bounded by the
+same byte/line caps and a parser event/time budget — a document that exceeds
+them, contains NUL bytes, or is not valid UTF-8 falls back to the source view.
+Mouse selection and copy in the rendered view capture the typeset text (no
+markup or URLs), not the original source.
 
 PNG, JPEG, GIF, and WebP files initially show verified metadata only. Press `o`
 or click `[Open]` to explicitly open the image in the host system's default

@@ -2470,6 +2470,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         ""
     };
+    let md_hint = app
+        .markdown_presentation_hint()
+        .map_or_else(String::new, |hint| format!("  {hint}"));
     let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
             "  ↑↓  {tab_keys}  ^C quit  Enter preview  o open  y path{ignore_hint}  ^B tree  q×2"
@@ -2480,7 +2483,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else if area.width < 96 && app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓  ^C quit  [/] folds  ^D/R/O nav  ^S symbols  ^F find  {tab_keys}  y path Y real  ^B tree  q×2"
+            "  ↑↓  ^C quit  [/] folds  ^D/R/O nav  ^S symbols  ^F find{md_hint}  {tab_keys}  y path Y real  ^B tree  q×2"
         )
     } else if area.width < 96 {
         format!(
@@ -2488,7 +2491,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.tab().content.mode == ContentMode::Preview {
         format!(
-            "  ↑↓  ^C quit  [/] folds  Enter toggle  ^D/R/O nav  ^S symbols  Alt+click def  Alt+←/→ hist  ^F find  {tab_keys}  y copy Y real  ^B tree  q×2"
+            "  ↑↓  ^C quit  [/] folds  Enter toggle  ^D/R/O nav  ^S symbols  Alt+click def  Alt+←/→ hist  ^F find{md_hint}  {tab_keys}  y copy Y real  ^B tree  q×2"
         )
     } else if app.tab().content.mode == ContentMode::Diff {
         format!(
@@ -3005,6 +3008,27 @@ fn highlight_style_with_theme(kind: HighlightKind, theme: &Theme) -> Style {
             .bg(theme.nav_target)
             .add_modifier(Modifier::BOLD),
         HighlightKind::NavigationHover => Style::default().add_modifier(Modifier::UNDERLINED),
+        HighlightKind::MdHeading => Style::default()
+            .fg(theme.md_heading)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::MdStrong => Style::default()
+            .fg(theme.md_strong)
+            .add_modifier(Modifier::BOLD),
+        HighlightKind::MdEmphasis => Style::default()
+            .fg(theme.md_emphasis)
+            .add_modifier(Modifier::ITALIC),
+        HighlightKind::MdStrikethrough => Style::default()
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::CROSSED_OUT),
+        HighlightKind::MdCode => Style::default().fg(theme.md_code),
+        HighlightKind::MdCodeBlock => Style::default().fg(theme.md_code_block),
+        HighlightKind::MdLink => Style::default()
+            .fg(theme.md_link)
+            .add_modifier(Modifier::UNDERLINED),
+        HighlightKind::MdQuote => Style::default().fg(theme.md_quote),
+        HighlightKind::MdListMarker => Style::default().fg(theme.md_list_marker),
+        HighlightKind::MdRule => Style::default().fg(theme.md_rule),
+        HighlightKind::MdRaw => Style::default().fg(theme.md_raw),
         HighlightKind::ImagePixel {
             foreground,
             background,
