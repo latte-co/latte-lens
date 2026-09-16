@@ -55,7 +55,9 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
 
 1. 运行环境可用（`AgentTargetProvider::available()`，见 §4）；
 2. Content 面板聚焦；
-3. `ContentMode::Preview`，且不在编辑模态；
+3. `ContentMode::Preview` 或 `ContentMode::Diff`，且不在编辑模态。
+   Preview 选区带源码坐标，使用锚点模板；Diff 选区是 unified-diff 原文，
+   无 content identity，锚点不可用、强制 Plain（注释仍可加）；
 4. 当前 tab 存在非空内容选区（`selected_content_text().is_some()`）。
 
 按下 `Ctrl+E`（同时接受精确的 SUPER 别名）→ 打开 agent picker。
@@ -275,6 +277,8 @@ Sending
    - `Ctrl+E` → picker → Enter 默认锚点模板投递到正确 pane、焦点切换、
      成功清选区；直接键入注释后载荷含锚点/▎注释/围栏；Tab 切纯文本后发原文；
      picker 渲染注释输入条、占位提示与载荷预览；
+     Git Diff 选区打开 picker 时无锚点、Tab 无法切到锚点、逐字发送 unified-diff
+     原文（保留 `+`/`-` 前缀）；
      Esc 取消保留选区且不发送；仅有 blocked 会话时关闭 picker；
    - 拖拽中 ctrl 上升沿 arm：普通 up 不开 picker，armed up 开 picker。
 3. **argv 协议（`tests/send_agent_protocol.rs`，POSIX）**：用一个固定行为的

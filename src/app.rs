@@ -8005,11 +8005,22 @@ impl App {
         self.agent_provider.available()
     }
 
+    /// Content modes whose text selection may be sent to an agent. Preview
+    /// carries source coordinates and uses the anchored template; Diff is a
+    /// unified-diff patch with no file identity, so it always sends plain
+    /// text (the anchor is unavailable in the picker).
+    fn send_to_agent_mode_active(&self) -> bool {
+        matches!(
+            self.tab().content.mode,
+            ContentMode::Preview | ContentMode::Diff
+        )
+    }
+
     /// Whether the footer should advertise `^E send to agent` right now.
     pub fn send_agent_footer_active(&self) -> bool {
         self.agent_provider.available()
             && self.tab().content.edit.is_none()
-            && self.tab().content.mode == ContentMode::Preview
+            && self.send_to_agent_mode_active()
             && self.selected_content_text().is_some()
     }
 
@@ -8026,7 +8037,7 @@ impl App {
         self.send_to_agent_available()
             && !self.send_to_agent.is_open()
             && self.tab().content.edit.is_none()
-            && self.tab().content.mode == ContentMode::Preview
+            && self.send_to_agent_mode_active()
             && self.focused_pane == FocusPane::Content
             && self.selected_content_text().is_some()
     }

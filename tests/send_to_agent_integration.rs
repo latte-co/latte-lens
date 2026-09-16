@@ -1,5 +1,7 @@
 //! Integration tests for send-selection-to-agent (Herdr-style backend).
 
+mod support;
+
 use std::{
     fs,
     path::Path,
@@ -449,4 +451,97 @@ fn esc_closes_picker_and_keeps_selection() {
     assert!(!app.send_to_agent.is_open());
     assert!(app.selected_content_text().is_some());
     assert!(calls.lock().unwrap().sends.is_empty());
+}
+
+#[test]
+fn diff_view_sends_raw_patch_without_anchor() {
+    use support::TestRepo;
+
+    let repo = TestRepo::new();
+    repo.write("single.txt", "alpha beta\nsecond line\n");
+    repo.commit_all("initial");
+    repo.write("single.txt", "alpha BETA changed\nsecond line\n");
+
+    let (provider, calls) = FakeAgentProvider::new(
+        true,
+        vec![target("claude", "w1:p2", AgentLifecycle::Idle, repo.root())],
+    );
+    let (mut app, mut terminal) = ready_app_with(repo.root(), provider);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // Load the working-tree diff.
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    for _ in 0..200 {
+        app.poll_background();
+        app.wait_background_once();
+        if app.tab().content.mode == ContentMode::Diff
+            && app
+                .tab()
+                .content
+                .lines
+                .iter()
+                .any(|line| line.starts_with("@@"))
+        {
+            break;
+        }
+    }
+    assert_eq!(app.tab().content.mode, ContentMode::Diff);
+
+    // Select the hunk's -/+ lines using the Diff gutter geometry (two number
+    // columns), then open the picker.
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let content_x = app.ui_regions.content_inner.x;
+    let row = app.ui_regions.content_inner.y;
+    let text_x = content_x + app.content_gutter_width() as u16;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        text_x,
+        row + 6, // "-alpha beta"
+        KeyModifiers::NONE,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 10,
+        row + 7, // "+alpha BETA changed"
+        KeyModifiers::NONE,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 10,
+        row + 7,
+        KeyModifiers::NONE,
+    ));
+    let selected = app
+        .selected_content_text()
+        .expect("a non-empty diff hunk selection");
+    assert!(
+        selected.contains('\n')
+            && selected.lines().any(|l| l.starts_with('-'))
+            && selected.lines().any(|l| l.starts_with('+')),
+        "raw unified-diff prefixes must survive selection: {selected:?}"
+    );
+
+    assert!(
+        app.send_agent_footer_active(),
+        "footer advertises ^E in diff view"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    wait_phase(&mut app, |phase| phase == SendPhase::Picking);
+
+    // A diff has no file identity/coordinates: the anchor template is
+    // unavailable and Tab cannot switch to it.
+    assert!(!app.send_to_agent.anchor_available());
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.send_to_agent.template,
+        latte_lens::send_agent::SendTemplate::Plain
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_phase(&mut app, |phase| phase == SendPhase::Closed);
+
+    assert_eq!(
+        calls.lock().unwrap().sends,
+        vec![("w1:p2".to_owned(), selected)]
+    );
 }

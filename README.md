@@ -148,7 +148,7 @@ Inside the TUI:
 | `r` | Refresh repository state |
 | `q` / `esc` | Press twice within 1.5 seconds to quit; `esc` closes an active search first |
 | `ctrl-c` | Quit immediately when no content is selected; copy the current selection otherwise |
-| `ctrl-e` | With a preview selection, open the send-to-agent picker; type a one-line note, `Tab` between a `path:line` anchored code block and plain text, then stage the message in a running agent session's input without submitting (terminal workspace manager such as Herdr required) |
+| `ctrl-e` | With a selection in the Preview or Git Diff pane, open the send-to-agent picker; type a one-line note, `Tab` between a `path:line` anchored code block (Preview only) and plain text, then stage the message in a running agent session's input without submitting (terminal workspace manager such as Herdr required) |
 
 Mouse controls:
 
