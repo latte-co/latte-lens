@@ -170,16 +170,149 @@ fn ctrl_e_opens_picker_and_enter_delivers_draft_without_submitting() {
     wait_phase(&mut app, |phase| phase == SendPhase::Picking);
     assert_eq!(app.send_to_agent.targets.len(), 2);
 
-    // Enter delivers to the first selectable target.
+    // Enter delivers to the first selectable target. The default template
+    // wraps the selection with a source anchor; .txt opens a bare fence.
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     wait_phase(&mut app, |phase| phase == SendPhase::Closed);
 
     let state = calls.lock().unwrap();
-    assert_eq!(state.sends, vec![("w1:p2".to_owned(), "lpha ".to_owned())]);
+    assert_eq!(
+        state.sends,
+        vec![(
+            "w1:p2".to_owned(),
+            "single.txt:1\n```\nlpha \n```".to_owned()
+        )]
+    );
     assert_eq!(state.focus, vec!["w1:p2".to_owned()]);
     drop(state);
     // The selection is consumed after a successful delivery.
     assert!(app.selected_content_text().is_none());
+}
+
+#[test]
+fn typed_annotation_is_wrapped_above_the_fenced_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("code.rs"), "fn main() {}\n").unwrap();
+    let (provider, calls) = FakeAgentProvider::new(
+        true,
+        vec![target(
+            "claude",
+            "w1:p2",
+            AgentLifecycle::Idle,
+            directory.path(),
+        )],
+    );
+    let (mut app, mut terminal) = ready_app_with(directory.path(), provider);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    select_first_row(&mut app, KeyModifiers::NONE);
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        app.ui_regions.content_inner.x + 9,
+        app.ui_regions.content_inner.y,
+        KeyModifiers::NONE,
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    wait_phase(&mut app, |phase| phase == SendPhase::Picking);
+
+    // Typing lands directly in the annotation field (no mode shortcut).
+    for ch in "why no buffer?".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_phase(&mut app, |phase| phase == SendPhase::Closed);
+
+    let payload = &calls.lock().unwrap().sends[0].1;
+    assert_eq!(payload, "code.rs:1\n▎why no buffer?\n\n```rust\nn mai\n```");
+}
+
+#[test]
+fn tab_cycles_to_plain_and_sends_raw_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("single.txt"), "alpha beta\n").unwrap();
+    let (provider, calls) = FakeAgentProvider::new(
+        true,
+        vec![target(
+            "claude",
+            "w1:p2",
+            AgentLifecycle::Idle,
+            directory.path(),
+        )],
+    );
+    let (mut app, mut terminal) = ready_app_with(directory.path(), provider);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    select_first_row(&mut app, KeyModifiers::NONE);
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        app.ui_regions.content_inner.x + 9,
+        app.ui_regions.content_inner.y,
+        KeyModifiers::NONE,
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    wait_phase(&mut app, |phase| phase == SendPhase::Picking);
+
+    // One Tab switches the anchor template to plain text.
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_phase(&mut app, |phase| phase == SendPhase::Closed);
+
+    assert_eq!(
+        calls.lock().unwrap().sends,
+        vec![("w1:p2".to_owned(), "lpha ".to_owned())]
+    );
+}
+
+#[test]
+fn picker_renders_annotation_input_and_anchor_preview() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("code.rs"), "fn main() {}\n").unwrap();
+    let (provider, _calls) = FakeAgentProvider::new(
+        true,
+        vec![target(
+            "claude",
+            "w1:p2",
+            AgentLifecycle::Idle,
+            directory.path(),
+        )],
+    );
+    let (mut app, mut terminal) = ready_app_with(directory.path(), provider);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    select_first_row(&mut app, KeyModifiers::NONE);
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        app.ui_regions.content_inner.x + 9,
+        app.ui_regions.content_inner.y,
+        KeyModifiers::NONE,
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    wait_phase(&mut app, |phase| phase == SendPhase::Picking);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let screen: String = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(screen.contains("code.rs:1"), "anchor status visible");
+    assert!(screen.contains("n mai"), "payload preview visible");
+    assert!(
+        screen.contains("type a note"),
+        "annotation placeholder visible"
+    );
+
+    // Typing replaces the placeholder with the draft note.
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(screen.contains("▎q"));
+    assert!(!screen.contains("type a note"));
 }
 
 #[test]

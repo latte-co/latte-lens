@@ -425,6 +425,7 @@ fn regions(areas: DrawAreas) -> UiRegions {
         content_inner: content_rows,
         send_agent_popup: Rect::default(),
         send_agent_rows: Vec::new(),
+        send_agent_row_offset: 0,
     }
 }
 
@@ -1068,16 +1069,17 @@ fn navigation_picker_item(
 }
 
 fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
+    use crate::send_agent::{MAX_SEND_BYTES, SendTemplate};
+
     let popup = search_popup_area(frame.area());
     frame.render_widget(Clear, popup);
 
-    let chars = app.send_to_agent.payload_chars();
-    let truncated = if app.send_to_agent.truncated {
-        " (truncated)"
-    } else {
-        ""
-    };
-    let title = format!(" Send selection to… ({chars} chars{truncated}) ");
+    let built = app.send_to_agent.built_payload();
+    let title = format!(
+        " Send selection to agent · {}/{} B ",
+        built.text.len(),
+        MAX_SEND_BYTES
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent()))
@@ -1087,7 +1089,22 @@ fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
         ));
     let inner = inset_horizontal(block.inner(popup), 1);
     frame.render_widget(block, popup);
-    let [body, help] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let row_cap = app
+        .send_to_agent
+        .targets
+        .len()
+        .clamp(1, 6)
+        .try_into()
+        .unwrap_or(6u16);
+    let [rows_area, note_area, status_area, preview_area, help] = Layout::vertical([
+        Constraint::Length(row_cap),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
     app.ui_regions.send_agent_popup = popup;
     app.ui_regions.send_agent_rows.clear();
@@ -1096,6 +1113,22 @@ fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
         app.send_to_agent.phase,
         crate::send_agent::SendPhase::Discovering
     );
+    let sending = matches!(
+        app.send_to_agent.phase,
+        crate::send_agent::SendPhase::Sending
+    );
+
+    // -- Agent rows (windowed so the selected target is always visible) -----
+    let targets = app.send_to_agent.targets.clone();
+    let cap = row_cap as usize;
+    let row_start = if targets.len() <= cap {
+        0
+    } else {
+        (app.send_to_agent.selected + 1).saturating_sub(cap)
+    };
+    app.ui_regions.send_agent_row_offset = row_start;
+    let row_rects = Layout::vertical((0..cap).map(|_| Constraint::Length(1)).collect::<Vec<_>>())
+        .split(rows_area);
 
     if discovering {
         frame.render_widget(
@@ -1103,34 +1136,22 @@ fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
                 "Discovering agents…",
                 Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
             )),
-            body,
+            row_rects[0],
         );
-    } else if app.send_to_agent.targets.is_empty() {
+    } else if targets.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "No active agent sessions detected.",
                 Style::default().fg(muted()),
             )),
-            body,
+            row_rects[0],
         );
     } else {
-        let visible = body.height as usize;
-        let targets = app.send_to_agent.targets.clone();
-        let selected = app.send_to_agent.selected;
-        let row_rects = Layout::vertical(
-            targets
-                .iter()
-                .take(visible)
-                .map(|_| Constraint::Length(1))
-                .chain(std::iter::once(Constraint::Min(0)))
-                .collect::<Vec<_>>(),
-        )
-        .split(body);
-
-        for (index, target) in targets.iter().take(visible).enumerate() {
-            let rect = row_rects[index];
+        for (slot, index) in (row_start..targets.len().min(row_start + cap)).enumerate() {
+            let target = &targets[index];
+            let rect = row_rects[slot];
             app.ui_regions.send_agent_rows.push(rect);
-            let is_selected = index == selected;
+            let is_selected = index == app.send_to_agent.selected;
             let base = if !target.selectable {
                 Style::default().fg(muted()).add_modifier(Modifier::DIM)
             } else if is_selected {
@@ -1139,7 +1160,7 @@ fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
                 Style::default()
             };
             let marker = if is_selected { "● " } else { "  " };
-            let title: String = target.title.chars().take(48).collect();
+            let title: String = target.title.chars().take(40).collect();
             let line = Line::from(vec![
                 Span::styled(marker, base),
                 Span::styled(format!("{:<8} ", target.agent), base),
@@ -1160,13 +1181,121 @@ fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    // -- Annotation input (focused on open; typing lands here directly) -----
+    let input_width = usize::from(note_area.width).saturating_sub(2).max(1);
+    let annotation = app.send_to_agent.annotation.clone();
+    let caret = app.send_to_agent.annotation_caret;
+    let (before, after) = search_query_window(&annotation, caret, input_width);
+    let mut note_spans = vec![Span::styled(
+        "▎ ",
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+    )];
+    if annotation.is_empty() {
+        note_spans.push(Span::styled(
+            "type a note for the agent (optional) — Enter stages, Esc cancels",
+            Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        note_spans.push(Span::styled(before, Style::default().fg(text_primary())));
+        note_spans.push(Span::styled(
+            "│",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+        note_spans.push(Span::styled(after, Style::default().fg(text_primary())));
+    }
+    frame.render_widget(Paragraph::new(Line::from(note_spans)), note_area);
+
+    // -- Status: template + truncation summary ------------------------------
+    let mut status = Vec::new();
+    match app.send_to_agent.template {
+        SendTemplate::Anchor => {
+            if let Some(anchor) = &app.send_to_agent.anchor {
+                let range = if anchor.start_line == anchor.end_line {
+                    format!("{}:{}", anchor.path, anchor.start_line)
+                } else {
+                    format!("{}:{}-{}", anchor.path, anchor.start_line, anchor.end_line)
+                };
+                status.push(Span::styled(
+                    format!("⌖ {range}"),
+                    Style::default().fg(accent()),
+                ));
+                status.push(Span::styled("  Tab: plain", Style::default().fg(muted())));
+            }
+        }
+        SendTemplate::Plain => {
+            status.push(Span::styled(
+                "plain selection",
+                Style::default().fg(text_primary()),
+            ));
+            if app.send_to_agent.anchor_available() {
+                status.push(Span::styled("  Tab: anchor", Style::default().fg(muted())));
+            }
+        }
+    }
+    if built.truncated {
+        status.push(Span::styled(
+            format!(
+                "   ⚠ {} of {} lines omitted (middle)",
+                built.omitted_lines, built.total_lines
+            ),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(status)), status_area);
+
+    // -- Live payload preview ------------------------------------------------
+    let preview_height = preview_area.height as usize;
+    let payload_lines = built.text.split('\n').collect::<Vec<_>>();
+    let mut shown: Vec<Line> = payload_lines
+        .iter()
+        .take(preview_height)
+        .map(|line| {
+            Line::from(Span::styled(
+                truncate_to_width(line, preview_area.width as usize),
+                Style::default().fg(subtle()),
+            ))
+        })
+        .collect();
+    if payload_lines.len() > preview_height {
+        if shown.len() == preview_height {
+            shown.pop();
+        }
+        shown.push(Line::from(Span::styled(
+            format!("… {} more lines", payload_lines.len() - preview_height + 1),
+            Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    frame.render_widget(Paragraph::new(shown), preview_area);
+
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "↑↓ select · Enter send draft · Esc close",
+            if sending {
+                "Staging draft…".to_owned()
+            } else {
+                "↑↓ agent · Tab format · Enter stage (no submit) · Esc cancel".to_owned()
+            },
             Style::default().fg(muted()),
         )),
         help,
     );
+
+    // Real terminal cursor on the annotation caret (ratatui hides it unless
+    // set every frame). Discovering keeps the input focused too.
+    if !sending {
+        let caret_col = if annotation.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(
+                search_query_window(&annotation, caret, input_width)
+                    .0
+                    .as_str(),
+            )
+        };
+        frame.set_cursor_position(Position {
+            x: note_area.x + 2 + caret_col as u16,
+            y: note_area.y,
+        });
+    }
 }
 
 fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPickerState) {

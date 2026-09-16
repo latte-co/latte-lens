@@ -148,7 +148,7 @@ Inside the TUI:
 | `r` | Refresh repository state |
 | `q` / `esc` | Press twice within 1.5 seconds to quit; `esc` closes an active search first |
 | `ctrl-c` | Quit immediately when no content is selected; copy the current selection otherwise |
-| `ctrl-e` | With a preview selection, open the send-to-agent picker and stage the selected text in a running agent session's input (terminal workspace manager such as Herdr required; draft is never submitted) |
+| `ctrl-e` | With a preview selection, open the send-to-agent picker; type a one-line note, `Tab` between a `path:line` anchored code block and plain text, then stage the message in a running agent session's input without submitting (terminal workspace manager such as Herdr required) |
 
 Mouse controls:
 
@@ -464,9 +464,14 @@ seconds, so a stray navigation key cannot close the application.
 When Lens runs inside a terminal workspace manager that exposes agent sessions
 (Herdr), a content selection can be handed to another pane without round-tripping
 the clipboard: press `Ctrl+E` (or tap `Ctrl` mid-drag, then release) to open the
-send-to-agent picker. The chosen session receives the selected text as a
-bracketed-paste draft in its composer; Lens never presses Enter, so you stay in
-control of the actual submission.
+send-to-agent picker. The input line is focused on open, so you can immediately
+type a one-line note; the default message anchors the snippet as
+`path:start-end` plus a fenced code block (and the `▎`-prefixed note above it),
+and `Tab` switches to plain selected text. Selections over 4 KiB keep their head
+and tail with a line-number gutter and an "omitted" marker, while the anchor
+still records the full range. The chosen session receives the assembled message
+as a bracketed-paste draft in its composer; Lens never presses Enter, so you
+stay in control of the actual submission.
 Preview, Diff, and informational content all
 support selection. Line-number gutters are excluded from copied previews,
 multi-line selections preserve newlines, and Unicode grapheme clusters remain

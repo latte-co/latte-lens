@@ -823,6 +823,9 @@ pub struct UiRegions {
     pub send_agent_popup: Rect,
     /// Per-row hit regions inside the send-to-agent picker, in list order.
     pub send_agent_rows: Vec<Rect>,
+    /// Index of the first target represented by `send_agent_rows` (the list
+    /// scrolls when there are more targets than visible rows).
+    pub send_agent_row_offset: usize,
 }
 
 impl UiRegions {
@@ -4603,7 +4606,8 @@ impl App {
                     .ui_regions
                     .send_agent_rows
                     .iter()
-                    .position(|rect| contains(*rect, mouse.column, mouse.row));
+                    .position(|rect| contains(*rect, mouse.column, mouse.row))
+                    .map(|position| self.ui_regions.send_agent_row_offset + position);
                 if let Some(index) = hit {
                     if self.send_to_agent.select_index(index) {
                         self.accept_send_to_agent_selection();
@@ -8034,13 +8038,40 @@ impl App {
         let Some(text) = self.selected_content_text() else {
             return;
         };
-        let (payload, truncated) =
-            crate::send_agent::truncate_payload(&text, crate::send_agent::MAX_SEND_BYTES);
+        let anchor = self.send_selection_anchor();
         let generation = self.send_to_agent_requests.begin();
-        self.send_to_agent
-            .begin_discover(generation, payload, truncated);
+        self.send_to_agent.begin_discover(generation, text, anchor);
         self.runtime
             .request_agent_discover(crate::runtime::AgentDiscoverRequest { generation });
+    }
+
+    /// Source coordinates for the anchor template. Only source-coordinate
+    /// previews qualify: a successful Preview with line numbers and a content
+    /// identity, where selection line indices map 1:1 to file lines (folded
+    /// lines stay part of the range just like copy). Rendered Markdown, Diff
+    /// views, and search snapshots return None and send plain text.
+    fn send_selection_anchor(&self) -> Option<crate::send_agent::SelectionAnchor> {
+        let content = &self.tab().content;
+        if content.mode != ContentMode::Preview || !content.show_line_numbers {
+            return None;
+        }
+        let identity = content.identity.as_ref()?;
+        let selection = content.selection?;
+        let (start, end) = selection.normalized();
+        if start == end {
+            return None;
+        }
+        let path = identity.path();
+        let language = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(crate::send_agent::fence_language);
+        Some(crate::send_agent::SelectionAnchor {
+            path: path.display().to_string(),
+            start_line: start.line + 1,
+            end_line: end.line + 1,
+            language,
+        })
     }
 
     fn close_send_to_agent_picker(&mut self) {
@@ -8049,10 +8080,29 @@ impl App {
     }
 
     fn handle_send_to_agent_picker_key(&mut self, key: KeyEvent) {
+        // Annotation drafting owns printable keys: the picker opens with the
+        // input focused, so typing goes straight into the note. Agent rows are
+        // reached with the arrow keys only (arrows never collide with text).
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_send_to_agent_picker(),
-            (KeyCode::Down | KeyCode::Char('j'), _) => self.send_to_agent.move_selection(1),
-            (KeyCode::Up | KeyCode::Char('k'), _) => self.send_to_agent.move_selection(-1),
+            (KeyCode::Down, _) => self.send_to_agent.move_selection(1),
+            (KeyCode::Up, _) => self.send_to_agent.move_selection(-1),
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                self.send_to_agent.cycle_template();
+            }
+            (KeyCode::Backspace, _) => self.send_to_agent.annotation_backspace(),
+            (KeyCode::Left, _) => self.send_to_agent.annotation_move_caret(-1),
+            (KeyCode::Right, _) => self.send_to_agent.annotation_move_caret(1),
+            (KeyCode::Home, _) => self.send_to_agent.annotation_home(),
+            (KeyCode::End, _) => self.send_to_agent.annotation_end(),
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if matches!(
+                    self.send_to_agent.phase,
+                    crate::send_agent::SendPhase::Picking
+                ) =>
+            {
+                self.send_to_agent.insert_annotation_char(ch);
+            }
             (KeyCode::Enter, _) => self.accept_send_to_agent_selection(),
             _ => {}
         }
@@ -8068,10 +8118,10 @@ impl App {
         let Some(target) = self.send_to_agent.selected_target().cloned() else {
             return;
         };
-        let payload = self.send_to_agent.payload.clone();
+        let payload = self.send_to_agent.built_payload().text;
         let generation = self.send_to_agent_requests.begin();
         self.send_to_agent.begin_sending(generation);
-        self.set_navigation_status(NavigationStatusLevel::Info, "Sending selection…");
+        self.set_navigation_status(NavigationStatusLevel::Info, "Staging selection…");
         self.runtime
             .request_agent_send(crate::runtime::AgentSendRequest {
                 generation,

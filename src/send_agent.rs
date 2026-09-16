@@ -24,10 +24,20 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 
 /// Maximum payload delivered in one send. The Herdr pane input is a composer
-/// buffer, not a file transfer; large selections are truncated at a UTF-8
-/// boundary and the UI reports the truncation. The lower Windows ceiling
-/// keeps the whole argv command line inside the CreateProcess limit.
-pub const MAX_SEND_BYTES: usize = if cfg!(windows) { 8 * 1024 } else { 32 * 1024 };
+/// buffer, not a file transfer: the whole staged message (anchor, annotation,
+/// and selection together) must fit in 4 KiB. Larger selections keep their
+/// head and tail and omit the middle at whole-line boundaries; the anchor
+/// still records the full original range so the agent can open the file.
+pub const MAX_SEND_BYTES: usize = 4096;
+
+/// Maximum annotation length in UTF-8 bytes. Annotations are one-line
+/// questions or instructions; a screenful is more than enough.
+pub const MAX_ANNOTATION_BYTES: usize = 512;
+
+/// Bytes reserved up front while budgeting a truncated payload (anchor suffix
+/// and omitted-marker line). The final assembly is still verified against
+/// [`MAX_SEND_BYTES`], so this only needs to be conservative.
+const TRUNCATION_RESERVE: usize = 220;
 
 /// Hard ceiling for any single backend CLI response.
 const MAX_BACKEND_OUTPUT: usize = 256 * 1024;
@@ -201,6 +211,414 @@ pub fn truncate_payload(text: &str, max_bytes: usize) -> (String, bool) {
     (text[..end].to_owned(), true)
 }
 
+// ---------------------------------------------------------------------------
+// Payload wrapping (anchor + annotation + fenced selection)
+// ---------------------------------------------------------------------------
+
+/// How the staged message presents the selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SendTemplate {
+    /// The selection text alone, with an optional annotation above it.
+    Plain,
+    /// `path:start-end` header, an optional `▎` annotation, and a fenced code
+    /// block. Only available when the selection has source coordinates.
+    Anchor,
+}
+
+/// Source coordinates of the snapshot selection, captured when the picker
+/// opens. Line numbers are 1-based and inclusive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionAnchor {
+    /// Workspace-relative display path.
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    /// Fence language hint derived from the file extension, if known.
+    pub language: Option<&'static str>,
+}
+
+impl SelectionAnchor {
+    /// `path:line` for a single line, `path:start-end` for a multi-line range.
+    fn header(&self) -> String {
+        if self.start_line == self.end_line {
+            format!("{}:{}", self.path, self.start_line)
+        } else {
+            format!("{}:{}-{}", self.path, self.start_line, self.end_line)
+        }
+    }
+}
+
+/// The final text to stage plus bookkeeping for the picker's status line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltPayload {
+    pub text: String,
+    /// True when middle lines were omitted to fit [`MAX_SEND_BYTES`].
+    pub truncated: bool,
+    pub total_lines: usize,
+    pub kept_lines: usize,
+    pub omitted_lines: usize,
+    pub omitted_bytes: usize,
+}
+
+impl BuiltPayload {
+    fn full(text: String, total_lines: usize) -> Self {
+        Self {
+            text,
+            truncated: false,
+            total_lines,
+            kept_lines: total_lines,
+            omitted_lines: 0,
+            omitted_bytes: 0,
+        }
+    }
+}
+
+/// Build the exact message staged into the agent composer. Pure and
+/// budget-exact: the result never exceeds [`MAX_SEND_BYTES`] and never splits
+/// a UTF-8 character. `Anchor` without an anchor falls back to `Plain`.
+pub fn build_payload(
+    selection: &str,
+    anchor: Option<&SelectionAnchor>,
+    annotation: &str,
+    template: SendTemplate,
+) -> BuiltPayload {
+    let annotation = annotation.trim();
+    let code = selection.strip_suffix('\n').unwrap_or(selection);
+    match (template, anchor) {
+        (SendTemplate::Anchor, Some(anchor)) => build_anchored(code, annotation, anchor),
+        _ => build_plain(code, annotation),
+    }
+}
+
+/// Annotation block: every line prefixed with `▎` so the human's note stays
+/// visually separated from quoted code in the composer and the chat history.
+fn annotation_block(annotation: &str) -> String {
+    annotation
+        .lines()
+        .map(|line| format!("▎{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_plain(code: &str, annotation: &str) -> BuiltPayload {
+    let lines: Vec<&str> = code.split('\n').collect();
+    let total = lines.len();
+    let prefix = if annotation.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", annotation_block(annotation))
+    };
+
+    let full = format!("{prefix}{code}");
+    if full.len() <= MAX_SEND_BYTES {
+        return BuiltPayload::full(full, total);
+    }
+
+    let budget = MAX_SEND_BYTES - prefix.len() - TRUNCATION_RESERVE;
+    let split = split_head_tail(&lines, budget, 0);
+    let marker = plain_marker(split.omitted, split.omitted_bytes);
+    let text = format!(
+        "{prefix}{}\n{}\n{}",
+        split.head.join("\n"),
+        marker,
+        split.tail.join("\n")
+    );
+    let verified = verify_budget(text, &lines, &split, |head, tail, omitted, bytes| {
+        format!(
+            "{prefix}{}\n{}\n{}",
+            head.join("\n"),
+            plain_marker(omitted, bytes),
+            tail.join("\n")
+        )
+    });
+    BuiltPayload {
+        total_lines: total,
+        kept_lines: total - verified.omitted,
+        omitted_lines: verified.omitted,
+        omitted_bytes: verified.omitted_bytes,
+        truncated: true,
+        text: verified.text,
+    }
+}
+
+fn build_anchored(code: &str, annotation: &str, anchor: &SelectionAnchor) -> BuiltPayload {
+    let lines: Vec<&str> = code.split('\n').collect();
+    let total = lines.len();
+    let fence = code_fence(code);
+    let fence_open = match anchor.language {
+        Some(language) => format!("{fence}{language}"),
+        None => fence.clone(),
+    };
+    let note = if annotation.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", annotation_block(annotation))
+    };
+
+    let full = format!("{}\n{note}{fence_open}\n{code}\n{fence}", anchor.header());
+    if full.len() <= MAX_SEND_BYTES {
+        return BuiltPayload::full(full, total);
+    }
+
+    // Truncated: the anchor gains a summary suffix and retained lines carry a
+    // line-number gutter so surviving snippets still map to real source.
+    let gutter_width = anchor.end_line.checked_ilog10().unwrap_or(0) as usize + 1;
+    let fixed = anchor.header().len()
+        + anchor_suffix(total, total).len()
+        + note.len()
+        + fence_open.len()
+        + 1
+        + fence.len()
+        + TRUNCATION_RESERVE;
+    let budget = MAX_SEND_BYTES.saturating_sub(fixed);
+    let split = split_head_tail(&lines, budget, gutter_width + "│".len());
+
+    let gutter_line = |line_no: usize, line: &str| format!("{line_no:>gutter_width$}│{line}\n");
+    let assemble = |head_count: usize, tail_count: usize| -> (String, usize, usize) {
+        let omitted = total - head_count - tail_count;
+        let kept_bytes: usize = lines[..head_count]
+            .iter()
+            .chain(lines[total - tail_count..].iter())
+            .map(|line| line.len() + 1)
+            .sum();
+        let total_bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+        let omitted_bytes = total_bytes.saturating_sub(kept_bytes);
+        let mut text = format!(
+            "{}{}\n{note}{fence_open}\n",
+            anchor.header(),
+            anchor_suffix(total, omitted)
+        );
+        for (offset, line) in lines[..head_count].iter().enumerate() {
+            text.push_str(&gutter_line(anchor.start_line + offset, line));
+        }
+        if omitted > 0 {
+            text.push_str(&code_marker(omitted, omitted_bytes, anchor));
+            text.push('\n');
+        }
+        for (index, line) in lines[total - tail_count..].iter().enumerate() {
+            let line_no = anchor.start_line + total - tail_count + index;
+            text.push_str(&gutter_line(line_no, line));
+        }
+        text.push_str(&fence);
+        (text, omitted, omitted_bytes)
+    };
+
+    // Exact shrink: the gutter width is constant, so per-line accounting is
+    // exact; drop tail lines (then head lines) until the budget is met.
+    let (mut head_count, mut tail_count) = (split.head.len(), split.tail.len());
+    let (mut text, mut omitted, mut omitted_bytes) = assemble(head_count, tail_count);
+    while text.len() > MAX_SEND_BYTES && head_count + tail_count > 0 {
+        if tail_count > 0 {
+            tail_count -= 1;
+        } else {
+            head_count -= 1;
+        }
+        (text, omitted, omitted_bytes) = assemble(head_count, tail_count);
+    }
+
+    BuiltPayload {
+        text,
+        truncated: true,
+        total_lines: total,
+        kept_lines: total - omitted,
+        omitted_lines: omitted,
+        omitted_bytes,
+    }
+}
+
+fn anchor_suffix(total: usize, omitted: usize) -> String {
+    format!(" ({total} lines selected, {omitted} omitted)")
+}
+
+fn plain_marker(omitted: usize, omitted_bytes: usize) -> String {
+    format!(
+        "⋮ ── omitted {omitted} lines ({}) ──",
+        format_bytes(omitted_bytes)
+    )
+}
+
+fn code_marker(omitted: usize, omitted_bytes: usize, anchor: &SelectionAnchor) -> String {
+    format!(
+        "⋮ ── omitted {omitted} lines ({}) see {} ──",
+        format_bytes(omitted_bytes),
+        anchor.header()
+    )
+}
+
+/// Head/tail line split. Each retained line costs its text bytes, one
+/// newline, and (in anchored mode) the gutter width; the head gets about 55%
+/// of the budget and the tail the rest, always on whole-line boundaries.
+struct LineSplit<'a> {
+    head: Vec<&'a str>,
+    tail: Vec<&'a str>,
+    omitted: usize,
+    omitted_bytes: usize,
+}
+
+fn split_head_tail<'a>(lines: &[&'a str], budget: usize, gutter_bytes: usize) -> LineSplit<'a> {
+    let cost = |line: &&str| line.len() + 1 + gutter_bytes;
+    let total_cost: usize = lines.iter().map(cost).sum();
+    if total_cost <= budget {
+        return LineSplit {
+            head: lines.to_vec(),
+            tail: Vec::new(),
+            omitted: 0,
+            omitted_bytes: 0,
+        };
+    }
+    let head_budget = budget * 55 / 100;
+    let tail_budget = budget.saturating_sub(head_budget);
+    let mut used = 0usize;
+    let mut head_count = 0usize;
+    for line in lines {
+        let line_cost = cost(line);
+        if used + line_cost > head_budget || head_count + 1 >= lines.len() {
+            break;
+        }
+        used += line_cost;
+        head_count += 1;
+    }
+    used = 0;
+    let mut tail_count = 0usize;
+    for line in lines.iter().rev() {
+        let line_cost = cost(line);
+        if used + line_cost > tail_budget || head_count + tail_count + 1 >= lines.len() {
+            break;
+        }
+        used += line_cost;
+        tail_count += 1;
+    }
+    if head_count == 0 && !lines.is_empty() {
+        head_count = 1;
+    }
+    if tail_count == 0 && lines.len() > head_count {
+        tail_count = 1;
+    }
+    let omitted = lines.len() - head_count - tail_count;
+    let kept_bytes: usize = lines[..head_count]
+        .iter()
+        .chain(lines[lines.len() - tail_count..].iter())
+        .map(|line| line.len() + 1)
+        .sum();
+    let total_bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+    LineSplit {
+        head: lines[..head_count].to_vec(),
+        tail: lines[lines.len() - tail_count..].to_vec(),
+        omitted,
+        omitted_bytes: total_bytes.saturating_sub(kept_bytes),
+    }
+}
+
+/// Final safety net for the plain path: keep dropping retained lines until
+/// the assembled message fits. The anchored path performs exact accounting
+/// (gutter width is fixed), so this is only reached if an estimate was off.
+fn verify_budget<'a>(
+    mut text: String,
+    lines: &[&'a str],
+    split: &LineSplit<'a>,
+    reassemble: impl Fn(&[&'a str], &[&'a str], usize, usize) -> String,
+) -> LineSplitText {
+    let mut head_count = split.head.len();
+    let mut tail_count = split.tail.len();
+    loop {
+        if text.len() <= MAX_SEND_BYTES || head_count + tail_count == 0 {
+            break;
+        }
+        if tail_count > 0 {
+            tail_count -= 1;
+        } else {
+            head_count -= 1;
+        }
+        let omitted = lines.len() - head_count - tail_count;
+        let kept_bytes: usize = lines[..head_count]
+            .iter()
+            .chain(lines[lines.len() - tail_count..].iter())
+            .map(|line| line.len() + 1)
+            .sum();
+        let total_bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+        text = reassemble(
+            &lines[..head_count],
+            &lines[lines.len() - tail_count..],
+            omitted,
+            total_bytes.saturating_sub(kept_bytes),
+        );
+    }
+    let omitted = lines.len() - head_count - tail_count;
+    let kept_bytes: usize = lines[..head_count]
+        .iter()
+        .chain(lines[lines.len() - tail_count..].iter())
+        .map(|line| line.len() + 1)
+        .sum();
+    let total_bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+    LineSplitText {
+        text,
+        omitted,
+        omitted_bytes: total_bytes.saturating_sub(kept_bytes),
+    }
+}
+
+struct LineSplitText {
+    text: String,
+    omitted: usize,
+    omitted_bytes: usize,
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{}.{} KB", bytes / 1024, (bytes % 1024) * 10 / 1024)
+    }
+}
+
+/// Fence delimiter long enough that the selection's own backtick runs cannot
+/// close the block early (minimum three backticks).
+fn code_fence(code: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in code.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(longest + 1).max("```".to_owned())
+}
+
+/// Best-effort fenced-code language hint from a file extension.
+pub fn fence_language(extension: &str) -> Option<&'static str> {
+    Some(match extension {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" | "tsx" => "typescript",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "scala" => "scala",
+        "sh" | "bash" | "zsh" => "bash",
+        "ps1" | "psm1" => "powershell",
+        "lua" => "lua",
+        "pl" => "perl",
+        "md" | "markdown" => "markdown",
+        "json" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "html" | "htm" | "xml" => "xml",
+        "css" | "scss" | "sass" => "css",
+        "sql" => "sql",
+        "proto" => "proto",
+        _ => return None,
+    })
+}
+
 fn sanitize_title(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -229,9 +647,19 @@ pub struct SendToAgentState {
     pub phase: SendPhase,
     pub targets: Vec<AgentTarget>,
     pub selected: usize,
-    /// Selection snapshot taken when the picker opened; what gets delivered.
-    pub payload: String,
-    pub truncated: bool,
+    /// Raw selection snapshot taken when the picker opened; wrapping and
+    /// truncation happen in [`SendToAgentState::built_payload`].
+    pub selection: String,
+    /// Source coordinates for the anchor template; None for Diff views,
+    /// search previews, and other coordinate-free selections.
+    pub anchor: Option<SelectionAnchor>,
+    /// Active template; forced to Plain when there is no anchor.
+    pub template: SendTemplate,
+    /// One-line annotation drafted directly in the picker, `▎`-prefixed at
+    /// build time.
+    pub annotation: String,
+    /// Annotation caret as a UTF-8 byte offset.
+    pub annotation_caret: usize,
     /// Generation of the request currently represented by this state.
     pub generation: u64,
 }
@@ -242,8 +670,11 @@ impl Default for SendToAgentState {
             phase: SendPhase::Closed,
             targets: Vec::new(),
             selected: 0,
-            payload: String::new(),
-            truncated: false,
+            selection: String::new(),
+            anchor: None,
+            template: SendTemplate::Plain,
+            annotation: String::new(),
+            annotation_caret: 0,
             generation: 0,
         }
     }
@@ -254,13 +685,26 @@ impl SendToAgentState {
         !matches!(self.phase, SendPhase::Closed)
     }
 
-    /// Snapshot the payload and move into the discovering phase.
-    pub fn begin_discover(&mut self, generation: u64, payload: String, truncated: bool) {
+    /// Snapshot the selection and move into the discovering phase. The picker
+    /// is interactive for annotation drafting before discovery returns.
+    pub fn begin_discover(
+        &mut self,
+        generation: u64,
+        selection: String,
+        anchor: Option<SelectionAnchor>,
+    ) {
         self.phase = SendPhase::Discovering;
         self.targets.clear();
         self.selected = 0;
-        self.payload = payload;
-        self.truncated = truncated;
+        self.selection = selection;
+        self.template = if anchor.is_some() {
+            SendTemplate::Anchor
+        } else {
+            SendTemplate::Plain
+        };
+        self.anchor = anchor;
+        self.annotation.clear();
+        self.annotation_caret = 0;
         self.generation = generation;
     }
 
@@ -295,8 +739,11 @@ impl SendToAgentState {
         self.phase = SendPhase::Closed;
         self.targets.clear();
         self.selected = 0;
-        self.payload.clear();
-        self.truncated = false;
+        self.selection.clear();
+        self.anchor = None;
+        self.template = SendTemplate::Plain;
+        self.annotation.clear();
+        self.annotation_caret = 0;
         self.generation = 0;
     }
 
@@ -336,14 +783,91 @@ impl SendToAgentState {
             .filter(|target| target.selectable)
     }
 
+    /// Whether the anchor template can be selected (the selection has source
+    /// coordinates).
+    pub const fn anchor_available(&self) -> bool {
+        self.anchor.is_some()
+    }
+
+    /// Cycle between the anchored and plain templates. No-op without an
+    /// anchor. Returns the resulting template.
+    pub fn cycle_template(&mut self) -> SendTemplate {
+        if self.anchor.is_some() {
+            self.template = match self.template {
+                SendTemplate::Anchor => SendTemplate::Plain,
+                SendTemplate::Plain => SendTemplate::Anchor,
+            };
+        }
+        self.template
+    }
+
+    /// Insert a printable character at the annotation caret. Control
+    /// characters are rejected and the annotation is hard-capped at
+    /// [`MAX_ANNOTATION_BYTES`]; returns false when nothing was inserted.
+    pub fn insert_annotation_char(&mut self, ch: char) -> bool {
+        if ch.is_control() {
+            return false;
+        }
+        if self.annotation.len() + ch.len_utf8() > MAX_ANNOTATION_BYTES {
+            return false;
+        }
+        self.annotation.insert(self.annotation_caret, ch);
+        self.annotation_caret += ch.len_utf8();
+        true
+    }
+
+    /// Delete the character before the caret.
+    pub fn annotation_backspace(&mut self) {
+        if self.annotation_caret == 0 {
+            return;
+        }
+        let mut prev = self.annotation_caret - 1;
+        while !self.annotation.is_char_boundary(prev) {
+            prev -= 1;
+        }
+        self.annotation
+            .replace_range(prev..self.annotation_caret, "");
+        self.annotation_caret = prev;
+    }
+
+    pub fn annotation_move_caret(&mut self, delta: isize) {
+        let len = self.annotation.chars().count() as isize;
+        let current = self.annotation[..self.annotation_caret].chars().count() as isize;
+        let next = (current + delta).clamp(0, len) as usize;
+        self.annotation_caret = self
+            .annotation
+            .char_indices()
+            .nth(next)
+            .map_or(self.annotation.len(), |(index, _)| index);
+    }
+
+    pub fn annotation_home(&mut self) {
+        self.annotation_caret = 0;
+    }
+
+    pub fn annotation_end(&mut self) {
+        self.annotation_caret = self.annotation.len();
+    }
+
+    /// Assemble the exact message that will be staged, applying the template,
+    /// annotation, and the 4 KiB head/tail budget.
+    pub fn built_payload(&self) -> BuiltPayload {
+        build_payload(
+            &self.selection,
+            self.anchor.as_ref(),
+            &self.annotation,
+            self.template,
+        )
+    }
+
     pub fn begin_sending(&mut self, generation: u64) {
         self.phase = SendPhase::Sending;
         self.generation = generation;
     }
 
     /// Payload byte length for the picker subtitle / status report.
-    pub fn payload_chars(&self) -> usize {
-        self.payload.chars().count()
+    pub fn payload_bytes(&self) -> usize {
+        self.built_payload().text.len()
     }
 }
 
@@ -598,7 +1122,7 @@ mod tests {
         let root = Path::new("/workspace/repo");
         let discovery = parse_agent_list(FIXTURE, root, None).unwrap();
         let mut state = SendToAgentState::default();
-        state.begin_discover(7, "let x = 1;".to_owned(), false);
+        state.begin_discover(7, "let x = 1;".to_owned(), None);
         assert_eq!(state.phase, SendPhase::Discovering);
 
         // Stale generation is discarded.
@@ -634,7 +1158,7 @@ mod tests {
     #[test]
     fn picker_stale_failure_after_close_is_ignored() {
         let mut state = SendToAgentState::default();
-        state.begin_discover(1, String::new(), false);
+        state.begin_discover(1, String::new(), None);
         state.close();
         assert!(!state.fail_discovery(1));
     }
@@ -647,5 +1171,187 @@ mod tests {
         ]}}";
         let discovery = parse_agent_list(json, Path::new("/w"), None).unwrap();
         assert_eq!(discovery.targets[0].title, "a ]52;x b");
+    }
+
+    fn anchor(path: &str, start: usize, end: usize) -> SelectionAnchor {
+        let language = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(fence_language);
+        SelectionAnchor {
+            path: path.to_owned(),
+            start_line: start,
+            end_line: end,
+            language,
+        }
+    }
+
+    #[test]
+    fn plain_template_without_annotation_is_the_raw_selection() {
+        let built = build_payload("lpha ", None, "", SendTemplate::Plain);
+        assert_eq!(built.text, "lpha ");
+        assert!(!built.truncated);
+    }
+
+    #[test]
+    fn anchor_template_wraps_single_line_with_path_and_line() {
+        let built = build_payload(
+            "let x = 1;",
+            Some(&anchor("src/app.rs", 10, 10)),
+            "",
+            SendTemplate::Anchor,
+        );
+        assert_eq!(built.text, "src/app.rs:10\n```rust\nlet x = 1;\n```");
+    }
+
+    #[test]
+    fn anchor_header_uses_a_range_for_multiple_lines() {
+        let built = build_payload(
+            "a\nb",
+            Some(&anchor("x.go", 10, 11)),
+            "",
+            SendTemplate::Anchor,
+        );
+        assert!(built.text.starts_with("x.go:10-11\n```go\n"));
+    }
+
+    #[test]
+    fn annotation_sits_between_anchor_and_code_with_bar_prefix() {
+        let built = build_payload(
+            "let x = 1;",
+            Some(&anchor("src/app.rs", 10, 10)),
+            "why no buffer?",
+            SendTemplate::Anchor,
+        );
+        assert_eq!(
+            built.text,
+            "src/app.rs:10\n▎why no buffer?\n\n```rust\nlet x = 1;\n```"
+        );
+    }
+
+    #[test]
+    fn plain_annotation_precedes_the_selection() {
+        let built = build_payload(
+            "@@ -1 +1 @@\n-x\n+y",
+            None,
+            "reproduces on my machine?",
+            SendTemplate::Plain,
+        );
+        assert_eq!(
+            built.text,
+            "▎reproduces on my machine?\n\n@@ -1 +1 @@\n-x\n+y"
+        );
+    }
+
+    #[test]
+    fn unknown_extension_opens_a_bare_fence() {
+        let built = build_payload(
+            "native.rule()",
+            Some(&anchor("scripts/deploy.bzl", 7, 7)),
+            "",
+            SendTemplate::Anchor,
+        );
+        assert_eq!(built.text, "scripts/deploy.bzl:7\n```\nnative.rule()\n```");
+    }
+
+    #[test]
+    fn embedded_backtick_runs_upgrade_the_fence() {
+        let code = "let s = \"```\";";
+        let built = build_payload(code, Some(&anchor("a.rs", 1, 1)), "", SendTemplate::Anchor);
+        assert!(
+            built.text.contains("````rust\n"),
+            "fence must outrun the embedded run: {}",
+            built.text
+        );
+        assert!(built.text.ends_with("````"));
+    }
+
+    #[test]
+    fn large_selection_keeps_head_and_tail_with_gutter_and_marker() {
+        let lines: Vec<String> = (0..200)
+            .map(|i| format!("line {i:03} {}", "x".repeat(34)))
+            .collect();
+        let code = lines.join("\n");
+        let built = build_payload(
+            &code,
+            Some(&anchor("big.rs", 100, 299)),
+            "explain shape",
+            SendTemplate::Anchor,
+        );
+        assert!(built.text.len() <= MAX_SEND_BYTES, "{}", built.text.len());
+        assert!(built.truncated);
+        assert_eq!(built.total_lines, 200);
+        assert!(built.omitted_lines > 0);
+        assert_eq!(built.kept_lines, 200 - built.omitted_lines);
+        assert!(
+            built
+                .text
+                .starts_with("big.rs:100-299 (200 lines selected, ")
+        );
+        assert!(built.text.contains("▎explain shape\n\n"));
+        // First retained line carries the gutter; last retained line maps to
+        // the real final source line.
+        assert!(built.text.contains("\n100│line 000"));
+        assert!(built.text.contains("\n299│line 199 "));
+        assert!(built.text.contains("omitted"));
+        assert!(built.text.ends_with("```"));
+    }
+
+    #[test]
+    fn truncated_plain_payload_still_carries_annotation_and_fits() {
+        let lines: Vec<String> = (0..400)
+            .map(|i| format!("payload line {i} data data data"))
+            .collect();
+        let code = lines.join("\n");
+        let built = build_payload(&code, None, "see hunk", SendTemplate::Plain);
+        assert!(built.text.len() <= MAX_SEND_BYTES);
+        assert!(built.truncated);
+        assert!(built.text.starts_with("▎see hunk\n\n"));
+        assert!(built.text.contains("omitted"));
+    }
+
+    #[test]
+    fn annotation_input_respects_the_byte_cap_and_controls() {
+        let mut state = SendToAgentState::default();
+        state.begin_discover(1, "x".to_owned(), None);
+        assert!(state.insert_annotation_char('好'));
+        assert!(!state.insert_annotation_char('\n'));
+        assert!(!state.insert_annotation_char('\u{7f}'));
+        let max = "é".repeat(MAX_ANNOTATION_BYTES / 2); // 2 bytes each
+        state.annotation = max.clone();
+        state.annotation_caret = max.len();
+        assert!(!state.insert_annotation_char('x'), "cap is hard");
+        state.annotation_backspace();
+        assert_eq!(state.annotation.chars().count(), max.chars().count() - 1);
+    }
+
+    #[test]
+    fn template_cycle_is_gated_on_anchor() {
+        let mut state = SendToAgentState::default();
+        state.begin_discover(1, "x".to_owned(), Some(anchor("a.rs", 1, 1)));
+        assert_eq!(state.template, SendTemplate::Anchor);
+        assert_eq!(state.cycle_template(), SendTemplate::Plain);
+        assert_eq!(state.cycle_template(), SendTemplate::Anchor);
+
+        state.close();
+        state.begin_discover(1, "x".to_owned(), None);
+        assert_eq!(state.template, SendTemplate::Plain);
+        assert_eq!(state.cycle_template(), SendTemplate::Plain);
+    }
+
+    #[test]
+    fn annotation_caret_moves_by_char_not_byte() {
+        let mut state = SendToAgentState::default();
+        state.begin_discover(1, "x".to_owned(), None);
+        for ch in "好ab".chars() {
+            state.insert_annotation_char(ch);
+        }
+        assert_eq!(state.annotation, "好ab");
+        state.annotation_move_caret(-1);
+        assert_eq!(state.annotation_caret, "好a".len());
+        state.annotation_home();
+        assert_eq!(state.annotation_caret, 0);
+        state.annotation_end();
+        assert_eq!(state.annotation_caret, state.annotation.len());
     }
 }

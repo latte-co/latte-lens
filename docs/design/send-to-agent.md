@@ -12,15 +12,16 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
 本期提供：
 
 - 划词后，通过**键盘**或**鼠标修饰手势**打开 agent 会话选择器；
-- 选择目标会话后，把**选区原文**以 bracketed paste 语义投递到该会话输入框，
-  **不回车、不提交**；
+- 选择器打开后可**直接键入一行注释**，并在「锚点模板 / 纯文本」间切换；
+- 确认后把**组装后的消息**（锚点 + ▎注释 + 围栏选区）以 bracketed paste 语义
+  投递到该会话输入框，**不回车、不提交**；
 - 终端 workspace manager 作为汇聚层，Lens 只依赖其会话发现与文本注入能力，
   不与任何单一 agent 的私有协议耦合。
 
 非目标（本期不做）：
 
 - 不替用户提交（不调用 `agent prompt` 一类"粘贴并回车"接口）；
-- 不包装路径/代码块模板（"锚点载荷"留作二期菜单项）；
+- 注释仅单行（多行/多段批注留作后续）；
 - 不支持编辑模态（`EditSession`）选区；编辑态文本未经终端转义清洗，需独立安全评审；
 - 不列出未被识别为 agent 的普通 shell pane；
 - 不实现 Herdr 之外的终端适配（通道以 trait 预留）；
@@ -80,34 +81,76 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
 
 ### 3.3 Agent picker
 
-复用 navigation results popup / tab palette 的交互范式（键盘 + 鼠标同构）：
+复用 navigation results popup / tab palette 的交互范式（键盘 + 鼠标同构）。
+弹窗从上到下为：agent 行（最多 6 行，超出窗口滚动）、注释输入条、
+模板/截断状态行、载荷实时预览、帮助行。
 
-- 标题：`Send selection to…`，副行展示载荷字节数（截断后为实际发送字节数）；
+- 标题：`Send selection to agent · <actual>/4096 B`（组装后的真实字节数）；
 - 每行：状态 glyph + agent 名（`claude`/`codex`/…）+ 状态词
   （idle/working/blocked/done/unknown）+ pane 标题 + `pane_id`；
 - 排序：`cwd` 规范化后等于 Lens 当前仓库根（`App::root`）的会话置顶，
   其余按 agent 名、标题稳定排序；
 - 过滤：排除 Lens 自身 pane（`HERDR_PANE_ID`）；`blocked` 会话渲染为置灰且不可选；
   仅列出被识别为 agent 的 pane；
-- 键控：`↑/↓`（`j/k`）移动、`Enter` 确认、`Esc`/点击外部取消；
+- **注释输入条默认聚焦**：打开即可键入（真实终端光标落在输入条），
+  不需要模式切换快捷键；agent 行只用 `↑/↓` 选择（方向键事件与可打印字符不冲突）；
+- 键控：
+  - 可打印字符（含 Shift）→ 写入注释；`Backspace` 删除、`←/→/Home/End` 移动光标；
+  - `↑/↓` 移动 agent 选择（跳过 blocked，环绕）；
+  - `Tab` 在「锚点 / 纯文本」两模板间切换（无锚点时锚点不可达）；
+  - `Enter` 确认、`Esc`/点击外部取消；
 - 总是弹出：即使只有一个可选目标也要求显式确认，避免误发；
 - 空态：没有可选会话时显示
-  `No active agent sessions detected (herdr agent start …)`；
-- 打开 picker 时异步刷新会话列表；列表到达前显示 `Discovering agents…`。
+  `No active agent sessions detected.`；
+- 打开 picker 时异步刷新会话列表；列表到达前显示 `Discovering agents…`，
+  注释输入不被发现过程阻塞。
 
-### 3.4 投递与反馈
+### 3.4 载荷模板、注释与截断
+
+确认时由纯函数 `build_payload(selection, anchor, annotation, template)` 组装：
+
+- **模板 Anchor（源码坐标选区的默认值）**：
+
+  ```text
+  src/app.rs:8415-8417
+  ▎这里为什么不用 buffer？
+
+  ```rust
+  ...选区原文...
+  ```
+  ```
+
+  - 锚点单行 `path:line`、多行 `path:start-end`（闭区间，1 基，沿用
+    grep/编译器与 lens 自身状态栏的裸行号写法，可被终端 cmd+click）；
+  - 围栏语言由扩展名映射（`fence_language`），未知扩展名开裸围栏；
+    选区内含更长反引号游程时围栏自动加长；
+  - 仅源码坐标预览可用：成功 Preview、显示行号、有 content identity；
+    渲染态 Markdown、Diff、搜索快照无坐标，强制 Plain。
+- **模板 Plain（Tab 切换，或无锚点时）**：选区原文；有注释时注释段在前，
+  不虚构文件名与围栏。
+- **注释**：每行加 `▎` 前缀（提问/指令通用，且在 composer 与聊天记录中与
+  引用代码视觉分离）；单行、UTF-8 硬上限 512 B（`MAX_ANNOTATION_BYTES`），
+  控制字符拒收。
+- **截断**：整条消息硬上限 4 KiB（`MAX_SEND_BYTES`，跨平台一致）。
+  超出时按**整行**保留选区首部（约 55%）与尾部、省略中间：
+  - Anchor：锚点仍写完整原始区间并加
+    ` (N lines selected, M omitted)` 后缀；保留行带 `行号│` 侧栏，
+    残留片段仍能对上真实行号；中间插入
+    `⋮ ── omitted M lines (X B) see path:起-止 ──`；
+  - Plain：同样首尾保留，省略标记不带文件名；
+  - 极端单行超长退化为字符边界截断；最终组装再做一次精确收缩，
+    保证结果绝不超过 4096 B 且不切半个 UTF-8 字符；
+  - picker 预览与状态行实时反映截断（`⚠ M of N lines omitted (middle)`）。
+
+### 3.5 投递与反馈
 
 确认后：
 
 1. 后台 worker 执行 `send-text`（不回车）+ focus 目标 pane；
-2. picker 关闭，状态栏显示 `Sending…`；
+2. picker 关闭，状态栏显示 `Staging…`；
 3. 成功：`Sent <N> chars to <agent> · <pane_id>`，清除内容选区，
    终端焦点由 workspace manager 切到目标 pane（用户随即补话、亲手 Enter）；
 4. 失败：状态栏错误消息（见 §6），选区保留以便重试。
-
-载荷：选区原文（来自已通过 `sanitize_terminal_text` 的预览缓冲）。
-超过 `MAX_SEND_BYTES`（32 KiB）按 UTF-8 字符边界截断，副标题与状态栏明示
-`<N> chars (truncated)`。
 
 ## 4. 通道抽象
 
@@ -171,10 +214,11 @@ fake/default 实现不得进入生产注册表）。
 Idle
   ── Ctrl+E / armed release（选区非空、available）──▶ Discovering
 Discovering
-  ── targets 到达 ──▶ Picking(targets, selection 快照)
+  ── targets 到达 ──▶ Picking(targets, selection + anchor 快照,
+  │                            annotation/template 草稿)
   ── 发现失败/无可选 ──▶ 状态栏消息，回到 Idle（选区保留）
-Picking
-  ── Enter(target) ──▶ Sending(pane_id, payload)
+Picking（注释输入条始终聚焦；键入写注释，↑↓ 选人，Tab 切模板）
+  ── Enter(target) ──▶ Sending(pane_id, build_payload 结果)
   ── Esc / 点击外部 ──▶ Idle（选区保留）
 Sending
   ── 成功 ──▶ Idle（清选区、状态栏 Sent、focus）
@@ -220,13 +264,18 @@ Sending
 1. **纯逻辑单测（`src/send_agent.rs` 内联 `#[cfg(test)]`）**：
    - `herdr agent list` 真实形态 JSON fixture 的解析：全状态枚举、缺字段、
      标题控制字符清洗、cwd 置顶排序、自身 pane 排除、blocked 置灰；
-   - 截断按 UTF-8 字符边界；picker reducer 的 generation 失效防护、
-     键盘移动跳过 blocked、stale failure 忽略。
+   - 载荷组装：单行/多行锚点头、▎注释位置、Plain 无锚点回退、未知扩展名裸围栏、
+     内嵌反引号升级围栏、4 KiB 首尾截断（侧栏行号/省略标记/总长不超上限）、
+     注释 512 B 硬上限与控制字符拒收、Tab 模板门控、注释光标按字符移动；
+   - picker reducer 的 generation 失效防护、键盘移动跳过 blocked、
+     stale failure 忽略。
 2. **App 集成（`tests/send_to_agent_integration.rs`，注入 fake provider，
    走真实 runtime worker + completion 通道）**：
    - 无后端时 `Ctrl+E`/footer 完全静默；
-   - `Ctrl+E` → picker → Enter 投递到正确 pane、载荷逐字节一致、焦点切换、
-     成功清选区；Esc 取消保留选区且不发送；仅有 blocked 会话时关闭 picker；
+   - `Ctrl+E` → picker → Enter 默认锚点模板投递到正确 pane、焦点切换、
+     成功清选区；直接键入注释后载荷含锚点/▎注释/围栏；Tab 切纯文本后发原文；
+     picker 渲染注释输入条、占位提示与载荷预览；
+     Esc 取消保留选区且不发送；仅有 blocked 会话时关闭 picker；
    - 拖拽中 ctrl 上升沿 arm：普通 up 不开 picker，armed up 开 picker。
 3. **argv 协议（`tests/send_agent_protocol.rs`，POSIX）**：用一个固定行为的
    fake `herdr` shell 脚本（`HERDR_BIN_PATH` 指向它）端到端锁住
