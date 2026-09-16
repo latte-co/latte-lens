@@ -296,7 +296,7 @@ fn picker_renders_annotation_input_and_anchor_preview() {
     assert!(screen.contains("code.rs:1"), "anchor status visible");
     assert!(screen.contains("n mai"), "payload preview visible");
     assert!(
-        screen.contains("type a note"),
+        screen.contains("Type a question or instruction"),
         "annotation placeholder visible"
     );
 
@@ -312,7 +312,7 @@ fn picker_renders_annotation_input_and_anchor_preview() {
         .collect::<Vec<_>>()
         .join("");
     assert!(screen.contains("▎q"));
-    assert!(!screen.contains("type a note"));
+    assert!(!screen.contains("Type a question or instruction"));
 }
 
 #[test]
