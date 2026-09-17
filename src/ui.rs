@@ -1859,15 +1859,20 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             Style::default().fg(Theme::current().success),
         )))]
     } else {
-        // When re-rooted, indent guides are relative to the view root so
-        // children start at depth 0 instead of the global workspace depth.
-        let root_depth = app
-            .tab()
-            .files()
-            .view_root
-            .as_ref()
-            .filter(|_| app.tree_scope == TreeScope::AllFiles)
-            .map_or(0, |root| root.components().count());
+        // When re-rooted (or in single-file view), indent guides are
+        // relative to the effective root so its children start at depth 0
+        // instead of the global workspace depth.
+        let all_files_scope = app.tree_scope == TreeScope::AllFiles;
+        let files = app.tab().files();
+        let root_depth = if all_files_scope {
+            files
+                .view_root
+                .as_deref()
+                .or(files.single_file.as_deref().and_then(Path::parent))
+                .map_or(0, |root| root.components().count())
+        } else {
+            0
+        };
         match app.tree_scope {
             TreeScope::AllFiles => app
                 .visible_entries()
@@ -2021,12 +2026,18 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
     } else {
         Theme::current().tree_accent
     };
-    let view_root = app
-        .tab()
-        .files()
-        .view_root
-        .clone()
-        .filter(|_| app.tree_scope == TreeScope::AllFiles);
+    // In single-file view the breadcrumb shows the file path itself; the
+    // file name tail is bold and non-clickable, while every ancestor
+    // directory segment navigates (and leaves single-file mode).
+    let view_root = if app.tree_scope == TreeScope::AllFiles {
+        let files = app.tab().files();
+        files
+            .view_root
+            .clone()
+            .or_else(|| files.single_file.clone())
+    } else {
+        None
+    };
     if let Some(view_root) = view_root {
         draw_tree_breadcrumb(
             frame,

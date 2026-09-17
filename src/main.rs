@@ -1,4 +1,7 @@
-use std::{io, path::PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 #[cfg(feature = "agent-observability")]
 use std::{
@@ -37,7 +40,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Repository or directory to inspect.
+    /// Repository, directory, or file to inspect.
     #[arg(default_value = ".")]
     path: PathBuf,
 }
@@ -177,12 +180,29 @@ fn install_terminal_panic_hook() {
 }
 
 fn run_tui(path: PathBuf) -> Result<()> {
-    let workspace = path
-        .canonicalize()
-        .with_context(|| format!("cannot open {}", path.display()))?;
-    if !workspace.is_dir() {
-        bail!("{} is not a directory", workspace.display());
-    }
+    // `latte-lens path/to/file.md` opens a Files view holding exactly that
+    // one file (like an editor opening a document). Every runtime requires a
+    // directory root, so the workspace root becomes the containing directory
+    // and the file travels through `AppOptions::initial_file` as a display
+    // filter on the initial Files tab.
+    let requested = match path.canonicalize() {
+        Ok(requested) => requested,
+        Err(error) => return Err(cannot_open_error(&path, error)),
+    };
+    let (workspace, initial_file) = if requested.is_dir() {
+        (requested, None)
+    } else if requested.is_file() {
+        let parent = requested
+            .parent()
+            .map(Path::to_path_buf)
+            .context("opened file has no parent directory")?;
+        (parent, Some(requested))
+    } else {
+        bail!(
+            "{} is neither a directory nor a regular file",
+            requested.display()
+        );
+    };
     // Ensure any panic in the TUI loop restores the terminal instead of
     // leaving it frozen in raw mode / alternate screen.
     install_terminal_panic_hook();
@@ -202,6 +222,7 @@ fn run_tui(path: PathBuf) -> Result<()> {
         AppOptions {
             navigation: loaded.navigation.settings,
             navigation_config_warning,
+            initial_file,
         },
     )?;
     #[cfg(feature = "agent-observability")]
@@ -214,6 +235,130 @@ fn run_tui(path: PathBuf) -> Result<()> {
         app.run(terminal)
     })?;
     Ok(())
+}
+
+/// Build the friendliest possible error for a path that cannot be opened:
+/// state what was attempted, and when the miss looks like a typo, offer the
+/// closest names from the same directory instead of a bare OS error.
+fn cannot_open_error(path: &Path, error: io::Error) -> anyhow::Error {
+    let attempted = absolute_candidate(path);
+    match error.kind() {
+        io::ErrorKind::NotFound => {
+            let mut message = format!(
+                "cannot open {}\n\n{} does not exist",
+                path.display(),
+                attempted.display()
+            );
+            match attempted.parent() {
+                Some(parent) if parent.is_dir() => {
+                    match similar_entry_names(&attempted, parent).as_slice() {
+                        [] => {}
+                        [single] => message.push_str(&format!("\n\nDid you mean '{single}'?")),
+                        many => {
+                            message.push_str("\n\nDid you mean one of the following?");
+                            for name in many {
+                                message.push_str(&format!("\n  {name}"));
+                            }
+                        }
+                    }
+                }
+                Some(parent) => message.push_str(&format!(
+                    "\n\ndirectory {} does not exist",
+                    parent.display()
+                )),
+                None => {}
+            }
+            anyhow::Error::msg(message)
+        }
+        io::ErrorKind::PermissionDenied => anyhow::Error::msg(format!(
+            "cannot open {}\n\n{}: permission denied",
+            path.display(),
+            attempted.display()
+        )),
+        _ => anyhow::Error::new(error).context(format!("cannot open {}", path.display())),
+    }
+}
+
+/// Resolve `path` against the current directory so error messages show where
+/// the lookup actually happened, without requiring the path to exist.
+fn absolute_candidate(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(current) => current.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+const SUGGESTION_SCAN_LIMIT: usize = 4096;
+const MAX_SUGGESTION_DISTANCE: usize = 2;
+const MAX_SUGGESTIONS: usize = 3;
+
+/// Collect the closest entry names in `parent` to the failed path's final
+/// component. The scan is bounded and the result is deterministically ordered
+/// so a typo surfaces a small, stable set of suggestions.
+fn similar_entry_names(target: &Path, parent: &Path) -> Vec<String> {
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let needle = name.to_lowercase();
+    let hidden = needle.starts_with('.');
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut candidates: Vec<(usize, String)> = Vec::new();
+    for entry in entries.take(SUGGESTION_SCAN_LIMIT).flatten() {
+        let Ok(candidate) = entry.file_name().into_string() else {
+            continue;
+        };
+        if candidate == name {
+            continue;
+        }
+        let hay = candidate.to_lowercase();
+        if hay.starts_with('.') != hidden {
+            continue;
+        }
+        let distance = bounded_edit_distance(&needle, &hay, MAX_SUGGESTION_DISTANCE + 1);
+        let prefix = hay.starts_with(&needle) || needle.starts_with(&hay);
+        if distance <= MAX_SUGGESTION_DISTANCE || prefix {
+            candidates.push((distance, candidate));
+        }
+    }
+    candidates.sort();
+    candidates.truncate(MAX_SUGGESTIONS);
+    candidates.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Levenshtein distance over characters, abandoning the computation (and
+/// returning `cap + 1`) once no completion of the current row can land within
+/// `cap` edits.
+fn bounded_edit_distance(left: &str, right: &str, cap: usize) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.len().abs_diff(right.len()) > cap {
+        return cap + 1;
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0_usize; right.len() + 1];
+    for (index, left_char) in left.iter().enumerate() {
+        current[0] = index + 1;
+        let mut row_minimum = current[0];
+        for (position, right_char) in right.iter().enumerate() {
+            let substitution = previous[position] + usize::from(left_char != right_char);
+            let value = (previous[position + 1] + 1)
+                .min(current[position] + 1)
+                .min(substitution);
+            current[position + 1] = value;
+            row_minimum = row_minimum.min(value);
+        }
+        if row_minimum > cap {
+            return cap + 1;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 #[cfg(feature = "agent-observability")]
@@ -299,5 +444,40 @@ impl Drop for TerminalInputGuard {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
         let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_edit_distance, similar_entry_names};
+
+    #[test]
+    fn edit_distance_counts_edits_and_respects_the_cap() {
+        assert_eq!(bounded_edit_distance("agents.md", "agents.md2", 3), 1);
+        assert_eq!(bounded_edit_distance("abc", "abc", 3), 0);
+        assert_eq!(bounded_edit_distance("a", "zzzzzzz", 2), 3);
+    }
+
+    #[test]
+    fn suggestions_rank_closest_names_and_skip_unrelated_entries() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        for name in ["AGENTS.md", "AGENTS.md.bak", "notes.txt", ".git"] {
+            std::fs::write(sandbox.path().join(name), b"x").expect("write");
+        }
+        let suggestions = similar_entry_names(&sandbox.path().join("AGENTS.md2"), sandbox.path());
+        assert_eq!(suggestions, vec!["AGENTS.md".to_string()]);
+    }
+
+    #[test]
+    fn suggestions_break_distance_ties_deterministically() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        for name in ["alphax.txt", "alpha.txt"] {
+            std::fs::write(sandbox.path().join(name), b"x").expect("write");
+        }
+        let suggestions = similar_entry_names(&sandbox.path().join("alphay.txt"), sandbox.path());
+        assert_eq!(
+            suggestions,
+            vec!["alpha.txt".to_string(), "alphax.txt".to_string()]
+        );
     }
 }

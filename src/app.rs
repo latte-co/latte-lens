@@ -1016,6 +1016,11 @@ pub struct FilesProjection {
     /// directory. The tab treats it as the display root; the global scan,
     /// runtimes, and repository graph stay rooted at the workspace root.
     pub view_root: Option<PathBuf>,
+    /// When set, the tree shows exactly this one workspace-relative file (the
+    /// `latte-lens path/to/file` startup mode). Like [`Self::view_root`],
+    /// this is a display filter only: the global scan, runtimes, and
+    /// repository graph stay rooted at the workspace root.
+    pub single_file: Option<PathBuf>,
     /// Whether [`Self::view_root`] looks like a project boundary (contains
     /// `.git` or a recognized language manifest), which lets it act as the
     /// preferred LSP server root for documents opened in this tab.
@@ -1031,6 +1036,7 @@ impl FilesProjection {
             visible_changed_entries: Vec::new(),
             truncated: false,
             view_root: None,
+            single_file: None,
             view_root_is_project: false,
         }
     }
@@ -1113,6 +1119,10 @@ pub struct App {
     git_changes_selection: Option<GitRowIdentity>,
     pending_all_scope_path: Option<PathBuf>,
     pending_all_scope_navigation: bool,
+    /// Startup single-file target (`latte-lens path/to/file`), as a
+    /// workspace-relative path. Consumed by the first All Files snapshot:
+    /// the file is revealed, selected, and its preview loaded.
+    pending_initial_file: Option<PathBuf>,
     pending_git_scope_path: Option<PathBuf>,
     pending_git_scope_fallback: Option<GitRowIdentity>,
     unloaded_directories: HashSet<PathBuf>,
@@ -1478,6 +1488,16 @@ impl App {
         // repository's status and diff paths into this workspace.
         let root = requested_root;
 
+        // `latte-lens path/to/file` opens a Files view holding exactly that
+        // one file. The workspace root stays the containing directory (all
+        // runtimes require a directory), so the file travels as a
+        // workspace-relative display filter until the first snapshot lands.
+        let initial_file: Option<PathBuf> = options
+            .initial_file
+            .take()
+            .and_then(|file| file.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .filter(|relative| !relative.as_os_str().is_empty());
+
         if let Err(error) = options.navigation.revalidate(&root) {
             options.navigation = NavigationSettings::disabled();
             options.navigation_config_warning = Some(format!("{error:#}"));
@@ -1498,6 +1518,12 @@ impl App {
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| TabKind::Files.label().to_owned());
+        if let Some(relative) = &initial_file {
+            initial_tab.files_mut().single_file = Some(relative.clone());
+            if let Some(name) = relative.file_name() {
+                initial_tab.title = name.to_string_lossy().into_owned();
+            }
+        }
         initial_tab.content.lines = vec![
             "Loading workspace…".to_owned(),
             String::new(),
@@ -1537,6 +1563,7 @@ impl App {
             git_changes_selection: None,
             pending_all_scope_path: None,
             pending_all_scope_navigation: false,
+            pending_initial_file: initial_file,
             pending_git_scope_path: None,
             pending_git_scope_fallback: None,
             unloaded_directories: HashSet::new(),
@@ -6197,6 +6224,8 @@ impl App {
         let is_project = Self::view_root_is_project_like(&absolute);
         {
             let files = self.tab_mut().files_mut();
+            // Re-rooting browses a directory, which leaves single-file mode.
+            files.single_file = None;
             files.view_root = Some(relative.clone());
             files.view_root_is_project = is_project;
         }
@@ -6211,19 +6240,21 @@ impl App {
         self.clipboard_status = Some(format!("Tab root: {}", relative.display()));
     }
 
-    /// Clear the active Files tab's view root, returning its tree to the
-    /// workspace root.
+    /// Clear the active Files tab's view root (and single-file filter),
+    /// returning its tree to the workspace root.
     fn reset_tab_root(&mut self) {
         if self.tree_scope != TreeScope::AllFiles {
             return;
         }
-        let changed = self.tab().files().view_root.is_some();
+        let files = self.tab().files();
+        let changed = files.view_root.is_some() || files.single_file.is_some();
         if !changed {
             return;
         }
         {
             let files = self.tab_mut().files_mut();
             files.view_root = None;
+            files.single_file = None;
             files.view_root_is_project = false;
         }
         self.sync_tab_title();
@@ -6232,10 +6263,28 @@ impl App {
         self.clipboard_status = Some("Tab root reset to workspace".to_owned());
     }
 
-    /// Move the active Files tab's view root up one level. At the workspace
-    /// root this is a no-op.
+    /// Move the active Files tab's view root up one level. In single-file
+    /// mode this leaves single-file view and browses the containing
+    /// directory; at the workspace root this is a no-op.
     fn tab_root_up(&mut self) {
         if self.tree_scope != TreeScope::AllFiles {
+            return;
+        }
+        let files = self.tab().files();
+        if files.view_root.is_none() {
+            let Some(single) = files.single_file.clone() else {
+                return;
+            };
+            let containing = single
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf);
+            match containing {
+                // Browse the directory that held the file.
+                Some(parent) => self.set_tab_root(parent),
+                // The file sat at the workspace root; just drop the filter.
+                None => self.reset_tab_root(),
+            }
             return;
         }
         let Some(current) = self.tab().files().view_root.clone() else {
@@ -6265,15 +6314,21 @@ impl App {
         self.clipboard_status = Some(format!("Tab root: {}", parent.display()));
     }
 
-    /// Recompute the active tab's title from its view root: a re-rooted tab
-    /// shows its workspace-relative path, otherwise the workspace name.
+    /// Recompute the active tab's title: a single-file tab shows the file
+    /// name, a re-rooted tab shows its workspace-relative path, otherwise
+    /// the workspace name.
     fn sync_tab_title(&mut self) {
         if self.tab().kind != TabKind::Files {
             return;
         }
-        let title = match self.tab().files().view_root.clone() {
-            Some(view_root) => view_root.display().to_string(),
-            None => self
+        let files = self.tab().files();
+        let title = match (&files.single_file, &files.view_root) {
+            (Some(single_file), _) => single_file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| single_file.display().to_string()),
+            (None, Some(view_root)) => view_root.display().to_string(),
+            (None, None) => self
                 .root
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -6297,10 +6352,31 @@ impl App {
 
     /// After a refresh, validate the active tab's view root: reset it if the
     /// directory was deleted, and re-request its children when the bounded
-    /// scan left them unloaded. Returns a status message when the view root
+    /// scan left them unloaded. Also drops the single-file filter once its
+    /// file provably no longer exists (every ancestor directory is loaded
+    /// and the file is absent). Returns a status message when the view root
     /// was reset (so the caller can surface it after content state settles).
     fn reconcile_view_root_after_refresh(&mut self) -> Option<String> {
         if self.tree_scope != TreeScope::AllFiles {
+            return None;
+        }
+        if let Some(single_file) = self.tab().files().single_file.clone() {
+            let ancestors_loaded = !self
+                .unloaded_directories
+                .iter()
+                .any(|directory| single_file.starts_with(directory));
+            let still_exists = self
+                .all_entries
+                .iter()
+                .any(|entry| entry.relative == single_file);
+            if ancestors_loaded && !still_exists {
+                self.tab_mut().files_mut().single_file = None;
+                self.sync_tab_title();
+                return Some(format!(
+                    "File {} no longer exists; showing the workspace",
+                    single_file.display()
+                ));
+            }
             return None;
         }
         let view_root = self.tab().files().view_root.clone()?;
@@ -7067,7 +7143,17 @@ impl App {
 
         match self.tree_scope {
             TreeScope::AllFiles => {
-                if let Some(path) = visible_navigation_path {
+                if let Some(initial_file) = self.pending_initial_file.take() {
+                    // Startup single-file mode: the first snapshot reveals
+                    // the file, selects it (which loads its preview), and
+                    // puts focus on the content pane like an editor opening
+                    // the document. Deep files keep the reveal alive through
+                    // `pending_all_scope_path` until their ancestors load.
+                    self.reveal_all_files_selection(initial_file);
+                    if !self.tree_hidden {
+                        self.focused_pane = FocusPane::Content;
+                    }
+                } else if let Some(path) = visible_navigation_path {
                     self.reveal_navigation_tree_selection(path);
                 } else if let Some(path) = self.pending_all_scope_path.clone() {
                     if self.pending_all_scope_navigation {
@@ -7309,6 +7395,14 @@ impl App {
                 view_root.display()
             ));
         }
+        // A single-file view shows exactly one row; revealing any other
+        // file broadens the view so the target row is visible.
+        if let Some(single_file) = self.tab().files().single_file.clone()
+            && single_file != path
+        {
+            self.tab_mut().files_mut().single_file = None;
+            self.sync_tab_title();
+        }
         self.pending_all_scope_path = Some(path.clone());
         let mut parent = path.parent();
         while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
@@ -7424,6 +7518,7 @@ impl App {
         let files_expansion = self.tab().files().expansion.clone();
         let unloaded = &self.unloaded_directories;
         let view_root = self.tab().files().view_root.clone();
+        let single_file = self.tab().files().single_file.clone();
         let rows: Vec<FileEntry> = self
             .entries_for_scope(TreeScope::AllFiles)
             .iter()
@@ -7432,6 +7527,12 @@ impl App {
                 // visible; the view root itself is the implicit top.
                 if let Some(view_root) = &view_root
                     && (entry.relative == *view_root || !entry.relative.starts_with(view_root))
+                {
+                    return false;
+                }
+                // Single-file view: exactly that one row is visible.
+                if let Some(single_file) = &single_file
+                    && entry.relative != *single_file
                 {
                     return false;
                 }

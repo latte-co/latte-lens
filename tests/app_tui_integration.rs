@@ -9,8 +9,9 @@ use std::{
 
 #[cfg(feature = "agent-observability")]
 use latte_lens::agent::*;
+use latte_lens::navigation::AppOptions;
 #[cfg(feature = "navigation-test-support")]
-use latte_lens::navigation::{AppOptions, NavigationSettings};
+use latte_lens::navigation::NavigationSettings;
 use latte_lens::{
     app::{
         App, ContentMode, FocusPane, GitRowKind, SearchMode, TabKind, TreeContextAction,
@@ -4758,6 +4759,7 @@ fn run_production_spawner_framed_journey() {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();
@@ -5416,6 +5418,188 @@ fn new_files_tab_defaults_to_workspace_root() {
     app.open_tab(TabKind::Files);
     assert_eq!(app.tab().files().view_root, None);
     assert!(visible_paths(&app).contains(&PathBuf::from("src")));
+}
+
+// ===========================================================================
+// Single-file startup (`latte-lens path/to/file`) integration tests
+// ===========================================================================
+
+/// 构造带启动选项的 app：树在左、可见，不强制焦点（保留启动行为）。
+fn ready_app_with_options(path: PathBuf, options: AppOptions) -> anyhow::Result<App> {
+    let mut app = App::with_options(path, PreviewRegistry::with_builtins(), options)?;
+    app.set_tree_side(TreeSide::Left);
+    app.set_tree_hidden(false);
+    settle(&mut app);
+    Ok(app)
+}
+
+#[test]
+fn single_file_startup_shows_only_that_file_and_loads_preview() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("AGENTS.md");
+    fs::write(&file, "hello latte\n").unwrap();
+    fs::write(directory.path().join("other.txt"), "other\n").unwrap();
+
+    let app = ready_app_with_options(
+        directory.path().to_path_buf(),
+        AppOptions {
+            initial_file: Some(file.canonicalize().unwrap()),
+            ..AppOptions::default()
+        },
+    )
+    .unwrap();
+
+    // 视图里只有这一个文件，且预览已加载。
+    assert_eq!(visible_paths(&app), [PathBuf::from("AGENTS.md")]);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("AGENTS.md"))
+    );
+    assert_eq!(app.tab().title, "AGENTS.md");
+    assert_eq!(app.tab().content.lines, ["hello latte"]);
+    // 类似编辑器打开文件：焦点落在内容面板。
+    assert_eq!(app.focused_pane, FocusPane::Content);
+}
+
+#[test]
+fn single_file_startup_reveals_nested_file_and_loads_preview() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("docs/design")).unwrap();
+    let file = directory.path().join("docs/design/spec.md");
+    fs::write(&file, "spec body\n").unwrap();
+
+    let app = ready_app_with_options(
+        directory.path().to_path_buf(),
+        AppOptions {
+            initial_file: Some(file.canonicalize().unwrap()),
+            ..AppOptions::default()
+        },
+    )
+    .unwrap();
+
+    // 深层文件通过懒加载 reveal 后成为唯一可见行。
+    assert_eq!(visible_paths(&app), [PathBuf::from("docs/design/spec.md")]);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("docs/design/spec.md"))
+    );
+    assert_eq!(app.tab().title, "spec.md");
+    assert_eq!(app.tab().content.lines, ["spec body"]);
+}
+
+#[test]
+fn single_file_view_backspace_browses_containing_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("docs")).unwrap();
+    let file = directory.path().join("docs/spec.md");
+    fs::write(&file, "spec\n").unwrap();
+    fs::write(directory.path().join("docs/other.txt"), "other\n").unwrap();
+
+    let mut app = ready_app_with_options(
+        directory.path().to_path_buf(),
+        AppOptions {
+            initial_file: Some(file.canonicalize().unwrap()),
+            ..AppOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(visible_paths(&app), [PathBuf::from("docs/spec.md")]);
+
+    // Backspace（树焦点）退出 single-file 模式，浏览所在目录。
+    app.handle_key(key(KeyCode::Char('h')));
+    app.handle_key(key(KeyCode::Backspace));
+    settle(&mut app);
+
+    assert_eq!(app.tab().files().single_file, None);
+    assert_eq!(app.tab().files().view_root, Some(PathBuf::from("docs")));
+    assert_eq!(app.tab().title, "docs");
+    let mut paths = visible_paths(&app);
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            PathBuf::from("docs/other.txt"),
+            PathBuf::from("docs/spec.md")
+        ]
+    );
+}
+
+#[test]
+fn revealing_a_different_file_leaves_single_file_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("AGENTS.md");
+    fs::write(&file, "hello latte\n").unwrap();
+    fs::write(directory.path().join("other.txt"), "other\n").unwrap();
+
+    let mut app = ready_app_with_options(
+        directory.path().to_path_buf(),
+        AppOptions {
+            initial_file: Some(file.canonicalize().unwrap()),
+            ..AppOptions::default()
+        },
+    )
+    .unwrap();
+
+    // Ctrl+P / 搜索 reveal 其他文件时，视图放宽为完整目录树。
+    app.reveal_all_files_selection_for_test(PathBuf::from("other.txt"));
+    assert_eq!(app.tab().files().single_file, None);
+    assert_eq!(
+        app.selected_relative_path(),
+        Some(PathBuf::from("other.txt"))
+    );
+}
+
+#[test]
+fn deleted_single_file_resets_to_workspace_after_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("AGENTS.md");
+    fs::write(&file, "hello latte\n").unwrap();
+
+    let mut app = ready_app_with_options(
+        directory.path().to_path_buf(),
+        AppOptions {
+            initial_file: Some(file.canonicalize().unwrap()),
+            ..AppOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(visible_paths(&app), [PathBuf::from("AGENTS.md")]);
+
+    fs::remove_file(&file).unwrap();
+    app.handle_key(key(KeyCode::Char('r')));
+    settle(&mut app);
+
+    assert_eq!(app.tab().files().single_file, None);
+    assert!(
+        app.clipboard_status
+            .as_deref()
+            .is_some_and(|status| status.contains("no longer exists"))
+    );
+}
+
+#[test]
+fn single_file_view_supports_edit_mode_and_atomic_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("notes.txt");
+    fs::write(&file, "hello\n").unwrap();
+
+    let mut app = ready_app_with_options(
+        directory.path().to_path_buf(),
+        AppOptions {
+            initial_file: Some(file.canonicalize().unwrap()),
+            ..AppOptions::default()
+        },
+    )
+    .unwrap();
+
+    // 启动即聚焦 Content：直接进入编辑、修改、原子保存。
+    app.handle_key(key(KeyCode::Char('i')));
+    assert!(app.edit_is_active(), "i should enter edit mode");
+    app.handle_key(key(KeyCode::End));
+    app.handle_key(key(KeyCode::Char('!')));
+    app.handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(!app.edit_is_dirty(), "edit should not be dirty after save");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello!\n");
 }
 
 // ===========================================================================
