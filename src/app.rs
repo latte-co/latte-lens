@@ -6353,23 +6353,17 @@ impl App {
     /// After a refresh, validate the active tab's view root: reset it if the
     /// directory was deleted, and re-request its children when the bounded
     /// scan left them unloaded. Also drops the single-file filter once its
-    /// file provably no longer exists (every ancestor directory is loaded
-    /// and the file is absent). Returns a status message when the view root
-    /// was reset (so the caller can surface it after content state settles).
+    /// file no longer exists on disk (checked without following symlinks, so
+    /// a bounded scan that never enumerated the file cannot produce a false
+    /// "deleted" verdict). Returns a status message when the view root was
+    /// reset (so the caller can surface it after content state settles).
     fn reconcile_view_root_after_refresh(&mut self) -> Option<String> {
         if self.tree_scope != TreeScope::AllFiles {
             return None;
         }
         if let Some(single_file) = self.tab().files().single_file.clone() {
-            let ancestors_loaded = !self
-                .unloaded_directories
-                .iter()
-                .any(|directory| single_file.starts_with(directory));
-            let still_exists = self
-                .all_entries
-                .iter()
-                .any(|entry| entry.relative == single_file);
-            if ancestors_loaded && !still_exists {
+            let absolute = self.root.join(&single_file);
+            if !path_exists_without_following(&absolute) {
                 self.tab_mut().files_mut().single_file = None;
                 self.sync_tab_title();
                 return Some(format!(
@@ -12438,6 +12432,69 @@ mod tests {
             app.visible_git_rows()
                 .iter()
                 .all(|row| !row.label.starts_with("[partial]"))
+        );
+    }
+
+    #[test]
+    fn truncated_scan_keeps_single_file_filter_for_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("late-notes.md");
+        fs::write(&file, "kept\n").unwrap();
+
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.tab_mut().files_mut().single_file = Some(PathBuf::from("late-notes.md"));
+        // A scan truncated inside the workspace root leaves root-level tail
+        // entries unenumerated, and the root itself cannot appear in
+        // unloaded_directories (its relative path is empty). The in-memory
+        // scan therefore proves nothing about existence; the deletion check
+        // must consult the filesystem.
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: true,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: None,
+            existing_changes: HashSet::new(),
+            full_repository_discovery: false,
+        });
+
+        assert_eq!(
+            app.tab().files().single_file,
+            Some(PathBuf::from("late-notes.md"))
+        );
+        assert_eq!(app.clipboard_status, None);
+    }
+
+    #[test]
+    fn truncated_scan_still_drops_filter_for_a_deleted_file() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.tab_mut().files_mut().single_file = Some(PathBuf::from("late-notes.md"));
+        // The filesystem check is authoritative in both directions: a
+        // truncated (inconclusive) scan must not keep a filter whose file
+        // is really gone.
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            branch: None,
+            projected_change_count: 0,
+            scan: ScanResult {
+                entries: Vec::new(),
+                truncated: true,
+                unloaded_directories: HashSet::new(),
+            },
+            graph: None,
+            existing_changes: HashSet::new(),
+            full_repository_discovery: false,
+        });
+
+        assert_eq!(app.tab().files().single_file, None);
+        assert!(
+            app.clipboard_status
+                .as_deref()
+                .is_some_and(|status| status.contains("no longer exists"))
         );
     }
 

@@ -2018,7 +2018,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
             )
         }
     } else {
-        format!("{entry_count} entries")
+        format_entry_count(entry_count)
     };
     let heading_width = file_button.x.saturating_sub(header.x);
     let tree_accent = if app.tree_scope == TreeScope::GitChanges {
@@ -2156,6 +2156,14 @@ fn agent_session_line(
 
 fn format_change_count(count: usize) -> String {
     format!("{count} change{}", if count == 1 { "" } else { "s" })
+}
+
+fn format_entry_count(count: usize) -> String {
+    if count == 1 {
+        "1 entry".to_owned()
+    } else {
+        format!("{count} entries")
+    }
 }
 
 fn git_tree_line(

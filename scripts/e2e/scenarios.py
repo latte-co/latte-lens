@@ -94,7 +94,11 @@ def wait_for_initial_files(session: PtySession) -> None:
             "Scanning files…" not in screen.text()
             and "Loading workspace…" not in screen.text()
             and "Loading directory" not in screen.text()
-            and (" loaded" in screen.text() or " entries" in screen.text())
+            and (
+                " loaded" in screen.text()
+                or " entries" in screen.text()
+                or " entry" in screen.text()
+            )
         ),
         "initial filesystem and repository snapshot",
     )
