@@ -32,7 +32,10 @@ use crate::agent::{
 use crate::{
     clipboard,
     content_safety::{FileFingerprint, path_exists_without_following},
-    diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
+    diff::{
+        DiffLineAnnotation, DiffLineKind, annotate_diff, diff_header_target_path,
+        line_number_width, parse_hunk_starts,
+    },
     folding::{FoldAnchor, FoldRegion, FoldSource, StructureSnapshot, SymbolId},
     git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
     lsp::{
@@ -265,7 +268,7 @@ struct SearchRestore {
     content_diff_lines: Vec<DiffLineAnnotation>,
     content_identity: Option<ContentIdentity>,
     content_markdown_presentation: MarkdownPresentation,
-    content_markdown_source_identity: Option<ContentIdentity>,
+    content_markdown_presentation_identity: Option<ContentIdentity>,
     content_fold_source: FoldSource,
     content_fold_regions: Vec<FoldRegion>,
     content_structure: StructureSnapshot,
@@ -730,6 +733,12 @@ pub(crate) struct ContentSelection {
     pub(crate) head: ContentPoint,
     pub(crate) dragging: bool,
     pub(crate) dragged: bool,
+    /// Sticky "send to agent" arming toggled by tapping Ctrl mid-drag. Read
+    /// only on a plain mouse-up (Ctrl-modified ups are swallowed by some
+    /// terminals, e.g. iTerm2); see `docs/design/send-to-agent.md`.
+    pub(crate) send_armed: bool,
+    /// Previous drag motion event's Ctrl state, for rising-edge detection.
+    pub(crate) ctrl_was_down: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -813,6 +822,13 @@ pub struct UiRegions {
     pub content_scrollbar_thumb_size: usize,
     pub content_body: Rect,
     pub content_inner: Rect,
+    /// Send-to-agent picker popup rect.
+    pub send_agent_popup: Rect,
+    /// Per-row hit regions inside the send-to-agent picker, in list order.
+    pub send_agent_rows: Vec<Rect>,
+    /// Index of the first target represented by `send_agent_rows` (the list
+    /// scrolls when there are more targets than visible rows).
+    pub send_agent_row_offset: usize,
 }
 
 impl UiRegions {
@@ -845,16 +861,18 @@ pub struct ContentState {
     pub provider: Option<String>,
     preview_kind: PreviewKind,
     source_target: Option<ContentTarget>,
-    /// Requested presentation for Markdown documents (rendered typeset view by
-    /// default, raw source after `m`). Persists across `reset_content` and
-    /// d/p toggles for the same file; a different file resets to rendered.
+    /// Requested presentation for Markdown documents (raw numbered source by
+    /// default; the rendered typeset view after `m`). Persists across
+    /// `reset_content` and d/p toggles for the same file; a different file
+    /// resets to source.
     markdown_presentation: MarkdownPresentation,
-    /// The document pinned to raw Markdown source by the user (`m`) or by a
-    /// source-coordinate entry point. Held independently of the loaded
-    /// snapshot because a Diff view clears `identity`; keeping the anchor here
-    /// lets a later Preview for the same file remember the source choice.
-    /// Only populated for successful Markdown previews requested as source.
-    markdown_source_identity: Option<ContentIdentity>,
+    /// Identity of the Markdown document that `markdown_presentation` belongs
+    /// to. Held independently of the loaded snapshot because a Diff view
+    /// clears `identity`; the anchor lets a later Preview/Diff request for the
+    /// same document reuse the current presentation choice, while a different
+    /// document falls back to the source default. Only populated after a
+    /// successful Markdown preview.
+    markdown_presentation_identity: Option<ContentIdentity>,
     pub show_line_numbers: bool,
     pub(crate) diff_lines: Vec<DiffLineAnnotation>,
     identity: Option<ContentIdentity>,
@@ -904,8 +922,8 @@ impl Default for ContentState {
             provider: None,
             preview_kind: PreviewKind::Text,
             source_target: None,
-            markdown_presentation: MarkdownPresentation::Rendered,
-            markdown_source_identity: None,
+            markdown_presentation: MarkdownPresentation::Source,
+            markdown_presentation_identity: None,
             show_line_numbers: false,
             diff_lines: Vec::new(),
             identity: None,
@@ -1176,6 +1194,11 @@ pub struct App {
     pub(crate) navigation_status: Option<NavigationStatus>,
     navigation_back: VecDeque<NavigationHistoryEntry>,
     navigation_forward: VecDeque<NavigationHistoryEntry>,
+    /// Outbound send-selection-to-agent backend (terminal workspace manager).
+    agent_provider: std::sync::Arc<dyn crate::send_agent::AgentTargetProvider>,
+    /// Picker/delivery view model for send-to-agent.
+    pub send_to_agent: crate::send_agent::SendToAgentState,
+    send_to_agent_requests: RequestGeneration,
 }
 
 impl App {
@@ -1357,6 +1380,10 @@ impl App {
         Self::with_options(path, preview_registry, AppOptions::default())
     }
 
+    fn default_agent_provider() -> std::sync::Arc<dyn crate::send_agent::AgentTargetProvider> {
+        std::sync::Arc::new(crate::send_agent::HerdrProvider::from_environment())
+    }
+
     pub fn with_options(
         path: PathBuf,
         preview_registry: PreviewRegistry,
@@ -1372,6 +1399,7 @@ impl App {
             } else {
                 SystemOpenAdapter::Host
             },
+            Self::default_agent_provider(),
         )
     }
 
@@ -1394,6 +1422,23 @@ impl App {
             tree::DEFAULT_MAX_ENTRIES,
             AppOptions::default(),
             SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
+            Self::default_agent_provider(),
+        )
+    }
+
+    /// Test-only: install a fake send-to-agent backend.
+    #[doc(hidden)]
+    pub fn with_agent_provider(
+        path: PathBuf,
+        provider: std::sync::Arc<dyn crate::send_agent::AgentTargetProvider>,
+    ) -> Result<Self> {
+        Self::with_preview_registry_scan_limit_and_options(
+            path,
+            PreviewRegistry::with_builtins(),
+            tree::DEFAULT_MAX_ENTRIES,
+            AppOptions::default(),
+            SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
+            provider,
         )
     }
 
@@ -1409,6 +1454,7 @@ impl App {
             scan_entry_limit,
             AppOptions::default(),
             SystemOpenAdapter::Disabled("desktop launch disabled by test harness".to_owned()),
+            Self::default_agent_provider(),
         )
     }
 
@@ -1418,6 +1464,7 @@ impl App {
         scan_entry_limit: usize,
         mut options: AppOptions,
         system_open_adapter: SystemOpenAdapter,
+        agent_provider: std::sync::Arc<dyn crate::send_agent::AgentTargetProvider>,
     ) -> Result<Self> {
         let requested_root = path
             .canonicalize()
@@ -1436,8 +1483,12 @@ impl App {
             options.navigation_config_warning = Some(format!("{error:#}"));
         }
 
-        let runtime =
-            WorkerRuntime::start(root.clone(), preview_registry.clone(), system_open_adapter)?;
+        let runtime = WorkerRuntime::start(
+            root.clone(),
+            preview_registry.clone(),
+            system_open_adapter,
+            std::sync::Arc::clone(&agent_provider),
+        )?;
         let search_runtime = SearchRuntime::start(root.clone())?;
         let navigation_runtime =
             NavigationRuntime::start(root.clone(), options.navigation.clone())?;
@@ -1549,6 +1600,9 @@ impl App {
             navigation_status: None,
             navigation_back: VecDeque::new(),
             navigation_forward: VecDeque::new(),
+            agent_provider,
+            send_to_agent: crate::send_agent::SendToAgentState::default(),
+            send_to_agent_requests: RequestGeneration::default(),
         };
         app.request_refresh(false);
         Ok(app)
@@ -2348,6 +2402,11 @@ impl App {
             self.handle_tab_palette_key(key);
             return;
         }
+        if self.send_to_agent.is_open() {
+            self.quit_confirmation = None;
+            self.handle_send_to_agent_picker_key(key);
+            return;
+        }
         if self.navigation_picker.is_some() {
             self.quit_confirmation = None;
             self.handle_navigation_picker_key(key);
@@ -2383,6 +2442,19 @@ impl App {
             } else {
                 self.should_quit = true;
             }
+            return;
+        }
+        // Send selection to agent. Ctrl is the canonical binding on every
+        // platform; Cmd/SUPER is accepted too when the terminal forwards it
+        // (mirrors the copy/save bindings).
+        if matches!(key.code, KeyCode::Char('e' | 'E'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && self.send_to_agent_entry_active()
+        {
+            self.quit_confirmation = None;
+            self.open_send_to_agent_picker();
             return;
         }
         if self.search.is_some() {
@@ -2616,7 +2688,11 @@ impl App {
             content_diff_lines: self.tab().content.diff_lines.clone(),
             content_identity: self.tab().content.identity.clone(),
             content_markdown_presentation: self.tab().content.markdown_presentation,
-            content_markdown_source_identity: self.tab().content.markdown_source_identity.clone(),
+            content_markdown_presentation_identity: self
+                .tab()
+                .content
+                .markdown_presentation_identity
+                .clone(),
             content_fold_source: self.tab().content.fold_source,
             content_fold_regions: self.tab().content.fold_regions.clone(),
             content_structure: self.tab().content.structure.clone(),
@@ -3194,6 +3270,8 @@ impl App {
                 },
                 dragging: false,
                 dragged: false,
+                send_armed: false,
+                ctrl_was_down: false,
             });
             edit.caret = ContentPoint {
                 line: last_line,
@@ -3489,6 +3567,8 @@ impl App {
                 head: caret,
                 dragging: false,
                 dragged: false,
+                send_armed: false,
+                ctrl_was_down: false,
             });
             sel.head = new_caret;
         } else {
@@ -3544,6 +3624,8 @@ impl App {
                                 head: before,
                                 dragging: false,
                                 dragged: false,
+                                send_armed: false,
+                                ctrl_was_down: false,
                             });
                             edit.caret = before;
                             edit.preferred_column = crate::text_layout::expand_tabs(
@@ -3584,6 +3666,8 @@ impl App {
                                     },
                                     dragging: false,
                                     dragged: false,
+                                    send_armed: false,
+                                    ctrl_was_down: false,
                                 });
                             }
                             edit.caret = before;
@@ -3617,6 +3701,8 @@ impl App {
                             head: caret,
                             dragging: true,
                             dragged: true,
+                            send_armed: false,
+                            ctrl_was_down: false,
                         });
                         sel.head = before;
                     }
@@ -3763,6 +3849,8 @@ impl App {
                     head: end,
                     dragging: false,
                     dragged: false,
+                    send_armed: false,
+                    ctrl_was_down: false,
                 });
                 edit.preferred_column =
                     crate::text_layout::expand_tabs(&tab.content.lines[line][..end_byte], 0, 0).1;
@@ -4222,11 +4310,9 @@ impl App {
         }
     }
 
-    /// Presentation for a search result preview/open. Content (text) hits
-    /// carry source line/byte coordinates and must open Markdown in source so
-    /// the match highlight lands correctly; file-name and recent-file results
-    /// have no coordinates and follow the normal open policy (rendered by
-    /// default, source retained for the pinned document).
+    /// Presentation for a search result preview/open. Source is the default
+    /// for every Markdown document; content (text) hits additionally carry
+    /// source line/byte coordinates so the match highlight lands correctly.
     fn presentation_for_search_result(&self, result: &SearchResult) -> MarkdownPresentation {
         let has_source_coordinates =
             result.line_number.is_some() && result.source_match_range.is_some();
@@ -4380,8 +4466,8 @@ impl App {
             // the restored rendered/source content agrees with the footer hint
             // and the first `m` press.
             self.tab_mut().content.markdown_presentation = restore.content_markdown_presentation;
-            self.tab_mut().content.markdown_source_identity =
-                restore.content_markdown_source_identity;
+            self.tab_mut().content.markdown_presentation_identity =
+                restore.content_markdown_presentation_identity;
             self.tab_mut().content.fold_source = restore.content_fold_source;
             self.tab_mut().content.fold_regions = restore.content_fold_regions;
             self.tab_mut().content.structure = restore.content_structure;
@@ -4515,6 +4601,24 @@ impl App {
             } else {
                 None
             };
+            return;
+        }
+        if self.send_to_agent.is_open() {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                let hit = self
+                    .ui_regions
+                    .send_agent_rows
+                    .iter()
+                    .position(|rect| contains(*rect, mouse.column, mouse.row))
+                    .map(|position| self.ui_regions.send_agent_row_offset + position);
+                if let Some(index) = hit {
+                    if self.send_to_agent.select_index(index) {
+                        self.accept_send_to_agent_selection();
+                    }
+                } else if !contains(self.ui_regions.send_agent_popup, mouse.column, mouse.row) {
+                    self.close_send_to_agent_picker();
+                }
+            }
             return;
         }
         if self.navigation_picker.is_some() {
@@ -5226,6 +5330,9 @@ impl App {
             head: before,
             dragging: true,
             dragged: false,
+            send_armed: false,
+            // Ctrl already held at mouse-down must not arm on the first move.
+            ctrl_was_down: mouse.modifiers.contains(KeyModifiers::CONTROL),
         });
     }
 
@@ -5285,9 +5392,20 @@ impl App {
         } else {
             before
         };
+        let ctrl_down = mouse.modifiers.contains(KeyModifiers::CONTROL);
+        // Toggle arming on the Ctrl rising edge of a drag motion. The state
+        // is sticky and is consumed by the plain mouse-up, so terminals that
+        // swallow Ctrl-modified release events still work.
+        let send_armed = if ctrl_down && !selection.ctrl_was_down {
+            !selection.send_armed
+        } else {
+            selection.send_armed
+        };
         self.tab_mut().content.selection = Some(ContentSelection {
             head,
             dragged: true,
+            send_armed,
+            ctrl_was_down: ctrl_down,
             ..selection
         });
     }
@@ -5308,11 +5426,28 @@ impl App {
             selection.dragging = false;
         }
         if selection.dragged {
-            // Terminal workspace managers may reserve Ctrl+C while still
-            // forwarding mouse input to the pane. Copying on release matches
-            // native terminal selection and keeps Ctrl+C as an explicit
-            // repeat-copy shortcut.
-            self.queue_selected_preview_copy();
+            // Re-read after the final drag update: the rising-edge toggle
+            // runs inside `drag_content_selection`.
+            let armed = self
+                .tab()
+                .content
+                .selection
+                .is_some_and(|selection| selection.send_armed);
+            if let Some(selection) = self.tab_mut().content.selection.as_mut() {
+                selection.send_armed = false;
+                selection.ctrl_was_down = false;
+            }
+            if armed && self.send_to_agent_available() && self.selected_content_text().is_some() {
+                // Sticky-armed release: skip the copy-on-release default and
+                // open the agent picker instead.
+                self.open_send_to_agent_picker();
+            } else {
+                // Terminal workspace managers may reserve Ctrl+C while still
+                // forwarding mouse input to the pane. Copying on release
+                // matches native terminal selection and keeps Ctrl+C as an
+                // explicit repeat-copy shortcut.
+                self.queue_selected_preview_copy();
+            }
         }
     }
 
@@ -6626,6 +6761,13 @@ impl App {
         for completion in self.navigation_runtime.take_symbol_completions() {
             self.apply_document_symbol_completion(completion);
         }
+        let (agent_discovery, agent_send) = self.runtime.take_agent_completions();
+        if let Some(completion) = agent_discovery {
+            self.apply_agent_discovery_completion(completion);
+        }
+        if let Some(completion) = agent_send {
+            self.apply_agent_send_completion(completion);
+        }
         self.apply_search_events();
         #[cfg(feature = "agent-observability")]
         self.poll_agent_background();
@@ -7852,6 +7994,415 @@ impl App {
         );
     }
 
+    /// Test-only: block until any background work item completes.
+    #[doc(hidden)]
+    pub fn wait_background_once(&self) -> bool {
+        self.runtime.wait_for_completion()
+    }
+
+    // ------------------------------------------------------------------
+    // Send selection to agent (terminal workspace manager integration)
+    // ------------------------------------------------------------------
+
+    fn send_to_agent_available(&self) -> bool {
+        self.agent_provider.available()
+    }
+
+    /// Content modes whose text selection may be sent to an agent. Preview
+    /// carries source coordinates and uses the anchored template; Diff is a
+    /// unified-diff patch with no file identity, so it always sends plain
+    /// text (the anchor is unavailable in the picker).
+    fn send_to_agent_mode_active(&self) -> bool {
+        matches!(
+            self.tab().content.mode,
+            ContentMode::Preview | ContentMode::Diff
+        )
+    }
+
+    /// Whether the footer should advertise `^E send to agent` right now.
+    pub fn send_agent_footer_active(&self) -> bool {
+        self.agent_provider.available()
+            && self.tab().content.edit.is_none()
+            && self.send_to_agent_mode_active()
+            && self.selected_content_text().is_some()
+    }
+
+    /// Live mid-drag arming state for the footer release hint.
+    pub fn content_selection_send_armed(&self) -> bool {
+        self.tab()
+            .content
+            .selection
+            .is_some_and(|selection| selection.send_armed)
+    }
+
+    /// Gating shared by the keyboard entry and the mid-drag Ctrl arm gesture.
+    fn send_to_agent_entry_active(&self) -> bool {
+        self.send_to_agent_available()
+            && !self.send_to_agent.is_open()
+            && self.tab().content.edit.is_none()
+            && self.send_to_agent_mode_active()
+            && self.focused_pane == FocusPane::Content
+            && self.selected_content_text().is_some()
+    }
+
+    fn open_send_to_agent_picker(&mut self) {
+        if !self.send_to_agent_entry_active() {
+            return;
+        }
+        let Some(selection) = self.tab().content.selection else {
+            return;
+        };
+        let (start, end) = selection.normalized();
+        if start == end {
+            return;
+        }
+
+        // Diff selections can begin/end on metadata rows (a fragment of the
+        // `@@ … @@ scope` hunk header, `index`, `---`/`+++`). Such fragments
+        // are not valid patch text and would corrupt the ```diff block, so
+        // trim them at the edges before building the message.
+        let (text, anchor) = if self.tab().content.mode == ContentMode::Diff {
+            match self.trimmed_diff_selection(start, end) {
+                Some((trimmed_start, trimmed_end)) => {
+                    let Some(text) = self.content_text_between(trimmed_start, trimmed_end) else {
+                        return;
+                    };
+                    let anchor = self.diff_selection_anchor(trimmed_start.line, trimmed_end.line);
+                    (text, anchor)
+                }
+                // Metadata-only selection: send the raw text with no anchor.
+                None => {
+                    let Some(text) = self.content_text_between(start, end) else {
+                        return;
+                    };
+                    (text, None)
+                }
+            }
+        } else {
+            let Some(text) = self.content_text_between(start, end) else {
+                return;
+            };
+            let anchor = self.preview_selection_anchor(start, end);
+            (text, anchor)
+        };
+
+        let generation = self.send_to_agent_requests.begin();
+        self.send_to_agent.begin_discover(generation, text, anchor);
+        self.runtime
+            .request_agent_discover(crate::runtime::AgentDiscoverRequest { generation });
+    }
+
+    /// Extract the exact text between two normalized selection points.
+    fn content_text_between(&self, start: ContentPoint, end: ContentPoint) -> Option<String> {
+        let mut selected = String::new();
+        for line_index in start.line..=end.line {
+            let line = self.tab().content.lines.get(line_index)?;
+            let start_byte = if line_index == start.line {
+                start.byte.min(line.len())
+            } else {
+                0
+            };
+            let end_byte = if line_index == end.line {
+                end.byte.min(line.len())
+            } else {
+                line.len()
+            };
+            selected.push_str(line.get(start_byte..end_byte)?);
+            if line_index < end.line {
+                selected.push('\n');
+            }
+        }
+        (!selected.is_empty()).then_some(selected)
+    }
+
+    /// Shrink a Diff selection to its valid patch edges. Full hunk headers
+    /// (`@@ … @@`) are valid unified-diff lines and survive; fragments of a
+    /// hunk header and `index`/`---`/`+++`/`diff --git` metadata are dropped
+    /// from both edges. Returns None when the range contains no actual patch
+    /// body (context/addition/deletion) at all.
+    fn trimmed_diff_selection(
+        &self,
+        start: ContentPoint,
+        end: ContentPoint,
+    ) -> Option<(ContentPoint, ContentPoint)> {
+        let content = &self.tab().content;
+        let kind_at = |line: usize| content.diff_lines.get(line).map(|a| a.kind);
+        let is_metadata = |line: usize| {
+            matches!(kind_at(line), Some(DiffLineKind::Metadata)) || kind_at(line).is_none()
+        };
+        let is_hunk = |line: usize| matches!(kind_at(line), Some(DiffLineKind::Hunk));
+        let line_len = |line: usize| content.lines.get(line).map_or(0, |text| text.len());
+
+        let mut first = start.line;
+        loop {
+            let droppable =
+                is_metadata(first) || (is_hunk(first) && first == start.line && start.byte > 0);
+            if droppable && first < end.line {
+                first += 1;
+            } else {
+                break;
+            }
+        }
+        let mut last = end.line;
+        loop {
+            let droppable = is_metadata(last)
+                || (is_hunk(last) && last == end.line && end.byte < line_len(last));
+            if droppable && last > first {
+                last -= 1;
+            } else {
+                break;
+            }
+        }
+        if first > last {
+            return None;
+        }
+        let has_patch_body = (first..=last).any(|line| {
+            matches!(
+                kind_at(line),
+                Some(
+                    DiffLineKind::Context
+                        | DiffLineKind::Addition
+                        | DiffLineKind::Deletion
+                        | DiffLineKind::NoNewline
+                )
+            )
+        });
+        if !has_patch_body {
+            return None;
+        }
+        let new_start = ContentPoint {
+            line: first,
+            byte: if first == start.line { start.byte } else { 0 },
+        };
+        let new_end = ContentPoint {
+            line: last,
+            byte: if last == end.line {
+                end.byte
+            } else {
+                line_len(last)
+            },
+        };
+        Some((new_start, new_end))
+    }
+
+    /// Source coordinates for the anchor template.
+    ///
+    /// Preview uses true file coordinates: a successful Preview with line
+    /// numbers and a content identity, where selection line indices map 1:1
+    /// to file lines (folded lines stay part of the range just like copy).
+    /// Rendered Markdown and search snapshots return None and send plain
+    /// text.
+    ///
+    /// Diff derives a softer anchor from the patch itself: the file named on
+    /// the nearest enclosing `diff --git a/… b/…` header, plus new-file line
+    /// numbers from the hunk annotations when available. A selection spanning
+    /// more than one file (multiple `diff --git` headers) has no single
+    /// anchor and falls back to plain text.
+    fn preview_selection_anchor(
+        &self,
+        start: ContentPoint,
+        end: ContentPoint,
+    ) -> Option<crate::send_agent::SelectionAnchor> {
+        let content = &self.tab().content;
+        if content.mode != ContentMode::Preview || !content.show_line_numbers {
+            return None;
+        }
+        let identity = content.identity.as_ref()?;
+        let path = identity.path();
+        let language = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(crate::send_agent::fence_language);
+        Some(crate::send_agent::SelectionAnchor {
+            path: path.display().to_string(),
+            start_line: start.line + 1,
+            end_line: end.line + 1,
+            language,
+            gutter: true,
+        })
+    }
+
+    /// Anchor for a unified-diff selection (file from the enclosing
+    /// `diff --git` header, new-side line numbers from hunk annotations).
+    fn diff_selection_anchor(
+        &self,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<crate::send_agent::SelectionAnchor> {
+        let content = &self.tab().content;
+        let lines = &content.lines;
+        // File owning the selection start: nearest `diff --git` header above.
+        let header_index = lines[..=start_line]
+            .iter()
+            .rposition(|line| line.starts_with("diff --git "))?;
+        let path = diff_header_target_path(&lines[header_index])?;
+        // A range crossing a later file header belongs to more than one file.
+        if lines
+            .iter()
+            .take(end_line + 1)
+            .skip(start_line + 1)
+            .any(|line| line.starts_with("diff --git "))
+        {
+            return None;
+        }
+
+        // New-file line numbers from the hunk annotations (additions and
+        // context carry them; deletions do not).
+        let new_line_at = |index: usize| {
+            content
+                .diff_lines
+                .get(index)
+                .and_then(|annotation| annotation.new_line)
+        };
+        let (start, finish) = match (
+            (start_line..=end_line).find_map(new_line_at),
+            (start_line..=end_line).rev().find_map(new_line_at),
+        ) {
+            (Some(first), Some(last)) => (first, last),
+            // Pure-deletion selection: resolve position from the enclosing
+            // hunk header's new-file start.
+            _ => {
+                let new_start = lines[..=start_line]
+                    .iter()
+                    .rev()
+                    .find(|line| line.starts_with("@@ "))
+                    .and_then(|header| parse_hunk_starts(header))
+                    .map(|(_old, new)| new)?;
+                (new_start, new_start)
+            }
+        };
+
+        Some(crate::send_agent::SelectionAnchor {
+            path,
+            start_line: start,
+            end_line: finish,
+            language: Some("diff"),
+            gutter: false,
+        })
+    }
+
+    fn close_send_to_agent_picker(&mut self) {
+        self.send_to_agent.close();
+        self.send_to_agent_requests.invalidate();
+    }
+
+    fn handle_send_to_agent_picker_key(&mut self, key: KeyEvent) {
+        // Annotation drafting owns printable keys: the picker opens with the
+        // input focused, so typing goes straight into the note. Agent rows are
+        // reached with the arrow keys only (arrows never collide with text).
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_send_to_agent_picker(),
+            (KeyCode::Down, _) => self.send_to_agent.move_selection(1),
+            (KeyCode::Up, _) => self.send_to_agent.move_selection(-1),
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                self.send_to_agent.cycle_template();
+            }
+            (KeyCode::Backspace, _) => self.send_to_agent.annotation_backspace(),
+            (KeyCode::Left, _) => self.send_to_agent.annotation_move_caret(-1),
+            (KeyCode::Right, _) => self.send_to_agent.annotation_move_caret(1),
+            (KeyCode::Home, _) => self.send_to_agent.annotation_home(),
+            (KeyCode::End, _) => self.send_to_agent.annotation_end(),
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if matches!(
+                    self.send_to_agent.phase,
+                    crate::send_agent::SendPhase::Picking
+                ) =>
+            {
+                self.send_to_agent.insert_annotation_char(ch);
+            }
+            (KeyCode::Enter, _) => self.accept_send_to_agent_selection(),
+            _ => {}
+        }
+    }
+
+    fn accept_send_to_agent_selection(&mut self) {
+        if !matches!(
+            self.send_to_agent.phase,
+            crate::send_agent::SendPhase::Picking
+        ) {
+            return;
+        }
+        let Some(target) = self.send_to_agent.selected_target().cloned() else {
+            return;
+        };
+        let payload = self.send_to_agent.built_payload().text;
+        let generation = self.send_to_agent_requests.begin();
+        self.send_to_agent.begin_sending(generation);
+        self.set_navigation_status(NavigationStatusLevel::Info, "Staging selection…");
+        self.runtime
+            .request_agent_send(crate::runtime::AgentSendRequest {
+                generation,
+                pane_id: target.pane_id,
+                agent: target.agent,
+                payload,
+            });
+    }
+
+    fn apply_agent_discovery_completion(
+        &mut self,
+        completion: crate::runtime::AgentDiscoveryCompletion,
+    ) {
+        if completion.generation != self.send_to_agent.generation {
+            return;
+        }
+        match completion.result {
+            Ok(targets) => {
+                let has_selectable = targets.iter().any(|target| target.selectable);
+                if targets.is_empty() || !has_selectable {
+                    self.send_to_agent.close();
+                    self.set_navigation_status(
+                        NavigationStatusLevel::Info,
+                        if targets.is_empty() {
+                            "No active agent sessions detected."
+                        } else {
+                            "Every agent session is blocked; resolve its prompt first."
+                        },
+                    );
+                    return;
+                }
+                self.send_to_agent
+                    .apply_discovery(completion.generation, targets);
+            }
+            Err(error) => {
+                self.send_to_agent.fail_discovery(completion.generation);
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("Agent discovery failed: {error}"),
+                );
+            }
+        }
+    }
+
+    fn apply_agent_send_completion(&mut self, completion: crate::runtime::AgentSendCompletion) {
+        if completion.generation != self.send_to_agent.generation {
+            return;
+        }
+        match completion.result {
+            Ok(outcome) => {
+                self.send_to_agent.close();
+                self.clear_content_selection();
+                let message = match outcome.focus_error {
+                    None => format!(
+                        "Sent {} chars to {} · {}",
+                        outcome.chars, outcome.agent, outcome.pane_id
+                    ),
+                    Some(focus_error) => format!(
+                        "Sent {} chars to {} · {} (focus: {focus_error})",
+                        outcome.chars, outcome.agent, outcome.pane_id
+                    ),
+                };
+                self.set_navigation_status(NavigationStatusLevel::Info, message);
+            }
+            Err(error) => {
+                self.send_to_agent.close();
+                self.set_navigation_status(
+                    NavigationStatusLevel::Error,
+                    format!("Send failed: {error}"),
+                );
+            }
+        }
+    }
+
     fn request_external_open(&mut self, trigger: ExternalOpenTrigger) {
         let Some((target, label)) = self.current_external_open_target() else {
             self.set_navigation_status(
@@ -8119,23 +8670,25 @@ impl App {
         self.dispatch_content_request(kind, label, target, review_path, presentation)
     }
 
-    /// Decide the Markdown presentation for a fresh file request: stay in
-    /// source view only when the request re-opens the exact document pinned to
-    /// source (`m` or a source-coordinate entry point). The anchor survives a
-    /// Diff view (which clears the loaded `identity`), so `d → p` remembers the
-    /// choice. Every other (new) document opens in the rendered default.
+    /// Decide the Markdown presentation for a fresh content request. Markdown
+    /// always opens in raw source by default (accurate selection, line
+    /// numbers, and send-to-agent anchors); `m` switches the currently loaded
+    /// document to the rendered view for that viewing session. A request that
+    /// re-addresses the document already in view (including d/p round-trips,
+    /// where the Diff snapshot carries no identity) reuses the current choice,
+    /// so reloading a rendered document does not silently flip back to source.
     /// Non-Markdown files ignore the value.
     fn presentation_for_new_request(&self, target: &ContentTarget) -> MarkdownPresentation {
-        let pinned_source = self
+        let same_document = self
             .tab()
             .content
-            .markdown_source_identity
+            .markdown_presentation_identity
             .as_ref()
             .is_some_and(|identity| self.target_matches_identity(target, identity));
-        if pinned_source {
-            MarkdownPresentation::Source
+        if same_document {
+            self.tab().content.markdown_presentation
         } else {
-            MarkdownPresentation::Rendered
+            MarkdownPresentation::Source
         }
     }
 
@@ -8896,15 +9449,14 @@ impl App {
         // stage request forces MarkdownPresentation::Source). Keep the anchor
         // in sync with the same rule as the normal completion path so that a
         // later Preview request for the navigated-to Markdown document keeps
-        // the source view instead of treating it as a new file.
-        let pin_source = self.tab().content.markdown_presentation == MarkdownPresentation::Source
-            && self
-                .tab()
-                .content
-                .identity
-                .as_ref()
-                .is_some_and(|identity| is_markdown_relative(identity.path()));
-        self.tab_mut().content.markdown_source_identity = pin_source
+        // its presentation instead of treating it as a new file.
+        let pin_document = self
+            .tab()
+            .content
+            .identity
+            .as_ref()
+            .is_some_and(|identity| is_markdown_relative(identity.path()));
+        self.tab_mut().content.markdown_presentation_identity = pin_document
             .then(|| self.tab().content.identity.clone())
             .flatten();
         self.tab_mut().content.fold_source = snapshot.fold_source;
@@ -9511,21 +10063,20 @@ impl App {
                 self.tab_mut().content.highlights = snapshot.highlights;
                 self.tab_mut().content.identity = snapshot.identity;
                 self.tab_mut().content.fold_source = snapshot.fold_source;
-                // Pin/clear the independent Markdown source anchor so the
-                // choice survives a later Diff view (which loads with no
-                // identity). Only successful Markdown previews requested as
-                // source are pinned; rendered results (including opening a
-                // different document) release it.
+                // Maintain the independent Markdown presentation anchor so
+                // the current choice survives a later Diff view (which loads
+                // with no identity). Every successful Markdown preview is
+                // anchored (source default or a rendered `m` toggle);
+                // non-Markdown results, including opening a different
+                // document, release the anchor.
                 if mode == ContentMode::Preview {
-                    let pin_source = self.tab().content.markdown_presentation
-                        == MarkdownPresentation::Source
-                        && self
-                            .tab()
-                            .content
-                            .identity
-                            .as_ref()
-                            .is_some_and(|identity| is_markdown_relative(identity.path()));
-                    self.tab_mut().content.markdown_source_identity = pin_source
+                    let pin_document = self
+                        .tab()
+                        .content
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| is_markdown_relative(identity.path()));
+                    self.tab_mut().content.markdown_presentation_identity = pin_document
                         .then(|| self.tab().content.identity.clone())
                         .flatten();
                 }
@@ -10978,6 +11529,8 @@ mod tests {
             head: ContentPoint { line: 3, byte: 4 },
             dragging: false,
             dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
         });
         assert_eq!(
             app.selected_content_text().as_deref(),
@@ -14612,7 +15165,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_snapshot_syncs_markdown_source_anchor() {
+    fn navigation_snapshot_syncs_markdown_presentation_anchor() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.md"), "# A\n").unwrap();
         fs::write(
@@ -14646,7 +15199,7 @@ mod tests {
             source_target: Some(ContentTarget::Workspace(PathBuf::from("b.md"))),
         });
         assert_eq!(
-            app.tab().content.markdown_source_identity,
+            app.tab().content.markdown_presentation_identity,
             Some(ContentIdentity::Workspace(PathBuf::from("b.md")))
         );
 
@@ -14660,8 +15213,8 @@ mod tests {
         assert_eq!(app.tab().content.provider.as_deref(), Some("text"));
         assert!(app.tab().content.show_line_numbers);
 
-        // Navigating on to a non-Markdown document releases the pin, so a
-        // later request for b.md reopens in the rendered default.
+        // Navigating on to a non-Markdown document releases the pin; Markdown
+        // still reopens in source under the new default.
         app.install_navigation_snapshot(ContentSnapshot {
             provider: Some("text".to_owned()),
             lines: vec!["fn c() {}".to_owned()],
@@ -14675,10 +15228,10 @@ mod tests {
             preview_kind: PreviewKind::Text,
             source_target: Some(ContentTarget::Workspace(PathBuf::from("c.rs"))),
         });
-        assert_eq!(app.tab().content.markdown_source_identity, None);
+        assert_eq!(app.tab().content.markdown_presentation_identity, None);
         assert_eq!(
             app.presentation_for_new_request(&ContentTarget::Workspace(PathBuf::from("b.md"))),
-            MarkdownPresentation::Rendered
+            MarkdownPresentation::Source
         );
     }
 
@@ -14707,5 +15260,191 @@ mod tests {
             row: end_row,
             modifiers: KeyModifiers::NONE,
         });
+    }
+
+    fn resolve_diff_anchor(app: &App) -> Option<crate::send_agent::SelectionAnchor> {
+        let content = &app.tab().content;
+        let selection = content.selection?;
+        let (start, end) = selection.normalized();
+        let (trimmed_start, trimmed_end) = app.trimmed_diff_selection(start, end)?;
+        app.diff_selection_anchor(trimmed_start.line, trimmed_end.line)
+    }
+
+    fn install_diff_selection(lines: Vec<&str>, start: usize, end: usize) -> App {
+        install_diff_selection_offsets(lines, start, 0, end, 64)
+    }
+
+    fn install_diff_selection_offsets(
+        lines: Vec<&str>,
+        start_line: usize,
+        start_byte: usize,
+        end_line: usize,
+        end_byte: usize,
+    ) -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        let owned: Vec<String> = lines.into_iter().map(str::to_owned).collect();
+        let content = &mut app.tab_mut().content;
+        content.mode = ContentMode::Diff;
+        content.show_line_numbers = true;
+        content.successful = true;
+        content.diff_lines = annotate_diff(&owned);
+        content.lines = owned;
+        content.selection = Some(ContentSelection {
+            anchor_before: ContentPoint {
+                line: start_line,
+                byte: start_byte,
+            },
+            anchor_after: ContentPoint {
+                line: end_line,
+                byte: end_byte,
+            },
+            head: ContentPoint {
+                line: end_line,
+                byte: end_byte,
+            },
+            dragging: false,
+            dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
+        });
+        app
+    }
+
+    #[test]
+    fn diff_edge_trimming_drops_a_mid_hunk_header_fragment() {
+        // Mirrors the real gesture that began mid-way on git's
+        // `@@ … @@ scope` hunk header and dragged across the change.
+        let lines = vec![
+            "diff --git a/docs/x.md b/docs/x.md",
+            "@@ -56,8 +56,10 @@ Lens scope suffix here",
+            " 1. gate one",
+            " 2. gate two",
+            "-old line",
+            "+new line",
+        ];
+        let app = install_diff_selection_offsets(
+            lines, 1, 30, // starts inside the hunk header, on its scope suffix
+            5, 9,
+        );
+        let content = &app.tab().content;
+        let (start, end) = content.selection.unwrap().normalized();
+        let (trimmed_start, trimmed_end) = app
+            .trimmed_diff_selection(start, end)
+            .expect("patch body remains");
+        assert_eq!(trimmed_start.line, 2, "hunk-header fragment is dropped");
+        assert_eq!(trimmed_end.line, 5);
+        let text = app
+            .content_text_between(trimmed_start, trimmed_end)
+            .unwrap();
+        assert_eq!(text, " 1. gate one\n 2. gate two\n-old line\n+new line");
+        assert!(!text.contains("scope suffix"));
+        let anchor = resolve_diff_anchor(&app).expect("anchor resolves after trimming");
+        assert_eq!(anchor.path, "docs/x.md");
+        assert_eq!(anchor.start_line, 56);
+    }
+
+    #[test]
+    fn diff_edge_trimming_keeps_a_full_hunk_header_and_drops_file_metadata() {
+        let lines = vec![
+            "diff --git a/x.rs b/x.rs",
+            "index 000..111 100644",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ];
+        // Drag from the index/metadata rows (full lines) through the hunk.
+        let app = install_diff_selection_offsets(lines, 1, 0, 6, 4);
+        let content = &app.tab().content;
+        let (start, end) = content.selection.unwrap().normalized();
+        let (trimmed_start, trimmed_end) = app
+            .trimmed_diff_selection(start, end)
+            .expect("patch body remains");
+        assert_eq!(trimmed_start.line, 4, "the full @@ hunk header survives");
+        let text = app
+            .content_text_between(trimmed_start, trimmed_end)
+            .unwrap();
+        assert!(text.starts_with("@@ -1 +1 @@\n"));
+        assert!(!text.contains("index 000"));
+    }
+
+    #[test]
+    fn diff_metadata_only_selection_has_no_anchor() {
+        let lines = vec![
+            "diff --git a/x.rs b/x.rs",
+            "index 000..111 100644",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "@@ -1 +1 @@",
+            "-old",
+        ];
+        // Select only metadata rows.
+        let app = install_diff_selection_offsets(lines, 0, 0, 3, 64);
+        assert!(resolve_diff_anchor(&app).is_none());
+    }
+
+    #[test]
+    fn diff_anchor_resolves_file_and_new_lines_within_one_file() {
+        let app = install_diff_selection(
+            vec![
+                "── WORKTREE ──",
+                "diff --git a/a-first.txt b/a-first.txt",
+                "--- a/a-first.txt",
+                "+++ b/a-first.txt",
+                "@@ -1 +1 @@",
+                "-old",
+                "+new",
+            ],
+            6,
+            7,
+        );
+        let anchor = resolve_diff_anchor(&app).expect("single-file hunk anchors");
+        assert_eq!(anchor.path, "a-first.txt");
+        // -old has no new line; +new replaces it at the first new line.
+        assert_eq!(anchor.start_line, 1);
+        assert_eq!(anchor.end_line, 1);
+        assert_eq!(anchor.language, Some("diff"));
+        assert!(!anchor.gutter);
+    }
+
+    #[test]
+    fn diff_anchor_is_none_when_selection_crosses_a_file_header() {
+        let app = install_diff_selection(
+            vec![
+                "diff --git a/a.txt b/a.txt",
+                "@@ -1 +1 @@",
+                "-old",
+                "+first",
+                "diff --git a/b.txt b/b.txt",
+                "@@ -1 +1 @@",
+                "-old",
+                "+second",
+            ],
+            2,
+            7,
+        );
+        assert!(
+            resolve_diff_anchor(&app).is_none(),
+            "a multi-file patch cannot have one file anchor"
+        );
+    }
+
+    #[test]
+    fn diff_anchor_for_pure_deletion_uses_hunk_new_start() {
+        let app = install_diff_selection(
+            vec![
+                "diff --git a/a.txt b/a.txt",
+                "@@ -5,2 +5 @@",
+                " keep",
+                "-gone",
+            ],
+            3,
+            3,
+        );
+        let anchor = resolve_diff_anchor(&app).expect("deletion anchors to the hunk");
+        assert_eq!(anchor.path, "a.txt");
+        assert_eq!((anchor.start_line, anchor.end_line), (5, 5));
     }
 }

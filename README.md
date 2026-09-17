@@ -137,9 +137,9 @@ Inside the TUI:
 | `{` / `}` | In focused Preview content, collapse or expand all folds |
 | `ctrl-shift-f` / `ctrl-t` | Open the workspace text-search popup; `ctrl-t` works in terminals that cannot distinguish `ctrl-shift-f` from `ctrl-f` |
 | `p` / `d` | Show Preview or Diff in the right pane |
-| `m` | In a Markdown Preview, switch between the rendered (typeset) view and the raw numbered source; opening another Markdown file resets to rendered |
+| `m` | In a Markdown Preview, switch between the raw numbered source and the rendered (typeset) view; opening another Markdown file resets to source |
 | `o` | Safely open the current Tree/Content file with the system default app; confirm an unknown non-executable file only after Lens explicitly asks |
-| `i` | In a text source Preview, enter edit mode (press `m` first to edit rendered Markdown); for a verified image with no system app, confirm a bounded TrueColor terminal preview |
+| `i` | In a text source Preview, enter edit mode (Markdown opens in source by default); for a verified image with no system app, confirm a bounded TrueColor terminal preview |
 | `ctrl-z` / `ctrl-y` | In edit mode, undo / redo |
 | `y` / `Y` | Copy the selected path: `y` copies the relative path (the link path for symlinks), `Y` copies the real/absolute path (resolved target for symlinks in All Files scope); directories get a trailing `/` |
 | `space` | Mark the displayed file diff reviewed; press again to clear the mark |
@@ -148,6 +148,7 @@ Inside the TUI:
 | `r` | Refresh repository state |
 | `q` / `esc` | Press twice within 1.5 seconds to quit; `esc` closes an active search first |
 | `ctrl-c` | Quit immediately when no content is selected; copy the current selection otherwise |
+| `ctrl-e` | With a selection in the Preview or Git Diff pane, open the send-to-agent picker; type a one-line note, `Tab` between an anchored fenced block and plain text, then stage the message in a running agent session's input without submitting (Preview anchors to `path:line`; Diff anchors to the hunk's file with a `diff` fence, falling back to plain text when the selection spans multiple files; terminal workspace manager such as Herdr required) |
 
 Mouse controls:
 
@@ -383,21 +384,22 @@ bounded target-path text without opening the target. Every read still declines
 FIFOs, sockets, devices, and Windows reparse points, and applies the same
 non-blocking, byte-and-line-bounded I/O to a link's target.
 
-Markdown files (`.md`/`.markdown`, case-insensitive extension) open in a
-**rendered reader view** by default: heading `#`, emphasis `*`/`**`/`~~`,
-code, and link markup is hidden, while headings, paragraphs, lists (`•`,
-numbered, `☐`/`☑` tasks), block quotes (`┃`), fenced code blocks, tables,
-and rules (`─`) are typeset and colored with dedicated foreground styles.
-Link URLs are not shown and nothing is fetched; images render as an
-`[image]` marker with their alt text, and raw HTML is displayed as sanitized
-text. The rendered view has no line numbers, folds, code navigation, or edit
-mode. Press `m` to switch to the raw numbered source (where folding, `i`
-editing, and navigation work), and `m` again to return; opening another
-Markdown file always resets to the rendered view. Rendering is bounded by the
-same byte/line caps and a parser event/time budget — a document that exceeds
-them, contains NUL bytes, or is not valid UTF-8 falls back to the source view.
-Mouse selection and copy in the rendered view capture the typeset text (no
-markup or URLs), not the original source.
+Markdown files (`.md`/`.markdown`, case-insensitive extension) open in the
+**raw numbered source view** by default, so mouse selection, copy, folds, code
+navigation, and `i` editing work against the exact text and line numbers of the
+file. Press `m` to switch to the rendered reader view, where heading `#`,
+emphasis `*`/`**`/`~~`, code, and link markup is hidden, while headings,
+paragraphs, lists (`•`, numbered, `☐`/`☑` tasks), block quotes (`┃`), fenced
+code blocks, tables, and rules (`─`) are typeset and colored with dedicated
+foreground styles. Link URLs are not shown and nothing is fetched; images
+render as an `[image]` marker with their alt text, and raw HTML is displayed as
+sanitized text. The rendered view has no line numbers, folds, code navigation,
+or edit mode. Press `m` again to return to source; opening another Markdown
+file always resets to the source view. Rendering is bounded by the same
+byte/line caps and a parser event/time budget — a document that exceeds them,
+contains NUL bytes, or is not valid UTF-8 stays in the source view. Mouse
+selection and copy in the rendered view capture the typeset text (no markup or
+URLs), not the original source.
 
 PNG, JPEG, GIF, and WebP files initially show verified metadata only. Press `o`
 or click `[Open]` to explicitly open the image in the host system's default
@@ -458,6 +460,18 @@ when the terminal forwards it) copies the selection again; `Ctrl+Shift+C` is
 also accepted. Without a selection, `Ctrl+C` exits immediately as a conventional
 terminal interrupt. `q` and `Esc` require a second matching press within 1.5
 seconds, so a stray navigation key cannot close the application.
+
+When Lens runs inside a terminal workspace manager that exposes agent sessions
+(Herdr), a content selection can be handed to another pane without round-tripping
+the clipboard: press `Ctrl+E` (or tap `Ctrl` mid-drag, then release) to open the
+send-to-agent picker. The input line is focused on open, so you can immediately
+type a one-line note; the default message anchors the snippet as
+`path:start-end` plus a fenced code block (and the `▎`-prefixed note above it),
+and `Tab` switches to plain selected text. Selections over 4 KiB keep their head
+and tail with a line-number gutter and an "omitted" marker, while the anchor
+still records the full range. The chosen session receives the assembled message
+as a bracketed-paste draft in its composer; Lens never presses Enter, so you
+stay in control of the actual submission.
 Preview, Diff, and informational content all
 support selection. Line-number gutters are excluded from copied previews,
 multi-line selections preserve newlines, and Unicode grapheme clusters remain

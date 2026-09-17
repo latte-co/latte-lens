@@ -378,34 +378,34 @@ def markdown_render_and_toggle(context: ScenarioContext) -> None:
     wait_for_initial_files(session)
     _click_tree_row(session, "doc.md")
     session.key(b"l")  # focus the content pane so its footer hints show
-    # Default: typeset rendering with markup hidden and the m-source footer hint.
+    # Default: numbered source view with markup visible and the m-render hint.
     session.wait_screen(
         (
             "doc.md",
             "Preview",
-            "Rendered Heading Alpha",
-            "uniquemdbullet one",
-            "uniquequote line",
-            "m source",
+            "# Rendered Heading Alpha",
+            "- uniquemdbullet one",
+            "> uniquequote line",
+            "m render",
         ),
-        "markdown opens in the rendered (typeset) view by default",
-        absent=("https://", "```", "# Rendered Heading"),
+        "markdown opens in the numbered source view by default",
+        absent=("• uniquemdbullet", "m source"),
     )
 
-    # m switches to the raw source view: heading marker, line numbers, footer.
-    session.key(b"m")
-    session.wait_screen(
-        ("# Rendered Heading Alpha", "m render"),
-        "m switches markdown to the numbered source view",
-        absent=("m source",),
-    )
-
-    # m switches back to rendering.
+    # m switches to the typeset rendering: markup hidden, footer hint flips.
     session.key(b"m")
     session.wait_screen(
         ("Rendered Heading Alpha", "• uniquemdbullet one", "m source"),
-        "m toggles markdown back to the rendered view",
+        "m switches markdown to the rendered (typeset) view",
         absent=("# Rendered Heading", "m render"),
+    )
+
+    # m switches back to source.
+    session.key(b"m")
+    session.wait_screen(
+        ("# Rendered Heading Alpha", "- uniquemdbullet one", "m render"),
+        "m toggles markdown back to the source view",
+        absent=("• uniquemdbullet", "m source"),
     )
 
 
@@ -1670,13 +1670,12 @@ def structure_navigation(context: ScenarioContext) -> None:
             absent=("Open File",),
         )
         if filename.endswith(".md"):
-            # File-name search honors the rendered Markdown default; document
-            # symbols and folds are source-coordinate features, so switch to the
-            # raw source view with `m` before driving structure navigation.
-            session.key(b"m")
+            # File-name search follows the source Markdown default, which is
+            # also the coordinate space document symbols and folds use, so no
+            # presentation switch is needed.
             session.wait_screen(
-                ("m render", "# Guide Root"),
-                f"{filename} switches to source before structure navigation",
+                ("m render",),
+                f"{filename} is already in the source view for structure navigation",
             )
         session.key(b"l")
         session.key(b"\x13")

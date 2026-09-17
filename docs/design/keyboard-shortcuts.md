@@ -21,7 +21,7 @@ Latte Lens 的快捷键按"作用域"分组设计，而不是混用不同 IDE �
 
 | 作用域 | 修饰符约定 | 适用场景 | 现有示例 |
 | --- | --- | --- | --- |
-| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索、`Ctrl+B` 折叠/展开 Tree |
+| 全局命令 | `Ctrl` + 助记字母 | 跨面板、跨视图的全局操作 | `Ctrl+P` tab 面板、`Ctrl+N` 新 tab 菜单、`Ctrl+F` 当前内容查找、`Ctrl+T` 工作区搜索、`Ctrl+B` 折叠/展开 Tree、`Ctrl+E` 发送选区到 agent |
 | 代码语义命令 | `Ctrl` + 助记字母 | 基于语言服务器的语义导航 | `Ctrl+D` Definition、`Ctrl+R` References、`Ctrl+O` Implementations、`Ctrl+S` Document Symbols |
 | 面板/树/视口移动 | 无修饰方向键或 TUI 单键 | 焦点移动、滚动、树展开折叠 | `↑/↓/←/→`、`j/k`、`h/l`、`Tab`、`Enter`、`[/]`、`{/}` |
 | 当前视图操作 | 无修饰小写单键 | 切换当前视图内容或刷新 | `p` Preview、`d` Diff、`r` Refresh、`q` Quit、`y/Y` 复制路径、`n/N` 更改文件、`x` 忽略错误 |
@@ -47,6 +47,7 @@ Search/Find/navigation results popup 时生效。
 | `Ctrl+F` | 在当前 Preview 或 Diff 中查找 |
 | `Ctrl+Shift+F` / `Ctrl+T` | 打开工作区文本搜索 popup；`Ctrl+T` 用于无法区分 `Ctrl+Shift+F` 与 `Ctrl+F` 的终端 |
 | `Ctrl+C` | 无内容选择时立即退出；有选择时复制当前选择 |
+| `Ctrl+E` | 内容 Preview 或 Git Diff 存在选区且终端 workspace manager（如 Herdr）可用时，打开「发送选区到 agent」选择器；Preview 以 `path:行号` 锚点 + 围栏代码组装，Diff 选区从补丁的 `diff --git` 头推导文件、用 ` ```diff ` 围栏保留 `+/-` 原文（选区跨多个文件时回退纯文本），均可直接键入一行 `▎` 注释、`Tab` 切换纯文本，确认后暂存进目标 agent 输入框但不提交（另可在拖拽选区途中轻点 `Ctrl` 武装，松开鼠标即打开选择器）。选择器内：直接打字写注释、`↑/↓` 选 agent、`Tab` 切模板、`Enter` 暂存、`Esc` 取消 |
 
 ### 3.2 代码语义命令
 
@@ -79,7 +80,7 @@ Search/Find/navigation results popup 时生效。
 | --- | --- |
 | `p` | 在右窗格显示 Preview |
 | `d` | 在右窗格显示 Diff |
-| `m` | Markdown Preview 中在排版渲染视图与原始编号源码视图间切换；打开另一个 Markdown 文件重置为渲染视图。仅当前文档为 `.md`/`.markdown` 时生效，其他视图/模态下为 no-op |
+| `m` | Markdown Preview 中在原始编号源码视图与排版渲染视图间切换；Markdown 默认以源码视图打开，打开另一个 Markdown 文件重置为源码视图。仅当前文档为 `.md`/`.markdown` 时生效，其他视图/模态下为 no-op |
 | `r` | 刷新仓库状态 |
 | `q` | 1.5 秒内按两次退出；`Esc` 先关闭活动搜索 |
 | `y` | 复制选定路径的相对路径（符号链接取 link path）；目录加尾部 `/` |
@@ -110,7 +111,7 @@ Search/Find/navigation results popup 时生效。
 
 | 按键 | 功能 |
 | --- | --- |
-| `i` | 进入编辑模式（仅文本源码 Preview；图片 Preview 下 `i` 仍为确认终端渲染；排版渲染的 Markdown 需先按 `m` 回到源码视图，footer 会提示） |
+| `i` | 进入编辑模式（仅文本源码 Preview；Markdown 默认即源码视图；若手动切到排版渲染视图，需先按 `m` 回到源码，footer 会提示；图片 Preview 下 `i` 仍为确认终端渲染） |
 | 可打印字符 | 在 caret 处插入（有选区时替换选区） |
 | `Enter` | 插入换行 |
 | `Backspace` / `Delete` | 向后 / 向前删除 |
@@ -196,8 +197,10 @@ Footer 只展示当前上下文可操作的快捷键，不列出全部清单；�
 1. **不用 `Ctrl+D` 兼任翻页**：`Ctrl+D` 专用于 Definition；翻页保留 `PageDown`、`PageUp`
    和鼠标滚轮。
 2. **不用两段 chord**：不引入 `g d`、`Ctrl+K` 等需要两段输入的组合。
-3. **不依赖 Command/Super 键**：macOS Command 键和 Super 键在终端环境无法稳定上报，
-   不纳入 canonical keymap。
+3. **不依赖 Command/Super 键**：macOS Command 键和 Super 键在终端环境无法稳定上报。
+   例外：当终端确实透传 SUPER 时，复制（`Ctrl+C`/`Cmd+C`）、保存（`Ctrl+S`/`Cmd+S`）、
+   发送选区（`Ctrl+E`/`Cmd+E`）接受同字母 Cmd 别名；canonical 主路径在三平台上始终是 `Ctrl`，
+   文档与 README 不以 Cmd 作为承诺。
 4. **不用 `Ctrl+I`**：`Ctrl+I` 与 `Tab` 在传统终端编码相同，无法稳定区分；
    Implementations 使用 `Ctrl+O`。
 5. **不在多个作用域定义同一按键的不同行为**：每个按键在同一焦点/视图状态下只能有

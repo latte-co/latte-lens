@@ -294,6 +294,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.navigation_picker.is_some() {
         dim_underlay(frame);
         draw_navigation_picker(frame, app);
+    } else if app.send_to_agent.is_open() {
+        dim_underlay(frame);
+        draw_send_to_agent_picker(frame, app);
     } else if app.search_is_active() {
         dim_underlay(frame);
         draw_search_popup(frame, app);
@@ -420,6 +423,9 @@ fn regions(areas: DrawAreas) -> UiRegions {
         content_scrollbar_thumb_size: 0,
         content_body,
         content_inner: content_rows,
+        send_agent_popup: Rect::default(),
+        send_agent_rows: Vec::new(),
+        send_agent_row_offset: 0,
     }
 }
 
@@ -1060,6 +1066,553 @@ fn navigation_picker_item(
             ListItem::new(Line::from(spans))
         }
     }
+}
+
+fn draw_send_to_agent_picker(frame: &mut Frame, app: &mut App) {
+    use crate::send_agent::{AgentLifecycle, MAX_ANNOTATION_BYTES, MAX_SEND_BYTES, SendTemplate};
+
+    let screen = frame.area();
+    let built = app.send_to_agent.built_payload();
+    let discovering = matches!(
+        app.send_to_agent.phase,
+        crate::send_agent::SendPhase::Discovering
+    );
+    let sending = matches!(
+        app.send_to_agent.phase,
+        crate::send_agent::SendPhase::Sending
+    );
+    let has_rows = !app.send_to_agent.targets.is_empty() && !discovering;
+    let payload_line_count = built.text.lines().count().max(1);
+
+    // Content rows inside the border: top pad, label, n rows, rule, note,
+    // status, gap, preview(lines+2), help, bottom pad = 10 fixed rows.
+    let fixed_inner = 10u16;
+    let desired_rows = if has_rows {
+        app.send_to_agent.targets.len().clamp(1, 5) as u16
+    } else {
+        1
+    };
+    let desired_preview = (payload_line_count as u16).clamp(5, 9);
+    // Inner budget = screen minus 2 border rows minus 1-cell margin each side.
+    let max_inner = screen.height.saturating_sub(4);
+    let (row_count, preview_count) =
+        fit_picker_rows(max_inner, fixed_inner, desired_rows, desired_preview);
+
+    let popup_width = screen.width.saturating_sub(4).min(86);
+    let popup_height =
+        (fixed_inner + row_count + preview_count + 2).min(screen.height.saturating_sub(2));
+    let popup = centered_rect(popup_width, popup_height, screen);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent()))
+        .title(Span::styled(
+            " Send to agent ",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [
+        _pad_top,
+        label_area,
+        rows_area,
+        rule_area,
+        note_area,
+        status_area,
+        _gap,
+        preview_wrap,
+        help_area,
+        _pad_bottom,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(row_count),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(preview_count + 2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    app.ui_regions.send_agent_popup = popup;
+    app.ui_regions.send_agent_rows.clear();
+
+    // -- Section label -------------------------------------------------------
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " TARGET",
+                Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if has_rows { "  · pick a session" } else { "" },
+                Style::default().fg(subtle()),
+            ),
+        ])),
+        label_area,
+    );
+
+    // -- Agent rows (windowed so the selected target stays visible) ----------
+    let targets = app.send_to_agent.targets.clone();
+    let cap = row_count as usize;
+    let row_start = if targets.len() <= cap {
+        0
+    } else {
+        (app.send_to_agent.selected + 1).saturating_sub(cap)
+    };
+    app.ui_regions.send_agent_row_offset = row_start;
+    let row_rects = Layout::vertical((0..cap).map(|_| Constraint::Length(1)).collect::<Vec<_>>())
+        .split(rows_area);
+
+    if discovering {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "   Discovering agents…",
+                Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+            )),
+            row_rects[0],
+        );
+    } else if targets.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "   No active agent sessions detected.",
+                Style::default().fg(muted()),
+            )),
+            row_rects[0],
+        );
+    } else {
+        for (slot, index) in (row_start..targets.len().min(row_start + cap)).enumerate() {
+            let target = &targets[index];
+            let rect = row_rects[slot];
+            app.ui_regions.send_agent_rows.push(rect);
+            let is_selected = index == app.send_to_agent.selected;
+            let dim = !target.selectable;
+            let marker_style = if dim {
+                Style::default().fg(muted()).add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+            };
+            let name_style = if dim {
+                Style::default().fg(muted()).add_modifier(Modifier::DIM)
+            } else if is_selected {
+                Style::default()
+                    .fg(accent())
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(text_primary())
+            };
+            let status_style = if dim {
+                Style::default().fg(muted()).add_modifier(Modifier::DIM)
+            } else if is_selected {
+                name_style
+            } else {
+                match target.status {
+                    AgentLifecycle::Idle => Style::default().fg(Theme::current().reviewed),
+                    AgentLifecycle::Working => Style::default().fg(Theme::current().status_mod),
+                    _ => Style::default().fg(subtle()),
+                }
+            };
+            let title: String = target.title.chars().take(36).collect();
+            let title_style = if dim {
+                Style::default().fg(muted()).add_modifier(Modifier::DIM)
+            } else if is_selected {
+                name_style
+            } else {
+                Style::default().fg(muted())
+            };
+            let pane_style = if dim {
+                Style::default().fg(muted()).add_modifier(Modifier::DIM)
+            } else if is_selected {
+                name_style
+            } else {
+                Style::default().fg(subtle())
+            };
+            let marker = if is_selected { "●" } else { " " };
+            let mut line = vec![
+                Span::styled(format!(" {marker} "), marker_style),
+                Span::styled(format!("{:<8}", target.agent), name_style),
+                Span::styled(format!(" {:<8}", target.status.label()), status_style),
+                Span::styled(format!(" {title}"), title_style),
+            ];
+            // Pad to the row width so the REVERSED selection reads as a bar.
+            let used: usize = line
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            let pane = format!(" {}", target.pane_id);
+            let pane_width = UnicodeWidthStr::width(pane.as_str());
+            let gap_width = (rect.width as usize)
+                .saturating_sub(used + pane_width)
+                .max(1);
+            line.push(Span::styled(" ".repeat(gap_width), name_style));
+            line.push(Span::styled(pane, pane_style));
+            frame.render_widget(Paragraph::new(Line::from(line)), rect);
+        }
+    }
+
+    // -- Hairline separating the session list from the drafting row ----------
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(rule_area.width as usize),
+            Style::default().fg(Theme::current().divider),
+        )),
+        rule_area,
+    );
+
+    // -- Annotation input (focused on open; typing lands here directly) ------
+    let prompt = " ▎ ";
+    let counter = format!(
+        "{}/{}",
+        app.send_to_agent.annotation.chars().count(),
+        MAX_ANNOTATION_BYTES
+    );
+    let counter_width = UnicodeWidthStr::width(counter.as_str()) as u16;
+    let [note_text_area, note_counter_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(counter_width + 2)])
+            .areas(note_area);
+    let input_width = note_text_area
+        .width
+        .saturating_sub(prompt.chars().count() as u16)
+        .max(1) as usize;
+    let annotation = app.send_to_agent.annotation.clone();
+    let caret = app.send_to_agent.annotation_caret;
+    let (before, after) = search_query_window(&annotation, caret, input_width);
+    let mut note_spans = vec![Span::styled(
+        prompt,
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+    )];
+    if annotation.is_empty() {
+        note_spans.push(Span::styled(
+            "Type a question or instruction for the agent (optional)",
+            Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        note_spans.push(Span::styled(before, Style::default().fg(text_primary())));
+        note_spans.push(Span::styled(
+            "│",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+        note_spans.push(Span::styled(after, Style::default().fg(text_primary())));
+    }
+    frame.render_widget(Paragraph::new(Line::from(note_spans)), note_text_area);
+    let at_cap = app.send_to_agent.annotation.len() >= MAX_ANNOTATION_BYTES;
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            counter,
+            Style::default().fg(if at_cap {
+                Theme::current().status_mod
+            } else {
+                subtle()
+            }),
+        ))
+        .right_aligned(),
+        note_counter_area,
+    );
+
+    // -- Status: template chip + truncation summary --------------------------
+    let mut chip = Vec::new();
+    match app.send_to_agent.template {
+        SendTemplate::Anchor => {
+            if let Some(anchor) = &app.send_to_agent.anchor {
+                let range = if anchor.start_line == anchor.end_line {
+                    format!("{}:{}", anchor.path, anchor.start_line)
+                } else {
+                    format!("{}:{}-{}", anchor.path, anchor.start_line, anchor.end_line)
+                };
+                chip.push(Span::styled(
+                    " ⌖ ",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ));
+                chip.push(Span::styled(range, Style::default().fg(accent())));
+                chip.push(Span::styled(
+                    "    Tab → plain",
+                    Style::default().fg(muted()),
+                ));
+            }
+        }
+        SendTemplate::Plain => {
+            chip.push(Span::styled(
+                " plain text",
+                Style::default().fg(text_primary()),
+            ));
+            if app.send_to_agent.anchor_available() {
+                chip.push(Span::styled(
+                    "    Tab → anchor",
+                    Style::default().fg(muted()),
+                ));
+            }
+        }
+    }
+    let warning = built.truncated.then(|| {
+        Span::styled(
+            format!(
+                "⚠ {} of {} lines omitted",
+                built.omitted_lines, built.total_lines
+            ),
+            Style::default()
+                .fg(Theme::current().status_mod)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
+    let [chip_area, warning_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(30)]).areas(status_area);
+    frame.render_widget(Paragraph::new(Line::from(chip)), chip_area);
+    if let Some(span) = warning {
+        frame.render_widget(Paragraph::new(span).right_aligned(), warning_area);
+    }
+
+    // -- Live payload preview in a recessed nested frame ---------------------
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::current().divider))
+        .title(Span::styled(
+            " staged message ",
+            Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(preview_block.clone(), preview_wrap);
+    let preview_inner = preview_block.inner(preview_wrap);
+    let inner_width = preview_inner.width as usize;
+    let payload_lines = built.text.split('\n').collect::<Vec<_>>();
+    let capacity = preview_count as usize;
+    let mut shown = Vec::new();
+    if payload_lines.len() <= capacity {
+        for (number, line) in payload_lines.iter().enumerate() {
+            shown.push(staged_message_line(
+                line,
+                number,
+                app.send_to_agent.template,
+                inner_width,
+            ));
+        }
+    } else {
+        // Long message: anchor/head, the omitted marker, and the tail (which
+        // carries the closing fence) so all three parts are visible at once.
+        let head_count = 2.min(capacity.saturating_sub(1));
+        let tail_count = capacity - head_count - 1;
+        for (number, line) in payload_lines[..head_count].iter().enumerate() {
+            shown.push(staged_message_line(
+                line,
+                number,
+                app.send_to_agent.template,
+                inner_width,
+            ));
+        }
+        let hidden = payload_lines.len() - capacity;
+        let marker_text = payload_lines
+            .iter()
+            .find(|line| line.starts_with('⋮'))
+            .map_or_else(|| format!("… {hidden} more lines"), ToString::to_string);
+        shown.push(staged_message_line(
+            &marker_text,
+            usize::MAX,
+            app.send_to_agent.template,
+            inner_width,
+        ));
+        for line in &payload_lines[payload_lines.len() - tail_count..] {
+            shown.push(staged_message_line(
+                line,
+                usize::MAX,
+                app.send_to_agent.template,
+                inner_width,
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(shown), preview_inner);
+
+    // -- Help row with keycaps (left) and payload size (right) ---------------
+    let size_text = format!("{} / {} B", built.text.len(), MAX_SEND_BYTES);
+    let size_width = UnicodeWidthStr::width(size_text.as_str()) as u16 + 1;
+    let [keys_area, size_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(size_width)]).areas(help_area);
+    let key = |label: &'static str| {
+        Span::styled(
+            label,
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        )
+    };
+    let desc = |label: &'static str| Span::styled(label, Style::default().fg(muted()));
+    let help_line: Vec<Span> = if sending {
+        vec![Span::styled(
+            "Staging draft…",
+            Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+        )]
+    } else {
+        vec![
+            key("↑↓"),
+            desc(" agent  "),
+            key("Tab"),
+            desc(" format  "),
+            key("Enter"),
+            desc(" stage (no submit)  "),
+            key("Esc"),
+            desc(" cancel"),
+        ]
+    };
+    frame.render_widget(Paragraph::new(Line::from(help_line)), keys_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(size_text, Style::default().fg(subtle()))).right_aligned(),
+        size_area,
+    );
+
+    // Real terminal cursor on the annotation caret (ratatui hides it unless
+    // set every frame). Discovering keeps the input focused too.
+    if !sending {
+        let caret_col = if annotation.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(
+                search_query_window(&annotation, caret, input_width)
+                    .0
+                    .as_str(),
+            )
+        };
+        frame.set_cursor_position(Position {
+            x: note_text_area.x + prompt.chars().count() as u16 + caret_col as u16,
+            y: note_text_area.y,
+        });
+    }
+}
+
+/// Split available vertical space between the session list and the preview,
+/// shrinking the preview first (down to three lines) and then the list.
+fn fit_picker_rows(
+    max_inner: u16,
+    fixed: u16,
+    desired_rows: u16,
+    desired_preview: u16,
+) -> (u16, u16) {
+    let need = fixed + desired_rows + desired_preview;
+    if need <= max_inner {
+        return (desired_rows, desired_preview);
+    }
+    let overflow = need - max_inner;
+    let from_preview = overflow.min(desired_preview.saturating_sub(3));
+    let preview = desired_preview - from_preview;
+    let rows = desired_rows.saturating_sub(overflow - from_preview).max(1);
+    (rows, preview)
+}
+
+/// Center a fixed-size rect inside `screen`.
+fn centered_rect(width: u16, height: u16, screen: Rect) -> Rect {
+    let width = width.min(screen.width);
+    let height = height.min(screen.height);
+    Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Color one line of the staged-message preview by structural role.
+fn staged_message_line(
+    line: &str,
+    number: usize,
+    template: crate::send_agent::SendTemplate,
+    max_width: usize,
+) -> Line<'static> {
+    use crate::send_agent::SendTemplate;
+    let max_width = max_width.saturating_sub(1);
+    let pad = || Span::styled(" ", Style::default());
+    let is_anchor_header = number == 0 && matches!(template, SendTemplate::Anchor);
+    if is_anchor_header {
+        // The header may carry a "(N lines selected, M omitted)" suffix.
+        return match line.split_once(" (") {
+            Some((header, suffix)) => {
+                let mut spans = vec![Span::styled(
+                    truncate_to_width(header, max_width),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )];
+                if !suffix.is_empty() {
+                    spans.push(Span::styled(
+                        truncate_to_width(&format!(" ({suffix}"), max_width),
+                        Style::default()
+                            .fg(Theme::current().status_mod)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Line::from(std::iter::once(pad()).chain(spans).collect::<Vec<_>>())
+            }
+            None => Line::from(vec![
+                pad(),
+                Span::styled(
+                    truncate_to_width(line, max_width),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        };
+    }
+    if let Some(rest) = line.strip_prefix("▎") {
+        let mut spans = vec![Span::styled(
+            "▎",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        )];
+        spans.push(Span::styled(
+            truncate_to_width(rest, max_width.saturating_sub(1)),
+            Style::default().fg(text_primary()),
+        ));
+        return Line::from(std::iter::once(pad()).chain(spans).collect::<Vec<_>>());
+    }
+    if !line.is_empty() && line.bytes().all(|byte| byte == b'`') {
+        return Line::from(vec![
+            pad(),
+            Span::styled(
+                truncate_to_width(line, max_width),
+                Style::default().fg(subtle()),
+            ),
+        ]);
+    }
+    if line.starts_with('⋮') && line.contains("omitted") {
+        return Line::from(vec![
+            pad(),
+            Span::styled(
+                truncate_to_width(line, max_width),
+                Style::default()
+                    .fg(Theme::current().status_mod)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+    }
+    if line.starts_with('…') {
+        return Line::from(vec![
+            pad(),
+            Span::styled(
+                truncate_to_width(line, max_width),
+                Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+    }
+    // Gutter rows from truncated payloads look like `100│code…`. The bar is
+    // U+2502 (three UTF-8 bytes), so split on byte indices, not chars+1.
+    if let Some(bar) = line.find('│') {
+        let digits = &line[..bar];
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            let split_at = bar + '│'.len_utf8();
+            let gutter_text = &line[..split_at];
+            let rest = &line[split_at..];
+            let gutter_width = gutter_text.chars().count();
+            let mut spans = vec![Span::styled(
+                truncate_to_width(gutter_text, gutter_width),
+                Style::default().fg(muted()),
+            )];
+            spans.push(Span::styled(
+                truncate_to_width(rest, max_width.saturating_sub(gutter_width)),
+                Style::default().fg(text_primary()),
+            ));
+            return Line::from(std::iter::once(pad()).chain(spans).collect::<Vec<_>>());
+        }
+    }
+    Line::from(vec![
+        pad(),
+        Span::styled(
+            truncate_to_width(line, max_width),
+            Style::default().fg(text_primary()),
+        ),
+    ])
 }
 
 fn draw_navigation_preview(frame: &mut Frame, area: Rect, picker: &NavigationPickerState) {
@@ -2388,6 +2941,22 @@ fn draw_preview_find(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.send_to_agent.is_open() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Send to agent ",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  ↑↓ select  Enter send draft  Esc close",
+                    Style::default().fg(muted()),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
     if app.navigation_picker.is_some() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -2473,7 +3042,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let md_hint = app
         .markdown_presentation_hint()
         .map_or_else(String::new, |hint| format!("  {hint}"));
-    let help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
+    let mut help = if app.focused_pane == FocusPane::Tree && area.width < 96 {
         format!(
             "  ↑↓  {tab_keys}  ^C quit  Enter preview  o open  y path{ignore_hint}  ^B tree  q×2"
         )
@@ -2502,6 +3071,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "  ↑↓  ←→ focus  drag copy  ^C quit  S+←→ scroll  {tab_keys}  p preview  d diff  r refresh  y copy Y real  ^B tree  q×2"
         )
     };
+    if app.send_agent_footer_active() {
+        help.push_str("  ^E send to agent");
+    }
     let content = if let Some(message) = app.quit_confirmation_message() {
         Line::from(vec![
             Span::styled(
@@ -2579,6 +3151,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 format!("Configuration: {warning}"),
                 Style::default().fg(Theme::current().missing),
+            ),
+        ])
+    } else if app.content_selection_send_armed() {
+        Line::from(vec![
+            Span::styled(
+                " Send ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "Release: send selection to agent · press Ctrl again to cancel",
+                Style::default()
+                    .fg(Theme::current().success)
+                    .add_modifier(Modifier::BOLD),
             ),
         ])
     } else if let Some(status) = &app.clipboard_status {
