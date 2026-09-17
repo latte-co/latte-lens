@@ -47,7 +47,7 @@ Search/Find/navigation results popup 时生效。
 | `Ctrl+F` | 在当前 Preview 或 Diff 中查找 |
 | `Ctrl+Shift+F` / `Ctrl+T` | 打开工作区文本搜索 popup；`Ctrl+T` 用于无法区分 `Ctrl+Shift+F` 与 `Ctrl+F` 的终端 |
 | `Ctrl+C` | 无内容选择时立即退出；有选择时复制当前选择 |
-| `Ctrl+E` | 内容 Preview 或 Git Diff 存在选区且终端 workspace manager（如 Herdr）可用时，打开「发送选区到 agent」选择器；Preview 默认以 `path:行号` 锚点 + 围栏代码组装（Diff 选区无文件坐标，只能发纯补丁文本），可直接键入一行 `▎` 注释、`Tab` 切换纯文本，确认后暂存进目标 agent 输入框但不提交（另可在拖拽选区途中轻点 `Ctrl` 武装，松开鼠标即打开选择器）。选择器内：直接打字写注释、`↑/↓` 选 agent、`Tab` 切模板、`Enter` 暂存、`Esc` 取消 |
+| `Ctrl+E` | 内容 Preview 或 Git Diff 存在选区且终端 workspace manager（如 Herdr）可用时，打开「发送选区到 agent」选择器；Preview 以 `path:行号` 锚点 + 围栏代码组装，Diff 选区从补丁的 `diff --git` 头推导文件、用 ` ```diff ` 围栏保留 `+/-` 原文（选区跨多个文件时回退纯文本），均可直接键入一行 `▎` 注释、`Tab` 切换纯文本，确认后暂存进目标 agent 输入框但不提交（另可在拖拽选区途中轻点 `Ctrl` 武装，松开鼠标即打开选择器）。选择器内：直接打字写注释、`↑/↓` 选 agent、`Tab` 切模板、`Enter` 暂存、`Esc` 取消 |
 
 ### 3.2 代码语义命令
 

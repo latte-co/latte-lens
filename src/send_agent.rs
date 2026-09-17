@@ -231,16 +231,28 @@ pub enum SendTemplate {
 pub struct SelectionAnchor {
     /// Workspace-relative display path.
     pub path: String,
+    /// First line of the range (new-file line for Diff hunks); 0 means the
+    /// anchor carries a path only.
     pub start_line: usize,
+    /// Last line of the range; equal to `start_line` for a single line.
     pub end_line: usize,
-    /// Fence language hint derived from the file extension, if known.
+    /// Fence language hint derived from the file extension, or `"diff"` for
+    /// a unified-diff hunk.
     pub language: Option<&'static str>,
+    /// Whether truncated payloads prefix retained lines with a `line│`
+    /// gutter. Source selections do (snippets must map back to real lines);
+    /// diff hunks do not (their `+`/`-` prefixes and `@@` headers already
+    /// carry position, and a number column would garble the patch).
+    pub gutter: bool,
 }
 
 impl SelectionAnchor {
-    /// `path:line` for a single line, `path:start-end` for a multi-line range.
+    /// `path:line` for a single line, `path:start-end` for a multi-line range,
+    /// and bare `path` when no line numbers apply.
     fn header(&self) -> String {
-        if self.start_line == self.end_line {
+        if self.start_line == 0 {
+            self.path.clone()
+        } else if self.start_line == self.end_line {
             format!("{}:{}", self.path, self.start_line)
         } else {
             format!("{}:{}-{}", self.path, self.start_line, self.end_line)
@@ -360,9 +372,20 @@ fn build_anchored(code: &str, annotation: &str, anchor: &SelectionAnchor) -> Bui
         return BuiltPayload::full(full, total);
     }
 
-    // Truncated: the anchor gains a summary suffix and retained lines carry a
-    // line-number gutter so surviving snippets still map to real source.
-    let gutter_width = anchor.end_line.checked_ilog10().unwrap_or(0) as usize + 1;
+    // Truncated: the anchor gains a summary suffix. Source selections also
+    // prefix retained lines with a numbered gutter so surviving snippets map
+    // to real file lines; diff hunks stay verbatim (their +/- prefixes and
+    // @@ headers already carry position, and a number column garbles them).
+    let gutter_width = if anchor.gutter {
+        anchor.end_line.checked_ilog10().unwrap_or(0) as usize + 1
+    } else {
+        0
+    };
+    let gutter_bytes = if anchor.gutter {
+        gutter_width + "│".len()
+    } else {
+        0
+    };
     let fixed = anchor.header().len()
         + anchor_suffix(total, total).len()
         + note.len()
@@ -371,9 +394,15 @@ fn build_anchored(code: &str, annotation: &str, anchor: &SelectionAnchor) -> Bui
         + fence.len()
         + TRUNCATION_RESERVE;
     let budget = MAX_SEND_BYTES.saturating_sub(fixed);
-    let split = split_head_tail(&lines, budget, gutter_width + "│".len());
+    let split = split_head_tail(&lines, budget, gutter_bytes);
 
-    let gutter_line = |line_no: usize, line: &str| format!("{line_no:>gutter_width$}│{line}\n");
+    let render_line = |line_no: usize, line: &str| {
+        if anchor.gutter {
+            format!("{line_no:>gutter_width$}│{line}\n")
+        } else {
+            format!("{line}\n")
+        }
+    };
     let assemble = |head_count: usize, tail_count: usize| -> (String, usize, usize) {
         let omitted = total - head_count - tail_count;
         let kept_bytes: usize = lines[..head_count]
@@ -389,7 +418,7 @@ fn build_anchored(code: &str, annotation: &str, anchor: &SelectionAnchor) -> Bui
             anchor_suffix(total, omitted)
         );
         for (offset, line) in lines[..head_count].iter().enumerate() {
-            text.push_str(&gutter_line(anchor.start_line + offset, line));
+            text.push_str(&render_line(anchor.start_line + offset, line));
         }
         if omitted > 0 {
             text.push_str(&code_marker(omitted, omitted_bytes, anchor));
@@ -397,7 +426,7 @@ fn build_anchored(code: &str, annotation: &str, anchor: &SelectionAnchor) -> Bui
         }
         for (index, line) in lines[total - tail_count..].iter().enumerate() {
             let line_no = anchor.start_line + total - tail_count + index;
-            text.push_str(&gutter_line(line_no, line));
+            text.push_str(&render_line(line_no, line));
         }
         text.push_str(&fence);
         (text, omitted, omitted_bytes)
@@ -608,6 +637,7 @@ pub fn fence_language(extension: &str) -> Option<&'static str> {
         "lua" => "lua",
         "pl" => "perl",
         "md" | "markdown" => "markdown",
+        "diff" | "patch" => "diff",
         "json" | "jsonc" => "json",
         "yaml" | "yml" => "yaml",
         "toml" => "toml",
@@ -1183,6 +1213,7 @@ mod tests {
             start_line: start,
             end_line: end,
             language,
+            gutter: true,
         }
     }
 
@@ -1241,6 +1272,68 @@ mod tests {
             built.text,
             "▎reproduces on my machine?\n\n@@ -1 +1 @@\n-x\n+y"
         );
+    }
+
+    #[test]
+    fn diff_anchor_uses_diff_fence_and_keeps_patch_prefixes_without_gutter() {
+        let anchor = SelectionAnchor {
+            path: "src/app.rs".to_owned(),
+            start_line: 42,
+            end_line: 42,
+            language: Some("diff"),
+            gutter: false,
+        };
+        let built = build_payload(
+            "-old\n+new",
+            Some(&anchor),
+            "did you intend this?",
+            SendTemplate::Anchor,
+        );
+        assert_eq!(
+            built.text,
+            "src/app.rs:42\n▎did you intend this?\n\n```diff\n-old\n+new\n```"
+        );
+    }
+
+    #[test]
+    fn path_only_anchor_omits_line_numbers() {
+        let anchor = SelectionAnchor {
+            path: "src/app.rs".to_owned(),
+            start_line: 0,
+            end_line: 0,
+            language: Some("diff"),
+            gutter: false,
+        };
+        let built = build_payload("-gone", Some(&anchor), "", SendTemplate::Anchor);
+        assert_eq!(built.text, "src/app.rs\n```diff\n-gone\n```");
+    }
+
+    #[test]
+    fn truncated_diff_anchor_keeps_verbatim_lines_without_number_gutter() {
+        let lines: Vec<String> = (0..200)
+            .map(|i| format!("+line {i:03} {}", "x".repeat(34)))
+            .collect();
+        let code = lines.join("\n");
+        let anchor = SelectionAnchor {
+            path: "big.rs".to_owned(),
+            start_line: 100,
+            end_line: 299,
+            language: Some("diff"),
+            gutter: false,
+        };
+        let built = build_payload(&code, Some(&anchor), "", SendTemplate::Anchor);
+        assert!(built.truncated);
+        assert!(built.text.len() <= MAX_SEND_BYTES);
+        assert!(
+            built.text.contains("\n+line 000"),
+            "diff lines must stay verbatim: {}",
+            built.text.lines().nth(4).unwrap_or("")
+        );
+        assert!(
+            !built.text.contains('│'),
+            "no numbered gutter may be injected into a patch"
+        );
+        assert!(built.text.contains("```diff"));
     }
 
     #[test]

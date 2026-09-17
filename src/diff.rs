@@ -82,7 +82,7 @@ const fn annotation(
     }
 }
 
-fn parse_hunk_starts(line: &str) -> Option<(usize, usize)> {
+pub(crate) fn parse_hunk_starts(line: &str) -> Option<(usize, usize)> {
     let mut fields = line.split_ascii_whitespace();
     if fields.next()? != "@@" {
         return None;
@@ -92,13 +92,60 @@ fn parse_hunk_starts(line: &str) -> Option<(usize, usize)> {
     (fields.next()? == "@@").then_some((old_start, new_start))
 }
 
+/// Target path (new-file side) named on a `diff --git a/old b/new` header.
+/// Quoted paths from `core.quotePath` have their surrounding quotes removed;
+/// other C-style escapes are left as Git wrote them.
+pub(crate) fn diff_header_target_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git ")?;
+    // The new path follows " b/" (plain) or `"b/` (quoted by quotePath).
+    let target = match rest.rsplit_once(" b/").or_else(|| rest.rsplit_once("\"b/")) {
+        Some((_, path)) => path,
+        None => return None,
+    };
+    let target = target
+        .strip_prefix('"')
+        .unwrap_or(target)
+        .strip_suffix('"')
+        .unwrap_or(target);
+    (!target.is_empty()).then(|| target.to_owned())
+}
+
 fn parse_range_start(field: &str, prefix: char) -> Option<usize> {
     field.strip_prefix(prefix)?.split(',').next()?.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width};
+    use super::{
+        DiffLineAnnotation, DiffLineKind, annotate_diff, diff_header_target_path,
+        line_number_width, parse_hunk_starts,
+    };
+
+    #[test]
+    fn diff_header_target_path_reads_the_new_side() {
+        assert_eq!(
+            diff_header_target_path("diff --git a/src/app.rs b/src/app.rs").as_deref(),
+            Some("src/app.rs")
+        );
+        // Rename: the new path wins.
+        assert_eq!(
+            diff_header_target_path("diff --git a/old.txt b/new.txt").as_deref(),
+            Some("new.txt")
+        );
+        // Quoted path loses its surrounding quotes.
+        assert_eq!(
+            diff_header_target_path("diff --git \"a/a b.md\" \"b/a b.md\"").as_deref(),
+            Some("a b.md")
+        );
+        assert_eq!(diff_header_target_path("index 000..111 100644"), None);
+    }
+
+    #[test]
+    fn hunk_starts_parse_both_sides() {
+        assert_eq!(parse_hunk_starts("@@ -8,3 +8,4 @@ x"), Some((8, 8)));
+        assert_eq!(parse_hunk_starts("@@ -1 +0,0 @@"), Some((1, 0)));
+        assert_eq!(parse_hunk_starts("not a hunk"), None);
+    }
 
     #[test]
     fn annotates_unified_diff_with_old_and_new_line_numbers() {

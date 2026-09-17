@@ -453,8 +453,55 @@ fn esc_closes_picker_and_keeps_selection() {
     assert!(calls.lock().unwrap().sends.is_empty());
 }
 
+/// Load the working-tree diff for the current file and wait until a hunk is
+/// displayed.
+fn open_diff(app: &mut App) {
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    for _ in 0..200 {
+        app.poll_background();
+        app.wait_background_once();
+        if app.tab().content.mode == ContentMode::Diff
+            && app
+                .tab()
+                .content
+                .lines
+                .iter()
+                .any(|line| line.starts_with("@@"))
+        {
+            return;
+        }
+    }
+    assert_eq!(app.tab().content.mode, ContentMode::Diff);
+}
+
+/// Drag-select a rectangle of diff content rows by line index. Small diffs
+/// render at scroll offset zero.
+fn select_diff_rows(app: &mut App, start_line: usize, end_line: usize, width: u16) {
+    let content_x = app.ui_regions.content_inner.x;
+    let row0 = app.ui_regions.content_inner.y;
+    let text_x = content_x + app.content_gutter_width() as u16;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        text_x,
+        row0 + start_line as u16,
+        KeyModifiers::NONE,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + width,
+        row0 + end_line as u16,
+        KeyModifiers::NONE,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + width,
+        row0 + end_line as u16,
+        KeyModifiers::NONE,
+    ));
+}
+
 #[test]
-fn diff_view_sends_raw_patch_without_anchor() {
+fn diff_hunk_gets_file_anchor_with_a_diff_fence() {
     use support::TestRepo;
 
     let repo = TestRepo::new();
@@ -468,80 +515,93 @@ fn diff_view_sends_raw_patch_without_anchor() {
     );
     let (mut app, mut terminal) = ready_app_with(repo.root(), provider);
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-
-    // Load the working-tree diff.
-    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-    for _ in 0..200 {
-        app.poll_background();
-        app.wait_background_once();
-        if app.tab().content.mode == ContentMode::Diff
-            && app
-                .tab()
-                .content
-                .lines
-                .iter()
-                .any(|line| line.starts_with("@@"))
-        {
-            break;
-        }
-    }
-    assert_eq!(app.tab().content.mode, ContentMode::Diff);
-
-    // Select the hunk's -/+ lines using the Diff gutter geometry (two number
-    // columns), then open the picker.
+    open_diff(&mut app);
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    let content_x = app.ui_regions.content_inner.x;
-    let row = app.ui_regions.content_inner.y;
-    let text_x = content_x + app.content_gutter_width() as u16;
-    app.handle_mouse(mouse(
-        MouseEventKind::Down(MouseButton::Left),
-        text_x,
-        row + 6, // "-alpha beta"
-        KeyModifiers::NONE,
-    ));
-    app.handle_mouse(mouse(
-        MouseEventKind::Drag(MouseButton::Left),
-        text_x + 10,
-        row + 7, // "+alpha BETA changed"
-        KeyModifiers::NONE,
-    ));
-    app.handle_mouse(mouse(
-        MouseEventKind::Up(MouseButton::Left),
-        text_x + 10,
-        row + 7,
-        KeyModifiers::NONE,
-    ));
+
+    // Hunk layout: line 6 is "-alpha beta", line 7 "+alpha BETA changed".
+    select_diff_rows(&mut app, 6, 7, 10);
     let selected = app
         .selected_content_text()
         .expect("a non-empty diff hunk selection");
-    assert!(
-        selected.contains('\n')
-            && selected.lines().any(|l| l.starts_with('-'))
-            && selected.lines().any(|l| l.starts_with('+')),
-        "raw unified-diff prefixes must survive selection: {selected:?}"
-    );
+    assert!(selected.lines().any(|l| l.starts_with('-')));
+    assert!(selected.lines().any(|l| l.starts_with('+')));
 
-    assert!(
-        app.send_agent_footer_active(),
-        "footer advertises ^E in diff view"
-    );
+    assert!(app.send_agent_footer_active());
     app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
     wait_phase(&mut app, |phase| phase == SendPhase::Picking);
 
-    // A diff has no file identity/coordinates: the anchor template is
-    // unavailable and Tab cannot switch to it.
-    assert!(!app.send_to_agent.anchor_available());
+    // The nearest diff --git header supplies the file; the addition's new
+    // line number is 1. The patch is wrapped in a ```diff fence verbatim.
+    let anchor = app
+        .send_to_agent
+        .anchor
+        .as_ref()
+        .expect("single-file diff anchor");
+    assert_eq!(anchor.path, "single.txt");
+    assert_eq!((anchor.start_line, anchor.end_line), (1, 1));
+    assert_eq!(anchor.language, Some("diff"));
+    assert!(!anchor.gutter);
+
+    let payload = app.send_to_agent.built_payload().text;
+    assert!(payload.starts_with("single.txt:1\n```diff\n"));
+    assert!(payload.trim_end().ends_with("```"));
+    assert!(payload.contains("-alpha beta"));
+    assert!(payload.contains("+alpha BETA"));
+
+    // Tab still drops back to the raw patch text.
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(
         app.send_to_agent.template,
         latte_lens::send_agent::SendTemplate::Plain
     );
+    assert_eq!(
+        app.send_to_agent.built_payload().text,
+        selected.trim_end_matches('\n')
+    );
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     wait_phase(&mut app, |phase| phase == SendPhase::Closed);
+    assert_eq!(calls.lock().unwrap().sends.len(), 1);
+}
 
-    assert_eq!(
-        calls.lock().unwrap().sends,
-        vec![("w1:p2".to_owned(), selected)]
+#[test]
+fn pure_deletion_hunk_anchors_at_the_hunk_new_start() {
+    use support::TestRepo;
+
+    let repo = TestRepo::new();
+    repo.write("single.txt", "keep\ngone\n");
+    repo.commit_all("initial");
+    repo.write("single.txt", "keep\n");
+
+    let (provider, _calls) = FakeAgentProvider::new(
+        true,
+        vec![target("claude", "w1:p2", AgentLifecycle::Idle, repo.root())],
     );
+    let (mut app, mut terminal) = ready_app_with(repo.root(), provider);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    open_diff(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    // @@ -1,2 +1 @@ / " keep" / "-gone": the deletion row has no new line.
+    let gone_row = app
+        .tab()
+        .content
+        .lines
+        .iter()
+        .position(|line| line == "-gone")
+        .unwrap();
+    select_diff_rows(&mut app, gone_row, gone_row, 6);
+    assert!(app.selected_content_text().is_some());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    wait_phase(&mut app, |phase| phase == SendPhase::Picking);
+    let anchor = app
+        .send_to_agent
+        .anchor
+        .as_ref()
+        .expect("deletion still anchors");
+    assert_eq!(anchor.path, "single.txt");
+    assert_eq!(anchor.start_line, 1, "falls back to the hunk's +1 start");
+    let payload = app.send_to_agent.built_payload().text;
+    assert_eq!(payload, "single.txt:1\n```diff\n-gone\n```");
 }

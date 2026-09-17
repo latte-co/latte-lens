@@ -56,8 +56,10 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
 1. 运行环境可用（`AgentTargetProvider::available()`，见 §4）；
 2. Content 面板聚焦；
 3. `ContentMode::Preview` 或 `ContentMode::Diff`，且不在编辑模态。
-   Preview 选区带源码坐标，使用锚点模板；Diff 选区是 unified-diff 原文，
-   无 content identity，锚点不可用、强制 Plain（注释仍可加）；
+   Preview 选区带源码坐标，使用锚点模板；Diff 选区的锚点从补丁自身推导
+   （最近的 `diff --git a/… b/…` 头 + hunk 新文件行号），围栏为 ```diff
+   且截断时不加数字侧栏（保留 `+`/`-`/`@@` 补丁语义）；选区跨多个文件头
+   时无单一归属，回退 Plain（注释仍可加）；
 4. 当前 tab 存在非空内容选区（`selected_content_text().is_some()`）。
 
 按下 `Ctrl+E`（同时接受精确的 SUPER 别名）→ 打开 agent picker。
@@ -127,7 +129,10 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
   - 围栏语言由扩展名映射（`fence_language`），未知扩展名开裸围栏；
     选区内含更长反引号游程时围栏自动加长；
   - 仅源码坐标预览可用：成功 Preview、显示行号、有 content identity；
-    渲染态 Markdown、Diff、搜索快照无坐标，强制 Plain。
+    渲染态 Markdown、搜索快照无坐标，强制 Plain。Diff 模式有独立的推导锚点
+    （见 §3.1 第 3 条）：文件取选区起点上方最近的 `diff --git` 头新侧路径，
+    行号取选区内首个/末个 hunk 新文件行号（纯删除选区回退到 hunk 的新起始
+    行），围栏语言固定为 `diff`；选区跨过后续文件头时不生成锚点。
 - **模板 Plain（Tab 切换，或无锚点时）**：选区原文；有注释时注释段在前，
   不虚构文件名与围栏。
 - **注释**：每行加 `▎` 前缀（提问/指令通用，且在 composer 与聊天记录中与
@@ -136,8 +141,9 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
 - **截断**：整条消息硬上限 4 KiB（`MAX_SEND_BYTES`，跨平台一致）。
   超出时按**整行**保留选区首部（约 55%）与尾部、省略中间：
   - Anchor：锚点仍写完整原始区间并加
-    ` (N lines selected, M omitted)` 后缀；保留行带 `行号│` 侧栏，
-    残留片段仍能对上真实行号；中间插入
+    ` (N lines selected, M omitted)` 后缀；源码选区的保留行带 `行号│` 侧栏，
+    Diff 锚点不加侧栏、逐字保留补丁行；
+    中间插入
     `⋮ ── omitted M lines (X B) see path:起-止 ──`；
   - Plain：同样首尾保留，省略标记不带文件名；
   - 极端单行超长退化为字符边界截断；最终组装再做一次精确收缩，

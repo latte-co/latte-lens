@@ -32,7 +32,10 @@ use crate::agent::{
 use crate::{
     clipboard,
     content_safety::{FileFingerprint, path_exists_without_following},
-    diff::{DiffLineAnnotation, DiffLineKind, annotate_diff, line_number_width},
+    diff::{
+        DiffLineAnnotation, DiffLineKind, annotate_diff, diff_header_target_path,
+        line_number_width, parse_hunk_starts,
+    },
     folding::{FoldAnchor, FoldRegion, FoldSource, StructureSnapshot, SymbolId},
     git::{ChangeVersion, DiffStat, FileStatus, GitRepo},
     lsp::{
@@ -8056,22 +8059,33 @@ impl App {
             .request_agent_discover(crate::runtime::AgentDiscoverRequest { generation });
     }
 
-    /// Source coordinates for the anchor template. Only source-coordinate
-    /// previews qualify: a successful Preview with line numbers and a content
-    /// identity, where selection line indices map 1:1 to file lines (folded
-    /// lines stay part of the range just like copy). Rendered Markdown, Diff
-    /// views, and search snapshots return None and send plain text.
+    /// Source coordinates for the anchor template.
+    ///
+    /// Preview uses true file coordinates: a successful Preview with line
+    /// numbers and a content identity, where selection line indices map 1:1
+    /// to file lines (folded lines stay part of the range just like copy).
+    /// Rendered Markdown and search snapshots return None and send plain
+    /// text.
+    ///
+    /// Diff derives a softer anchor from the patch itself: the file named on
+    /// the nearest enclosing `diff --git a/… b/…` header, plus new-file line
+    /// numbers from the hunk annotations when available. A selection spanning
+    /// more than one file (multiple `diff --git` headers) has no single
+    /// anchor and falls back to plain text.
     fn send_selection_anchor(&self) -> Option<crate::send_agent::SelectionAnchor> {
         let content = &self.tab().content;
-        if content.mode != ContentMode::Preview || !content.show_line_numbers {
-            return None;
-        }
-        let identity = content.identity.as_ref()?;
         let selection = content.selection?;
         let (start, end) = selection.normalized();
         if start == end {
             return None;
         }
+        if content.mode == ContentMode::Diff {
+            return self.diff_selection_anchor(start.line, end.line);
+        }
+        if content.mode != ContentMode::Preview || !content.show_line_numbers {
+            return None;
+        }
+        let identity = content.identity.as_ref()?;
         let path = identity.path();
         let language = path
             .extension()
@@ -8082,6 +8096,65 @@ impl App {
             start_line: start.line + 1,
             end_line: end.line + 1,
             language,
+            gutter: true,
+        })
+    }
+
+    /// Anchor for a unified-diff selection; see [`Self::send_selection_anchor`].
+    fn diff_selection_anchor(
+        &self,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<crate::send_agent::SelectionAnchor> {
+        let content = &self.tab().content;
+        let lines = &content.lines;
+        // File owning the selection start: nearest `diff --git` header above.
+        let header_index = lines[..=start_line]
+            .iter()
+            .rposition(|line| line.starts_with("diff --git "))?;
+        let path = diff_header_target_path(&lines[header_index])?;
+        // A range crossing a later file header belongs to more than one file.
+        if lines
+            .iter()
+            .take(end_line + 1)
+            .skip(start_line + 1)
+            .any(|line| line.starts_with("diff --git "))
+        {
+            return None;
+        }
+
+        // New-file line numbers from the hunk annotations (additions and
+        // context carry them; deletions do not).
+        let new_line_at = |index: usize| {
+            content
+                .diff_lines
+                .get(index)
+                .and_then(|annotation| annotation.new_line)
+        };
+        let (start, finish) = match (
+            (start_line..=end_line).find_map(new_line_at),
+            (start_line..=end_line).rev().find_map(new_line_at),
+        ) {
+            (Some(first), Some(last)) => (first, last),
+            // Pure-deletion selection: resolve position from the enclosing
+            // hunk header's new-file start.
+            _ => {
+                let new_start = lines[..=start_line]
+                    .iter()
+                    .rev()
+                    .find(|line| line.starts_with("@@ "))
+                    .and_then(|header| parse_hunk_starts(header))
+                    .map(|(_old, new)| new)?;
+                (new_start, new_start)
+            }
+        };
+
+        Some(crate::send_agent::SelectionAnchor {
+            path,
+            start_line: start,
+            end_line: finish,
+            language: Some("diff"),
+            gutter: false,
         })
     }
 
@@ -15064,5 +15137,100 @@ mod tests {
             row: end_row,
             modifiers: KeyModifiers::NONE,
         });
+    }
+
+    fn install_diff_selection(lines: Vec<&str>, start: usize, end: usize) -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        let owned: Vec<String> = lines.into_iter().map(str::to_owned).collect();
+        let content = &mut app.tab_mut().content;
+        content.mode = ContentMode::Diff;
+        content.show_line_numbers = true;
+        content.successful = true;
+        content.diff_lines = annotate_diff(&owned);
+        content.lines = owned;
+        content.selection = Some(ContentSelection {
+            anchor_before: ContentPoint {
+                line: start,
+                byte: 0,
+            },
+            anchor_after: ContentPoint {
+                line: end,
+                byte: 64,
+            },
+            head: ContentPoint { line: end, byte: 1 },
+            dragging: false,
+            dragged: true,
+            send_armed: false,
+            ctrl_was_down: false,
+        });
+        app
+    }
+
+    #[test]
+    fn diff_anchor_resolves_file_and_new_lines_within_one_file() {
+        let app = install_diff_selection(
+            vec![
+                "── WORKTREE ──",
+                "diff --git a/a-first.txt b/a-first.txt",
+                "--- a/a-first.txt",
+                "+++ b/a-first.txt",
+                "@@ -1 +1 @@",
+                "-old",
+                "+new",
+            ],
+            6,
+            7,
+        );
+        let anchor = app
+            .send_selection_anchor()
+            .expect("single-file hunk anchors");
+        assert_eq!(anchor.path, "a-first.txt");
+        // -old has no new line; +new replaces it at the first new line.
+        assert_eq!(anchor.start_line, 1);
+        assert_eq!(anchor.end_line, 1);
+        assert_eq!(anchor.language, Some("diff"));
+        assert!(!anchor.gutter);
+    }
+
+    #[test]
+    fn diff_anchor_is_none_when_selection_crosses_a_file_header() {
+        let app = install_diff_selection(
+            vec![
+                "diff --git a/a.txt b/a.txt",
+                "@@ -1 +1 @@",
+                "-old",
+                "+first",
+                "diff --git a/b.txt b/b.txt",
+                "@@ -1 +1 @@",
+                "-old",
+                "+second",
+            ],
+            2,
+            7,
+        );
+        assert!(
+            app.send_selection_anchor().is_none(),
+            "a multi-file patch cannot have one file anchor"
+        );
+    }
+
+    #[test]
+    fn diff_anchor_for_pure_deletion_uses_hunk_new_start() {
+        let app = install_diff_selection(
+            vec![
+                "diff --git a/a.txt b/a.txt",
+                "@@ -5,2 +5 @@",
+                " keep",
+                "-gone",
+            ],
+            3,
+            3,
+        );
+        let anchor = app
+            .send_selection_anchor()
+            .expect("deletion anchors to the hunk");
+        assert_eq!(anchor.path, "a.txt");
+        assert_eq!((anchor.start_line, anchor.end_line), (5, 5));
     }
 }
