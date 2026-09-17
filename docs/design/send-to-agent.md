@@ -131,8 +131,16 @@ Lens 是 multi-agent 终端里的只读仓库查看器；同一终端 workspace�
   - 仅源码坐标预览可用：成功 Preview、显示行号、有 content identity；
     渲染态 Markdown、搜索快照无坐标，强制 Plain。Diff 模式有独立的推导锚点
     （见 §3.1 第 3 条）：文件取选区起点上方最近的 `diff --git` 头新侧路径，
-    行号取选区内首个/末个 hunk 新文件行号（纯删除选区回退到 hunk 的新起始
-    行），围栏语言固定为 `diff`；选区跨过后续文件头时不生成锚点。
+    行号取选区内首个/末个补丁体行（Context/Addition/Deletion）对应的新文件
+    行号（纯删除选区回退到 hunk 的新起始行），围栏语言固定为 `diff`；
+    选区跨过后续文件头时不生成锚点；
+  - **Diff 选区边缘裁剪**：拖拽起点/终点常落在 `index`/`---`/`+++` 等文件
+    元数据行，或从 git 追加在 `@@` hunk 头后的作用域提示（如
+    `@@ -56,8 +56,10 @@ fn foo`）中间起选。组装前裁掉两端的元数据行；
+    端部的 hunk 头仅在被部分选中（起点 byte>0 或终点未到行尾）时裁掉，
+    完整选中的 `@@` 头保留（它是合法 patch 头）；裁剪后若不含任何
+    Context/Addition/Deletion/NoNewline 行，则判定为纯元数据选区、
+    不带锚点按原文发送；
 - **模板 Plain（Tab 切换，或无锚点时）**：选区原文；有注释时注释段在前，
   不虚构文件名与围栏。
 - **注释**：每行加 `▎` 前缀（提问/指令通用，且在 composer 与聊天记录中与
@@ -283,8 +291,10 @@ Sending
    - `Ctrl+E` → picker → Enter 默认锚点模板投递到正确 pane、焦点切换、
      成功清选区；直接键入注释后载荷含锚点/▎注释/围栏；Tab 切纯文本后发原文；
      picker 渲染注释输入条、占位提示与载荷预览；
-     Git Diff 选区打开 picker 时无锚点、Tab 无法切到锚点、逐字发送 unified-diff
-     原文（保留 `+`/`-` 前缀）；
+     Git Diff 选区打开 picker 时从补丁推导文件锚点与新文件行号、
+     ```diff 围栏保留 `+`/`-` 原文；纯删除 hunk 锚点取 hunk 新起始行；
+     跨文件选区回退纯文本；选区两端的元数据/hunk 头碎片被裁掉，
+     完整 `@@` 头保留，纯元数据选区无锚点；
      Esc 取消保留选区且不发送；仅有 blocked 会话时关闭 picker；
    - 拖拽中 ctrl 上升沿 arm：普通 up 不开 picker，armed up 开 picker。
 3. **argv 协议（`tests/send_agent_protocol.rs`，POSIX）**：用一个固定行为的

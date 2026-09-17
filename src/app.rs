@@ -8049,14 +8049,140 @@ impl App {
         if !self.send_to_agent_entry_active() {
             return;
         }
-        let Some(text) = self.selected_content_text() else {
+        let Some(selection) = self.tab().content.selection else {
             return;
         };
-        let anchor = self.send_selection_anchor();
+        let (start, end) = selection.normalized();
+        if start == end {
+            return;
+        }
+
+        // Diff selections can begin/end on metadata rows (a fragment of the
+        // `@@ … @@ scope` hunk header, `index`, `---`/`+++`). Such fragments
+        // are not valid patch text and would corrupt the ```diff block, so
+        // trim them at the edges before building the message.
+        let (text, anchor) = if self.tab().content.mode == ContentMode::Diff {
+            match self.trimmed_diff_selection(start, end) {
+                Some((trimmed_start, trimmed_end)) => {
+                    let Some(text) = self.content_text_between(trimmed_start, trimmed_end) else {
+                        return;
+                    };
+                    let anchor = self.diff_selection_anchor(trimmed_start.line, trimmed_end.line);
+                    (text, anchor)
+                }
+                // Metadata-only selection: send the raw text with no anchor.
+                None => {
+                    let Some(text) = self.content_text_between(start, end) else {
+                        return;
+                    };
+                    (text, None)
+                }
+            }
+        } else {
+            let Some(text) = self.content_text_between(start, end) else {
+                return;
+            };
+            let anchor = self.preview_selection_anchor(start, end);
+            (text, anchor)
+        };
+
         let generation = self.send_to_agent_requests.begin();
         self.send_to_agent.begin_discover(generation, text, anchor);
         self.runtime
             .request_agent_discover(crate::runtime::AgentDiscoverRequest { generation });
+    }
+
+    /// Extract the exact text between two normalized selection points.
+    fn content_text_between(&self, start: ContentPoint, end: ContentPoint) -> Option<String> {
+        let mut selected = String::new();
+        for line_index in start.line..=end.line {
+            let line = self.tab().content.lines.get(line_index)?;
+            let start_byte = if line_index == start.line {
+                start.byte.min(line.len())
+            } else {
+                0
+            };
+            let end_byte = if line_index == end.line {
+                end.byte.min(line.len())
+            } else {
+                line.len()
+            };
+            selected.push_str(line.get(start_byte..end_byte)?);
+            if line_index < end.line {
+                selected.push('\n');
+            }
+        }
+        (!selected.is_empty()).then_some(selected)
+    }
+
+    /// Shrink a Diff selection to its valid patch edges. Full hunk headers
+    /// (`@@ … @@`) are valid unified-diff lines and survive; fragments of a
+    /// hunk header and `index`/`---`/`+++`/`diff --git` metadata are dropped
+    /// from both edges. Returns None when the range contains no actual patch
+    /// body (context/addition/deletion) at all.
+    fn trimmed_diff_selection(
+        &self,
+        start: ContentPoint,
+        end: ContentPoint,
+    ) -> Option<(ContentPoint, ContentPoint)> {
+        let content = &self.tab().content;
+        let kind_at = |line: usize| content.diff_lines.get(line).map(|a| a.kind);
+        let is_metadata = |line: usize| {
+            matches!(kind_at(line), Some(DiffLineKind::Metadata)) || kind_at(line).is_none()
+        };
+        let is_hunk = |line: usize| matches!(kind_at(line), Some(DiffLineKind::Hunk));
+        let line_len = |line: usize| content.lines.get(line).map_or(0, |text| text.len());
+
+        let mut first = start.line;
+        loop {
+            let droppable =
+                is_metadata(first) || (is_hunk(first) && first == start.line && start.byte > 0);
+            if droppable && first < end.line {
+                first += 1;
+            } else {
+                break;
+            }
+        }
+        let mut last = end.line;
+        loop {
+            let droppable = is_metadata(last)
+                || (is_hunk(last) && last == end.line && end.byte < line_len(last));
+            if droppable && last > first {
+                last -= 1;
+            } else {
+                break;
+            }
+        }
+        if first > last {
+            return None;
+        }
+        let has_patch_body = (first..=last).any(|line| {
+            matches!(
+                kind_at(line),
+                Some(
+                    DiffLineKind::Context
+                        | DiffLineKind::Addition
+                        | DiffLineKind::Deletion
+                        | DiffLineKind::NoNewline
+                )
+            )
+        });
+        if !has_patch_body {
+            return None;
+        }
+        let new_start = ContentPoint {
+            line: first,
+            byte: if first == start.line { start.byte } else { 0 },
+        };
+        let new_end = ContentPoint {
+            line: last,
+            byte: if last == end.line {
+                end.byte
+            } else {
+                line_len(last)
+            },
+        };
+        Some((new_start, new_end))
     }
 
     /// Source coordinates for the anchor template.
@@ -8072,16 +8198,12 @@ impl App {
     /// numbers from the hunk annotations when available. A selection spanning
     /// more than one file (multiple `diff --git` headers) has no single
     /// anchor and falls back to plain text.
-    fn send_selection_anchor(&self) -> Option<crate::send_agent::SelectionAnchor> {
+    fn preview_selection_anchor(
+        &self,
+        start: ContentPoint,
+        end: ContentPoint,
+    ) -> Option<crate::send_agent::SelectionAnchor> {
         let content = &self.tab().content;
-        let selection = content.selection?;
-        let (start, end) = selection.normalized();
-        if start == end {
-            return None;
-        }
-        if content.mode == ContentMode::Diff {
-            return self.diff_selection_anchor(start.line, end.line);
-        }
         if content.mode != ContentMode::Preview || !content.show_line_numbers {
             return None;
         }
@@ -8100,7 +8222,8 @@ impl App {
         })
     }
 
-    /// Anchor for a unified-diff selection; see [`Self::send_selection_anchor`].
+    /// Anchor for a unified-diff selection (file from the enclosing
+    /// `diff --git` header, new-side line numbers from hunk annotations).
     fn diff_selection_anchor(
         &self,
         start_line: usize,
@@ -15139,7 +15262,25 @@ mod tests {
         });
     }
 
+    fn resolve_diff_anchor(app: &App) -> Option<crate::send_agent::SelectionAnchor> {
+        let content = &app.tab().content;
+        let selection = content.selection?;
+        let (start, end) = selection.normalized();
+        let (trimmed_start, trimmed_end) = app.trimmed_diff_selection(start, end)?;
+        app.diff_selection_anchor(trimmed_start.line, trimmed_end.line)
+    }
+
     fn install_diff_selection(lines: Vec<&str>, start: usize, end: usize) -> App {
+        install_diff_selection_offsets(lines, start, 0, end, 64)
+    }
+
+    fn install_diff_selection_offsets(
+        lines: Vec<&str>,
+        start_line: usize,
+        start_byte: usize,
+        end_line: usize,
+        end_byte: usize,
+    ) -> App {
         let directory = tempfile::tempdir().unwrap();
         let mut app = App::new(directory.path().to_path_buf()).unwrap();
         let owned: Vec<String> = lines.into_iter().map(str::to_owned).collect();
@@ -15151,20 +15292,97 @@ mod tests {
         content.lines = owned;
         content.selection = Some(ContentSelection {
             anchor_before: ContentPoint {
-                line: start,
-                byte: 0,
+                line: start_line,
+                byte: start_byte,
             },
             anchor_after: ContentPoint {
-                line: end,
-                byte: 64,
+                line: end_line,
+                byte: end_byte,
             },
-            head: ContentPoint { line: end, byte: 1 },
+            head: ContentPoint {
+                line: end_line,
+                byte: end_byte,
+            },
             dragging: false,
             dragged: true,
             send_armed: false,
             ctrl_was_down: false,
         });
         app
+    }
+
+    #[test]
+    fn diff_edge_trimming_drops_a_mid_hunk_header_fragment() {
+        // Mirrors the real gesture that began mid-way on git's
+        // `@@ … @@ scope` hunk header and dragged across the change.
+        let lines = vec![
+            "diff --git a/docs/x.md b/docs/x.md",
+            "@@ -56,8 +56,10 @@ Lens scope suffix here",
+            " 1. gate one",
+            " 2. gate two",
+            "-old line",
+            "+new line",
+        ];
+        let app = install_diff_selection_offsets(
+            lines, 1, 30, // starts inside the hunk header, on its scope suffix
+            5, 9,
+        );
+        let content = &app.tab().content;
+        let (start, end) = content.selection.unwrap().normalized();
+        let (trimmed_start, trimmed_end) = app
+            .trimmed_diff_selection(start, end)
+            .expect("patch body remains");
+        assert_eq!(trimmed_start.line, 2, "hunk-header fragment is dropped");
+        assert_eq!(trimmed_end.line, 5);
+        let text = app
+            .content_text_between(trimmed_start, trimmed_end)
+            .unwrap();
+        assert_eq!(text, " 1. gate one\n 2. gate two\n-old line\n+new line");
+        assert!(!text.contains("scope suffix"));
+        let anchor = resolve_diff_anchor(&app).expect("anchor resolves after trimming");
+        assert_eq!(anchor.path, "docs/x.md");
+        assert_eq!(anchor.start_line, 56);
+    }
+
+    #[test]
+    fn diff_edge_trimming_keeps_a_full_hunk_header_and_drops_file_metadata() {
+        let lines = vec![
+            "diff --git a/x.rs b/x.rs",
+            "index 000..111 100644",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ];
+        // Drag from the index/metadata rows (full lines) through the hunk.
+        let app = install_diff_selection_offsets(lines, 1, 0, 6, 4);
+        let content = &app.tab().content;
+        let (start, end) = content.selection.unwrap().normalized();
+        let (trimmed_start, trimmed_end) = app
+            .trimmed_diff_selection(start, end)
+            .expect("patch body remains");
+        assert_eq!(trimmed_start.line, 4, "the full @@ hunk header survives");
+        let text = app
+            .content_text_between(trimmed_start, trimmed_end)
+            .unwrap();
+        assert!(text.starts_with("@@ -1 +1 @@\n"));
+        assert!(!text.contains("index 000"));
+    }
+
+    #[test]
+    fn diff_metadata_only_selection_has_no_anchor() {
+        let lines = vec![
+            "diff --git a/x.rs b/x.rs",
+            "index 000..111 100644",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "@@ -1 +1 @@",
+            "-old",
+        ];
+        // Select only metadata rows.
+        let app = install_diff_selection_offsets(lines, 0, 0, 3, 64);
+        assert!(resolve_diff_anchor(&app).is_none());
     }
 
     #[test]
@@ -15182,9 +15400,7 @@ mod tests {
             6,
             7,
         );
-        let anchor = app
-            .send_selection_anchor()
-            .expect("single-file hunk anchors");
+        let anchor = resolve_diff_anchor(&app).expect("single-file hunk anchors");
         assert_eq!(anchor.path, "a-first.txt");
         // -old has no new line; +new replaces it at the first new line.
         assert_eq!(anchor.start_line, 1);
@@ -15210,7 +15426,7 @@ mod tests {
             7,
         );
         assert!(
-            app.send_selection_anchor().is_none(),
+            resolve_diff_anchor(&app).is_none(),
             "a multi-file patch cannot have one file anchor"
         );
     }
@@ -15227,9 +15443,7 @@ mod tests {
             3,
             3,
         );
-        let anchor = app
-            .send_selection_anchor()
-            .expect("deletion anchors to the hunk");
+        let anchor = resolve_diff_anchor(&app).expect("deletion anchors to the hunk");
         assert_eq!(anchor.path, "a.txt");
         assert_eq!((anchor.start_line, anchor.end_line), (5, 5));
     }
