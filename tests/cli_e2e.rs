@@ -40,6 +40,41 @@ fn invalid_path_fails_before_terminal_initialization() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot open"));
 }
 
+#[test]
+fn typoed_path_suggests_similar_directory_entries() {
+    let binary = env!("CARGO_BIN_EXE_latte-lens");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    std::fs::write(sandbox.path().join("AGENTS.md"), b"hello").expect("write");
+    let output = Command::new(binary)
+        .arg("AGENTS.md2")
+        .current_dir(sandbox.path())
+        .output()
+        .expect("run latte-lens with a typoed path");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot open AGENTS.md2"));
+    assert!(stderr.contains("Did you mean 'AGENTS.md'?"));
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+}
+
+#[test]
+fn missing_parent_directory_is_reported_without_suggestions() {
+    let binary = env!("CARGO_BIN_EXE_latte-lens");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let output = Command::new(binary)
+        .arg("no/such/dir/file.md")
+        .current_dir(sandbox.path())
+        .output()
+        .expect("run latte-lens with a missing parent directory");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no/such/dir/file.md does not exist"));
+    assert!(stderr.contains("directory"));
+    assert!(!stderr.contains("Did you mean"));
+}
+
 #[cfg(feature = "agent-observability")]
 #[test]
 fn hook_cli_is_fail_open_and_silent_when_no_adapter_is_registered() {

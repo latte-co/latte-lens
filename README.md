@@ -98,6 +98,16 @@ make install
 latte-lens /path/to/repository
 ```
 
+Passing a regular file opens a single-file view containing exactly that
+file — like an editor opening a document. The workspace root becomes the
+containing directory, the file's preview loads immediately with focus on
+the content pane, and edit mode (`i`) and Send to Agent (`Ctrl+E`) work
+as usual:
+
+```bash
+latte-lens /path/to/repository/AGENTS.md
+```
+
 By default, Cargo installs `latte-lens` into `~/.cargo/bin`.
 
 Install hooks later, or restore the exact pre-setup configuration printed by a

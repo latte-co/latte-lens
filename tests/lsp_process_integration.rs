@@ -87,6 +87,7 @@ fn repeated_real_crashes_back_off_and_fifth_failure_stops_spawning() {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();
@@ -171,6 +172,7 @@ fn distinct_session_keys_have_no_fixed_count_cap_and_reuse_identical_key() {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();
@@ -258,6 +260,7 @@ fn twelve_stalled_session_trees_shutdown_with_one_process_wide_deadline() {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();
@@ -330,6 +333,7 @@ fn escaped_pipe_owner_is_quarantined_without_fake_cleanup_or_unbounded_drop() {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();
@@ -405,6 +409,7 @@ fn run_pipe_holding_descendant_cleanup(role: &str, ready_marker: Option<&str>) {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();
@@ -464,6 +469,7 @@ fn run_incompatible_position_encoding_cleanup() {
         AppOptions {
             navigation: loaded.settings,
             navigation_config_warning: loaded.warning,
+            initial_file: None,
         },
     )
     .unwrap();

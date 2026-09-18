@@ -475,6 +475,11 @@ impl Default for NavigationSettings {
 pub struct AppOptions {
     pub navigation: NavigationSettings,
     pub navigation_config_warning: Option<String>,
+    /// Canonical absolute path of a regular file to open in a single-file
+    /// Files view (`latte-lens path/to/file.md`). Must live inside the
+    /// workspace root; values outside it (or non-files) are ignored. The
+    /// workspace root itself stays the containing directory.
+    pub initial_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]

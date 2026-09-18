@@ -56,7 +56,7 @@ Run commands from the repository root.
 | Command | Use |
 | --- | --- |
 | `make setup` | Install rustfmt, Clippy, LLVM tools, and `cargo-llvm-cov`. |
-| `cargo run -- /path/to/workspace` | Start Latte Lens against a directory; omit the path to use `.`. |
+| `cargo run -- /path/to/workspace` | Start Latte Lens against a directory or a single file; omit the path to use `.`. |
 | `make build` | Build the debug binary with the lockfile. |
 | `make ci` | Run the complete local handoff gate: formatting, check, lint, Rust tests, script tests, and PTY E2E. |
 | `make coverage` | Enforce the UT, production PTY E2E, and Agent Core coverage floors. |
