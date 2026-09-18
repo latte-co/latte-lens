@@ -1021,6 +1021,11 @@ pub struct FilesProjection {
     /// this is a display filter only: the global scan, runtimes, and
     /// repository graph stay rooted at the workspace root.
     pub single_file: Option<PathBuf>,
+    /// When set, the tree shows exactly this one file stored as an absolute
+    /// path outside the workspace (the `--attach` detached preview mode).
+    /// The single row is synthesized rather than filtered from the workspace
+    /// scan, and nothing else about the tab's workspace scope changes.
+    pub detached_file: Option<PathBuf>,
     /// Whether [`Self::view_root`] looks like a project boundary (contains
     /// `.git` or a recognized language manifest), which lets it act as the
     /// preferred LSP server root for documents opened in this tab.
@@ -1037,6 +1042,7 @@ impl FilesProjection {
             truncated: false,
             view_root: None,
             single_file: None,
+            detached_file: None,
             view_root_is_project: false,
         }
     }
@@ -1143,6 +1149,9 @@ pub struct App {
     tree_hidden: bool,
     scan_entry_limit: usize,
     runtime: WorkerRuntime,
+    /// Inbox served by the instance IPC server (see
+    /// [`App::attach_instance_inbox`]); the main loop drains it each frame.
+    instance_inbox: Option<crate::ipc::RequestInbox>,
     refresh_requests: RequestGeneration,
     external_open_requests: RequestGeneration,
     navigation_preview_requests: RequestGeneration,
@@ -1579,6 +1588,7 @@ impl App {
             tree_hidden: layout.tree_hidden,
             scan_entry_limit,
             runtime,
+            instance_inbox: None,
             refresh_requests: RequestGeneration::default(),
             external_open_requests: RequestGeneration::default(),
             navigation_preview_requests: RequestGeneration::default(),
@@ -1671,6 +1681,162 @@ impl App {
             .and_then(|index| self.agent_view.sessions.get(index))
     }
 
+    /// Attach the inbox served by this instance's IPC server. Connection
+    /// threads push `open` requests into it; [`App::run`] drains it every
+    /// frame and answers each request over its one-shot reply channel, so an
+    /// external `--attach` client can open paths in the running viewer.
+    pub fn attach_instance_inbox(&mut self, inbox: crate::ipc::RequestInbox) {
+        self.instance_inbox = Some(inbox);
+    }
+
+    /// Answer every forwarded `open` request currently sitting in the
+    /// instance inbox. Called once per frame from [`App::run`].
+    fn poll_instance_requests(&mut self) {
+        let Some(inbox) = self.instance_inbox.as_ref() else {
+            return;
+        };
+        let requests: Vec<crate::ipc::InstanceRequest> = {
+            let mut guard = inbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.drain(..).collect()
+        };
+        for request in requests {
+            let body = self.perform_instance_open(request.paths, request.focus);
+            // The connection thread may already have timed out and hung up;
+            // a failed reply is fine, the work above is still done.
+            let _ = request.reply.send(body);
+        }
+    }
+
+    /// Resolve absolute `open` paths against this instance's workspace.
+    /// Paths under the workspace root are revealed on a Files tab; files
+    /// outside it open in their own fresh tab as detached previews through
+    /// the same boundary-gated machinery that renders dependency sources
+    /// (the file's parent becomes the safety root, nothing enters the tree
+    /// or repository graph). Missing paths and out-of-workspace directories
+    /// are reported back as rejected while the valid paths are still opened.
+    fn perform_instance_open(
+        &mut self,
+        paths: Vec<String>,
+        focus: crate::ipc::Focus,
+    ) -> crate::ipc::ResponseBody {
+        let mut opened: Vec<String> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
+        let mut outside_directories = false;
+        for raw in &paths {
+            let candidate = PathBuf::from(raw);
+            let absolute = match candidate.canonicalize() {
+                Ok(absolute) => absolute,
+                Err(_) => {
+                    rejected.push(raw.clone());
+                    continue;
+                }
+            };
+            let inside_root = absolute
+                .strip_prefix(&self.root)
+                .ok()
+                .map(Path::to_path_buf)
+                .filter(|relative| !relative.as_os_str().is_empty());
+            match inside_root {
+                Some(relative) => {
+                    self.reveal_instance_path(relative, focus);
+                    opened.push(absolute.display().to_string());
+                }
+                None if absolute.is_dir() => {
+                    outside_directories = true;
+                    rejected.push(raw.clone());
+                }
+                None => {
+                    self.open_detached_instance_file(&absolute);
+                    opened.push(absolute.display().to_string());
+                }
+            }
+        }
+        if rejected.is_empty() {
+            crate::ipc::ResponseBody::Opened { opened }
+        } else {
+            let mut message = format!("cannot open: {}", rejected.join(", "));
+            if outside_directories {
+                message.push_str("; directories outside the workspace cannot be previewed");
+            }
+            if !opened.is_empty() {
+                message.push_str(&format!(" (opened: {})", opened.join(", ")));
+            }
+            crate::ipc::ResponseBody::Error { message }
+        }
+    }
+
+    /// Preview one file that lives outside the workspace in its own fresh
+    /// tab: the tab's tree shows exactly the detached file (a synthesized
+    /// row, never the workspace root), and the preview reuses the
+    /// dependency-source path. Detached files always get their own tab
+    /// regardless of the requested focus, so an in-flight workspace preview
+    /// is never replaced by an out-of-workspace one.
+    fn open_detached_instance_file(&mut self, absolute: &Path) {
+        self.open_tab(TabKind::Files);
+        {
+            let files = self.tab_mut().files_mut();
+            files.detached_file = Some(absolute.to_path_buf());
+            files.selection = Some(absolute.to_path_buf());
+        }
+        self.sync_tab_title();
+        self.rebuild_visible_rows();
+        self.tab_mut().tree_state.select(Some(0));
+        self.request_detached_file_preview(absolute);
+    }
+
+    /// Request the read-only preview for one out-of-workspace file: the
+    /// file's parent directory becomes the safety boundary, the file never
+    /// joins the tree or repository graph, and reads stay no-follow.
+    fn request_detached_file_preview(&mut self, absolute: &Path) {
+        let parent = absolute
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| absolute.to_path_buf());
+        let relative = absolute
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| absolute.to_path_buf());
+        self.request_content(
+            ContentKind::Preview,
+            absolute.display().to_string(),
+            ContentTarget::Dependency {
+                root: parent.clone(),
+                relative,
+                server_root: parent,
+            },
+        );
+    }
+
+    /// Bring the reveal target into view on a Files tab. `Focus::NewTab`
+    /// always opens a fresh tab; `Focus::Active` keeps the current tab when
+    /// it already shows Files and otherwise moves to the (single) existing
+    /// Files tab or opens one.
+    fn reveal_instance_path(&mut self, relative: PathBuf, focus: crate::ipc::Focus) {
+        match focus {
+            crate::ipc::Focus::NewTab => {
+                self.open_tab(TabKind::Files);
+            }
+            crate::ipc::Focus::Active => {
+                if self.tab().kind() != TabKind::Files {
+                    match self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.kind() == TabKind::Files)
+                        .map(|tab| tab.id)
+                    {
+                        Some(existing) => self.activate_tab(existing),
+                        None => {
+                            self.open_tab(TabKind::Files);
+                        }
+                    }
+                }
+            }
+        }
+        self.reveal_all_files_selection(relative);
+    }
+
     pub fn register_preview_provider<P>(&mut self, provider: P)
     where
         P: PreviewProvider + 'static,
@@ -1686,6 +1852,7 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.should_quit {
             self.poll_background();
+            self.poll_instance_requests();
             terminal.draw(|frame| ui::draw(frame, self))?;
 
             let poll_interval = if self.search.is_some() || self.tab().content.edit.is_some() {
@@ -6321,6 +6488,13 @@ impl App {
         if self.tab().kind != TabKind::Files {
             return;
         }
+        if let Some(detached) = self.tab().files().detached_file.clone() {
+            self.tab_mut().title = detached
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| detached.display().to_string());
+            return;
+        }
         let files = self.tab().files();
         let title = match (&files.single_file, &files.view_root) {
             (Some(single_file), _) => single_file
@@ -6359,6 +6533,20 @@ impl App {
     /// reset (so the caller can surface it after content state settles).
     fn reconcile_view_root_after_refresh(&mut self) -> Option<String> {
         if self.tree_scope != TreeScope::AllFiles {
+            return None;
+        }
+        if let Some(detached) = self.tab().files().detached_file.clone() {
+            // The detached file lives outside the workspace; validate it by
+            // its own absolute path.
+            if !path_exists_without_following(&detached) {
+                self.tab_mut().files_mut().detached_file = None;
+                self.sync_tab_title();
+                self.rebuild_visible_rows();
+                return Some(format!(
+                    "File {} no longer exists; showing the workspace",
+                    detached.display()
+                ));
+            }
             return None;
         }
         if let Some(single_file) = self.tab().files().single_file.clone() {
@@ -7397,6 +7585,12 @@ impl App {
             self.tab_mut().files_mut().single_file = None;
             self.sync_tab_title();
         }
+        // A detached-file view shows one out-of-workspace row; revealing any
+        // workspace path broadens the view to the tree.
+        if self.tab().files().detached_file.is_some() {
+            self.tab_mut().files_mut().detached_file = None;
+            self.sync_tab_title();
+        }
         self.pending_all_scope_path = Some(path.clone());
         let mut parent = path.parent();
         while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
@@ -7509,6 +7703,23 @@ impl App {
     }
 
     fn rebuild_visible_rows(&mut self) {
+        // A detached-file tab shows exactly one synthesized row for the
+        // out-of-workspace file; the workspace scan never contains it.
+        if let Some(detached) = self.tab().files().detached_file.clone() {
+            let entry = FileEntry {
+                relative: detached.clone(),
+                is_dir: false,
+                category: crate::tree::FileCategory::from_path(&detached),
+                depth: 0,
+                status: None,
+                contains_changes: false,
+                exists: true,
+                symlink_target: None,
+            };
+            self.tab_mut().files_mut().visible_rows = vec![entry];
+            self.normalize_tree_state();
+            return;
+        }
         let files_expansion = self.tab().files().expansion.clone();
         let unloaded = &self.unloaded_directories;
         let view_root = self.tab().files().view_root.clone();
@@ -8077,6 +8288,19 @@ impl App {
                 "{} no longer exists in the working tree.",
                 relative.display()
             )]);
+            return;
+        }
+        // A detached-file tab reloads its out-of-workspace preview through
+        // the boundary-gated dependency path instead of the workspace root,
+        // and stays out of the workspace-scoped recents list.
+        if self
+            .tab()
+            .files()
+            .detached_file
+            .as_ref()
+            .is_some_and(|detached| *detached == relative)
+        {
+            self.request_detached_file_preview(&relative);
             return;
         }
 
@@ -12101,6 +12325,170 @@ mod tests {
             ["No Git changes found in the partial filesystem results."]
         );
         assert!(!app.tab_mut().content.lines[0].contains("No uncommitted Git changes"));
+    }
+
+    #[test]
+    fn instance_open_requests_reveal_the_target_in_the_active_files_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("docs")).unwrap();
+        fs::write(directory.path().join("docs").join("note.md"), "hello").unwrap();
+        fs::write(directory.path().join("top.txt"), "top").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+
+        let inbox = crate::ipc::new_request_inbox();
+        app.attach_instance_inbox(inbox.clone());
+        let target = directory.path().join("docs").join("note.md");
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::ipc::InstanceRequest {
+                paths: vec![target.display().to_string()],
+                focus: crate::ipc::Focus::Active,
+                reply,
+            });
+        app.poll_instance_requests();
+
+        match receiver.recv().expect("reply") {
+            crate::ipc::ResponseBody::Opened { opened } => {
+                assert_eq!(opened, vec![target.display().to_string()])
+            }
+            other => panic!("expected opened reply, got {other:?}"),
+        }
+        assert_eq!(
+            app.tab().files().selection,
+            Some(PathBuf::from("docs").join("note.md"))
+        );
+    }
+
+    #[test]
+    fn instance_open_requests_outside_the_workspace_open_a_detached_preview_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("elsewhere.md"), "detached").unwrap();
+        fs::write(directory.path().join("note.md"), "hello").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+        assert_eq!(app.tabs().len(), 1);
+        let selection_before = app.tab().files().selection.clone();
+
+        let inbox = crate::ipc::new_request_inbox();
+        app.attach_instance_inbox(inbox.clone());
+        let target = outside.path().join("elsewhere.md");
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::ipc::InstanceRequest {
+                paths: vec![target.display().to_string()],
+                focus: crate::ipc::Focus::Active,
+                reply,
+            });
+        app.poll_instance_requests();
+
+        match receiver.recv().expect("reply") {
+            crate::ipc::ResponseBody::Opened { opened } => {
+                assert_eq!(opened, vec![target.display().to_string()])
+            }
+            other => panic!("expected opened reply, got {other:?}"),
+        }
+        // The file lives outside the workspace, so it always lands in its own
+        // fresh tab regardless of the requested focus: the original tab keeps
+        // its selection while the new tab's content pane resolves the request
+        // through a dependency-style identity bounded at the parent.
+        assert_eq!(app.tabs().len(), 2);
+        assert_eq!(app.tab().kind(), TabKind::Files);
+        assert_eq!(app.tabs()[0].files().selection, selection_before);
+        // The detached tab's tree shows exactly the one file — never the
+        // workspace scan (note.md stays out of the rows).
+        let files = app.tab().files();
+        assert_eq!(files.detached_file, Some(target.clone()));
+        assert_eq!(files.visible_rows.len(), 1);
+        assert_eq!(files.visible_rows[0].relative, target);
+        assert!(!files.visible_rows[0].is_dir);
+        assert_eq!(files.selection, Some(target.clone()));
+        assert_eq!(app.tab().tree_state.selected(), Some(0));
+        assert_eq!(app.tab().title, "elsewhere.md");
+        app.wait_for_background();
+        let identity = app
+            .tab()
+            .content
+            .identity
+            .clone()
+            .expect("preview identity");
+        match identity {
+            crate::runtime::ContentIdentity::Dependency { root, relative, .. } => {
+                assert_eq!(root, outside.path());
+                assert_eq!(relative, PathBuf::from("elsewhere.md"));
+            }
+            other => panic!("expected a detached dependency identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instance_open_requests_missing_paths_or_outside_directories_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("nested")).unwrap();
+        fs::write(directory.path().join("note.md"), "hello").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+        let selection_before = app.tab().files().selection.clone();
+
+        let inbox = crate::ipc::new_request_inbox();
+        app.attach_instance_inbox(inbox.clone());
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::ipc::InstanceRequest {
+                paths: vec![
+                    outside.path().join("nested").display().to_string(),
+                    directory.path().join("missing.md").display().to_string(),
+                ],
+                focus: crate::ipc::Focus::Active,
+                reply,
+            });
+        app.poll_instance_requests();
+
+        match receiver.recv().expect("reply") {
+            crate::ipc::ResponseBody::Error { message } => {
+                assert!(message.contains("cannot open"));
+                assert!(message.contains("nested"));
+                assert!(message.contains("missing.md"));
+                assert!(message.contains("directories outside the workspace"));
+            }
+            other => panic!("expected error reply, got {other:?}"),
+        }
+        assert_eq!(app.tab().files().selection, selection_before);
+    }
+
+    #[test]
+    fn instance_open_requests_with_new_tab_focus_open_a_files_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "hello").unwrap();
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+        assert_eq!(app.tabs().len(), 1);
+
+        let inbox = crate::ipc::new_request_inbox();
+        app.attach_instance_inbox(inbox.clone());
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::ipc::InstanceRequest {
+                paths: vec![directory.path().join("note.md").display().to_string()],
+                focus: crate::ipc::Focus::NewTab,
+                reply,
+            });
+        app.poll_instance_requests();
+
+        receiver.recv().expect("reply");
+        assert_eq!(app.tabs().len(), 2);
+        assert_eq!(app.tab().kind(), TabKind::Files);
+        assert_eq!(app.tab().files().selection, Some(PathBuf::from("note.md")));
     }
 
     #[test]

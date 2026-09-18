@@ -108,6 +108,38 @@ as usual:
 latte-lens /path/to/repository/AGENTS.md
 ```
 
+Every running instance announces itself on a private per-user socket, so you
+can list the instances you currently have open:
+
+```bash
+latte-lens ps
+latte-lens ps --json
+```
+
+The same socket lets a second command deliver a path into a viewer that is
+already open. `--attach` hands the path to the running instance whose
+workspace covers it (the deepest root wins) and reveals it on the active
+Files tab; `--new-tab` opens it in a fresh Files tab instead. Routing needs
+no extra flags in the common cases: if only one instance is running, any
+path — even a file outside its workspace such as `~/.bashrc` — goes straight
+to it, and if several instances are running you choose one from a short
+interactive menu (a non-interactive shell instead lists the instances and
+suggests `--target`). A file delivered to an instance whose workspace does
+not contain it opens in its own new tab as a detached preview: that tab
+lists just the one file (the workspace tree never opens), its content pane
+resolves through the same boundary-gated machinery used for dependency
+sources, and it never enters the Git views. `--target <pid|root>` overrides
+the automatic choice outright. Missing paths and out-of-workspace
+directories are still rejected. Without any running instance, a fresh
+viewer starts for the same path:
+
+```bash
+latte-lens --attach /path/to/repository/AGENTS.md
+latte-lens --attach ~/.bashrc
+latte-lens --attach --new-tab /path/to/repository
+latte-lens --attach --target 12345 /path/to/repository/AGENTS.md
+```
+
 By default, Cargo installs `latte-lens` into `~/.cargo/bin`.
 
 Install hooks later, or restore the exact pre-setup configuration printed by a

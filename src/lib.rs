@@ -8,6 +8,7 @@ mod diff;
 mod edit;
 mod folding;
 pub mod git;
+pub mod ipc;
 mod lsp;
 mod lsp_process;
 pub mod navigation;

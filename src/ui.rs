@@ -1866,10 +1866,23 @@ fn draw_tree(frame: &mut Frame, app: &mut App, header: Rect, rows: Rect) {
         let files = app.tab().files();
         let root_depth = if all_files_scope {
             files
-                .view_root
+                .detached_file
                 .as_deref()
-                .or(files.single_file.as_deref().and_then(Path::parent))
-                .map_or(0, |root| root.components().count())
+                .map(|_| 0usize)
+                .or_else(|| {
+                    files
+                        .view_root
+                        .as_deref()
+                        .map(|root| root.components().count())
+                })
+                .or_else(|| {
+                    files
+                        .single_file
+                        .as_deref()
+                        .and_then(Path::parent)
+                        .map(|root| root.components().count())
+                })
+                .unwrap_or(0)
         } else {
             0
         };
