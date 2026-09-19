@@ -75,6 +75,7 @@ fn missing_parent_directory_is_reported_without_suggestions() {
     assert!(!stderr.contains("Did you mean"));
 }
 
+#[cfg(unix)]
 #[test]
 fn ps_reports_no_instances_in_an_isolated_runtime_dir() {
     let binary = env!("CARGO_BIN_EXE_latte-lens");
@@ -89,6 +90,7 @@ fn ps_reports_no_instances_in_an_isolated_runtime_dir() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("no running instances"));
 }
 
+#[cfg(unix)]
 #[test]
 fn ps_json_reports_an_empty_document_without_instances() {
     let binary = env!("CARGO_BIN_EXE_latte-lens");
@@ -104,6 +106,7 @@ fn ps_json_reports_an_empty_document_without_instances() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
 }
 
+#[cfg(unix)]
 #[test]
 fn attach_with_a_missing_path_reports_the_lookup_failure() {
     let binary = env!("CARGO_BIN_EXE_latte-lens");

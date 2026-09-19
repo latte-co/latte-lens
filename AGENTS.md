@@ -34,7 +34,7 @@ text query. Preserve these bounded, non-blocking semantics for every workspace.
 | `src/tree.rs` | Bounded shallow scans and on-demand directory expansion for All Files. |
 | `src/search.rs` | Lazy, cancellable search inventory and streaming file/text search. |
 | `src/git.rs` | The system-Git process boundary and byte-preserving porcelain parsing. |
-| `src/ipc.rs` | Per-instance sockets, the instance handshake protocol, discovery backing `latte-lens ps`, and forwarded `open` requests backing `--attach`. |
+| `src/ipc.rs` | Per-instance Unix-domain sockets, the instance handshake protocol, discovery backing `latte-lens ps`, and forwarded `open` requests backing `--attach`. Wire types and the request inbox are cross-platform; the socket transport and both commands are `cfg(unix)` (Windows stable lacks AF_UNIX). |
 | `src/repo_graph.rs` | Nested-repository discovery, ownership, and repository relationships. |
 | `src/content_safety.rs` | Non-following path inspection and safe regular-file opening. |
 | `src/preview.rs` | Bounded preview-provider contract, registry, text preview, and syntax highlighting. |

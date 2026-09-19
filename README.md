@@ -140,6 +140,11 @@ latte-lens --attach --new-tab /path/to/repository
 latte-lens --attach --target 12345 /path/to/repository/AGENTS.md
 ```
 
+Instance delivery and `latte-lens ps` are **Unix-only** for now: they use
+Unix-domain sockets, which stable Rust on Windows does not yet expose. On
+Windows the TUI works as usual, but `ps` and `--attach` report that the
+commands are unavailable rather than failing silently.
+
 By default, Cargo installs `latte-lens` into `~/.cargo/bin`.
 
 Install hooks later, or restore the exact pre-setup configuration printed by a

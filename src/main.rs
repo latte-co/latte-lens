@@ -8,15 +8,18 @@ use std::{env, ffi::OsStr, io::Read, time::Instant};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "agent-observability")]
 use clap::Args;
 use clap::{Parser, Subcommand};
 #[cfg(feature = "agent-observability")]
 use latte_lens::agent::*;
+#[cfg(unix)]
+use latte_lens::ipc;
 use latte_lens::{
     app::App,
-    ipc,
     navigation::{AppOptions, load_user_configuration},
     preview::PreviewRegistry,
 };
@@ -159,6 +162,7 @@ fn main() -> Result<()> {
 /// an interactive picker (piped/non-interactive input lists the instances
 /// and suggests `--target`). Without any running instance the command falls
 /// back to starting a fresh viewer for the same path.
+#[cfg(unix)]
 fn run_attach(path: PathBuf, target: Option<&str>, new_tab: bool) -> Result<()> {
     // Resolve and validate the path first, so a typo reports suggestions
     // instead of instance-routing noise.
@@ -230,6 +234,7 @@ fn run_attach(path: PathBuf, target: Option<&str>, new_tab: bool) -> Result<()> 
 /// When no instance covers the scope and no target was given, a single
 /// running instance is chosen automatically; with several instances the
 /// result is [`Route::Ambiguous`] so the caller can offer a choice.
+#[cfg(unix)]
 fn select_instance<'a>(
     instances: &'a [ipc::Instance],
     target: Option<&str>,
@@ -278,12 +283,14 @@ fn select_instance<'a>(
 
 /// The outcome of routing an `--attach` request: either a single chosen
 /// instance or a set of candidates the user must pick from interactively.
+#[cfg(unix)]
 #[derive(Debug)]
 enum Route<'a> {
     Instance(&'a ipc::Instance),
     Ambiguous(Vec<&'a ipc::Instance>),
 }
 
+#[cfg(unix)]
 fn format_instance_list<'a>(instances: impl IntoIterator<Item = &'a ipc::Instance>) -> String {
     instances
         .into_iter()
@@ -295,6 +302,7 @@ fn format_instance_list<'a>(instances: impl IntoIterator<Item = &'a ipc::Instanc
 /// Prompt for a 1-based choice among running instances. Returns the chosen
 /// instance, or an error when the input is not a TTY, is cancelled, or is
 /// out of range.
+#[cfg(unix)]
 fn prompt_instance_choice<'a>(
     instances: &[&'a ipc::Instance],
     scope: &Path,
@@ -341,6 +349,7 @@ fn prompt_instance_choice<'a>(
 }
 /// One row of `latte-lens ps --json`: the protocol's instance identity plus
 /// the socket path a future `--attach` client would talk to.
+#[cfg(unix)]
 #[derive(serde::Serialize)]
 struct PsEntry<'a> {
     #[serde(flatten)]
@@ -351,6 +360,7 @@ struct PsEntry<'a> {
 /// List live Latte Lens instances from the per-user runtime directory.
 /// Discovery proves liveness by handshake, so the output never lists a
 /// crashed instance's leftover socket.
+#[cfg(unix)]
 fn run_ps(json: bool) -> Result<()> {
     let dir = ipc::runtime_dir().context("instance discovery is unavailable")?;
     let instances = ipc::discover(&dir);
@@ -383,6 +393,7 @@ fn run_ps(json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn unix_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -391,6 +402,7 @@ fn unix_millis_now() -> u64 {
 }
 
 /// Render elapsed time compactly: "42s", "12m05s", "3h05m", "2d04h".
+#[cfg(unix)]
 fn format_uptime(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     match seconds {
@@ -399,6 +411,20 @@ fn format_uptime(elapsed: Duration) -> String {
         3600..=86_399 => format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60),
         _ => format!("{}d{:02}h", seconds / 86_400, (seconds % 86_400) / 3600),
     }
+}
+
+// Instance discovery and `--attach` delivery use Unix-domain sockets. Stable
+// Rust still only exposes Windows AF_UNIX on nightly, so on Windows the two
+// commands fail with a clear message instead of silently doing nothing; the
+// TUI itself is unaffected.
+#[cfg(windows)]
+fn run_ps(_json: bool) -> Result<()> {
+    bail!("`latte-lens ps` is only available on Unix (Windows AF_UNIX is not yet stable)")
+}
+
+#[cfg(windows)]
+fn run_attach(_path: PathBuf, _target: Option<&str>, _new_tab: bool) -> Result<()> {
+    bail!("`--attach` is only available on Unix (Windows AF_UNIX is not yet stable)")
 }
 
 #[cfg(feature = "agent-observability")]
@@ -513,16 +539,19 @@ fn run_tui(path: PathBuf) -> Result<()> {
     // Serve the instance-discovery handshake (and forwarded open requests)
     // while the TUI runs. Best-effort: a broken runtime directory must not
     // block the viewer, and dropping the server when the TUI returns removes
-    // the socket file.
-    let instance_inbox = ipc::new_request_inbox();
-    let _instance_server = match ipc::IpcServer::start_serving(&workspace, &instance_inbox) {
-        Ok(server) => Some(server),
-        Err(error) => {
-            eprintln!("latte-lens: instance discovery unavailable: {error}");
-            None
-        }
-    };
-    app.attach_instance_inbox(instance_inbox);
+    // the socket file. Unix only: stable Windows does not expose AF_UNIX.
+    #[cfg(unix)]
+    {
+        let instance_inbox = ipc::new_request_inbox();
+        let _instance_server = match ipc::IpcServer::start_serving(&workspace, &instance_inbox) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("latte-lens: instance discovery unavailable: {error}");
+                None
+            }
+        };
+        app.attach_instance_inbox(instance_inbox);
+    }
 
     ratatui::run(|terminal| -> io::Result<()> {
         let _terminal_input = TerminalInputGuard::enable()?;
@@ -743,15 +772,21 @@ impl Drop for TerminalInputGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Route, bounded_edit_distance, format_uptime, prompt_instance_choice, select_instance,
-        similar_entry_names,
-    };
+    #[cfg(unix)]
+    use super::{Route, format_uptime, prompt_instance_choice, select_instance};
+    use super::{bounded_edit_distance, similar_entry_names};
+    #[cfg(unix)]
     use latte_lens::ipc::{self, Instance, InstanceInfo};
+    #[cfg(unix)]
     use std::io::Cursor;
-    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn instance(pid: u32, root: &str) -> Instance {
         Instance {
             socket_path: PathBuf::from(format!("/runtime/{pid}.sock")),
@@ -765,6 +800,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn selected_pid<'a>(route: Route<'a>) -> u32 {
         match route {
             Route::Instance(instance) => instance.info.pid,
@@ -772,6 +808,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn routing_prefers_the_deepest_instance_root_covering_the_path() {
         let instances = vec![
@@ -791,6 +828,7 @@ mod tests {
         assert_eq!(selected_pid(route), 10);
     }
 
+    #[cfg(unix)]
     #[test]
     fn routing_matches_roots_by_components_not_string_prefixes() {
         // `/home/me/project-x` shares a string prefix with root
@@ -812,6 +850,7 @@ mod tests {
         assert_eq!(pids, vec![20, 21]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_numeric_target_selects_by_exact_pid() {
         let instances = vec![instance(30, "/a"), instance(31, "/b")];
@@ -821,6 +860,7 @@ mod tests {
         assert!(select_instance(&instances, Some("99"), Path::new("/b/file.rs")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_path_target_reroutes_inside_the_target_subtree() {
         let instances = vec![instance(40, "/home/me"), instance(41, "/other")];
@@ -829,6 +869,7 @@ mod tests {
         assert_eq!(selected_pid(route), 40);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_single_running_instance_receives_uncovered_paths_without_a_target() {
         let instances = vec![instance(42, "/data00/projects/latte-co")];
@@ -837,6 +878,7 @@ mod tests {
         assert_eq!(selected_pid(route), 42);
     }
 
+    #[cfg(unix)]
     #[test]
     fn several_instances_without_coverage_become_an_ambiguous_choice() {
         let instances = vec![instance(50, "/alpha"), instance(51, "/beta")];
@@ -853,6 +895,7 @@ mod tests {
         assert_eq!(pids, vec![50, 51]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_explicit_path_target_that_covers_nothing_reports_the_list() {
         let instances = vec![instance(60, "/alpha"), instance(61, "/beta")];
@@ -864,6 +907,7 @@ mod tests {
         assert!(message.contains("pid 61"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_instance_choice_prompt_accepts_a_number() {
         let instances = [instance(70, "/alpha"), instance(71, "/beta")];
@@ -882,6 +926,7 @@ mod tests {
         assert!(rendered.contains("pid 71"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_instance_choice_prompt_rejects_bad_cancel_and_out_of_range_input() {
         let instances = [instance(80, "/alpha"), instance(81, "/beta")];
@@ -896,6 +941,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn uptime_renders_each_scale_compactly() {
         assert_eq!(format_uptime(Duration::from_secs(0)), "0s");

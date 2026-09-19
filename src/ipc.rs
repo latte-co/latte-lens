@@ -12,27 +12,35 @@
 //! Both directions are bounded ([`MAX_REQUEST_BYTES`]), and a connection
 //! carries exactly one request and at most one response.
 //!
-//! Platform note: the socket types come from `std::os::unix::net` and
-//! `std::os::windows::net`, which expose the same
-//! `UnixListener`/`UnixStream` surface (the Windows side requires the
-//! Winsock AF_UNIX support of Windows 10 1803+).
+//! Platform note: instance discovery and delivery use Unix-domain sockets
+//! (`std::os::unix::net`), so `latte-lens ps` and `--attach` are available on
+//! Unix only. The wire protocol types and the request inbox are platform
+//! independent; the Windows build of the TUI simply does not serve or accept
+//! instances. Stable Rust still exposes Windows AF_UNIX only on nightly.
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+// Socket transport, paths into syscalls, time, and the listener thread are
+// all part of the Unix-only transport.
+#[cfg(unix)]
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(windows)]
-use std::os::windows::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::thread::JoinHandle;
+#[cfg(unix)]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Wire protocol version answered by this build. Clients reject replies and
 /// instances reject requests whose version differs, so an upgraded binary
@@ -40,32 +48,40 @@ use std::os::windows::net::{UnixListener, UnixStream};
 /// misinterpreting it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// How long a forwarded request waits for the instance main loop to answer.
+/// The loop drains its inbox synchronously every frame, so a healthy instance
+/// answers well within this budget.
+#[cfg(unix)]
+const OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Upper bound on one serialized request or reply, in either direction.
+#[cfg(unix)]
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Connections served concurrently; excess clients are shed and time out.
+#[cfg(unix)]
 const MAX_ACTIVE_CONNECTIONS: usize = 4;
 
 /// Sockets probed by one discovery pass, in sorted file-name order.
+#[cfg(unix)]
 const MAX_DISCOVERED_INSTANCES: usize = 64;
 
 /// Per-I/O-operation deadline for the request/reply exchange.
+#[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Extra bytes consumed while draining an oversized request before replying,
 /// so the peer can finish writing and read the error without a reset.
+#[cfg(unix)]
 const MAX_DRAIN_BYTES: usize = MAX_REQUEST_BYTES;
 
 /// Per-socket deadline while fanning out discovery probes.
+#[cfg(unix)]
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Wake-up cadence of the non-blocking accept loop.
+#[cfg(unix)]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// How long a connection thread waits for the instance main loop to answer
-/// a forwarded `open` request. The loop drains its inbox synchronously every
-/// frame, so a healthy instance answers well within this budget.
-const OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Protocol
@@ -179,7 +195,7 @@ impl std::error::Error for IpcError {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime directory
+// Runtime directory (Unix transport only)
 // ---------------------------------------------------------------------------
 
 /// Resolve the per-user directory that hosts instance sockets:
@@ -188,6 +204,7 @@ impl std::error::Error for IpcError {
 /// `LATTE_LENS_RUNTIME_DIR`, then `XDG_RUNTIME_DIR/latte-lens`, then a
 /// per-uid temporary directory. The two features share the root but never
 /// entries, so one override isolates both in tests.
+#[cfg(unix)]
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let root = match std::env::var_os("LATTE_LENS_RUNTIME_DIR") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
@@ -220,11 +237,6 @@ fn default_runtime_root() -> io::Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("latte-lens-{uid}")))
 }
 
-#[cfg(windows)]
-fn default_runtime_root() -> io::Result<PathBuf> {
-    Ok(std::env::temp_dir().join("latte-lens"))
-}
-
 /// Create `dir` if needed and ensure it is private to the current user.
 /// A directory that cannot be made owner-only is refused rather than served
 /// from: another local user could otherwise talk to our instances.
@@ -251,20 +263,15 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    // The runtime root resolves inside the current user's temp directory,
-    // whose default ACLs already exclude other users.
-    std::fs::create_dir_all(dir)
-}
-
 /// `<pid>-<salt>.sock`, with a salt mixed from the wall clock so a recycled
 /// PID cannot collide with a leftover socket from a previous life of the
 /// same PID. Deterministic so tests can pin the format.
+#[cfg(unix)]
 fn socket_file_name(pid: u32, salt: u32) -> String {
     format!("{pid}-{salt:08x}.sock")
 }
 
+#[cfg(unix)]
 fn startup_salt(now: SystemTime) -> u32 {
     match now.duration_since(UNIX_EPOCH) {
         Ok(elapsed) => (elapsed.as_secs() as u32) ^ elapsed.subsec_nanos().rotate_left(16),
@@ -272,6 +279,7 @@ fn startup_salt(now: SystemTime) -> u32 {
     }
 }
 
+#[cfg(unix)]
 fn unix_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -280,10 +288,11 @@ fn unix_millis_now() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Instance side
+// Instance side (Unix transport only)
 // ---------------------------------------------------------------------------
 
 /// Static identity one instance serves over the `info` handshake.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct ServedIdentity {
     info: InstanceInfo,
@@ -311,6 +320,7 @@ pub fn new_request_inbox() -> RequestInbox {
 
 /// Route an `open` request either straight to a decline (no inbox attached)
 /// or through `inbox` to the instance main loop.
+#[cfg(unix)]
 fn forward_open(paths: Vec<String>, focus: Focus, inbox: Option<&RequestInbox>) -> Response {
     let Some(inbox) = inbox else {
         return error_response("this instance does not accept 'open' requests");
@@ -342,12 +352,14 @@ fn forward_open(paths: Vec<String>, focus: Focus, inbox: Option<&RequestInbox>) 
 /// Dropping the server stops the thread and removes the socket file. If the
 /// process dies first the file lingers, but discovery filters dead sockets
 /// out by failed handshake, so no separate cleanup pass exists.
+#[cfg(unix)]
 pub struct IpcServer {
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl IpcServer {
     /// Bind an instance socket in the process runtime directory and start
     /// serving handshakes. Failures are non-fatal by contract: callers warn
@@ -417,6 +429,7 @@ impl IpcServer {
     }
 }
 
+#[cfg(unix)]
 impl Drop for IpcServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -431,6 +444,7 @@ impl Drop for IpcServer {
 /// thread; a connect that misses the deadline strands that thread until the
 /// OS completes it, which is acceptable for the bounded discovery probes and
 /// the one startup stale-file probe that use this path.
+#[cfg(unix)]
 fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let path = path.to_path_buf();
@@ -452,6 +466,7 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 
 /// Bind a uniquely named socket in `dir`, reclaiming a leftover file only
 /// when no live peer answers on it.
+#[cfg(unix)]
 fn bind_listener(dir: &Path) -> io::Result<(UnixListener, PathBuf)> {
     let salt = startup_salt(SystemTime::now());
     let path = dir.join(socket_file_name(std::process::id(), salt));
@@ -483,6 +498,7 @@ fn bind_listener(dir: &Path) -> io::Result<(UnixListener, PathBuf)> {
     }
 }
 
+#[cfg(unix)]
 fn serve_until_stop(
     listener: UnixListener,
     socket_path: PathBuf,
@@ -519,11 +535,10 @@ fn serve_until_stop(
         }
     }
     drop(listener);
-    // Only reachable once the listener is closed, which matters on Windows:
-    // an open socket file cannot be removed there.
     let _ = std::fs::remove_file(&socket_path);
 }
 
+#[cfg(unix)]
 fn serve_connection(
     mut stream: UnixStream,
     identity: Arc<ServedIdentity>,
@@ -551,6 +566,7 @@ fn serve_connection(
 }
 
 /// Outcome of reading one request off the wire.
+#[cfg(unix)]
 enum RequestRead {
     /// The request terminator (newline) or EOF arrived within the bound.
     Complete(Vec<u8>),
@@ -561,6 +577,7 @@ enum RequestRead {
 /// Read one newline-terminated (or EOF-terminated) request document, bounded
 /// by [`MAX_REQUEST_BYTES`]. Bytes after the first newline are ignored: a
 /// connection carries exactly one request.
+#[cfg(unix)]
 fn read_bounded_request(stream: &mut UnixStream) -> io::Result<RequestRead> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -582,6 +599,7 @@ fn read_bounded_request(stream: &mut UnixStream) -> io::Result<RequestRead> {
 
 /// Consume up to `budget` further bytes, stopping at the request terminator,
 /// so the peer can finish writing and read our reply without a reset.
+#[cfg(unix)]
 fn drain_to_terminator(stream: &mut UnixStream, budget: usize) {
     let mut chunk = [0u8; 4096];
     let mut consumed = 0usize;
@@ -598,6 +616,7 @@ fn drain_to_terminator(stream: &mut UnixStream, budget: usize) {
     }
 }
 
+#[cfg(unix)]
 fn respond(payload: &[u8], identity: &ServedIdentity, inbox: Option<&RequestInbox>) -> Response {
     match serde_json::from_slice::<Request>(payload) {
         Ok(request) if request.proto == PROTOCOL_VERSION => match request.body {
@@ -616,6 +635,7 @@ fn respond(payload: &[u8], identity: &ServedIdentity, inbox: Option<&RequestInbo
     }
 }
 
+#[cfg(unix)]
 fn error_response(message: &str) -> Response {
     Response {
         proto: PROTOCOL_VERSION,
@@ -625,6 +645,7 @@ fn error_response(message: &str) -> Response {
     }
 }
 
+#[cfg(unix)]
 fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
     let mut line = serde_json::to_vec(response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -634,7 +655,7 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()
 }
 
 // ---------------------------------------------------------------------------
-// Client side
+// Client side (Unix transport only; `Instance` itself is plain data)
 // ---------------------------------------------------------------------------
 
 /// One live instance proven by handshake.
@@ -648,6 +669,7 @@ pub struct Instance {
 /// list. At most [`MAX_DISCOVERED_INSTANCES`] sockets are probed, in sorted
 /// file-name order, each with a [`DISCOVERY_TIMEOUT`] budget; results are
 /// ordered deterministically by `(started_at_ms, pid)`.
+#[cfg(unix)]
 pub fn discover(dir: &Path) -> Vec<Instance> {
     let mut names: Vec<String> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
@@ -679,6 +701,7 @@ pub fn discover(dir: &Path) -> Vec<Instance> {
 
 /// Send one request to the instance at `socket_path` and return its reply
 /// body, checking the protocol version on the way.
+#[cfg(unix)]
 pub fn send(socket_path: &Path, body: &RequestBody) -> Result<ResponseBody, IpcError> {
     // An `open` request may legitimately occupy the instance's whole
     // [`OPEN_REPLY_TIMEOUT`] budget, so the client's deadlines must exceed
@@ -691,6 +714,7 @@ pub fn send(socket_path: &Path, body: &RequestBody) -> Result<ResponseBody, IpcE
     exchange(socket_path, body, timeout)
 }
 
+#[cfg(unix)]
 fn exchange(
     socket_path: &Path,
     body: &RequestBody,
@@ -746,10 +770,12 @@ fn exchange(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn temp_dir() -> PathBuf {
         tempfile::tempdir().expect("sandbox").path().to_path_buf()
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_names_pin_pid_and_deterministic_salt() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -796,6 +822,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_serves_info_and_cleans_up_its_socket() {
         let dir = temp_dir();
@@ -820,6 +847,7 @@ mod tests {
     }
 
     /// Whether any `*.sock` entry remains under `dir`.
+    #[cfg(unix)]
     fn any_socket_file_present(dir: &Path) -> bool {
         std::fs::read_dir(dir)
             .expect("dir")
@@ -827,6 +855,7 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".sock"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_requests_are_declined_without_a_request_inbox() {
         let dir = temp_dir();
@@ -848,6 +877,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_requests_are_forwarded_through_the_inbox_and_answered() {
         let dir = temp_dir();
@@ -895,6 +925,7 @@ mod tests {
         drainer.join().expect("drainer thread");
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_requests_time_out_when_the_instance_never_answers() {
         let dir = temp_dir();
@@ -919,6 +950,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn protocol_version_mismatches_fail_with_a_message() {
         let dir = temp_dir();
@@ -939,6 +971,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn malformed_and_oversized_requests_get_error_replies() {
         let dir = temp_dir();
@@ -964,6 +997,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn discovery_skips_stale_files_and_missing_directories() {
         let dir = temp_dir();
@@ -974,6 +1008,7 @@ mod tests {
         assert!(discover(&dir).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn two_instances_in_one_directory_are_both_discoverable() {
         let dir = temp_dir();
@@ -1004,6 +1039,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_runtime_dir_override_places_sockets_under_instances() {
         let _guard = crate::test_support::lock_env();
