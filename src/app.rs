@@ -12327,6 +12327,7 @@ mod tests {
         assert!(!app.tab_mut().content.lines[0].contains("No uncommitted Git changes"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn instance_open_requests_reveal_the_target_in_the_active_files_tab() {
         let directory = tempfile::tempdir().unwrap();
@@ -12362,6 +12363,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn instance_open_requests_outside_the_workspace_open_a_detached_preview_tab() {
         let directory = tempfile::tempdir().unwrap();
@@ -12426,6 +12428,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn instance_open_requests_missing_paths_or_outside_directories_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
@@ -12464,6 +12467,7 @@ mod tests {
         assert_eq!(app.tab().files().selection, selection_before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn instance_open_requests_with_new_tab_focus_open_a_files_tab() {
         let directory = tempfile::tempdir().unwrap();
