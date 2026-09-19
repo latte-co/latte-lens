@@ -75,6 +75,54 @@ fn missing_parent_directory_is_reported_without_suggestions() {
     assert!(!stderr.contains("Did you mean"));
 }
 
+#[cfg(unix)]
+#[test]
+fn ps_reports_no_instances_in_an_isolated_runtime_dir() {
+    let binary = env!("CARGO_BIN_EXE_latte-lens");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let output = Command::new(binary)
+        .arg("ps")
+        .env("LATTE_LENS_RUNTIME_DIR", sandbox.path())
+        .output()
+        .expect("run latte-lens ps");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no running instances"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ps_json_reports_an_empty_document_without_instances() {
+    let binary = env!("CARGO_BIN_EXE_latte-lens");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let output = Command::new(binary)
+        .arg("ps")
+        .arg("--json")
+        .env("LATTE_LENS_RUNTIME_DIR", sandbox.path())
+        .output()
+        .expect("run latte-lens ps --json");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_with_a_missing_path_reports_the_lookup_failure() {
+    let binary = env!("CARGO_BIN_EXE_latte-lens");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let output = Command::new(binary)
+        .args(["--attach", "definitely-missing-thing"])
+        .env("LATTE_LENS_RUNTIME_DIR", sandbox.path())
+        .output()
+        .expect("run latte-lens --attach");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot open definitely-missing-thing"));
+    assert!(stderr.contains("does not exist"));
+}
+
 #[cfg(feature = "agent-observability")]
 #[test]
 fn hook_cli_is_fail_open_and_silent_when_no_adapter_is_registered() {
