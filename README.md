@@ -122,13 +122,13 @@ workspace covers it (the deepest root wins) and reveals it on the active
 Files tab; `--new-tab` opens it in a fresh Files tab instead. Routing needs
 no extra flags in the common cases: if only one instance is running, any
 path — even a file outside its workspace such as `~/.bashrc` — goes straight
-to it, and if several instances are running you choose one from a short
-interactive menu (a non-interactive shell instead lists the instances and
-suggests `--target`). A file delivered to an instance whose workspace does
-not contain it opens in its own new tab as a detached preview: that tab
-lists just the one file (the workspace tree never opens), its content pane
-resolves through the same boundary-gated machinery used for dependency
-sources, and it never enters the Git views. `--target <pid|root>` overrides
+to it, and if several instances are running and none of them covers the
+path, you choose one from a short interactive menu (a non-interactive shell
+instead lists the instances and suggests `--target`). A file delivered to an
+instance whose workspace does not contain it opens in its own new tab as a
+detached preview: that tab lists just the one file (the workspace tree never
+opens), its content pane resolves through the same boundary-gated machinery
+used for dependency sources, and it never enters the Git views. `--target <pid|root>` overrides
 the automatic choice outright. Missing paths and out-of-workspace
 directories are still rejected. Without any running instance, a fresh
 viewer starts for the same path:

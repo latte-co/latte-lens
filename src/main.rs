@@ -538,12 +538,13 @@ fn run_tui(path: PathBuf) -> Result<()> {
 
     // Serve the instance-discovery handshake (and forwarded open requests)
     // while the TUI runs. Best-effort: a broken runtime directory must not
-    // block the viewer, and dropping the server when the TUI returns removes
-    // the socket file. Unix only: stable Windows does not expose AF_UNIX.
+    // block the viewer. The server must stay bound for the whole function:
+    // dropping it stops the listener and removes the socket immediately.
+    // Unix only: stable Windows does not expose AF_UNIX.
     #[cfg(unix)]
-    {
+    let _instance_server: Option<ipc::IpcServer> = {
         let instance_inbox = ipc::new_request_inbox();
-        let _instance_server = match ipc::IpcServer::start_serving(&workspace, &instance_inbox) {
+        let server = match ipc::IpcServer::start_serving(&workspace, &instance_inbox) {
             Ok(server) => Some(server),
             Err(error) => {
                 eprintln!("latte-lens: instance discovery unavailable: {error}");
@@ -551,7 +552,8 @@ fn run_tui(path: PathBuf) -> Result<()> {
             }
         };
         app.attach_instance_inbox(instance_inbox);
-    }
+        server
+    };
 
     ratatui::run(|terminal| -> io::Result<()> {
         let _terminal_input = TerminalInputGuard::enable()?;

@@ -1733,14 +1733,12 @@ impl App {
                     continue;
                 }
             };
-            let inside_root = absolute
-                .strip_prefix(&self.root)
-                .ok()
-                .map(Path::to_path_buf)
-                .filter(|relative| !relative.as_os_str().is_empty());
+            // `strip_prefix` succeeding means the path is inside the
+            // workspace; the workspace root itself yields an empty relative.
+            let inside_root = absolute.strip_prefix(&self.root).ok();
             match inside_root {
                 Some(relative) => {
-                    self.reveal_instance_path(relative, focus);
+                    self.reveal_instance_path(relative.to_path_buf(), focus);
                     opened.push(absolute.display().to_string());
                 }
                 None if absolute.is_dir() => {
@@ -1833,6 +1831,13 @@ impl App {
                     }
                 }
             }
+        }
+        // An empty relative means the delivered path is the workspace root
+        // itself: the tree already shows the root as its implicit top, so
+        // just present the Files tab and leave the current selection where
+        // it is rather than forcing the first row.
+        if relative.as_os_str().is_empty() {
+            return;
         }
         self.reveal_all_files_selection(relative);
     }
@@ -12361,6 +12366,54 @@ mod tests {
             app.tab().files().selection,
             Some(PathBuf::from("docs").join("note.md"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_open_request_for_the_workspace_root_is_not_rejected_as_outside() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("docs")).unwrap();
+        fs::write(directory.path().join("docs").join("note.md"), "hello").unwrap();
+
+        let deliver = |app: &mut App, focus: crate::ipc::Focus| {
+            let inbox = crate::ipc::new_request_inbox();
+            app.attach_instance_inbox(inbox.clone());
+            let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+            inbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(crate::ipc::InstanceRequest {
+                    paths: vec![directory.path().display().to_string()],
+                    focus,
+                    reply,
+                });
+            app.poll_instance_requests();
+            receiver.recv().expect("reply")
+        };
+
+        // Active focus: the root is inside the workspace, so it opens rather
+        // than being rejected as an out-of-workspace directory; the existing
+        // selection is left on its file instead of jumping to the tree top.
+        let mut app = App::new(directory.path().to_path_buf()).unwrap();
+        app.wait_for_background();
+        let selection_before = app.tab().files().selection.clone();
+        match deliver(&mut app, crate::ipc::Focus::Active) {
+            crate::ipc::ResponseBody::Opened { opened } => {
+                assert_eq!(opened, vec![directory.path().display().to_string()]);
+            }
+            other => panic!("expected opened reply for the workspace root, got {other:?}"),
+        }
+        assert_eq!(app.tabs().len(), 1);
+        assert_eq!(app.tab().files().selection, selection_before);
+
+        // New-tab focus: the root opens a fresh Files tab, again successfully.
+        match deliver(&mut app, crate::ipc::Focus::NewTab) {
+            crate::ipc::ResponseBody::Opened { opened } => {
+                assert_eq!(opened, vec![directory.path().display().to_string()]);
+            }
+            other => panic!("expected opened reply for the workspace root, got {other:?}"),
+        }
+        assert_eq!(app.tabs().len(), 2);
     }
 
     #[cfg(unix)]
