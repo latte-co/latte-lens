@@ -39,7 +39,9 @@ Lens 自有 Hook 提供精确增量事件，两路证据在既有 reducer 中仲
   （同 SubjectNamespace + 同 AuthorityId + 同 native session UUID →
   同一 SessionKey）；
 - 一次补齐盲区 1/2/3 的 current-state 感知，盲区 4 的 pane 级拓扑归属性
-  证据（vendor subagent 拓扑仍以 Hook 事件为准）。
+  证据（vendor subagent 拓扑仍以 Hook 事件为准）；其中盲区 2 依赖本设计
+  **新增**的 Activity Observational 降级仲裁规则（§6.3）——这是对
+  `arbitrate_activity` 的一处受限扩展，不是既有行为。
 
 非目标（本期不做）：
 
@@ -48,8 +50,9 @@ Lens 自有 Hook 提供精确增量事件，两路证据在既有 reducer 中仲
 - 不读取 `herdr agent read` 的终端屏幕内容，不采集 `terminal_title`
   （含用户 prompt 派生文本，隐私边界见 §12）；
 - 不直连 `herdr.sock` 私有协议，只使用官方声明为稳定契约的 CLI；
-- 不采集 `--machine` 远端 SSH machine 的 session（其 native ID 属于远端
-  install，authority 作用域不同，见 §5.3）；
+- 不采集 `--machine` 远端 SSH machine 的 session：现有 AuthorityId 是
+  与机器无关的静态常量（§5.3），本机与远端的同 UUID 条目会被无条件
+  误合并，身份歧义在现模型内无法表达，见 §12；
 - 不改变 known_count/live_count 语义、Agents UI 既有契约与 Hook 路径行为；
 - 不为 Herdr 生成 resume/attach/控制能力（沿用可观测性设计 §10.10）。
 
@@ -112,8 +115,12 @@ Lens 自有 Hook 提供精确增量事件，两路证据在既有 reducer 中仲
   VersionedExperimental`，probe 期字段校验，形状漂移 fail-closed；
 - 无公开事件订阅 API；`herdr agent wait --until <status> --timeout <ms>`
   是单目标 bounded long-poll（S2 备选，S1 不用）；
-- 运行环境门控与 #26 `HerdrProvider::available()` 一致：
-  `HERDR_ENV == "1"` 且 `HERDR_SOCKET_PATH` 非空；可执行文件解析顺序
+- 运行环境门控：`HERDR_ENV == "1"` **且** `HERDR_SOCKET_PATH` 非空
+  （instance ID 由 socket path 派生，缺失则无法定位 server，直接视为
+  不可用）。注意与 #26 的差异：`HerdrProvider::available()`
+  （`src/send_agent.rs`）只检查 `HERDR_ENV == "1"`，不检查 socket
+  path；`docs/design/send-to-agent.md` 对此同样表述过宽，属既有文档
+  漂移，应另行修正——本设计不声称「一致」。可执行文件解析顺序
   `HERDR_BIN_PATH` → PATH 中的 `herdr`（测试注入用）；
 - pane/agent/workspace ID 均为单 server 作用域（skill 明示「IDs and live
   agent names are scoped to one server」）；不加 `--machine` 时只访问
@@ -144,8 +151,11 @@ Lens 自有 Hook 提供精确增量事件，两路证据在既有 reducer 中仲
   本次运行期间的 live provider evidence）；
 - **Lifecycle**：Herdr 不提供 lifecycle 证据（Unsupported）；`done` 与
   条目消失只影响 presence/activity；
-- **Activity**：Observational 候选参与仲裁，不压制 Hook 的 authoritative
-  事件证据（§6.3）；
+- **Activity**：Herdr 候选为 Observational，永不下调 Hook 侧
+  Authoritative 证据的胜出（§6.3）；仅当无未过期 Authoritative 候选时
+  （恰是盲区 2 场景），Observational 候选按 §6.3 新增的降级规则胜出，
+  而不是被现有 `arbitrate_activity` 的 Authoritative-only 过滤直接丢弃为
+  `Unknown`；
 - **Freshness**：snapshot 刷新即刷新 lease；轮询间隔 + 一次容错轮次后
   未见新 snapshot → `Stale`，Activity 回退 Unknown（不合成终态）。
 
@@ -243,6 +253,15 @@ pub struct HerdrSnapshotProvider { /* poll 线程句柄、有界缓存、drainin
   直连 Hook 的 native ID 属于同一产品同一 identity 体系」的验证记录
   （claude：两侧均为 Claude Code session UUID；codex：均为 Codex
   session id；opencode：均为 OpenCode session id）；
+- **AuthorityId 复用硬契约**：可映射条目的 AuthorityId 必须与对应
+  Hook adapter 的 `authority()` 输出**逐字节相等**（claude 条目 ≡
+  `ClaudeHookAdapter::authority()`，codex/opencode 同理）。现有 Hook 侧
+  AuthorityId 是静态常量摘要（如
+  `stable_hash(b"claude-session-authority", [namespace, b"session_id"])`），
+  与机器/install 无关；实现时须将三个构造提取为共享常量/函数供两侧
+  复用，禁止 Herdr adapter 自行从 socket path、`source` 字段或 install
+  位置派生——任何自派生值都会使 `session_key` 不等、合并静默失败成
+  两行（§10.1 契约测试锁定）；
 - 未映射的 `agent` 值（cursor/kimi/droid/…共 18 种中的其余）→ 该条目
   **只产生 unattributed presence**，不创建 session、不猜测 namespace；
   后续新增映射必须附带验证记录并走设计修订；
@@ -255,9 +274,9 @@ pub struct HerdrSnapshotProvider { /* poll 线程句柄、有界缓存、drainin
 ```text
 Herdr entry:  agent="claude", agent_session={kind:"id", value:UUID_X}
   ──映射──▶ SubjectNamespace = anthropic/claude-code
-  ──authority──▶ AuthorityId = 本机 vendor install 作用域
-              （value 由 Herdr 安装在该环境的 integration hook 上报，
-               source="herdr:claude"）
+  ──authority──▶ AuthorityId = ClaudeHookAdapter::authority() 的字节复用
+              （静态常量摘要，与机器/install/来源无关；
+               source="herdr:claude" 仅作诊断，不参与派生）
   ──IdentityKeyer.session_key──▶ SessionKey_H
 
 Lens hook:   session_id = UUID_X
@@ -267,9 +286,10 @@ Lens hook:   session_id = UUID_X
 
 - 合并仅依赖三者同时可证明；`pane_id`/`cwd`/`terminal_title`/
   `workspace_id` **绝不参与**合并（可观测性设计 §5.1）；
-- `--machine` 远端数据不采集，因此不存在远端 authority 混入；未来若
-  采集，远端条目必须使用 observer-isolated AuthorityId（宁可两行
-  Partial，不误合并）；
+- `--machine` 远端数据不采集：静态 AuthorityId 不区分机器，本机与远端
+  出现同 UUID 条目时会被无条件合并，身份歧义在现模型内无法表达；未来
+  若采集，必须先扩展 authority 模型（远端专属 authority 构造或显式
+  拒绝跨 scope 合并），列为 S3 前置条件（§12）；
 - `cwd` 只经 `IdentityKeyer.workspace_hint()` 生成 keyed hint；raw
   cwd 在 adapter 有界内存中即弃，不进入 `AgentObservation`。
 
@@ -302,8 +322,11 @@ Lens hook:   session_id = UUID_X
   下一次成功即刷新（reducer 侧按 §3 Freshness 规则处理）；
 - 线程退出条件：`begin_draining()` 或 AgentRuntime shutdown；无其他
   副作用；
-- 该模型不改 `AgentRuntime`/`AgentState` 核心逻辑：runtime 仍按既有
-  round-robin 调 `snapshot()`/`next_event()`，30s 重 probe contract。
+- 该模型不改 `AgentRuntime` 的调度：runtime 仍按既有 round-robin 调
+  `snapshot()`/`next_event()`，30s 重 probe contract。但 S1 **并非零
+  核心改动**：§6.3 的降级仲裁需要对 `AgentState` 的 `arbitrate_activity`
+  做一处受限扩展（既有 Authoritative 路径行为逐字节不变），这是本设计
+  显式声明的唯一核心改动面。
 
 ### 6.2 注册
 
@@ -315,12 +338,29 @@ fake/default decoder 禁令不变；同步更新该文档 §11 与
 
 ### 6.3 与 Hook 证据的仲裁
 
-- Activity：Hook 事件证据（事件点 + 30s lease）vs Herdr snapshot
-  （Observational + lease）。按既有 per-domain 候选仲裁：先过期淘汰，
-  再按 authority 比较——Hook 侧 Activity 为 Partial/lease 制，与 Herdr
-  同级时按 `observed_at` 新旧裁决，冲突不可调和时回退 `Unknown` 并记录
-  `DecisionTrace`（`EqualAuthorityConflict`），绝不按 observer 名称
-  定胜负；
+- Activity：现有 `arbitrate_activity`（`src/agent/state.rs`）是
+  **Authoritative-only**：先过滤只留 Authoritative 候选，为空即回退
+  `Unknown` + `Suppressed`；`EqualAuthorityConflict` 只会在多个
+  Authoritative 候选值不一致时出现，`observed_at` 只在值一致时选
+  winner。而 Hook 侧 Activity 的 contract 声明就是 Authoritative
+  （claude/codex/opencode 三个直连 adapter 均如此），Herdr 是
+  Observational——两侧**永远不同级**，现有代码下不存在「Hook vs
+  Herdr 同级冲突」这一比较。因此 S1 对 `arbitrate_activity` 增加一条
+  降级规则（既有 Authoritative 路径行为逐字节不变）：
+  1. 存在未过期 Authoritative 候选 → 行为完全不变：Herdr 候选不参与
+     胜出，仅在 `competing`/trace 中留痕，Hook 证据胜出；多个
+     Authoritative 候选值不一致仍回退 `Unknown` + conflict trace；
+  2. 无未过期 Authoritative 候选（盲区 2 场景：Hook 缺失或 lease
+     过期）→ 对未过期 Observational 候选执行降级 pass：值一致 →
+     胜出，`DecisionTrace.authority` 如实记录 `Observational`、
+     provenance 记录 `AggregatedScreenInference`，绝不声称
+     Authoritative；是否新增 `DecisionDisposition::Degraded` 变体在
+     实现期决定，但 trace 必须能区分「降级胜出」与「Authoritative
+     胜出」；
+  3. 多个 Observational 候选值不一致 → 回退 `Unknown` + conflict
+     trace，绝不按 observer 名称定胜负（S1 单实例下不会触发，规则为
+     多实例/未来 provider 预留）；
+  4. Herdr 候选自身 lease 过期 → 不参与任何 pass，走既有 Stale 回退。
 - Lifecycle：Herdr 无 lifecycle 证据，不参与该 domain 仲裁；Hook 的
   SessionEnd/Stop 不受影响；
 - Presence：Herdr 在自己 scope 内 authoritative；其 tombstone 只移除
@@ -378,7 +418,10 @@ Agents 视图：
    - privacy canary：fixture 注入 raw cwd/native UUID/terminal_title
      标记串，断言不出现于 observation/metadata projection；
    - 映射表契约：每个 SubjectNamespace 映射的合并/不合并双向
-     （同 UUID 合并、异 UUID 不合并、无 identity 不建 session）。
+     （同 UUID 合并、异 UUID 不合并、无 identity 不建 session）；
+   - AuthorityId 字节相等契约：三个映射 subject 的 Herdr 侧
+     AuthorityId 与对应 Hook adapter `authority()` 输出逐字节相等
+     （防止自派生回归，§5.2）。
 2. **Provider UT（`src/agent/herdr_provider.rs`，fake `herdr` 脚本）**：
    - argv 协议：`HERDR_BIN_PATH` 指向固定行为脚本，锁死
      「只调用 `agent list`、argv 逐参数、绝不出现 send-text/prompt/
@@ -391,8 +434,12 @@ Agents 视图：
 4. **Reducer 集成（合成 envelope，`tests/` 注入 fake provider）**：
    - Herdr snapshot + 同 UUID Hook 事件 → 单 session 行、双 observer、
      Coverage 正确；
-   - 仲裁矩阵：Hook Working vs Herdr idle（时间新旧/同级冲突回退
-     Unknown + DecisionTrace）；lease 到期 Stale；snapshot 刷新 Revived；
+   - 仲裁矩阵（对齐 §6.3 新规则）：Hook Authoritative 未过期 vs Herdr
+     任意值 → Hook 胜、Herdr 留 competing；Hook 缺失/过期 + Herdr
+     working/idle/blocked → 降级胜出且 trace 如实标记 Observational
+     （**盲区 2 验收用例**）；两侧均过期 → Unknown/Stale；合成第二个
+     Observational provider 值不一致 → Unknown + conflict trace；
+     snapshot 刷新 → Revived；
    - Complete snapshot 缺失条目 → presence tombstone，lifecycle 不变；
    - seq 回退 → Reset → Reconciling → 恢复；
    - 冷启动盲区回归：Lens 启动时 fake provider 已有两条 session，无
@@ -407,7 +454,7 @@ Agents 视图：
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| **S1（本期）** | adapter + provider（轮询线程/缓存）+ registry 注册（修订决策 22）+ §10.1–10.5 测试 + 文档同步 | 冷启动盲区用例、合并用例、仲裁矩阵、argv 协议全绿；`make ci` 通过 |
+| **S1（本期）** | adapter + provider（轮询线程/缓存）+ `arbitrate_activity` 降级规则（§6.3）+ registry 注册（修订决策 22）+ §10.1–10.5 测试 + 文档同步 | 冷启动盲区用例、盲区 2 降级仲裁用例、合并用例、仲裁矩阵、argv 协议全绿；`make ci` 通过 |
 | **S2** | `state_change_seq` 差分 → per-entry `RawEvent` 增量流；cadence 可配置；（可选）`agent wait` long-poll 线程 | 事件路径 contract 测试；无变化轮次零 envelope |
 | **S3（候选）** | Herdr 公开 stream API 接入；`terminal_title` 作为 Presentation 证据（隐私评审前置）；远端 `--machine` scope（observer-isolated AuthorityId） | 另立设计修订 |
 
@@ -415,8 +462,9 @@ Agents 视图：
 
 1. `feat(agent): herdr/cli-snapshot adapter 与 SubjectNamespace 映射`；
 2. `feat(agent): HerdrSnapshotProvider 轮询与缓存`；
-3. `feat(agent): production registry 注册与决策 22 修订（含文档同步）`；
-4. `test(agent): fake herdr 协议/reducer 仲裁/冷启动回归`。
+3. `feat(agent): Activity Observational 降级仲裁规则`；
+4. `feat(agent): production registry 注册与决策 22 修订（含文档同步）`；
+5. `test(agent): fake herdr 协议/reducer 仲裁/冷启动回归`。
 
 ## 12. 风险与开放问题
 
@@ -436,4 +484,5 @@ Agents 视图：
   的 Observational Ended 候选（首期否）；Windows 上 Herdr env/CLI 行为
   未验证（无 cfg 门控，靠 runtime 探测自然 Unavailable）；同机多 Herdr
   server（socket 不同）时 discover 是否需要枚举多个 instance（首期仅
-  `HERDR_SOCKET_PATH` 指向的一个）。
+  `HERDR_SOCKET_PATH` 指向的一个）；静态 AuthorityId 的跨机器语义
+  （`--machine` 采集的前置条件，见 §5.3）。
