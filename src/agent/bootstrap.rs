@@ -7,8 +7,9 @@ use std::{
 
 use super::{
     AgentRuntime, AgentRuntimeServices, FilesystemLiveReceiverRegistry, FilesystemMetadataStore,
-    IdentityKeyer, InstanceRegistry, LiveIngressPolicy, SessionMetadataStore, WorkspaceSelector,
-    bind_registered_live_receiver, load_or_create_install_identity, production_adapter_registry,
+    HerdrSnapshotProvider, IdentityKeyer, InstanceRegistry, LiveIngressPolicy,
+    SessionMetadataStore, WorkspaceSelector, bind_registered_live_receiver,
+    load_or_create_install_identity, production_adapter_registry,
     resolve_runtime_root_from_environment, resolve_state_root_from_environment, resolve_workspace,
 };
 
@@ -33,7 +34,9 @@ impl fmt::Display for AgentBootstrapError {
 impl Error for AgentBootstrapError {}
 
 /// Build the real Lens Agent runtime with only explicitly approved adapters.
-/// The provider registry remains empty until a read-only integration is added.
+/// The Herdr read-only snapshot provider joins only when its environment
+/// gate (HERDR_ENV + HERDR_SOCKET_PATH) declares a local server; without
+/// the gate the runtime stays hook-only.
 pub fn start_production_agent_runtime(
     selected_path: &Path,
 ) -> Result<ProductionAgentRuntime, AgentBootstrapError> {
@@ -78,6 +81,12 @@ fn start_production_agent_runtime_with_roots(
     let mut services = AgentRuntimeServices::new(adapters, identity, metadata);
     services.instances = instances;
     services.receiver = Some(receiver);
+    // Read-only Herdr bridge: registered only when the environment declares
+    // a local Herdr server (`docs/design/herdr-observation-provider.md`
+    // §2.2). The provider never gets a send/focus channel.
+    if let Some(provider) = HerdrSnapshotProvider::from_environment() {
+        services.providers.push(Box::new(provider));
+    }
     Ok(ProductionAgentRuntime {
         runtime: AgentRuntime::start(services),
         selector,

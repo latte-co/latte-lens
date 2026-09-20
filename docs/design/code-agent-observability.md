@@ -1976,7 +1976,7 @@ C0–C2 完成后，`openai/codex-hook`、`anthropic/claude-code-hook`、`openco
 19. Changes/artifacts 仅 live memory，使用 Exact/Observed/Inferred，并记录 observer provenance。
 20. PreviewProvider 只处理安全 workspace file preview，不承载 Agent/provider live state。
 21. Durable spool、compression、checkpoint 和 history 纳入历史增强方案，不能让 metadata index 演变为无界日志。
-22. 当前生产 registry 只注册 `openai/codex-hook`、`anthropic/claude-code-hook` 与 `opencode/plugin`；test fakes、默认 decoder 与其他 production adapter/provider 均不得进入。
+22. 当前生产 registry 注册五个显式批准的真实 observer：`openai/codex-hook`、`anthropic/claude-code-hook`、`opencode/plugin`、`bytedance/traex-hook`（本条补登）与 `herdr/cli-snapshot`（只读 snapshot provider，bootstrap 按 `HERDR_ENV` + `HERDR_SOCKET_PATH` 环境门控注册，见 [Herdr observation provider 设计](herdr-observation-provider.md)）；test fakes、默认 decoder 与其他 production adapter/provider 均不得进入。
 
 ## 17. 风险与开放问题
 
@@ -2045,7 +2045,7 @@ C0–C2 完成后，`openai/codex-hook`、`anthropic/claude-code-hook`、`openco
 - State root 统一为 LATTE_LENS_STATE_DIR → LATTE_HOME/lens/state → user-home/.latte/lens/state，no-follow/reparse/network-share tests 通过。
 - Privacy byte scan 证明 metadata、IPC fixture 和日志没有 prompt/tool body/transcript/raw ID/token。
 - Synthetic envelopes 覆盖 mid-session discovery、turn/tool/subagent、change/artifact、stale/revival、tombstone、Gap 和 LivePartial。
-- 生产 registry 只包含四个显式批准的真实 adapter，CLI 不暴露 synthetic observer，默认构建不包含测试 harness。
+- 生产 registry 只包含五个显式批准的真实 observer（四个 hook adapter 与 Herdr 只读 snapshot provider），CLI 不暴露 synthetic observer，默认构建不包含测试 harness。
 - make ci、make coverage 通过；CLI/打包变化时 make package-smoke 通过。
 - 接口依赖方向、可靠性、隐私和五平台边界的验证项全部通过，且没有未解决的阻塞项。
 

@@ -129,7 +129,7 @@ fn adapter(fixture: &Fixture) -> Arc<dyn CodeAgentAdapter> {
 #[test]
 fn production_registry_contains_only_approved_hook_adapters_and_has_no_fallback() {
     let production = production_adapter_registry();
-    assert_eq!(production.len(), 4);
+    assert_eq!(production.len(), 5);
     assert!(
         production
             .resolve(&ObserverId::parse(CODEX_HOOK_OBSERVER_ID).expect("Codex observer"))
@@ -148,6 +148,13 @@ fn production_registry_contains_only_approved_hook_adapters_and_has_no_fallback(
     assert!(
         production
             .resolve(&ObserverId::parse(TRAEX_HOOK_OBSERVER_ID).expect("TraeX observer"))
+            .is_some()
+    );
+    // The Herdr snapshot adapter joins the registry; it only ever decodes
+    // provider snapshot items, never hook deliveries.
+    assert!(
+        production
+            .resolve(&ObserverId::parse(HERDR_SNAPSHOT_OBSERVER_ID).expect("Herdr observer"))
             .is_some()
     );
 

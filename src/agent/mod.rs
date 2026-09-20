@@ -77,4 +77,7 @@ pub fn production_adapter_registry() -> AdapterRegistry {
         .register(std::sync::Arc::new(TraexHookAdapter::new()))
         .expect("production observer ids are unique");
     registry
+        .register(std::sync::Arc::new(HerdrSnapshotAdapter::new()))
+        .expect("production observer ids are unique");
+    registry
 }
