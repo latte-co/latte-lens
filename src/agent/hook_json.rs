@@ -169,6 +169,35 @@ impl<'a> HookJsonParser<'a> {
         Ok(value)
     }
 
+    /// Parse one unsigned integer JSON number. Fractions, exponents, and
+    /// negative values are rejected so callers never silently round.
+    pub(super) fn parse_bounded_u64(&mut self) -> Result<u64, AdapterError> {
+        self.whitespace();
+        let mut value: u64 = 0;
+        let mut digits = 0;
+        if self.consume(b'-') {
+            return Err(AdapterError::MalformedInput);
+        }
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            let digit = u64::from(self.next().expect("peeked digit") - b'0');
+            value = value
+                .checked_mul(10)
+                .and_then(|scaled| scaled.checked_add(digit))
+                .ok_or(AdapterError::MalformedInput)?;
+            digits += 1;
+        }
+        if digits == 0 {
+            return Err(AdapterError::MalformedInput);
+        }
+        if digits > 1 && self.bytes[self.position - digits] == b'0' {
+            return Err(AdapterError::MalformedInput);
+        }
+        match self.peek() {
+            Some(b'.') | Some(b'e') | Some(b'E') => Err(AdapterError::MalformedInput),
+            _ => Ok(value),
+        }
+    }
+
     pub(super) fn skip_value(&mut self, depth: usize) -> Result<(), AdapterError> {
         if depth > MAX_JSON_DEPTH {
             return Err(AdapterError::MalformedInput);
