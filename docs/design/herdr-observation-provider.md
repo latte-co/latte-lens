@@ -1,6 +1,6 @@
 # Herdr 只读 Observation Provider 设计（Session 感知增强）
 
-状态：**草案评审，尚未实现。**
+状态：**S1 已实现（adapter、provider、降级仲裁、production registry 注册与 §10 测试全部落地）。S2/S3 未实施。**
 
 本期定义「把聚合型终端运行时 Herdr 作为 read-only ObservationProvider 接入
 Latte Lens 的 Code Agent 可观测性架构」，落地
