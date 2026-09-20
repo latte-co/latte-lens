@@ -108,12 +108,24 @@ pub(crate) struct HerdrEntry {
     agent_status: Option<String>,
     cwd: Option<String>,
     pane_id: String,
-    /// Parsed only to reject malformed entries; the adapter itself never
-    /// derives a fact from it.
+    /// Read by the snapshot provider for restart detection; the adapter
+    /// itself never derives a fact from it.
     state_change_seq: u64,
 }
 
 impl HerdrEntry {
+    /// Pane identity read by the snapshot provider for stable ordering and
+    /// sequence-regression detection.
+    pub(crate) fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    /// Monotonic change counter read by the snapshot provider for
+    /// server-restart detection (design §4.3). Never enters envelopes.
+    pub(crate) fn state_change_seq(&self) -> u64 {
+        self.state_change_seq
+    }
+
     /// Native session id when the entry carries `agent_session.kind == "id"`.
     /// Non-`id` kinds (path-like identifiers) are not identity evidence.
     fn native_session_id(&self) -> Option<&str> {
@@ -136,7 +148,7 @@ impl HerdrEntry {
 
     /// Parse one entry, or `Ok(None)` when it carries no stable pane
     /// identity and therefore cannot anchor any fact.
-    fn parse(bytes: &[u8]) -> Result<Option<Self>, AdapterError> {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Option<Self>, AdapterError> {
         let mut entry = HerdrEntry {
             agent: None,
             session_kind: None,
@@ -395,7 +407,7 @@ impl CodeAgentAdapter for HerdrSnapshotAdapter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -406,7 +418,9 @@ mod tests {
         StreamEpoch, StreamRef, WorkspaceScope,
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared with `herdr_provider` tests: env mutation is process-global
+    /// in the lib test binary, so all Herdr env tests serialize on one lock.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Holds `ENV_LOCK` for the guard's lifetime. While alive, call only
     /// `*_locked` helpers — re-entering `EnvGuard` on the same thread

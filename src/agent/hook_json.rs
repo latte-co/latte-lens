@@ -215,6 +215,34 @@ impl<'a> HookJsonParser<'a> {
         }
     }
 
+    /// Walk one JSON array, reporting each element's byte span
+    /// `[start, end)` after syntactically validating it. Used by snapshot
+    /// providers to slice per-entry payloads without allocating substrings.
+    pub(super) fn parse_array_spans(
+        &mut self,
+        mut visit: impl FnMut(usize, usize) -> Result<(), AdapterError>,
+    ) -> Result<(), AdapterError> {
+        self.whitespace();
+        self.expect(b'[')?;
+        self.whitespace();
+        if self.consume(b']') {
+            return Ok(());
+        }
+        loop {
+            self.whitespace();
+            let start = self.position;
+            self.skip_value(1)?;
+            let end = self.position;
+            visit(start, end)?;
+            self.whitespace();
+            if self.consume(b']') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+            self.whitespace();
+        }
+    }
+
     fn skip_composite(&mut self, open: u8, close: u8, depth: usize) -> Result<(), AdapterError> {
         self.expect(open)?;
         self.whitespace();
