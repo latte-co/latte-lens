@@ -174,8 +174,11 @@ pub struct HerdrSnapshotProvider { /* poll 线程句柄、有界缓存、drainin
 ### 4.1 执行纪律（复用 #26 模式）
 
 - 子进程 argv 独立参数传递，无 shell；
-- 只允许一个子命令形状：`herdr agent list`（argv allowlist 在
-  `tests/send_agent_protocol.rs` 同款 fake-binary 协议测试中锁死）；
+- argv allowlist 只允许两个形状：`herdr agent list`（快照采集）与
+  `herdr --version`（§4.2 `discover()` 的 instance version 来源）；
+  其余任何子命令/参数（含 send-text、prompt、focus、read、wait、
+  `--machine`）一律禁止；fake-binary 协议测试同时锁定这两个形状
+  （§10.2，模式沿用 `tests/send_agent_protocol.rs`）；
 - stdout 解析上限 128 KiB、agent 条目上限 64（`MAX_RAW_SNAPSHOT_ITEMS`
   256 与 snapshot 聚合 256 KiB 之内）；超限 → `completeness = Truncated`，
   保留稳定排序前缀，不静默截断；
@@ -211,10 +214,18 @@ pub struct HerdrSnapshotProvider { /* poll 线程句柄、有界缓存、drainin
   （可观测性设计 §5.4「不能保证 sequence 应始终返回 None」）；
 - `state_change_seq` 是 provider 内部优化与失效检测信号，**不是**
   `StreamSequence`，不进入 envelope；
-- epoch 规则：同一 `pane_id` 的 `state_change_seq` 回退，或
-  `HERDR_SOCKET_PATH` 指向的 server 重启证据（instance version 变化），
-  视为 server 重启 → 切换 `StreamEpoch` 并向上报告 `Reset`，reducer
-  进入 Reconciling 并以新 snapshot 恢复；
+- epoch 与 Reset 通道（**两拍机制**）：S1 是 snapshot-only provider
+  （`next_event()` 恒 `Idle`，`RawSnapshot` 结构不带 epoch 字段），
+  因此不经 `ProviderEventOutcome::Reset` 上报（该通道保留给 S2 差分
+  事件流），而用两拍闭合信号通道：
+  1. 第一拍——轮询线程检测到同一 `pane_id` 的 `state_change_seq`
+     回退，或 instance version 变化，判定为 server 重启：作废缓存、
+     内部 epoch 计数 +1，此后 `snapshot()` 返回
+     `ProviderError::Unavailable`，命中 runtime 既有「snapshot `Err` →
+     `ProviderRuntimeStatus::Reconciling`」分支；
+  2. 第二拍——下一轮 `probe()` 将内部 epoch 计数编入 contract
+     revision，`provider_epoch`（= digest(instance digest, revision)）
+     随之变化产生新 `StreamEpoch`，Reconciling 以新 snapshot 收敛；
 - provider 重启（Lens 重启）天然产生新 epoch，无需持久化。
 
 ## 5. Adapter 设计
@@ -323,17 +334,24 @@ Lens hook:   session_id = UUID_X
 - 线程退出条件：`begin_draining()` 或 AgentRuntime shutdown；无其他
   副作用；
 - 该模型不改 `AgentRuntime` 的调度：runtime 仍按既有 round-robin 调
-  `snapshot()`/`next_event()`，30s 重 probe contract。但 S1 **并非零
-  核心改动**：§6.3 的降级仲裁需要对 `AgentState` 的 `arbitrate_activity`
-  做一处受限扩展（既有 Authoritative 路径行为逐字节不变），这是本设计
-  显式声明的唯一核心改动面。
+  `snapshot()`/`next_event()`，30s 重 probe contract；§4.3 的两拍
+  Reset 通道也只复用 runtime 既有分支。但 S1 **并非零核心改动**：§6.3
+  的降级仲裁需要对 `AgentState` 的 `arbitrate_activity` 及其 trace
+  构造做受限扩展（既有 Authoritative 路径行为逐字节不变），交付物有
+  三：① Observational 降级 pass；② winner trace 的 competing 留痕
+  （现状 `applied_trace` 的 `competing` 恒为空，需扩展为收集落选的
+  未过期候选）；③ Observational 版 conflict trace（现状
+  `conflict_trace` 的 `authority` 硬编码 `Authoritative`，直接复用会
+  错误标注冲突方）。这是本设计显式声明的核心改动面。
 
 ### 6.2 注册
 
 `src/agent/bootstrap.rs` 将 `HerdrSnapshotProvider` + adapter 注册进
-production registry。**这修订可观测性设计决策日志第 22 条**（「当前生产
-registry 只注册四 adapter」）：修订为五个（新增 `herdr/cli-snapshot`），
-fake/default decoder 禁令不变；同步更新该文档 §11 与
+production registry。**这修订可观测性设计决策日志第 22 条**：原决策具名
+三个 adapter（Codex/Claude/OpenCode），而生产 registry 实际已注册四个
+（`src/agent/mod.rs` 含 TraeX，测试卡点文档亦按四个表述）——修订时先
+补齐 TraeX 的具名，再改为五个（新增 `herdr/cli-snapshot`），fake/default
+decoder 禁令不变；同步更新该文档 §11 与
 `docs/testing/code-agent-observability-test-gates.md` 的 registry 清单。
 
 ### 6.3 与 Hook 证据的仲裁
@@ -347,9 +365,12 @@ fake/default decoder 禁令不变；同步更新该文档 §11 与
   Observational——两侧**永远不同级**，现有代码下不存在「Hook vs
   Herdr 同级冲突」这一比较。因此 S1 对 `arbitrate_activity` 增加一条
   降级规则（既有 Authoritative 路径行为逐字节不变）：
-  1. 存在未过期 Authoritative 候选 → 行为完全不变：Herdr 候选不参与
-     胜出，仅在 `competing`/trace 中留痕，Hook 证据胜出；多个
-     Authoritative 候选值不一致仍回退 `Unknown` + conflict trace；
+  1. 存在未过期 Authoritative 候选 → 胜出规则完全不变：Hook 证据
+     胜出，Herdr 候选不参与比较；落选的未过期 Herdr 候选进入 winner
+     trace 的 `competing` 留痕（交付物②：现状 `applied_trace` 的
+     `competing` 恒为空，非冲突场景无任何承载，需扩展收集）；多个
+     Authoritative 候选值不一致仍回退 `Unknown` + conflict trace
+     （行为不变）；
   2. 无未过期 Authoritative 候选（盲区 2 场景：Hook 缺失或 lease
      过期）→ 对未过期 Observational 候选执行降级 pass：值一致 →
      胜出，`DecisionTrace.authority` 如实记录 `Observational`、
@@ -357,9 +378,11 @@ fake/default decoder 禁令不变；同步更新该文档 §11 与
      Authoritative；是否新增 `DecisionDisposition::Degraded` 变体在
      实现期决定，但 trace 必须能区分「降级胜出」与「Authoritative
      胜出」；
-  3. 多个 Observational 候选值不一致 → 回退 `Unknown` + conflict
-     trace，绝不按 observer 名称定胜负（S1 单实例下不会触发，规则为
-     多实例/未来 provider 预留）；
+  3. 多个 Observational 候选值不一致 → 回退 `Unknown` +
+     **Observational 版 conflict trace**（交付物③：直接复用
+     `conflict_trace` 会把 `authority` 硬编码为 `Authoritative`，
+     错误标注冲突方的证据级别），绝不按 observer 名称定胜负
+     （S1 单实例下不会触发，规则为多实例/未来 provider 预留）；
   4. Herdr 候选自身 lease 过期 → 不参与任何 pass，走既有 Stale 回退。
 - Lifecycle：Herdr 无 lifecycle 证据，不参与该 domain 仲裁；Hook 的
   SessionEnd/Stop 不受影响；
@@ -387,7 +410,7 @@ Agents 视图：
 | `herdr agent list` 超时/非零退出 | 该轮放弃，缓存保持上次值并标 stale；连续 2 次后 health Degraded |
 | JSON 形状漂移（字段缺失/类型变化） | 单条目丢弃 + diagnostic；外层形状不符 → probe/snapshot `InvalidResponse`，instance 降 Unavailable，待 30s 重 probe |
 | 条目数/字节超限 | `completeness = Truncated`，UI 显示 Partial |
-| Herdr server 重启（seq 回退） | epoch 切换 + `Reset` → Reconciling → 新 snapshot 恢复 |
+| Herdr server 重启（seq 回退/version 变化） | 缓存作废、`snapshot()` 报 `Unavailable` → Reconciling；下轮 probe 新 epoch → 新 snapshot 恢复（§4.3 两拍） |
 | Lens 自身 pane 出现在列表 | 正常处理：Lens 进程不是 agent，不会出现在 `agent list` |
 
 ## 9. 安全与隐私边界
@@ -423,9 +446,9 @@ Agents 视图：
      AuthorityId 与对应 Hook adapter `authority()` 输出逐字节相等
      （防止自派生回归，§5.2）。
 2. **Provider UT（`src/agent/herdr_provider.rs`，fake `herdr` 脚本）**：
-   - argv 协议：`HERDR_BIN_PATH` 指向固定行为脚本，锁死
-     「只调用 `agent list`、argv 逐参数、绝不出现 send-text/prompt/
-     focus/read」；
+   - argv 协议：`HERDR_BIN_PATH` 指向固定行为脚本，锁死「只调用
+     `agent list` 与 `--version` 两个允许形状、argv 逐参数、绝不
+     出现 send-text/prompt/focus/read/wait/`--machine`」；
    - 轮询线程：cadence、2s 超时、连续失败降级、draining 停止；
    - 缓存语义：snapshot 返回最近成功值、Unavailable 路径、Truncated。
 3. **Contract/Registry**：production registry 含五 observer 的注册
@@ -439,9 +462,12 @@ Agents 视图：
      working/idle/blocked → 降级胜出且 trace 如实标记 Observational
      （**盲区 2 验收用例**）；两侧均过期 → Unknown/Stale；合成第二个
      Observational provider 值不一致 → Unknown + conflict trace；
-     snapshot 刷新 → Revived；
+     snapshot 刷新 → Freshness `Stale` 回到 `Current`
+     （`ObservationFreshness` 仅 Unknown/Current/Stale，无 "Revived"
+     术语）；
    - Complete snapshot 缺失条目 → presence tombstone，lifecycle 不变；
-   - seq 回退 → Reset → Reconciling → 恢复；
+   - seq 回退 → `snapshot()` 报 `Unavailable` → `ProviderStatus::
+     Reconciling` → 下轮 probe 新 epoch → 恢复（§4.3 两拍机制）；
    - 冷启动盲区回归：Lens 启动时 fake provider 已有两条 session，无
      任何 Hook 事件 → Agents 视图即显示两条（盲区 1/3 的验收用例）。
 5. **E2E**：headless journey（fake `herdr` 脚本 + metadata 断言）进
@@ -454,7 +480,7 @@ Agents 视图：
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| **S1（本期）** | adapter + provider（轮询线程/缓存）+ `arbitrate_activity` 降级规则（§6.3）+ registry 注册（修订决策 22）+ §10.1–10.5 测试 + 文档同步 | 冷启动盲区用例、盲区 2 降级仲裁用例、合并用例、仲裁矩阵、argv 协议全绿；`make ci` 通过 |
+| **S1（本期）** | adapter + provider（轮询线程/缓存、两拍 Reset）+ `arbitrate_activity` 降级仲裁与 trace 三项交付物（§6.1/§6.3）+ registry 注册（修订决策 22）+ §10.1–10.5 测试 + 文档同步 | 冷启动盲区用例、盲区 2 降级仲裁用例、合并用例、仲裁矩阵、argv 协议全绿；`make ci` 通过 |
 | **S2** | `state_change_seq` 差分 → per-entry `RawEvent` 增量流；cadence 可配置；（可选）`agent wait` long-poll 线程 | 事件路径 contract 测试；无变化轮次零 envelope |
 | **S3（候选）** | Herdr 公开 stream API 接入；`terminal_title` 作为 Presentation 证据（隐私评审前置）；远端 `--machine` scope（observer-isolated AuthorityId） | 另立设计修订 |
 
@@ -462,7 +488,7 @@ Agents 视图：
 
 1. `feat(agent): herdr/cli-snapshot adapter 与 SubjectNamespace 映射`；
 2. `feat(agent): HerdrSnapshotProvider 轮询与缓存`；
-3. `feat(agent): Activity Observational 降级仲裁规则`；
+3. `feat(agent): Activity Observational 降级仲裁与 trace 扩展`；
 4. `feat(agent): production registry 注册与决策 22 修订（含文档同步）`；
 5. `test(agent): fake herdr 协议/reducer 仲裁/冷启动回归`。
 
