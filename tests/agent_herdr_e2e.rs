@@ -26,7 +26,7 @@ use std::{
 };
 
 use latte_lens::{agent::*, app::App};
-use support::agent::{FakeIdentityKeyer, InMemoryMetadataStore};
+use support::agent::InMemoryMetadataStore;
 
 /// All env mutation is process-global; this binary runs one journey at a
 /// time behind this lock and always restores the prior values.
@@ -144,6 +144,10 @@ fn cold_start_herdr_snapshot_populates_sessions_without_any_hook_event() {
 
     // Two live Claude panes with distinct native session ids; one is
     // blocked, mapping to WaitingPermission as Observational evidence.
+    // A third pane carries an empty `cwd`, which fails workspace-hint
+    // validation. It must be dropped at entry granularity only (design §8):
+    // the other two panes still have to reach the view — the whole snapshot
+    // round must not be discarded.
     let entries = [
         agent_entry(
             "w1:p1",
@@ -159,6 +163,7 @@ fn cold_start_herdr_snapshot_populates_sessions_without_any_hook_event() {
             workspace.to_str().unwrap(),
             2,
         ),
+        agent_entry("w1:p3", "cold-session-cccc", "idle", "", 3),
     ];
     fs::write(root.join("agents.json"), agents_json(&entries)).expect("agents");
 
@@ -166,7 +171,10 @@ fn cold_start_herdr_snapshot_populates_sessions_without_any_hook_event() {
     let socket = root.join("herdr.sock");
     let _env = EnvGuard::configure(&socket, &bin);
 
-    let identity = Arc::new(FakeIdentityKeyer::new());
+    // Use the production HMAC keyer (not FakeIdentityKeyer): it performs the
+    // real empty-id validation, so the empty-`cwd` pane below actually takes
+    // the workspace-hint failure path under test.
+    let identity = Arc::new(HmacIdentityKeyer::new(SensitiveId::new(&[0x48; 32])).expect("keyer"));
     let workspace_hint = identity
         .workspace_hint(SensitiveWorkspaceLocator::new(
             workspace.to_str().unwrap().as_bytes(),

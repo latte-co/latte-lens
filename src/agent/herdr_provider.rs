@@ -47,6 +47,28 @@ const HERDR_MAX_AGENT_ENTRIES: usize = 64;
 const HERDR_CACHE_FRESHNESS: Duration = Duration::from_secs(10);
 /// Consecutive failures before health degrades (design §6.1).
 const HERDR_DEGRADED_FAILURES: u32 = 2;
+/// Max version length in **bytes**. Must stay identical to the `BoundedText`
+/// width in `bounded_version` (`BoundedText<64>`), which validates by byte
+/// length; truncating by `chars()` could leave a multi-byte version over the
+/// byte limit and fail closed on every discover/probe.
+const HERDR_VERSION_BYTE_LIMIT: usize = 64;
+
+/// Trim and cap a version string at the byte limit without splitting a
+/// UTF-8 character (the prefix on a non-boundary index is walked back to a
+/// leading byte, whose top two bits are not `10`).
+fn truncate_version(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.len() <= HERDR_VERSION_BYTE_LIMIT {
+        trimmed.to_owned()
+    } else {
+        let mut end = HERDR_VERSION_BYTE_LIMIT.min(trimmed.len());
+        let bytes = trimmed.as_bytes();
+        while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        trimmed[..end].to_owned()
+    }
+}
 
 struct CachedList {
     captured_at: Timestamp,
@@ -205,7 +227,7 @@ fn poll_once(binary: &str, need_version: bool) -> PollOutcome {
     // interval (design §4.3).
     let version = if need_version {
         match run_capture(binary, &["--version"], HERDR_CALL_TIMEOUT) {
-            Ok(output) => Some(output.trim().chars().take(64).collect::<String>()),
+            Ok(output) => Some(truncate_version(&output)),
             Err(CaptureError::NotFound) => {
                 return PollOutcome {
                     verdict: PollVerdict::Terminal,
@@ -1087,6 +1109,76 @@ exit 2
                 .get(),
             2
         );
+    }
+
+    #[test]
+    fn truncate_version_uses_byte_bounds_without_splitting_utf8() {
+        // Pure boundary check for the char-vs-byte fix: the cap must match
+        // BoundedText<64>'s byte semantics and never split a character.
+        let ascii = "a".repeat(70);
+        assert_eq!(truncate_version(&ascii).len(), HERDR_VERSION_BYTE_LIMIT);
+
+        // 22 three-byte CJK chars = 66 bytes / 22 chars. A char-based cap
+        // would keep all 22 and overflow BoundedText<64>; the byte cap must
+        // walk back to the last char boundary at 63 bytes (21 chars).
+        let multibyte: String = "甲".repeat(22);
+        assert_eq!(multibyte.len(), 66);
+        let capped = truncate_version(&multibyte);
+        assert_eq!(capped.len(), 63);
+        assert_eq!(capped.chars().count(), 21);
+        // Trimming whitespace still applies before capping.
+        assert_eq!(truncate_version("  herdr 1.0  \n"), "herdr 1.0");
+    }
+
+    #[test]
+    fn multibyte_version_survives_both_discover_and_probe() {
+        // End-to-end for the byte-cap fix: a real multi-byte version whose
+        // char count is within 64 but whose byte count exceeds it must not
+        // make bounded_version fail closed on either consumer. The old
+        // chars().take(64) kept all 66 bytes; discover() returned Err and
+        // probe() returned InvalidResponse (PR#30 review, non-blocking).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        write_version(path, &"甲".repeat(22));
+        write_agents(path, &agents_json(&[entry("w1:p2", "claude", "idle", 1)]));
+        let mut provider = provider(path);
+
+        // First discover starts the poll worker; wait until the thread has
+        // captured both the list and the version before observing either.
+        provider
+            .discover(
+                &selector(),
+                ProviderDiscoveryLimits { max_instances: 32 },
+                Instant::now(),
+            )
+            .expect("discover starts the worker");
+        assert!(wait_for(&provider, |state| {
+            cache_len(state) == 1 && state.version.is_some()
+        }));
+
+        let instances = provider
+            .discover(
+                &selector(),
+                ProviderDiscoveryLimits { max_instances: 32 },
+                Instant::now(),
+            )
+            .expect("discover must not fail on a byte-oversized multibyte version");
+        let version = instances[0].version.as_ref().expect("version served");
+        assert!(
+            version.as_str().len() <= HERDR_VERSION_BYTE_LIMIT,
+            "discover version over byte limit: {}",
+            version.as_str().len()
+        );
+
+        // probe builds the contract through the same bounded_version path.
+        let contract = provider
+            .probe(&instances[0], Instant::now())
+            .expect("probe must not InvalidResponse on the capped version");
+        let served = contract
+            .observer_version
+            .as_ref()
+            .expect("probe carries the version");
+        assert!(served.as_str().len() <= HERDR_VERSION_BYTE_LIMIT);
     }
 
     #[test]

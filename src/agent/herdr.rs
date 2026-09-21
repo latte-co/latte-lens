@@ -299,15 +299,20 @@ impl CodeAgentAdapter for HerdrSnapshotAdapter {
             return Ok(DecodeOutcome::Ignore(IgnoreReason::MissingStableIdentity));
         };
         let mapped = entry.agent.as_deref().and_then(mapped_subject);
-        let workspace = entry
-            .cwd
-            .as_deref()
-            .map(|cwd| {
-                identity
-                    .workspace_hint(SensitiveWorkspaceLocator::new(cwd.as_bytes()))
-                    .map_err(|_| AdapterError::IdentityRejected)
-            })
-            .transpose()?;
+        // A field-level surprise on the workspace hint must drop only this
+        // entry, never the whole snapshot round (design §8 单条目丢弃):
+        // the runtime abandons an entire `RawSnapshot` when one item returns
+        // `Err`, so an empty/invalid `cwd` here would silence every other
+        // pane on the server. Treat it like an entry with no facts.
+        let workspace = match entry.cwd.as_deref() {
+            Some(cwd) => {
+                match identity.workspace_hint(SensitiveWorkspaceLocator::new(cwd.as_bytes())) {
+                    Ok(hint) => Some(hint),
+                    Err(_) => return Ok(DecodeOutcome::Ignore(IgnoreReason::NoObservableFact)),
+                }
+            }
+            None => None,
+        };
 
         let mut presence_native =
             Vec::with_capacity(instance.digest().as_bytes().len() + entry.pane_id.len() + 16);
@@ -634,6 +639,21 @@ pub(crate) mod tests {
         assert_eq!(
             outcome,
             DecodeOutcome::Ignore(IgnoreReason::MissingStableIdentity)
+        );
+    }
+
+    #[test]
+    fn empty_cwd_drops_only_the_entry_instead_of_failing_the_round() {
+        // Design §8 (单条目丢弃): an entry whose `cwd` cannot yield a
+        // workspace hint (here the empty string, the only value that parses
+        // yet fails identity validation) must return an entry-level Ignore.
+        // Returning `Err` would make the runtime discard the *whole*
+        // RawSnapshot and silence every other pane (PR#30 review, blocking).
+        let payload = entry("claude", "working", "id", RAW_SESSION).replace(RAW_CWD, "");
+        let outcome = decode(&payload);
+        assert_eq!(
+            outcome,
+            DecodeOutcome::Ignore(IgnoreReason::NoObservableFact)
         );
     }
 

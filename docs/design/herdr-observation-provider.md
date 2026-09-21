@@ -314,7 +314,9 @@ Lens hook:   session_id = UUID_X
 2. 可映射 identity 时：`Session` upsert（SessionRef，DiscoveredMidSession
    语义由 reducer 决定）；
 3. `Activity::Set(working→Working | idle→Idle | blocked→WaitingPermission)`
-   @ Observational + lease（`valid_until = captured_at + 轮询间隔 × 2`）；
+   @ Observational + lease（`valid_until = captured_at + 60s`；lease 须
+   跨过 runtime 30s 重探测间隔加一个容差轮，更短会让健康候选在两次
+   provider 拉取之间抖动为 `Stale`）；
    `unknown`/`done` 不产生 Activity op（缺失不是清除）；
 4. workspace 匹配当前选择目录时的 `WorkspaceHint` 一致性校验事实。
 
