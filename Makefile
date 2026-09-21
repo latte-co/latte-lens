@@ -21,7 +21,7 @@ E2E_ARTIFACT_DIR ?= target/e2e-artifacts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup fmt fmt-check check lint test test-navigation-real installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e-navigation e2e-tab-shell e2e agent-ut agent-contract agent-harness-self-test agent-e2e-hook codex-hooks-canary claude-hooks-canary opencode-plugin-canary traex-hooks-canary agent-e2e agent-e2e-tui agent-package-negative agent-ci coverage coverage-unit coverage-e2e coverage-agent coverage-html bench ci build release package package-smoke install clean
+.PHONY: help setup fmt fmt-check check lint test test-navigation-real installer-check script-test e2e-self-test e2e-files e2e-git e2e-search e2e-navigation e2e-tab-shell e2e agent-ut agent-contract agent-harness-self-test agent-e2e-hook codex-hooks-canary claude-hooks-canary opencode-plugin-canary traex-hooks-canary herdr-snapshot-canary agent-e2e agent-e2e-tui agent-package-negative agent-ci coverage coverage-unit coverage-e2e coverage-agent coverage-html bench ci build release package package-smoke install clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Latte Lens engineering commands:\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -96,6 +96,7 @@ agent-ut: ## Run Agent module unit tests and compile-fail doctests
 agent-contract: ## Run synthetic Agent contract, state, metadata, and transport suites
 	$(CARGO) test --all-features --locked --test agent_observability_contract
 	$(CARGO) test --all-features --locked --test agent_state_integration
+	$(CARGO) test --all-features --locked --test agent_herdr_arbitration
 	$(CARGO) test --all-features --locked --test agent_metadata_integration
 	$(CARGO) test --all-features --locked --test agent_transport_contract
 
@@ -118,8 +119,13 @@ traex-hooks-canary: ## Validate SessionStart with an installed TraeX and isolate
 	@test -n "$(TRAEX_BIN)" || { echo "TRAEX_BIN must point to the TraeX executable"; exit 2; }
 	LATTE_LENS_TRAEX_BIN="$(TRAEX_BIN)" $(CARGO) test --all-features --locked --test traex_hooks_compatibility -- --ignored --exact installed_traex_session_start_invokes_the_production_latte_lens_hook --nocapture
 
-agent-e2e: ## Run all-platform headless Agent runtime/App scenarios
+herdr-snapshot-canary: ## Validate one real herdr agent list round trip against a local Herdr server
+	@test -n "$(HERDR_SOCKET_PATH)" || { echo "export HERDR_ENV=1 and HERDR_SOCKET_PATH for a reachable local Herdr server"; exit 2; }
+	HERDR_ENV=1 $(CARGO) test --all-features --locked --test agent_herdr_e2e -- --ignored --exact installed_herdr_agent_list_decodes_through_the_production_gate --nocapture
+
+agent-e2e: ## Run all-platform headless Agent runtime/App scenarios (Herdr fake-binary journey is Unix-only)
 	$(CARGO) test --all-features --locked --test agent_runtime_e2e
+	$(CARGO) test --all-features --locked --test agent_herdr_e2e
 
 agent-e2e-tui: ## Run the synthetic Agent vertical slice through a real POSIX PTY
 	$(CARGO) build --locked --features agent-observability-harness --bin latte-lens-agent-harness

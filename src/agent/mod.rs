@@ -17,6 +17,8 @@ mod dispatcher;
 mod envelope;
 mod error;
 mod explain;
+mod herdr;
+mod herdr_provider;
 mod hook;
 mod hook_json;
 mod hook_setup;
@@ -43,6 +45,8 @@ pub use dispatcher::*;
 pub use envelope::*;
 pub use error::*;
 pub use explain::*;
+pub use herdr::*;
+pub use herdr_provider::*;
 pub use hook::*;
 pub use hook_setup::*;
 pub use identity::*;
@@ -71,6 +75,9 @@ pub fn production_adapter_registry() -> AdapterRegistry {
         .expect("production observer ids are unique");
     registry
         .register(std::sync::Arc::new(TraexHookAdapter::new()))
+        .expect("production observer ids are unique");
+    registry
+        .register(std::sync::Arc::new(HerdrSnapshotAdapter::new()))
         .expect("production observer ids are unique");
     registry
 }

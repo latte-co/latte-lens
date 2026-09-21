@@ -15,6 +15,11 @@ pub enum DecisionValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecisionDisposition {
     Applied,
+    /// A lower-than-Authoritative candidate won because no unexpired
+    /// Authoritative evidence exists (degraded arbitration pass). The trace
+    /// records the real authority/provenance and never claims
+    /// Authoritative (`docs/design/herdr-observation-provider.md` §6.3).
+    Degraded,
     Expired,
     Suppressed,
     StaleSequence,

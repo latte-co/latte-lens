@@ -1538,7 +1538,7 @@ fn arbitrate(
             false,
         );
     };
-    (value, applied_trace(winner), false)
+    (value, applied_trace(winner, &candidates), false)
 }
 
 fn arbitrate_activity(
@@ -1555,28 +1555,69 @@ fn arbitrate_activity(
         .copied()
         .filter(|candidate| candidate.authority == EvidenceAuthority::Authoritative)
         .collect::<Vec<_>>();
-    if authoritative.is_empty() {
+    if !authoritative.is_empty() {
+        // Authoritative pass: the winner rule is unchanged (design §6.3
+        // rule 1); Observational candidates (Herdr) never participate in
+        // the comparison — they only leave a suppressed competing trace.
+        let values = authoritative
+            .iter()
+            .map(|candidate| candidate.value)
+            .collect::<BTreeSet<_>>();
+        if values.len() != 1 {
+            return (
+                ActivityState::Unknown,
+                conflict_trace(domain, &authoritative),
+                true,
+            );
+        }
+        let winner = authoritative
+            .into_iter()
+            .max_by_key(|candidate| candidate.observed_at)
+            .expect("authoritative candidate exists");
+        let CandidateValue::Activity(value) = winner.value else {
+            return (
+                ActivityState::Unknown,
+                DecisionTrace::unknown(domain, DecisionDisposition::Suppressed),
+                false,
+            );
+        };
+        return (value, applied_trace(winner, &candidates), false);
+    }
+
+    // Degraded pass (design §6.3 rule 2): no unexpired Authoritative
+    // candidate — hook evidence is missing or its lease expired. Agreeing
+    // Observational candidates may win, but the trace says so honestly.
+    let observational = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.authority == EvidenceAuthority::Observational)
+        .collect::<Vec<_>>();
+    if observational.is_empty() {
         return (
             ActivityState::Unknown,
             DecisionTrace::unknown(domain, DecisionDisposition::Suppressed),
             false,
         );
     }
-    let values = authoritative
+    let values = observational
         .iter()
         .map(|candidate| candidate.value)
         .collect::<BTreeSet<_>>();
     if values.len() != 1 {
+        // Observational disagreement resolves to Unknown with an honest
+        // conflict trace, but never escalates the session conflict flag:
+        // that stays Authoritative-only (design §6.3 rule 3, reserved for
+        // multi-instance deployments).
         return (
             ActivityState::Unknown,
-            conflict_trace(domain, &authoritative),
-            true,
+            conflict_trace(domain, &observational),
+            false,
         );
     }
-    let winner = authoritative
+    let winner = observational
         .into_iter()
         .max_by_key(|candidate| candidate.observed_at)
-        .expect("authoritative candidate exists");
+        .expect("observational candidate exists");
     let CandidateValue::Activity(value) = winner.value else {
         return (
             ActivityState::Unknown,
@@ -1584,10 +1625,13 @@ fn arbitrate_activity(
             false,
         );
     };
-    (value, applied_trace(winner), false)
+    (value, degraded_trace(winner, &candidates), false)
 }
 
-fn applied_trace(candidate: &EvidenceCandidate) -> DecisionTrace {
+fn applied_trace(
+    candidate: &EvidenceCandidate,
+    candidates: &[&EvidenceCandidate],
+) -> DecisionTrace {
     DecisionTrace {
         domain: candidate.domain,
         effective_value: candidate.value.decision(),
@@ -1597,8 +1641,58 @@ fn applied_trace(candidate: &EvidenceCandidate) -> DecisionTrace {
         observed_at: Some(candidate.observed_at),
         valid_until: candidate.valid_until,
         disposition: DecisionDisposition::Applied,
-        competing: BoundedVec::new(),
+        competing: suppressed_competing(candidate, candidates),
     }
+}
+
+/// Degraded win trace: same shape as `applied_trace`, but the disposition
+/// and the recorded authority/provenance make clear that no Authoritative
+/// evidence backed this decision (design §6.3 rule 2).
+fn degraded_trace(
+    candidate: &EvidenceCandidate,
+    candidates: &[&EvidenceCandidate],
+) -> DecisionTrace {
+    DecisionTrace {
+        domain: candidate.domain,
+        effective_value: candidate.value.decision(),
+        winning_observer: Some(candidate.source.observer.clone()),
+        authority: candidate.authority,
+        provenance: Some(candidate.provenance),
+        observed_at: Some(candidate.observed_at),
+        valid_until: candidate.valid_until,
+        disposition: DecisionDisposition::Degraded,
+        competing: suppressed_competing(candidate, candidates),
+    }
+}
+
+/// Collect the losing unexpired candidates a winner outranked, as visible
+/// `Suppressed` competing evidence (design §6.3 rule 1, 交付物②).
+///
+/// Only lower-authority losers are recorded: an Authoritative winner
+/// suppresses its Observational competitors (hook evidence vs Herdr),
+/// while same-value same-authority hook candidates keep today's behavior
+/// of leaving no trace. With an Observational winner every other
+/// candidate is by construction non-Authoritative.
+fn suppressed_competing(
+    winner: &EvidenceCandidate,
+    candidates: &[&EvidenceCandidate],
+) -> BoundedVec<super::CompetingEvidenceSummary, 4> {
+    let competing = candidates
+        .iter()
+        .filter(|candidate| {
+            !std::ptr::eq(**candidate, winner)
+                && candidate.authority != EvidenceAuthority::Authoritative
+        })
+        .take(4)
+        .map(|candidate| super::CompetingEvidenceSummary {
+            observer: candidate.source.observer.clone(),
+            domain: candidate.domain,
+            authority: candidate.authority,
+            current: true,
+            disposition: DecisionDisposition::Suppressed,
+        })
+        .collect();
+    BoundedVec::try_from_vec(competing).expect("competing evidence capped")
 }
 
 fn conflict_trace(domain: EvidenceDomain, candidates: &[&EvidenceCandidate]) -> DecisionTrace {
@@ -1613,11 +1707,17 @@ fn conflict_trace(domain: EvidenceDomain, candidates: &[&EvidenceCandidate]) -> 
             disposition: DecisionDisposition::EqualAuthorityConflict,
         })
         .collect();
+    // The trace must not overstate the conflicting evidence's level: hook
+    // conflicts are Authoritative, Herdr-only disagreements are
+    // Observational (design §6.3 rule 3, 交付物③).
+    let authority = candidates
+        .first()
+        .map_or(EvidenceAuthority::None, |candidate| candidate.authority);
     DecisionTrace {
         domain,
         effective_value: DecisionValue::Unknown,
         winning_observer: None,
-        authority: EvidenceAuthority::Authoritative,
+        authority,
         provenance: None,
         observed_at: candidates
             .iter()

@@ -57,7 +57,9 @@ impl OpenCodePluginAdapter {
         ))
     }
 
-    fn authority() -> AuthorityId {
+    /// Authority digest byte-shared with the Herdr snapshot adapter's
+    /// declarative subject mapping (design §5.2).
+    pub fn authority() -> AuthorityId {
         AuthorityId::from_digest(stable_hash(
             b"opencode-session-authority",
             &[OPENCODE_SUBJECT_NAMESPACE.as_bytes(), b"sessionID"],

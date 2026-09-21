@@ -11,7 +11,7 @@
 1. C0–C2 的 UT、contract test 和 E2E 全部使用 synthetic fixture，不启动、不配置、不修改任何真实 Code Agent。
 2. UT 验证单个纯逻辑不变量；contract test 验证 trait/registry/contract 组合边界；E2E 验证进程、runtime、App reducer 和最终 UI 的真实链路。不能用大量 UI E2E 代替 reducer UT。
 3. 现有 `scripts/e2e_tui.py` 继续作为 Files、Git Changes、Search/Preview 的阻断级 production E2E。Agent 场景使用独立 harness 和脚本，不把测试入口藏进 production CLI、环境变量或 registry。
-4. production registry 只允许显式批准的真实 adapter；当前为 `openai/codex-hook`、`anthropic/claude-code-hook`、`opencode/plugin` 与 `bytedance/traex-hook`。FakeAdapter、FakeProvider、FakePublisher、FakeIdentityKeyer 和故障注入只存在于 `tests/` 或专用测试 binary。
+4. production registry 只允许显式批准的真实 adapter；当前为 `openai/codex-hook`、`anthropic/claude-code-hook`、`opencode/plugin`、`bytedance/traex-hook` 与 `herdr/cli-snapshot`（只读 snapshot provider，bootstrap 按 `HERDR_ENV` + `HERDR_SOCKET_PATH` 门控注册）。FakeAdapter、FakeProvider、FakePublisher、FakeIdentityKeyer 和故障注入只存在于 `tests/` 或专用测试 binary。
 5. 相关门禁单次失败即阻断，不自动 retry。重跑只用于诊断，不能把第二次通过当成原失败已解决。
 6. 测试使用显式 Timestamp、sequence、epoch 和 generation；除 PTY 等待屏幕收敛外禁止依赖 wall-clock sleep。
 7. 每个缺陷必须在能够复现它的最低测试层增加回归用例；只有跨进程或终端行为才进入 E2E。
@@ -40,7 +40,7 @@ flowchart LR
 | G4 | 真实 terminal loop、Agent list/detail、键鼠与退出行为 | not required | not required | required | 已实现独立 PTY baseline |
 | G5 | 某个真实 Code Agent 的版本兼容和权限验证 | independent | independent | independent | Codex/Claude/TraeX SessionStart、OpenCode session.created 手工 canary 已实现；完整 matrix 待实现 |
 
-G5 不属于 C0–C2 core 完成条件。四个 production adapter 的官方形状 fixture 与 production CLI/receiver E2E 是集成前置证据；`make codex-hooks-canary`、`make claude-hooks-canary` 分别证明本机已安装 binary 能从隔离配置触发 SessionStart，`make opencode-plugin-canary` 证明本机 OpenCode 能加载真实插件并通过 loopback session.create 触发 session.created，`make traex-hooks-canary TRAEX_BIN=/path/to/traex` 证明显式选择的 TraeX binary 能从隔离配置触发 SessionStart。单条 canary 都不能表述为完整 turn/tool/subagent 或跨平台兼容。
+G5 不属于 C0–C2 core 完成条件。四个 hook adapter 的官方形状 fixture、Herdr 的 fake-herdr argv/JSON 形状协议测试（`agent::herdr`/`agent::herdr_provider`）与 production CLI/receiver E2E 是集成前置证据；`make codex-hooks-canary`、`make claude-hooks-canary` 分别证明本机已安装 binary 能从隔离配置触发 SessionStart，`make opencode-plugin-canary` 证明本机 OpenCode 能加载真实插件并通过 loopback session.create 触发 session.created，`make traex-hooks-canary TRAEX_BIN=/path/to/traex` 证明显式选择的 TraeX binary 能从隔离配置触发 SessionStart，`make herdr-snapshot-canary`（需先导出 `HERDR_ENV=1` 与 `HERDR_SOCKET_PATH`）证明生产 env gate 能对本机运行中的 Herdr 完成一次真实 `agent list` 的 discover/probe/snapshot/decode。单条 canary 都不能表述为完整 turn/tool/subagent 或跨平台兼容。
 
 ### 2.1 当前基线与缺口
 
@@ -306,7 +306,7 @@ Linux/macOS 执行 PTY suite。Windows 在 C2 先以 Ratatui TestBackend + headl
 默认和 release 构建必须满足：
 
 - 默认构建包含 production `agent-observability` 与通用 Hook CLI，并且正常编译和运行；
-- production AdapterRegistry 只包含显式批准的真实 adapter，当前为 `openai/codex-hook`、`anthropic/claude-code-hook`、`opencode/plugin` 与 `bytedance/traex-hook`；
+- production AdapterRegistry 只包含显式批准的真实 adapter，当前为 `openai/codex-hook`、`anthropic/claude-code-hook`、`opencode/plugin`、`bytedance/traex-hook` 与 `herdr/cli-snapshot`；
 - production registry、CLI help 与 release archive 不包含 synthetic/test observer 或 fake；
 - CLI help、配置 schema 和环境变量中不存在 synthetic/test observer 入口；
 - release archive 只有正式 binary、README、LICENSE 和约定资产；
@@ -395,14 +395,15 @@ C1 完成需要 E2E-H-001 至 E2E-H-004、E2E-H-008、E2E-H-011、E2E-H-013 以�
 | Target | 内容 | 预算 |
 |---|---|---:|
 | `make agent-ut` | agent module UT + compile-fail doctest | 15 s |
-| `make agent-contract` | fake contract suites + production Codex/Claude/OpenCode/TraeX adapter contract | 15 s |
+| `make agent-contract` | fake contract suites + production Codex/Claude/OpenCode/TraeX/Herdr adapter contract 与 Herdr 降级仲裁 reducer | 15 s |
 | `make agent-harness-self-test` | sandbox、recorder、watchdog、cleanup oracle 自测 | 10 s |
 | `make agent-e2e-hook` | synthetic loopback + production Codex/Claude/OpenCode/TraeX CLI offline/live contract | 30 s |
 | `make codex-hooks-canary` | 已安装 Codex binary + 隔离 HOME + mock provider 的 SessionStart 手工 canary | 15 s |
 | `make claude-hooks-canary` | 已安装 Claude binary + 临时 settings + 隔离 HOME + mock provider 的 SessionStart 手工 canary | 15 s |
 | `make opencode-plugin-canary` | 已安装 OpenCode + 临时插件 + 隔离 HOME + loopback health/session.create 的手工 canary；首次运行允许完成本地数据库迁移 | 45 s |
 | `make traex-hooks-canary TRAEX_BIN=/path/to/traex` | 指定 TraeX binary + 隔离 HOME/config + mock provider 的 SessionStart 手工 canary | 15 s |
-| `make agent-e2e` | L2 all-platform headless scenarios | 60 s |
+| `make herdr-snapshot-canary` | 本机运行中的 Herdr + 生产 env gate 的一次真实 `agent list` discover/probe/snapshot/decode 手工 canary（需 `HERDR_ENV=1`、`HERDR_SOCKET_PATH`） | 20 s |
+| `make agent-e2e` | L2 all-platform headless scenarios（含 Unix-only 的 Herdr 冷启动盲区 fake-binary journey） | 60 s |
 | `make agent-e2e-tui` | POSIX test-binary PTY scenarios | 180 s |
 | `make agent-ci` | G0–G4 中当前阶段适用项 | 240 s |
 
