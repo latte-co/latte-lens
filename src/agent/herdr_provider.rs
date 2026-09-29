@@ -11,7 +11,7 @@
 //! provider.md` §4).
 
 use std::{
-    io,
+    io::{self, Read},
     process::{Child, Command, Stdio},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -38,6 +38,9 @@ const HERDR_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// stdout read cap for one `agent list` reply. A reply cut by this cap is
 /// rejected fail-closed; it is never silently truncated (design §8).
 const HERDR_STDOUT_CAP: usize = 128 * 1024;
+/// Chunk size for bounded output reads: small enough that the stdout cap trips
+/// at most one chunk over the limit, large enough that reads stay cheap.
+const HERDR_READ_CHUNK: usize = 4 * 1024;
 /// Maximum agent entries served per snapshot; beyond that the snapshot is
 /// served as `Truncated` with the stable pane-sorted prefix.
 const HERDR_MAX_AGENT_ENTRIES: usize = 64;
@@ -94,6 +97,11 @@ struct ProviderState {
     /// Per-pane `state_change_seq` from the last accepted list; a
     /// regression means the server restarted. Never leaves this struct.
     last_seqs: std::collections::BTreeMap<String, u64>,
+    /// Whether one successful list has established the restart-detection
+    /// baseline. The first successful poll seeds `version`/`last_seqs`
+    /// without comparisons (a cold start is not a restart); only later
+    /// `None -> Some(v)` version recoveries must bump the epoch.
+    baseline_established: bool,
 }
 
 impl ProviderState {
@@ -107,6 +115,7 @@ impl ProviderState {
             failures: 0,
             shape_valid: false,
             last_seqs: std::collections::BTreeMap::new(),
+            baseline_established: false,
         }
     }
 }
@@ -341,24 +350,42 @@ fn apply_successful_poll(state: &mut ProviderState, stdout: &[u8], version: Opti
     // counter. The next probe's contract revision follows, giving the
     // runtime a clean two-phase reset instead of a silent merge across
     // server lifetimes.
-    let seq_regression = parsed
-        .iter()
-        .any(|(pane, seq, _)| state.last_seqs.get(pane).is_some_and(|prev| *seq < *prev));
-    let version_changed = version
-        .as_ref()
-        .zip(state.version.as_ref())
-        .is_some_and(|(new, old)| new != old);
-    if let Some(version) = version {
-        state.version = Some(version);
-    }
-    if seq_regression || version_changed {
-        state.epoch_counter = state.epoch_counter.saturating_add(1);
-        state.cache = None;
-        state.last_seqs.clear();
-        state.failures = 0;
-        state.shape_valid = true;
-        state.health = ProviderHealth::Available;
-        return;
+    if !state.baseline_established {
+        // Cold start: the first successful list only seeds the baseline.
+        // A `None -> Some(v)` version here is normal (the version probe
+        // shares this first round), not a restart — the epoch must stay at
+        // its initial value.
+        if let Some(version) = version {
+            state.version = Some(version);
+        }
+        state.baseline_established = true;
+    } else {
+        let seq_regression = parsed
+            .iter()
+            .any(|(pane, seq, _)| state.last_seqs.get(pane).is_some_and(|prev| *seq < *prev));
+        // `None -> Some(v)` after the baseline is a change: revision N was
+        // already registered with no observer version because the first
+        // `--version` probe failed; serving the later-discovered version at
+        // the same revision would present a different contract at an
+        // unchanged revision and wedge the instance on
+        // `StaleContractRevision` forever.
+        let version_changed = match (version.as_ref(), state.version.as_ref()) {
+            (Some(new), Some(old)) => new != old,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if let Some(version) = version {
+            state.version = Some(version);
+        }
+        if seq_regression || version_changed {
+            state.epoch_counter = state.epoch_counter.saturating_add(1);
+            state.cache = None;
+            state.last_seqs.clear();
+            state.failures = 0;
+            state.shape_valid = true;
+            state.health = ProviderHealth::Available;
+            return;
+        }
     }
 
     // Stable ordering: the pane-id sort keeps the truncated prefix stable.
@@ -381,6 +408,7 @@ fn apply_successful_poll(state: &mut ProviderState, stdout: &[u8], version: Opti
     state.health = ProviderHealth::Available;
 }
 
+#[derive(Debug)]
 enum CaptureError {
     NotFound,
     Timeout,
@@ -393,6 +421,19 @@ enum CaptureError {
 /// separate argv arguments, no shell, null stdin, detached waiter with a
 /// bounded channel, SIGKILL on timeout, ETXTBSY retries. Errors collapse
 /// into the coarse [`CaptureError`] shapes the poll loop needs.
+///
+/// Unlike `wait_with_output` (which buffers both pipes to completion before
+/// anything is inspected), stdout is collected only up to
+/// [`HERDR_STDOUT_CAP`] and stderr is drained by a sibling thread that
+/// discards every byte. Memory is therefore bounded even if the backend
+/// floods a pipe, and a capped stdout kills the child immediately instead
+/// of stalling until the outer timeout.
+///
+/// Neither the stderr drain nor the timeout-path waiter is joined: a
+/// grandchild that outlives the SIGKILLed direct child can inherit a pipe,
+/// and joining would pin the poll thread for the grandchild's lifetime.
+/// Both threads finish promptly in the normal case (direct exec, no shell);
+/// a wedged backend costs at most a detached thread, never a blocked lens.
 fn run_capture(binary: &str, args: &[&str], timeout: Duration) -> Result<String, CaptureError> {
     let mut command = Command::new(binary);
     command
@@ -400,31 +441,94 @@ fn run_capture(binary: &str, args: &[&str], timeout: Duration) -> Result<String,
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = spawn_with_retry(&mut command)?;
+    let mut child = spawn_with_retry(&mut command)?;
     let pid = child.id();
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
     let (tx, rx) = std::sync::mpsc::channel();
-    let waiter = thread::spawn(move || tx.send(child.wait_with_output()));
-    let output = match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) => {
-            let _ = waiter.join();
-            return Err(CaptureError::Failed);
+    thread::spawn(move || {
+        // Drain stderr concurrently and discard everything. Detached (never
+        // joined): a backend that floods stderr must neither grow lens
+        // memory nor fill its pipe and wedge the stdout read, and a
+        // grandchild holding the pipe after the backend dies must not block
+        // this waiter on a drain EOF that never arrives.
+        thread::spawn(move || drain_pipe(&mut stderr));
+        // Read stdout up to the cap; kill the child the moment it trips so a
+        // flooding backend is stopped without waiting for the outer timeout.
+        let stdout_outcome = collect_bounded(&mut stdout, HERDR_STDOUT_CAP);
+        if matches!(stdout_outcome, BoundedRead::TooLarge) {
+            kill_process(pid);
         }
+        // `wait` reaps only the direct child, which the SIGKILL above (or a
+        // natural exit) finishes promptly; it does not wait on grandchildren.
+        let _ = tx.send((stdout_outcome, child.wait()));
+    });
+    let (stdout_outcome, status) = match rx.recv_timeout(timeout) {
+        Ok(pair) => pair,
         Err(_) => {
             // Best-effort SIGKILL so a wedged backend cannot outlive the
-            // timeout; the detached waiter then reaps the exit.
+            // timeout. The waiter is deliberately detached (not joined): the
+            // direct child dies, but a surviving grandchild inheriting a pipe
+            // could delay the in-waiter read beyond the call's budget.
             kill_process(pid);
-            let _ = waiter.join();
             return Err(CaptureError::Timeout);
         }
     };
-    if !output.status.success() {
+    let stdout = match stdout_outcome {
+        BoundedRead::Collected(bytes) => bytes,
+        BoundedRead::TooLarge => return Err(CaptureError::TooLarge),
+        BoundedRead::Failed => return Err(CaptureError::Failed),
+    };
+    if !status.is_ok_and(|status| status.success()) {
         return Err(CaptureError::Failed);
     }
-    if output.stdout.len() > HERDR_STDOUT_CAP {
-        return Err(CaptureError::TooLarge);
+    String::from_utf8(stdout).map_err(|_| CaptureError::InvalidUtf8)
+}
+
+/// Outcome of a size-capped pipe read.
+#[derive(Debug)]
+enum BoundedRead {
+    Collected(Vec<u8>),
+    /// More than the cap was available; the surplus was never read.
+    TooLarge,
+    Failed,
+}
+
+/// Read to EOF while retaining at most `cap` bytes. Tripping the cap stops
+/// reading immediately rather than buffering the whole payload first.
+fn collect_bounded<R: Read>(reader: &mut R, cap: usize) -> BoundedRead {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; HERDR_READ_CHUNK];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return BoundedRead::Collected(buffer),
+            Ok(len) => {
+                if buffer.len().saturating_add(len) > cap {
+                    return BoundedRead::TooLarge;
+                }
+                buffer.extend_from_slice(&chunk[..len]);
+            }
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return BoundedRead::Failed,
+        }
     }
-    String::from_utf8(output.stdout).map_err(|_| CaptureError::InvalidUtf8)
+}
+
+/// Drain a pipe to EOF without retaining anything (time is bounded by the
+/// outer subprocess timeout; memory is bounded to one chunk).
+fn drain_pipe<R: Read>(reader: &mut R) {
+    let mut chunk = [0_u8; HERDR_READ_CHUNK];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return,
+            // Match the stdout reader: an interrupted read is retried, not
+            // treated as EOF (which would stop draining and let a chatty
+            // backend fill the pipe again).
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 fn spawn_with_retry(command: &mut Command) -> Result<Child, CaptureError> {
@@ -489,11 +593,19 @@ struct SlicedList {
     complete: bool,
 }
 
-/// Validate the outer shape (`result.type == "agent_list"`, `result.agents`
-/// is an array) and slice entry spans (design §4.2). Span collection stops
-/// one past the entry cap so truncation is detected, never silent.
+/// Validate the outer shape (`result.type == "agent_list"` **and**
+/// `result.agents` is present as an array) and slice entry spans
+/// (design §4.2). Span collection stops one past the entry cap so
+/// truncation is detected, never silent.
+///
+/// A missing `agents` key is malformed, not an empty list: an empty array
+/// `[]` visits this arm with zero spans, while a missing key would skip it
+/// entirely. Treating the two as equal would publish a `Complete` empty
+/// snapshot for a shape-drifting backend and tombstone every pane's
+/// evidence on the reducer side.
 fn slice_agent_list(stdout: &[u8]) -> Result<SlicedList, AdapterError> {
     let mut list_type_seen = false;
+    let mut agents_seen = false;
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut parser = HookJsonParser::new(stdout);
     parser.parse_object(|parser, key| match key {
@@ -505,18 +617,21 @@ fn slice_agent_list(stdout: &[u8]) -> Result<SlicedList, AdapterError> {
                 list_type_seen = true;
                 Ok(())
             }
-            "agents" => parser.parse_array_spans(|start, end| {
-                if spans.len() <= HERDR_MAX_AGENT_ENTRIES {
-                    spans.push((start, end));
-                }
-                Ok(())
-            }),
+            "agents" => {
+                agents_seen = true;
+                parser.parse_array_spans(|start, end| {
+                    if spans.len() <= HERDR_MAX_AGENT_ENTRIES {
+                        spans.push((start, end));
+                    }
+                    Ok(())
+                })
+            }
             _ => parser.skip_value(1),
         }),
         _ => parser.skip_value(1),
     })?;
     parser.finish()?;
-    if !list_type_seen {
+    if !list_type_seen || !agents_seen {
         return Err(AdapterError::MalformedInput);
     }
     let complete = spans.len() <= HERDR_MAX_AGENT_ENTRIES;
@@ -529,10 +644,12 @@ impl ObservationProvider for HerdrSnapshotProvider {
         Self::observer()
     }
 
-    /// The workspace selector is intentionally ignored: one provider
-    /// instance serves exactly one local Herdr server, and workspace
-    /// scoping happens downstream via adapter workspace hints and reducer
-    /// scope rules.
+    /// Discovery is workspace-agnostic on purpose: one provider instance
+    /// serves exactly one local Herdr server, whose panes may live in any
+    /// workspace. Per-workspace selection is enforced at the snapshot
+    /// delivery boundary in the runtime (`emit_provider_snapshot` filters
+    /// decoded observations by the selector and pins the snapshot scope),
+    /// not here — there is no per-workspace argv for this backend.
     fn discover(
         &mut self,
         _selector: &WorkspaceSelector,
@@ -622,8 +739,15 @@ impl ObservationProvider for HerdrSnapshotProvider {
                 complete = false;
                 break;
             }
-            let bounded =
-                BoundedBytes::try_new(item.clone()).map_err(|_| ProviderError::BoundsExceeded)?;
+            // One oversized entry is dropped at entry granularity (design §8:
+            // 单条目丢弃), never as a whole-round `BoundsExceeded`: rejecting
+            // here would silence every other pane on the server. The dropped
+            // pane also forces Truncated so the reducer does not tombstone
+            // evidence for the pane that could not be represented.
+            let Ok(bounded) = BoundedBytes::try_new(item.clone()) else {
+                complete = false;
+                continue;
+            };
             total = total
                 .checked_add(bounded.as_slice().len())
                 .ok_or(ProviderError::BoundsExceeded)?;
@@ -640,7 +764,14 @@ impl ObservationProvider for HerdrSnapshotProvider {
                 })
                 .map_err(|_| ProviderError::BoundsExceeded)?;
         }
-        RawSnapshot::try_new(None, None, complete, items).map_err(|_| ProviderError::BoundsExceeded)
+        // A genuinely empty list (`agents: []`) is a valid Complete snapshot,
+        // but `RawSnapshot::try_new` derives `captured_at` from the max item
+        // time and falls back to the Unix epoch with zero items. Carry the
+        // real capture time explicitly so the reducer does not treat the
+        // round as ancient.
+        RawSnapshot::try_new(None, None, complete, items)
+            .map(|snapshot| snapshot.with_captured_at(cache.captured_at))
+            .map_err(|_| ProviderError::BoundsExceeded)
     }
 
     /// Stage 1 is snapshot-only: there is no event stream yet (§4.2).
@@ -1374,5 +1505,230 @@ exit 2
         let log_len = fs::read(path.join("calls.log")).unwrap().len();
         thread::sleep(10 * TEST_CADENCE);
         assert_eq!(fs::read(path.join("calls.log")).unwrap().len(), log_len);
+    }
+
+    /// Regression for the post-merge `None -> Some(version)` wedge: when the
+    /// first `--version` probe fails before any contract is established, the
+    /// later-recovered version must still trigger a reset epoch instead of
+    /// presenting a new observer version at the old revision (which the
+    /// registry rejects as `StaleContractRevision` forever).
+    #[test]
+    fn version_recovered_after_a_failed_first_probe_bumps_the_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // No version.txt yet: the fake script's `cat` fails, so the first
+        // rounds carry version None while `agent list` succeeds.
+        write_agents(path, &agents_json(&[entry("w1:p2", "claude", "idle", 1)]));
+        let mut provider = provider(path);
+
+        let instances = provider
+            .discover(
+                &selector(),
+                ProviderDiscoveryLimits { max_instances: 32 },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(wait_for(&provider, |state| cache_len(state) == 1
+            && state.version.is_none()));
+
+        // Baseline contract is revision 1 with no observer version.
+        let contract = provider.probe(&instances[0], Instant::now()).unwrap();
+        assert_eq!(contract.revision.get(), 1);
+        assert!(contract.observer_version.is_none());
+
+        // Version probe recovers on the next version interval.
+        write_version(path, "herdr 0.9.1\n");
+        assert!(
+            wait_for(&provider, |state| {
+                state.epoch_counter == 2
+                    && state.version.as_deref() == Some("herdr 0.9.1")
+                    && cache_len(state) == 1
+            }),
+            "version recovery never reset the epoch"
+        );
+        let contract = provider.probe(&instances[0], Instant::now()).unwrap();
+        assert_eq!(contract.revision.get(), 2);
+        assert_eq!(
+            contract.observer_version.as_ref().map(BoundedText::as_str),
+            Some("herdr 0.9.1")
+        );
+    }
+
+    /// A successful first round with a version present must seed the baseline
+    /// at revision 1 — cold start is not a restart.
+    #[test]
+    fn first_round_with_version_seeds_revision_one_without_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        write_version(path, "herdr 0.9.1\n");
+        write_agents(path, &agents_json(&[entry("w1:p2", "claude", "idle", 1)]));
+        let mut provider = provider(path);
+
+        let instances = provider
+            .discover(
+                &selector(),
+                ProviderDiscoveryLimits { max_instances: 32 },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(wait_for(&provider, |state| cache_len(state) == 1));
+        let state = lock_state(&provider.shared.0);
+        assert_eq!(state.epoch_counter, 1);
+        assert!(state.baseline_established);
+        drop(state);
+        assert_eq!(
+            provider
+                .probe(&instances[0], Instant::now())
+                .unwrap()
+                .revision
+                .get(),
+            1
+        );
+    }
+
+    /// A missing `agents` key is malformed, not an empty complete list: it
+    /// must demote the provider and never publish a tombstone-causing empty
+    /// Complete snapshot.
+    #[test]
+    fn missing_agents_key_is_malformed_not_an_empty_list() {
+        assert!(slice_agent_list(br#"{"id":"x","result":{"type":"agent_list"}}"#).is_err());
+        assert!(
+            slice_agent_list(br#"{"id":"x","result":{"type":"agent_list","agents":[]}}"#).is_ok(),
+            "an explicit empty array is a valid complete empty list"
+        );
+    }
+
+    /// An explicit empty list serves a Complete snapshot carrying the real
+    /// capture time, never `captured_at == 0` (which the reducer would read
+    /// as an ancient round).
+    #[test]
+    fn empty_agent_list_is_complete_with_a_real_captured_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        write_version(path, "herdr 0.9.1\n");
+        write_agents(
+            path,
+            r#"{"id":"cli:agent:list","result":{"type":"agent_list","agents":[]}}"#,
+        );
+        let mut provider = provider(path);
+
+        let instances = provider
+            .discover(
+                &selector(),
+                ProviderDiscoveryLimits { max_instances: 32 },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(wait_for(&provider, |state| {
+            state
+                .cache
+                .as_ref()
+                .is_some_and(|cache| cache.items.is_empty() && cache.complete)
+        }));
+        let snapshot = provider
+            .snapshot(&instances[0], None, limits(), Instant::now())
+            .expect("empty list still serves");
+        assert!(snapshot.is_complete());
+        assert_eq!(snapshot.items().len(), 0);
+        assert!(
+            snapshot.captured_at().as_unix_millis() > 0,
+            "empty snapshot must carry the cache capture time"
+        );
+    }
+
+    /// One entry larger than the per-item payload cap is dropped at entry
+    /// granularity and forces Truncated; the sibling pane is still served and
+    /// the whole round is never rejected (design §8).
+    #[test]
+    fn oversized_entry_is_dropped_without_losing_the_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        write_version(path, "herdr 0.9.1\n");
+        // A valid entry carrying an oversized ignored field.
+        let padding = "A".repeat(70_000);
+        let oversized = format!(
+            r#"{{"agent":"claude","agent_status":"idle","cwd":"/workspace/repo","padding":"{padding}","pane_id":"w0:p0","state_change_seq":1}}"#
+        );
+        let normal = entry("w1:p1", "claude", "idle", 2);
+        write_agents(path, &agents_json(&[oversized, normal]));
+        let mut provider = provider(path);
+
+        let instances = provider
+            .discover(
+                &selector(),
+                ProviderDiscoveryLimits { max_instances: 32 },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(wait_for(&provider, |state| cache_len(state) == 2));
+        let snapshot = provider
+            .snapshot(&instances[0], None, limits(), Instant::now())
+            .expect("the round survives the oversized entry");
+        assert!(
+            !snapshot.is_complete(),
+            "dropping an entry forces Truncated"
+        );
+        assert_eq!(snapshot.items().len(), 1, "only the normal pane is served");
+        let served = String::from_utf8(snapshot.items()[0].payload.as_slice().to_vec()).unwrap();
+        assert!(served.contains(r#""pane_id":"w1:p1""#), "got {served}");
+    }
+
+    #[test]
+    fn collect_bounded_stops_at_the_cap_without_buffering_more() {
+        let mut input: &[u8] = &[0_u8; HERDR_STDOUT_CAP + 10_000];
+        assert!(matches!(
+            collect_bounded(&mut input, HERDR_STDOUT_CAP),
+            BoundedRead::TooLarge
+        ));
+        // Exactly the cap (here a whole number of chunks) is accepted; only
+        // strictly more trips the bound.
+        let mut exact: &[u8] = &[0_u8; HERDR_STDOUT_CAP];
+        match collect_bounded(&mut exact, HERDR_STDOUT_CAP) {
+            BoundedRead::Collected(bytes) => assert_eq!(bytes.len(), HERDR_STDOUT_CAP),
+            other => panic!("an exact-cap read must be collected, got {other:?}"),
+        }
+        let mut small: &[u8] = b"hello";
+        match collect_bounded(&mut small, HERDR_STDOUT_CAP) {
+            BoundedRead::Collected(bytes) => assert_eq!(bytes, b"hello"),
+            other => panic!("expected collected, got {other:?}"),
+        }
+    }
+
+    /// Install a tiny script whose behaviour is fully controlled inline.
+    fn install_script(dir: &Path, body: &str) -> PathBuf {
+        let script = dir.join("script");
+        fs::write(&script, format!("#!{}\n{body}", shell())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn stdout_beyond_the_cap_is_rejected_without_running_to_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Emit far more than the cap and keep running afterwards; the bounded
+        // reader must trip and SIGKILL rather than buffering it all.
+        let script = install_script(
+            dir.path(),
+            "head -c 300000 /dev/zero | tr '\\0' 'x'\nsleep 5\n",
+        );
+        let start = Instant::now();
+        let result = run_capture(script.to_str().unwrap(), &[], HERDR_CALL_TIMEOUT);
+        assert!(matches!(result, Err(CaptureError::TooLarge)), "{result:?}");
+        // Killed on the cap, not after the 2 s outer timeout.
+        assert!(
+            start.elapsed() < HERDR_CALL_TIMEOUT,
+            "cap did not kill early"
+        );
+    }
+
+    #[test]
+    fn a_stderr_flooding_child_does_not_block_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        // Flood stderr forever while stdout closes cleanly; the drain thread
+        // must keep the pipe open enough for stdout/EOF and the outer timeout
+        // to reap the child (Timeout), with no unbounded buffering.
+        let script = install_script(dir.path(), "while true; do echo flood; done >&2");
+        let result = run_capture(script.to_str().unwrap(), &[], Duration::from_millis(300));
+        assert!(matches!(result, Err(CaptureError::Timeout)), "{result:?}");
     }
 }

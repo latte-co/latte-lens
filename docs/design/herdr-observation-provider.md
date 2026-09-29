@@ -203,6 +203,18 @@ pub struct HerdrSnapshotProvider { /* poll 线程句柄、有界缓存、drainin
   payload = 该条目原始 JSON 的有界字节，`observed_at = captured_at`）；
   `complete = true`（scope 内），`watermark = None`（§4.3），
   `cursor = None`；缓存为空且从未成功 → `Unavailable`；
+- **workspace 隔离在交付边界，不在 `discover()`**：一个 Herdr server
+  返回的 pane 可能位于本机任意目录，而该后端没有按 workspace 过滤的
+  argv。因此 provider 始终上报这一个 instance，由 runtime 在解码后的
+  快照交付处（`emit_provider_snapshot`）按当前 `WorkspaceSelector`
+  逐条过滤：事实自身的 workspace hint 为准，缺失时回退到
+  session/presence 引用；无法归属到任何 workspace 的事实放行，归属到
+  未选中 workspace 的事实丢弃。同时把快照 scope 从 `Selected`（reducer
+  中的全放行）收紧为 `Explicit(选中 workspace)`，使下一轮 Complete
+  tombstone 只作用于被选中的目录。`agents: []` 是合法的空 Complete
+  快照（携带真实 `captured_at`）；缺失 `agents` 键则是形状错误
+  （`InvalidResponse`），二者不得混淆——后者绝不能产生空 Complete
+  快照去清空证据；
 - `next_event()`：S1 恒返回 `Idle`（纯快照 provider）；S2 起返回
   `state_change_seq` 差分构造的 per-entry `RawEvent`（§11）；
 - `begin_draining()`：停止轮询线程、清空缓存；不向 Herdr 发送任何
