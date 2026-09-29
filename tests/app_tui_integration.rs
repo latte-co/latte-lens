@@ -1805,7 +1805,7 @@ fn same_named_repo_directories_keep_summaries_selection_and_diff_ownership_isola
 }
 
 #[test]
-fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_error_visible() {
+fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_warning_visible() {
     let workspace = tempfile::tempdir().unwrap();
     let nested = workspace.path().join("good-repo");
     init_repo(&nested);
@@ -1822,7 +1822,8 @@ fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_error_visible() {
     assert_eq!(app.total_repository_count, 1);
     assert_eq!(app.dirty_repository_count, 1);
     assert_eq!(app.changed_count, 1);
-    assert!(app.repository_error_count > 0);
+    // The invalid marker is a soft warning, not a repository error.
+    assert_eq!(app.repository_error_count, 0);
     assert!(
         app.visible_git_rows()
             .iter()
@@ -1831,14 +1832,17 @@ fn nonrepo_workspace_keeps_dirty_descendant_repo_and_discovery_error_visible() {
     assert!(
         app.visible_git_rows()
             .iter()
-            .any(|row| row.label.contains("[error] bad-repo"))
+            .any(|row| row.label.contains("[skipped] bad-repo"))
     );
     assert!(app.tab().content.lines.iter().any(|line| line == "+after"));
 
     let backend = TestBackend::new(100, 18);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    assert!(format!("{:?}", terminal.backend().buffer()).contains("workspace not repo"));
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("workspace not repo"));
+    // A soft warning must not render the red repository-error status line.
+    assert!(!rendered.contains("repository error"));
 }
 
 #[test]

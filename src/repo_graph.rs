@@ -151,7 +151,15 @@ pub struct DiscoveryReport {
     pub entries_scanned: usize,
     pub repositories_discovered: usize,
     pub truncations: Vec<DiscoveryTruncation>,
+    /// Hard failures that usually mean the snapshot is unreliable: Git could
+    /// not be invoked, a directory could not be read, a path escaped the
+    /// workspace, or a submodule could not be resolved. These drive the red
+    /// "repository errors" signal.
     pub errors: Vec<DiscoveryError>,
+    /// Non-fatal, skippable conditions: a `.git` marker is present but not a
+    /// valid worktree (a stale/leftover marker). These are surfaced softly
+    /// rather than counted as errors, since there is nothing to fix in Git.
+    pub warnings: Vec<DiscoveryError>,
     /// Directory symlinks followed during discovery, as
     /// `(workspace-relative access path, raw link target)` pairs so the UI can
     /// show where a linked repository actually lives.
@@ -380,7 +388,10 @@ impl Discovery {
                     }
                     Ok(None) => {
                         if has_git_marker(&directory) {
-                            self.error(&directory, "Git marker is not a valid worktree");
+                            // A present-but-invalid `.git` marker is a harmless
+                            // leftover (e.g. an aborted `git init` or a pruned
+                            // worktree pointer), not a fault in the snapshot.
+                            self.warning(&directory, "Git marker is not a valid worktree");
                         }
                     }
                     Err(error) => self.error(&directory, format!("{error:#}")),
@@ -774,6 +785,16 @@ impl Discovery {
 
     fn error(&mut self, path: impl AsRef<Path>, message: impl Into<String>) {
         self.report.errors.push(DiscoveryError {
+            path: path.as_ref().to_path_buf(),
+            message: message.into(),
+        });
+    }
+
+    /// Record a non-fatal, skippable condition. Kept separate from
+    /// [`Self::error`] so stale/invalid Git markers do not raise the red
+    /// repository-error signal.
+    fn warning(&mut self, path: impl AsRef<Path>, message: impl Into<String>) {
+        self.report.warnings.push(DiscoveryError {
             path: path.as_ref().to_path_buf(),
             message: message.into(),
         });

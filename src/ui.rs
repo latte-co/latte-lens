@@ -2204,6 +2204,7 @@ fn git_tree_line(
             (Some(DiffReviewState::Reviewed), _) => "✓ ",
             (Some(DiffReviewState::ChangedAfterReview), _) => "↻ ",
             (None, GitRowKind::Pointer(_)) => "~ ",
+            (None, GitRowKind::Issue(_)) if row.warning => "· ",
             (None, GitRowKind::Issue(_)) => "! ",
             (None, GitRowKind::Change(_)) => "- ",
             (None, GitRowKind::Repository { .. } | GitRowKind::Directory) => unreachable!(),
@@ -2228,6 +2229,8 @@ fn git_tree_line(
     };
     let icon_color = if selected && focused || row.is_container() {
         theme.git_accent
+    } else if matches!(row.kind, GitRowKind::Issue(_)) && row.warning {
+        theme.text_muted
     } else if matches!(row.kind, GitRowKind::Issue(_)) {
         theme.missing
     } else {
@@ -2245,7 +2248,9 @@ fn git_tree_line(
         spans.push(Span::styled("│ ", Style::default().fg(theme.text_muted)));
     }
     spans.push(Span::styled(icon, Style::default().fg(icon_color)));
-    let label_style = if !row.exists && !selected {
+    let label_style = if row.warning && !selected {
+        dim_when_unfocused(Style::default().fg(theme.text_muted), focused)
+    } else if !row.exists && !selected {
         dim_when_unfocused(Style::default().fg(theme.missing), focused)
     } else if repository_has_changes && !selected {
         dim_when_unfocused(Style::default().fg(theme.tree_change_hint), focused)

@@ -567,11 +567,69 @@ fn discovery_limits_and_invalid_git_markers_are_explicit() {
     assert!(
         invalid_graph
             .report()
-            .errors
+            .warnings
             .iter()
             .any(|error| error.path == invalid.canonicalize().unwrap()),
-        "errors: {:?}",
+        "warnings: {:?}",
+        invalid_graph.report().warnings
+    );
+    assert!(
+        invalid_graph
+            .report()
+            .errors
+            .iter()
+            .all(|error| error.path != invalid.canonicalize().unwrap()),
+        "an empty .git directory must be a soft warning, not a hard error: {:?}",
         invalid_graph.report().errors
+    );
+}
+
+#[test]
+fn stale_or_broken_git_markers_are_soft_warnings_not_errors() {
+    let workspace = tempfile::tempdir().unwrap();
+    init(&workspace.path().join("healthy"));
+
+    // A leftover `.git` directory holding only the default exclude file, like
+    // a half-finished `git init` (the real-world HOME fixture).
+    let leftover_dir = workspace.path().join("leftover-dir");
+    fs::create_dir_all(leftover_dir.join(".git").join("info")).unwrap();
+    fs::write(
+        leftover_dir.join(".git").join("info").join("exclude"),
+        "# leftover\n",
+    )
+    .unwrap();
+
+    // A worktree/submodule `.git` file pointing at a Git directory that no
+    // longer exists.
+    let stale_pointer = workspace.path().join("stale-pointer");
+    fs::create_dir_all(&stale_pointer).unwrap();
+    fs::write(
+        stale_pointer.join(".git"),
+        "gitdir: /nonexistent/git/directory\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(workspace.path()).unwrap();
+
+    assert_eq!(graph.report().repositories_discovered, 1);
+    assert!(
+        graph.report().errors.is_empty(),
+        "stale markers must not be hard errors: {:?}",
+        graph.report().errors
+    );
+    let warning_paths: Vec<PathBuf> = graph
+        .report()
+        .warnings
+        .iter()
+        .map(|error| error.path.clone())
+        .collect();
+    assert!(
+        warning_paths.contains(&leftover_dir.canonicalize().unwrap()),
+        "warnings: {warning_paths:?}"
+    );
+    assert!(
+        warning_paths.contains(&stale_pointer.canonicalize().unwrap()),
+        "warnings: {warning_paths:?}"
     );
 }
 
