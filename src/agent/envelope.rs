@@ -40,6 +40,17 @@ pub struct SnapshotScope {
     pub domains: BoundedSet<EvidenceDomain, 12>,
 }
 
+impl SnapshotScope {
+    /// Override the workspace boundary. Delivery code that filters
+    /// observations down to an explicit selector must pin the scope to the
+    /// same workspaces, or a `Selected` (pass-through) scope would carry
+    /// tombstones beyond what the observations actually covered.
+    pub fn with_workspaces(mut self, workspaces: WorkspaceScope) -> Self {
+        self.workspaces = workspaces;
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotCompleteness {
     Complete,

@@ -252,6 +252,116 @@ fn cold_start_herdr_snapshot_populates_sessions_without_any_hook_event() {
     );
 }
 
+/// #1 regression: one Herdr backend reports panes from every workspace on the
+/// machine, but Lens has selected exactly one directory. Panes from another
+/// workspace must never enter the selected AgentState (counts, metadata, or
+/// tombstone scope). Switching the selection to the other workspace must
+/// converge to only that workspace's pane.
+#[test]
+fn provider_snapshots_are_filtered_to_the_selected_workspace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let workspace_a = root.join("repo-a");
+    let workspace_b = root.join("repo-b");
+    fs::create_dir_all(&workspace_a).expect("workspace A");
+    fs::create_dir_all(&workspace_b).expect("workspace B");
+    fs::write(root.join("version.txt"), "herdr 0.9.1\n").expect("version");
+
+    // One backend, two panes in two distinct workspaces.
+    let entries = [
+        agent_entry(
+            "w1:pA",
+            "scope-session-aaaa",
+            "working",
+            workspace_a.to_str().unwrap(),
+            1,
+        ),
+        agent_entry(
+            "w1:pB",
+            "scope-session-bbbb",
+            "idle",
+            workspace_b.to_str().unwrap(),
+            2,
+        ),
+    ];
+    fs::write(root.join("agents.json"), agents_json(&entries)).expect("agents");
+
+    let bin = install_fake_herdr(root);
+    let socket = root.join("herdr.sock");
+    let _env = EnvGuard::configure(&socket, &bin);
+
+    let identity: Arc<dyn IdentityKeyer> =
+        Arc::new(HmacIdentityKeyer::new(SensitiveId::new(&[0x48; 32])).expect("keyer"));
+    let hint_for = |workspace: &Path| {
+        identity
+            .workspace_hint(SensitiveWorkspaceLocator::new(
+                workspace.to_str().unwrap().as_bytes(),
+            ))
+            .expect("workspace hint")
+    };
+    let hint_a = hint_for(&workspace_a);
+    let hint_b = hint_for(&workspace_b);
+    assert_ne!(hint_a, hint_b);
+
+    let mut app = App::new(workspace_a.clone()).expect("app");
+
+    // Attach selecting workspace A only.
+    let metadata_a = Arc::new(InMemoryMetadataStore::default());
+    let mut services_a = AgentRuntimeServices::new(
+        Arc::new(production_adapter_registry()),
+        Arc::clone(&identity),
+        metadata_a.clone(),
+    );
+    services_a.providers.push(Box::new(
+        HerdrSnapshotProvider::from_environment().expect("provider A"),
+    ));
+    let selector_a =
+        WorkspaceSelector::new(BoundedVec::try_from_vec(vec![hint_a.clone()]).expect("selector A"));
+    app.attach_agent_runtime(AgentRuntime::start(services_a), selector_a)
+        .expect("attach A");
+
+    poll_until(&mut app, |view| {
+        view.live_count == 1 && view.known_count == 1
+    });
+    // The metadata projection must likewise carry only A's session.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while metadata_a.writes().is_empty() && Instant::now() < deadline {
+        app.poll_background();
+        thread::sleep(Duration::from_millis(5));
+    }
+    let writes_a = metadata_a.writes();
+    assert_eq!(writes_a.len(), 1, "B's pane leaked into A's metadata");
+    assert_eq!(writes_a[0].session.workspace(), &hint_a);
+
+    // Switch the selection to B: a fresh runtime/generation clears state and
+    // must converge to only B's pane.
+    let metadata_b = Arc::new(InMemoryMetadataStore::default());
+    let mut services_b = AgentRuntimeServices::new(
+        Arc::new(production_adapter_registry()),
+        Arc::clone(&identity),
+        metadata_b.clone(),
+    );
+    services_b.providers.push(Box::new(
+        HerdrSnapshotProvider::from_environment().expect("provider B"),
+    ));
+    let selector_b =
+        WorkspaceSelector::new(BoundedVec::try_from_vec(vec![hint_b.clone()]).expect("selector B"));
+    app.attach_agent_runtime(AgentRuntime::start(services_b), selector_b)
+        .expect("attach B");
+
+    poll_until(&mut app, |view| {
+        view.live_count == 1 && view.known_count == 1
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while metadata_b.writes().is_empty() && Instant::now() < deadline {
+        app.poll_background();
+        thread::sleep(Duration::from_millis(5));
+    }
+    let writes_b = metadata_b.writes();
+    assert_eq!(writes_b.len(), 1, "A's pane leaked into B's metadata");
+    assert_eq!(writes_b[0].session.workspace(), &hint_b);
+}
+
 /// §10.6 optional canary (never runs in CI; `make herdr-snapshot-canary`).
 ///
 /// Validates one real `herdr agent list` round trip against a locally running

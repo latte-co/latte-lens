@@ -17,10 +17,10 @@ use super::{
     MetadataLoadLimits, MetadataSnapshot, MetadataWriteOutcome, ObservationEnvelope,
     ObservationProvider, ObservedEntityKind, ObserverId, ObserverInstanceId, ProviderCursor,
     ProviderDiscoveryLimits, ProviderEventOutcome, ProviderInstance, ReceiveOutcome,
-    RetentionPolicy, SessionKey, SessionMetadataDelta, SessionMetadataStore, SnapshotCompleteness,
-    SnapshotEnvelope, SnapshotId, SnapshotLimits, SnapshotScope, StreamEpoch, StreamOp, StreamRef,
-    StreamSequence, Timestamp, TransportRejectReason, ValidatedEnvelope, WorkspaceHint,
-    WorkspaceScope, WorkspaceSelector, stable_hash,
+    RetentionPolicy, SessionKey, SessionMetadataDelta, SessionMetadataStore, SessionRef,
+    SnapshotCompleteness, SnapshotEnvelope, SnapshotId, SnapshotLimits, SnapshotScope, StreamEpoch,
+    StreamOp, StreamRef, StreamSequence, Timestamp, TransportRejectReason, ValidatedEnvelope,
+    WorkspaceHint, WorkspaceScope, WorkspaceSelector, stable_hash,
 };
 
 pub const DEFAULT_AGENT_REQUEST_CAPACITY: usize = 256;
@@ -806,7 +806,7 @@ fn refresh_providers(
                 }
             };
             if emit_provider_snapshot(
-                endpoint, services, generation, &instance, &contract, &stream, &raw,
+                endpoint, services, generation, selector, &instance, &contract, &stream, &raw,
             ) {
                 any_current = true;
                 active.push(ActiveProviderInstance {
@@ -829,10 +829,12 @@ fn refresh_providers(
     any_current
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_provider_snapshot(
     endpoint: &AgentRuntimeEndpoint,
     services: &AgentRuntimeServices,
     generation: u64,
+    selector: &WorkspaceSelector,
     instance: &ProviderInstance,
     contract: &InstanceContract,
     stream: &StreamRef,
@@ -860,10 +862,23 @@ fn emit_provider_snapshot(
             return false;
         }
     }
+    // One backend serves panes from every workspace on the machine; the
+    // provider has no per-workspace argv. Drop observations for workspaces
+    // Lens did not select at this delivery boundary, so a pane in /repo/B
+    // can never enter /repo/A's AgentState. Facts with no observable
+    // workspace pass through (there is nothing to key a filter on).
+    if !selector.workspaces().is_empty() {
+        observations.retain(|observation| observation_matches_selector(observation, selector));
+    }
+    // Pin the snapshot scope to the exact selected workspaces. A
+    // `Selected` scope is a pass-through in the reducer and would let the
+    // (already filtered) observations carry tombstones across every
+    // workspace on the next Complete round.
     let scope = raw
         .scope()
         .cloned()
-        .unwrap_or_else(|| contract_snapshot_scope(contract));
+        .unwrap_or_else(|| contract_snapshot_scope(contract))
+        .with_workspaces(workspace_scope(selector));
     let snapshot_id = snapshot_id(stream, raw.cursor(), raw.watermark());
     let supports_chunking = contract.snapshot_semantics.chunked;
     let completeness = if !raw.is_complete() || (!supports_chunking && observations.len() > 64) {
@@ -1162,6 +1177,48 @@ fn provider_event_composite(
     }
     output.extend_from_slice(item.event_name.as_str().as_bytes());
     output
+}
+
+/// Build the explicit workspace boundary implied by a selector.
+///
+/// An empty selector (no workspace chosen yet) stays `Selected`: there is
+/// nothing to restrict to yet, and the metadata/provider loops already skip
+/// reconcile until a workspace is selected.
+fn workspace_scope(selector: &WorkspaceSelector) -> WorkspaceScope {
+    if selector.workspaces().is_empty() {
+        WorkspaceScope::Selected
+    } else {
+        WorkspaceScope::Explicit(
+            BoundedVec::try_from_vec(selector.workspaces().to_vec())
+                .expect("selector is bounded by MAX_SELECTED_WORKSPACES"),
+        )
+    }
+}
+
+/// Whether one decoded fact is allowed through the workspace selector.
+///
+/// The fact's own workspace hint wins; facts that do not carry one fall back
+/// to their session/presence reference. A fact attributable to a known,
+/// unselected workspace is dropped; an unattributable fact is kept (there is
+/// no key to filter on, and presence facts legitimately precede the cwd).
+fn observation_matches_selector(
+    observation: &super::AgentObservation,
+    selector: &WorkspaceSelector,
+) -> bool {
+    if selector.workspaces().is_empty() {
+        return true;
+    }
+    let workspace = observation
+        .workspace
+        .as_ref()
+        .or_else(|| observation.session.as_ref().map(SessionRef::workspace))
+        .or_else(|| {
+            observation
+                .presence
+                .as_ref()
+                .and_then(|presence| presence.workspace())
+        });
+    workspace.is_none_or(|hint| selector.workspaces().contains(hint))
 }
 
 fn contract_snapshot_scope(contract: &InstanceContract) -> SnapshotScope {
