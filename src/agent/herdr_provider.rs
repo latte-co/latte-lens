@@ -520,7 +520,12 @@ fn drain_pipe<R: Read>(reader: &mut R) {
     let mut chunk = [0_u8; HERDR_READ_CHUNK];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            // Match the stdout reader: an interrupted read is retried, not
+            // treated as EOF (which would stop draining and let a chatty
+            // backend fill the pipe again).
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
             Ok(_) => {}
         }
     }
@@ -1675,6 +1680,13 @@ exit 2
             collect_bounded(&mut input, HERDR_STDOUT_CAP),
             BoundedRead::TooLarge
         ));
+        // Exactly the cap (here a whole number of chunks) is accepted; only
+        // strictly more trips the bound.
+        let mut exact: &[u8] = &[0_u8; HERDR_STDOUT_CAP];
+        match collect_bounded(&mut exact, HERDR_STDOUT_CAP) {
+            BoundedRead::Collected(bytes) => assert_eq!(bytes.len(), HERDR_STDOUT_CAP),
+            other => panic!("an exact-cap read must be collected, got {other:?}"),
+        }
         let mut small: &[u8] = b"hello";
         match collect_bounded(&mut small, HERDR_STDOUT_CAP) {
             BoundedRead::Collected(bytes) => assert_eq!(bytes, b"hello"),

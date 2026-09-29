@@ -1749,9 +1749,17 @@ fn scope_covers_presence(scope: &SnapshotScope, presence: &PresenceRef) -> bool 
         .is_none_or(|subject| scope.subjects.contains(subject))
         && match &scope.workspaces {
             WorkspaceScope::Selected => true,
+            // `None` means the fact has not been attributed to a workspace
+            // yet (a pane whose cwd is missing this round). Ingress and the
+            // delivery filter both fail open for it, so tombstoning must
+            // match: otherwise an unattributed pane that disappears (or
+            // later acquires a cwd and changes PresenceRef key) could never
+            // be reaped under an Explicit scope and would linger forever.
+            // A live unattributed pane is still in `seen_presences` and
+            // survives; only a vanished one is removed.
             WorkspaceScope::Explicit(workspaces) => presence
                 .workspace()
-                .is_some_and(|workspace| workspaces.contains(workspace)),
+                .is_none_or(|workspace| workspaces.contains(workspace)),
         }
 }
 

@@ -827,6 +827,101 @@ fn complete_snapshot_tombstones_only_its_source_and_partial_does_not() {
 }
 
 #[test]
+fn unattributed_presence_without_workspace_is_reaped_by_explicit_tombstone() {
+    // Regression: ingress and the delivery filter fail open for a
+    // workspace-less presence (a pane whose cwd is missing this round), so
+    // Complete-snapshot tombstoning under an Explicit scope must fail open
+    // too. Otherwise the pane enters the selected view but can never be
+    // removed once it vanishes (or later acquires a cwd and changes
+    // PresenceRef key), lingering forever.
+    let fixture = StateFixture::new();
+    let mut state = AgentState::new(1);
+
+    let presence = PresenceRef::new(
+        StableDigest::from_bytes([9; 32]),
+        Some(fixture.subject.clone()),
+        None,
+    );
+    let presence_observation = AgentObservation {
+        observed_at: Timestamp::from_unix_millis(10),
+        valid_until: None,
+        presence: Some(presence.clone()),
+        session: None,
+        agent: None,
+        turn: None,
+        workspace: None,
+        kind: ObservationKind::Presence(PresenceOp::Seen),
+        evidence: EvidenceClaim {
+            support: CapabilitySupport::Confirmed,
+            authority: EvidenceAuthority::Authoritative,
+            provenance: EvidenceProvenance::InstrumentedHook,
+        },
+    };
+    state.apply_envelope(
+        1,
+        fixture.event(
+            &fixture.first,
+            90,
+            Some(1),
+            vec![presence_observation.clone()],
+        ),
+    );
+    assert_eq!(state.view().unattributed_presences.len(), 1);
+
+    let presence_scope = SnapshotScope {
+        workspaces: WorkspaceScope::Explicit(
+            BoundedVec::try_from_vec(vec![fixture.workspace.clone()]).expect("workspaces"),
+        ),
+        subjects: BoundedSet::try_from_iter([fixture.subject.clone()]).expect("subjects"),
+        entity_kinds: BoundedSet::try_from_iter([ObservedEntityKind::Presence]).expect("entities"),
+        domains: BoundedSet::try_from_iter([EvidenceDomain::Presence]).expect("domains"),
+    };
+    let presence_snapshot = |snapshot_byte: u8, observations: BoundedVec<AgentObservation, 64>| {
+        fixture
+            .registry
+            .validate_envelope(
+                ObservationEnvelope::Snapshot(SnapshotEnvelope {
+                    stream: stream(&fixture.first),
+                    snapshot_id: SnapshotId::from_digest(digest(snapshot_byte)),
+                    chunk_index: 0,
+                    final_chunk: true,
+                    captured_at: Timestamp::from_unix_millis(100),
+                    scope: presence_scope.clone(),
+                    completeness: SnapshotCompleteness::Complete,
+                    watermark: Some(StreamSequence::new(1)),
+                    observations,
+                }),
+                &fixture.first.contract,
+            )
+            .expect("validated presence snapshot")
+    };
+
+    // A Complete round that still sees the unattributed pane keeps it: it is
+    // in seen_presences even though it carries no workspace.
+    state.apply_envelope(
+        1,
+        presence_snapshot(
+            91,
+            BoundedVec::try_from_vec(vec![presence_observation]).expect("seen presence"),
+        ),
+    );
+    assert_eq!(
+        state.view().unattributed_presences.len(),
+        1,
+        "a live unattributed pane must survive while still in the list"
+    );
+
+    // A later Complete round no longer contains it: the vanished pane must
+    // be reaped despite having no workspace hint.
+    state.apply_envelope(1, presence_snapshot(92, BoundedVec::new()));
+    assert_eq!(
+        state.view().unattributed_presences.len(),
+        0,
+        "a vanished unattributed pane must be tombstoned under an Explicit scope"
+    );
+}
+
+#[test]
 fn terminal_metadata_is_preserved_but_open_metadata_is_advisory() {
     let fixture = StateFixture::new();
     for (hint, expected) in [
