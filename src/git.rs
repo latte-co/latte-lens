@@ -121,6 +121,17 @@ pub(crate) struct GitStatusSnapshot {
     state: Vec<u8>,
 }
 
+/// Outcome of probing a directory for a Git repository.
+#[derive(Clone, Debug)]
+pub(crate) enum DiscoveryOutcome {
+    /// A usable repository was resolved.
+    Repo(GitRepo),
+    /// Git recognized repository structure but refused to use it; `message` is
+    /// Git's diagnostic. This is a real, corrupt/unsupported repository that
+    /// must surface as an error rather than be silently skipped.
+    Rejected { message: String },
+}
+
 #[derive(Clone, Debug)]
 pub struct GitRepo {
     root: PathBuf,
@@ -129,6 +140,26 @@ pub struct GitRepo {
 
 impl GitRepo {
     pub fn discover(path: &Path) -> Result<Option<Self>> {
+        Ok(match Self::inspect(path)? {
+            Some(DiscoveryOutcome::Repo(repo)) => Some(repo),
+            // A structurally present but rejected repository is not a usable
+            // repo for this permissive entry point; callers that need to
+            // distinguish corruption from "not a repository" use `inspect`.
+            Some(DiscoveryOutcome::Rejected { .. }) | None => None,
+        })
+    }
+
+    /// Inspect `path` like [`Self::discover`], but preserve Git's decision
+    /// instead of collapsing every non-zero `rev-parse` into `None`:
+    ///
+    /// - [`DiscoveryOutcome::Repo`] when a usable repository is resolved;
+    /// - [`DiscoveryOutcome::Rejected`] when Git ran successfully but refused
+    ///   a structurally present repository (for example an unsupported
+    ///   `core.repositoryformatversion`), carrying Git's diagnostic;
+    /// - `None` when the path is simply not inside a repository.
+    ///
+    /// Only the process failing to spawn returns an error.
+    pub(crate) fn inspect(path: &Path) -> Result<Option<DiscoveryOutcome>> {
         let output = git_command()
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(path)
@@ -136,7 +167,18 @@ impl GitRepo {
             .context("failed to run git; make sure it is installed and available in PATH")?;
 
         if !output.status.success() {
-            return Ok(None);
+            let message = String::from_utf8_lossy(&output.stderr);
+            let message = message.trim();
+            // Git emits a diagnostic when it recognizes repository structure
+            // but cannot use it; empty stderr is the ordinary "not a
+            // repository" result when no `.git` is found on the path.
+            return Ok(if message.is_empty() {
+                None
+            } else {
+                Some(DiscoveryOutcome::Rejected {
+                    message: message.to_owned(),
+                })
+            });
         }
 
         let Some(root) = git_path_from_output(&output.stdout) else {
@@ -152,7 +194,7 @@ impl GitRepo {
         let git_dir = git_path_from_output(&git_dir_output.stdout)
             .context("Git returned an empty Git directory path")?;
 
-        Ok(Some(Self { root, git_dir }))
+        Ok(Some(DiscoveryOutcome::Repo(Self { root, git_dir })))
     }
 
     pub fn root(&self) -> &Path {

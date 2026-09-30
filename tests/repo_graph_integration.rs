@@ -567,11 +567,110 @@ fn discovery_limits_and_invalid_git_markers_are_explicit() {
     assert!(
         invalid_graph
             .report()
-            .errors
+            .warnings
             .iter()
             .any(|error| error.path == invalid.canonicalize().unwrap()),
-        "errors: {:?}",
+        "warnings: {:?}",
+        invalid_graph.report().warnings
+    );
+    assert!(
+        invalid_graph
+            .report()
+            .errors
+            .iter()
+            .all(|error| error.path != invalid.canonicalize().unwrap()),
+        "an empty .git directory must be a soft warning, not a hard error: {:?}",
         invalid_graph.report().errors
+    );
+}
+
+#[test]
+fn stale_or_broken_git_markers_are_soft_warnings_not_errors() {
+    let workspace = tempfile::tempdir().unwrap();
+    init(&workspace.path().join("healthy"));
+
+    // A leftover `.git` directory holding only the default exclude file, like
+    // a half-finished `git init` (the real-world HOME fixture).
+    let leftover_dir = workspace.path().join("leftover-dir");
+    fs::create_dir_all(leftover_dir.join(".git").join("info")).unwrap();
+    fs::write(
+        leftover_dir.join(".git").join("info").join("exclude"),
+        "# leftover\n",
+    )
+    .unwrap();
+
+    // A worktree/submodule `.git` file pointing at a Git directory that no
+    // longer exists.
+    let stale_pointer = workspace.path().join("stale-pointer");
+    fs::create_dir_all(&stale_pointer).unwrap();
+    fs::write(
+        stale_pointer.join(".git"),
+        "gitdir: /nonexistent/git/directory\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(workspace.path()).unwrap();
+
+    assert_eq!(graph.report().repositories_discovered, 1);
+    assert!(
+        graph.report().errors.is_empty(),
+        "stale markers must not be hard errors: {:?}",
+        graph.report().errors
+    );
+    let warning_paths: Vec<PathBuf> = graph
+        .report()
+        .warnings
+        .iter()
+        .map(|error| error.path.clone())
+        .collect();
+    assert!(
+        warning_paths.contains(&leftover_dir.canonicalize().unwrap()),
+        "warnings: {warning_paths:?}"
+    );
+    assert!(
+        warning_paths.contains(&stale_pointer.canonicalize().unwrap()),
+        "warnings: {warning_paths:?}"
+    );
+}
+
+#[test]
+fn structurally_complete_but_corrupt_repository_is_a_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    init(&workspace.path().join("healthy"));
+
+    // A structurally complete repository (HEAD, config, objects, refs all
+    // present) that Git explicitly refuses via an unsupported
+    // core.repositoryformatversion. This must stay a hard error carrying Git's
+    // diagnostic; it must never be downgraded to a skippable stale marker.
+    let corrupt = workspace.path().join("corrupt");
+    init(&corrupt);
+    fs::write(
+        corrupt.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(workspace.path()).unwrap();
+
+    assert_eq!(graph.report().repositories_discovered, 1);
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != corrupt.canonicalize().unwrap()),
+        "a corrupt but complete repository must not be a soft warning: {:?}",
+        graph.report().warnings
+    );
+    let error = graph
+        .report()
+        .errors
+        .iter()
+        .find(|error| error.path == corrupt.canonicalize().unwrap())
+        .expect("the corrupt repository must be a hard discovery error");
+    assert!(
+        !error.message.trim().is_empty(),
+        "the hard error must carry Git's diagnostic"
     );
 }
 
