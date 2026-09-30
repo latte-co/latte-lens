@@ -634,6 +634,47 @@ fn stale_or_broken_git_markers_are_soft_warnings_not_errors() {
 }
 
 #[test]
+fn structurally_complete_but_corrupt_repository_is_a_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    init(&workspace.path().join("healthy"));
+
+    // A structurally complete repository (HEAD, config, objects, refs all
+    // present) that Git explicitly refuses via an unsupported
+    // core.repositoryformatversion. This must stay a hard error carrying Git's
+    // diagnostic; it must never be downgraded to a skippable stale marker.
+    let corrupt = workspace.path().join("corrupt");
+    init(&corrupt);
+    fs::write(
+        corrupt.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(workspace.path()).unwrap();
+
+    assert_eq!(graph.report().repositories_discovered, 1);
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != corrupt.canonicalize().unwrap()),
+        "a corrupt but complete repository must not be a soft warning: {:?}",
+        graph.report().warnings
+    );
+    let error = graph
+        .report()
+        .errors
+        .iter()
+        .find(|error| error.path == corrupt.canonicalize().unwrap())
+        .expect("the corrupt repository must be a hard discovery error");
+    assert!(
+        !error.message.trim().is_empty(),
+        "the hard error must carry Git's diagnostic"
+    );
+}
+
+#[test]
 fn repository_cap_is_explicit_and_git_internals_do_not_consume_the_entry_budget() {
     let workspace = tempfile::tempdir().unwrap();
     init(&workspace.path().join("a"));
