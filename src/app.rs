@@ -168,6 +168,10 @@ pub struct GitTreeRow {
     pub detail: String,
     pub status: Option<FileStatus>,
     pub exists: bool,
+    /// Soft, skippable issue (a stale/invalid Git marker) rendered without the
+    /// hard-error treatment. `false` for real changes, repositories, and hard
+    /// discovery errors.
+    pub warning: bool,
     ancestors: Vec<GitRowIdentity>,
     file_entry: Option<FileEntry>,
 }
@@ -2263,6 +2267,7 @@ impl App {
             GitRowKind::Repository { .. } => "Repository",
             GitRowKind::Directory => "Directory",
             GitRowKind::Pointer(_) => "Submodule pointer",
+            GitRowKind::Issue(_) if row.warning => "Skipped invalid Git marker",
             GitRowKind::Issue(_) => "Repository error",
             GitRowKind::Change(_) => self.tab().content.mode.title(),
         }
@@ -7448,7 +7453,21 @@ impl App {
                         self.reveal_all_files_selection(path);
                     }
                 } else {
-                    self.restore_visible_selection(Some(completion.relative));
+                    // Anchor on the user's current selection, not on the
+                    // directory that just finished loading. Lazy scans of
+                    // directories above the viewport complete asynchronously;
+                    // anchoring on them dragged the selection (and scroll
+                    // offset) back up toward the top. When a directory was
+                    // expanded explicitly, its path is already the recorded
+                    // selection, so expansion positioning is preserved.
+                    // Anchor on the user's current selection, not on the
+                    // directory that just finished loading. Lazy scans of
+                    // directories above the viewport complete asynchronously;
+                    // anchoring on them dragged the selection (and scroll
+                    // offset) back up toward the top. When a directory was
+                    // expanded explicitly, its path is already the recorded
+                    // selection, so expansion positioning is preserved.
+                    self.restore_visible_selection(self.tab().files().selection.clone());
                 }
             }
             TreeScope::GitChanges => {
@@ -11065,23 +11084,33 @@ fn build_git_rows(
     }
     trie.compute_counts(&snapshots, &pointer_paths);
 
-    // Attach each discovery error to the deepest trie node (directory or
-    // repository) that contains its path, so errors render inside their
-    // group instead of a flat dump at the bottom of the list.
-    let mut issues_by_node: HashMap<PathBuf, Vec<&DiscoveryError>> = HashMap::new();
-    let mut unattached_issues = Vec::new();
-    for error in &graph.report().errors {
+    // Attach each discovery error or soft warning to the deepest trie node
+    // (directory or repository) that contains its path, so issues render
+    // inside their group instead of a flat dump at the bottom of the list.
+    // The bool marks soft, skippable warnings (invalid Git markers).
+    let mut issues_by_node: HashMap<PathBuf, Vec<(&DiscoveryError, bool)>> = HashMap::new();
+    let mut unattached_issues: Vec<(&DiscoveryError, bool)> = Vec::new();
+    let reported_issues = graph
+        .report()
+        .errors
+        .iter()
+        .map(|error| (error, false))
+        .chain(graph.report().warnings.iter().map(|error| (error, true)));
+    for (error, warning) in reported_issues {
         if crate::config::is_ignored_error_path(&error.path, ignored_paths) {
             continue;
         }
         match error.path.strip_prefix(root) {
             Ok(relative) if !relative.as_os_str().is_empty() => match trie.deepest_node(relative) {
                 Some((node_path, _)) => {
-                    issues_by_node.entry(node_path).or_default().push(error);
+                    issues_by_node
+                        .entry(node_path)
+                        .or_default()
+                        .push((error, warning));
                 }
-                None => unattached_issues.push(error),
+                None => unattached_issues.push((error, warning)),
             },
-            _ => unattached_issues.push(error),
+            _ => unattached_issues.push((error, warning)),
         }
     }
 
@@ -11116,8 +11145,8 @@ fn build_git_rows(
         &symlink_targets,
         &mut rows,
     );
-    for error in unattached_issues {
-        rows.push(issue_row(root, error, None));
+    for (error, warning) in unattached_issues {
+        rows.push(issue_row(root, error, warning, None));
     }
     rows
 }
@@ -11213,7 +11242,7 @@ fn walk_virtual_trie(
     snapshots: &HashMap<RepoId, &RepoSnapshot>,
     children: &HashMap<RepoId, Vec<RepoId>>,
     change_projection: &GitChangeProjection<'_>,
-    issues_by_node: &HashMap<PathBuf, Vec<&DiscoveryError>>,
+    issues_by_node: &HashMap<PathBuf, Vec<(&DiscoveryError, bool)>>,
     symlink_targets: &HashMap<PathBuf, PathBuf>,
     rows: &mut Vec<GitTreeRow>,
 ) {
@@ -11312,6 +11341,7 @@ fn virtual_directory_row(
         detail,
         status: None,
         exists: true,
+        warning: false,
         ancestors: ancestors.to_vec(),
         file_entry: None,
     }
@@ -11321,14 +11351,19 @@ fn emit_node_issues(
     node_path: &Path,
     node_ancestors: &[GitRowIdentity],
     root: &Path,
-    issues_by_node: &HashMap<PathBuf, Vec<&DiscoveryError>>,
+    issues_by_node: &HashMap<PathBuf, Vec<(&DiscoveryError, bool)>>,
     rows: &mut Vec<GitTreeRow>,
 ) {
     let Some(issues) = issues_by_node.get(node_path) else {
         return;
     };
-    for error in issues {
-        rows.push(issue_row(root, error, Some((node_path, node_ancestors))));
+    for (error, warning) in issues {
+        rows.push(issue_row(
+            root,
+            error,
+            *warning,
+            Some((node_path, node_ancestors)),
+        ));
     }
 }
 
@@ -11399,6 +11434,7 @@ fn append_repository_rows(
         detail,
         status: None,
         exists: true,
+        warning: false,
         ancestors: repo_ancestors.to_vec(),
         file_entry: None,
     });
@@ -11414,6 +11450,7 @@ fn append_repository_rows(
             detail: "parent Gitlink".to_owned(),
             status: Some(pointer.status),
             exists: snapshot.node.kind != RepoKind::SubmodulePlaceholder,
+            warning: false,
             ancestors: owned_ancestors.clone(),
             file_entry: None,
         });
@@ -11514,6 +11551,7 @@ fn append_change_rows(
                 detail: String::new(),
                 status: Some(change.status),
                 exists: entry.exists,
+                warning: false,
                 ancestors,
                 file_entry: Some(entry),
             });
@@ -11543,6 +11581,7 @@ fn append_change_rows(
                 detail: String::new(),
                 status: None,
                 exists: entry.exists,
+                warning: false,
                 ancestors,
                 file_entry: Some(entry),
             });
@@ -11661,8 +11700,10 @@ const fn repo_kind_label(kind: RepoKind) -> &'static str {
 fn issue_row(
     root: &Path,
     error: &DiscoveryError,
+    warning: bool,
     attachment: Option<(&Path, &[GitRowIdentity])>,
 ) -> GitTreeRow {
+    let prefix = if warning { "[skipped]" } else { "[error]" };
     let (label, depth, ancestors) = match attachment {
         Some((node_relative, node_ancestors)) => {
             let relative = error.path.strip_prefix(root).unwrap_or(&error.path);
@@ -11672,13 +11713,13 @@ fn issue_row(
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or(relative);
             (
-                format!("[error] {}", display_workspace_path(label_path)),
+                format!("{prefix} {}", display_workspace_path(label_path)),
                 node_ancestors.len(),
                 node_ancestors.to_vec(),
             )
         }
         None => (
-            format!("[error] {}", compact_workspace_path(root, &error.path)),
+            format!("{prefix} {}", compact_workspace_path(root, &error.path)),
             0,
             Vec::new(),
         ),
@@ -11691,6 +11732,7 @@ fn issue_row(
         detail: error.message.clone(),
         status: None,
         exists: false,
+        warning,
         ancestors,
         file_entry: None,
     }
@@ -13474,7 +13516,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!graph.report().errors.is_empty());
+        assert!(graph.report().errors.is_empty());
+        assert!(!graph.report().warnings.is_empty());
 
         let mut app = App::new(root.to_path_buf()).unwrap();
         app.apply_refresh_snapshot(RefreshSnapshot {
@@ -13490,6 +13533,9 @@ mod tests {
             full_repository_discovery: true,
         });
         app.apply_tree_scope(TreeScope::GitChanges);
+        // A stale marker is a soft warning: visible in the tree but it does not
+        // raise the repository-error count.
+        assert_eq!(app.repository_error_count, 0);
 
         let rows = app.visible_git_rows();
         let team_a = rows
@@ -13502,7 +13548,8 @@ mod tests {
             .iter()
             .find(|row| matches!(row.kind, GitRowKind::Issue(_)))
             .expect("issue row");
-        assert_eq!(issue.label, "[error] stale-marker");
+        assert!(issue.warning);
+        assert_eq!(issue.label, "[skipped] stale-marker");
         assert_eq!(issue.depth, team_a.depth + 1);
         assert!(issue.ancestors.contains(&team_a.identity));
     }
@@ -13541,10 +13588,12 @@ mod tests {
             full_repository_discovery: true,
         });
         app.apply_tree_scope(TreeScope::GitChanges);
+        // The warning row is visible but never counted as a repository error.
+        assert_eq!(app.repository_error_count, 0);
         assert!(
             app.visible_git_rows()
                 .iter()
-                .any(|row| matches!(row.kind, GitRowKind::Issue(_)))
+                .any(|row| matches!(row.kind, GitRowKind::Issue(_)) && row.warning)
         );
 
         app.ignored_error_paths.insert(stale_path);
@@ -13562,19 +13611,15 @@ mod tests {
     fn ignoring_repository_path_suppresses_status_error() {
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path();
-        // A repository with a broken submodule: git status fails, producing a
-        // status_error on the repository row.
+        // A repository whose index is corrupt: `git rev-parse` still succeeds
+        // (so it is discovered) but `git status` fails, producing a hard
+        // status_error on the repository row. A nested stale submodule marker
+        // adds a soft warning under the same repository.
         let repo = root.join("broken-repo");
         init_git_repository(&repo);
-        fs::write(
-            repo.join(".gitmodules"),
-            "[submodule \"proto\"]\n\tpath = proto\n\turl = https://example.com/proto.git\n",
-        )
-        .unwrap();
-        // Commit .gitmodules so the repository itself is clean and the only
-        // errors come from the broken submodule.
+        fs::write(repo.join("tracked"), "content\n").unwrap();
         let output = Command::new("git")
-            .args(["add", ".gitmodules"])
+            .args(["add", "tracked"])
             .current_dir(&repo)
             .output()
             .unwrap();
@@ -13587,12 +13632,18 @@ mod tests {
                 "user.name=Test",
                 "commit",
                 "-m",
-                "add gitmodules",
+                "seed index",
             ])
             .current_dir(&repo)
             .output()
             .unwrap();
         assert!(output.status.success());
+        fs::write(
+            repo.join(".git").join("index"),
+            b"not a valid git index\xff\xfe",
+        )
+        .unwrap();
+        // Soft warning nested under the repository.
         let submodule = repo.join("proto");
         fs::create_dir_all(&submodule).unwrap();
         fs::write(
@@ -13626,15 +13677,21 @@ mod tests {
         });
         app.apply_tree_scope(TreeScope::GitChanges);
 
-        // There is at least one error (discovery error and/or status error).
-        assert!(app.repository_error_count > 0);
+        // Only the repository's status failure is a hard error; the stale
+        // submodule marker is a soft warning and is not counted.
+        assert_eq!(app.repository_error_count, 1);
+        assert!(
+            app.visible_git_rows()
+                .iter()
+                .any(|row| matches!(row.kind, GitRowKind::Issue(_)) && row.warning)
+        );
 
         let repo_path = repo.canonicalize().unwrap();
         app.ignored_error_paths.insert(repo_path);
         app.rebuild_git_rows();
 
-        // After ignoring the repository path, all errors under it are
-        // suppressed and the count drops to zero.
+        // After ignoring the repository path, the hard status error and the
+        // soft warning beneath it are both suppressed; the count drops to zero.
         assert!(app.visible_git_rows().iter().all(|row| matches!(
             &row.kind,
             GitRowKind::Repository {
@@ -13645,12 +13702,147 @@ mod tests {
         assert_eq!(app.repository_error_count, 0);
     }
 
+    #[test]
+    fn lazy_directory_completion_keeps_selection_below_the_loaded_folder() {
+        use crate::tree::FileCategory;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().to_path_buf();
+
+        let mk = |relative: &str, is_dir: bool| FileEntry {
+            relative: PathBuf::from(relative),
+            is_dir,
+            category: FileCategory::Plain,
+            depth: relative.matches('/').count(),
+            status: None,
+            contains_changes: false,
+            exists: true,
+            symlink_target: None,
+        };
+
+        // Initial shallow scan: a lazy (unloaded) folder `a` at the top plus
+        // many regular files below it.
+        let mut initial = vec![mk("a", true)];
+        for index in 0..40 {
+            initial.push(mk(&format!("f{index:02}"), false));
+        }
+        let mut unloaded = HashSet::new();
+        unloaded.insert(PathBuf::from("a"));
+
+        let mut app = App::new(root).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            scan: ScanResult {
+                entries: initial,
+                truncated: false,
+                unloaded_directories: unloaded,
+            },
+            ..empty_snapshot()
+        });
+        app.apply_tree_scope(TreeScope::AllFiles);
+
+        // The folder is expanded (its scan is pending), but the user moves the
+        // selection down near the bottom, like scrolling or pressing ↓ past the
+        // not-yet-loaded folder.
+        app.tab_mut()
+            .files_mut()
+            .expansion
+            .insert(PathBuf::from("a"), true);
+        app.rebuild_visible_rows();
+        let bottom = app.tree_row_count() - 1;
+        app.select(bottom);
+        assert_eq!(
+            app.selected_relative_path().as_deref(),
+            Some(Path::new("f39"))
+        );
+        let index_before = app.tab().tree_state.selected().unwrap();
+
+        // The pending scan of `a` completes; its children sort in above the
+        // current selection.
+        let children = vec![mk("a/a1", false), mk("a/a2", false)];
+        app.apply_directory_completion(DirectoryCompletion {
+            tree_epoch: app.tree_epoch,
+            relative: PathBuf::from("a"),
+            result: Ok(ScanResult {
+                entries: children,
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            }),
+        });
+
+        // The selection stays on the same entry instead of jumping back up to
+        // the freshly loaded folder; its index only shifts down by the inserted
+        // rows.
+        assert_eq!(
+            app.selected_relative_path().as_deref(),
+            Some(Path::new("f39")),
+            "a lazy directory completion must not drag the selection to the top"
+        );
+        assert_eq!(app.tab().tree_state.selected().unwrap(), index_before + 2);
+    }
+
+    #[test]
+    fn lazy_directory_completion_after_expand_keeps_the_expanded_folder_selected() {
+        use crate::tree::FileCategory;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().to_path_buf();
+        let mk = |relative: &str, is_dir: bool| FileEntry {
+            relative: PathBuf::from(relative),
+            is_dir,
+            category: FileCategory::Plain,
+            depth: relative.matches('/').count(),
+            status: None,
+            contains_changes: false,
+            exists: true,
+            symlink_target: None,
+        };
+
+        let mut unloaded = HashSet::new();
+        unloaded.insert(PathBuf::from("a"));
+        let mut app = App::new(root).unwrap();
+        app.apply_refresh_snapshot(RefreshSnapshot {
+            scan: ScanResult {
+                entries: vec![mk("a", true), mk("f0", false)],
+                truncated: false,
+                unloaded_directories: unloaded,
+            },
+            ..empty_snapshot()
+        });
+        app.apply_tree_scope(TreeScope::AllFiles);
+        // Expanding the folder selects it immediately (as toggle_expand does).
+        app.tab_mut()
+            .files_mut()
+            .expansion
+            .insert(PathBuf::from("a"), true);
+        app.restore_visible_selection(Some(PathBuf::from("a")));
+        assert_eq!(
+            app.selected_relative_path().as_deref(),
+            Some(Path::new("a"))
+        );
+
+        app.apply_directory_completion(DirectoryCompletion {
+            tree_epoch: app.tree_epoch,
+            relative: PathBuf::from("a"),
+            result: Ok(ScanResult {
+                entries: vec![mk("a/a1", false)],
+                truncated: false,
+                unloaded_directories: HashSet::new(),
+            }),
+        });
+
+        // Expansion positioning is preserved even though the completion is
+        // anchored through the recorded selection rather than completion.relative.
+        assert_eq!(
+            app.selected_relative_path().as_deref(),
+            Some(Path::new("a"))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn git_changes_preserves_non_utf8_path_components() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path();
         // A directory whose name is not valid UTF-8 (0x80, 0x81 are

@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::content_safety::resolves_to_directory;
-use crate::git::{ChangeDetails, FileStatus, GitRepo, GitStatusEntry, SubmoduleStatus};
+use crate::git::{
+    ChangeDetails, DiscoveryOutcome, FileStatus, GitRepo, GitStatusEntry, SubmoduleStatus,
+};
 
 /// Maximum number of directories considered while looking for Git worktrees.
 ///
@@ -142,6 +144,20 @@ pub struct DiscoveryError {
     pub message: String,
 }
 
+/// Probe result for a directory carrying a `.git` marker.
+enum ExactDiscovery {
+    Repository(GitRepo, PathBuf, GitLayout),
+    /// A `.git` marker is present but no usable repository resolved. Git's
+    /// diagnostic is retained when available. Whether this is a skippable
+    /// stale marker or a real corrupt repository is decided structurally by
+    /// [`stale_marker_shape`].
+    NotUsable {
+        diagnostic: Option<String>,
+    },
+    /// There is no usable Git marker at this path.
+    Nothing,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryReport {
     /// Number of directories considered for traversal.
@@ -151,7 +167,15 @@ pub struct DiscoveryReport {
     pub entries_scanned: usize,
     pub repositories_discovered: usize,
     pub truncations: Vec<DiscoveryTruncation>,
+    /// Hard failures that usually mean the snapshot is unreliable: Git could
+    /// not be invoked, a directory could not be read, a path escaped the
+    /// workspace, or a submodule could not be resolved. These drive the red
+    /// "repository errors" signal.
     pub errors: Vec<DiscoveryError>,
+    /// Non-fatal, skippable conditions: a `.git` marker is present but not a
+    /// valid worktree (a stale/leftover marker). These are surfaced softly
+    /// rather than counted as errors, since there is nothing to fix in Git.
+    pub warnings: Vec<DiscoveryError>,
     /// Directory symlinks followed during discovery, as
     /// `(workspace-relative access path, raw link target)` pairs so the UI can
     /// show where a linked repository actually lives.
@@ -335,16 +359,46 @@ impl Discovery {
     }
 
     fn discover_containing_repository(&mut self) -> Result<()> {
-        let Some(repo) = GitRepo::discover(&self.workspace_root)? else {
-            return Ok(());
-        };
-        let canonical_root = repo
-            .root()
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
-        if canonical_root != self.workspace_root {
-            let layout = git_layout(&canonical_root).unwrap_or(GitLayout::GitDirectory);
-            self.add_candidate(repo, canonical_root.clone(), layout, &canonical_root, false);
+        match GitRepo::inspect(&self.workspace_root)? {
+            Some(DiscoveryOutcome::Repo(repo)) => {
+                let canonical_root = repo
+                    .root()
+                    .canonicalize()
+                    .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
+                if canonical_root != self.workspace_root {
+                    let layout = git_layout(&canonical_root).unwrap_or(GitLayout::GitDirectory);
+                    self.add_candidate(
+                        repo,
+                        canonical_root.clone(),
+                        layout,
+                        &canonical_root,
+                        false,
+                    );
+                }
+            }
+            Some(DiscoveryOutcome::Rejected { .. }) | None => {
+                // When the selected directory carries its own marker,
+                // walk_workspace classifies it directly. Otherwise Git may
+                // have stopped at a containing marker the downward walk cannot
+                // reach (opening a child). Locate it, ask Git directly, and
+                // apply the same stale-vs-corrupt classification so a stale
+                // ancestor seen from a child is still a soft warning.
+                let root = self.workspace_root.clone();
+                if !has_git_marker(&root)
+                    && let Some(ancestor) = nearest_ancestor_marker(&root)
+                {
+                    match GitRepo::inspect(&ancestor) {
+                        Ok(Some(DiscoveryOutcome::Rejected { message })) => {
+                            self.report_unusable_marker(&ancestor, Some(message));
+                        }
+                        Ok(None) => self.report_unusable_marker(&ancestor, None),
+                        // A healthy containing repo is handled by the Repo arm;
+                        // a spawn/IO failure is a hard error.
+                        Ok(Some(DiscoveryOutcome::Repo(_))) => {}
+                        Err(error) => self.error(&ancestor, format!("{error:#}")),
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -367,7 +421,7 @@ impl Discovery {
         while let Some((directory, access_path, depth, via_symlink)) = queue.pop_front() {
             if directory == self.workspace_root || has_git_marker(&directory) {
                 match self.discover_exact_repository(&directory) {
-                    Ok(Some((repo, canonical_root, layout))) => {
+                    Ok(ExactDiscovery::Repository(repo, canonical_root, layout)) => {
                         if !self.add_candidate(
                             repo,
                             canonical_root,
@@ -378,11 +432,13 @@ impl Discovery {
                             break;
                         }
                     }
-                    Ok(None) => {
-                        if has_git_marker(&directory) {
-                            self.error(&directory, "Git marker is not a valid worktree");
-                        }
+                    Ok(ExactDiscovery::NotUsable { diagnostic }) => {
+                        // A marker is present (git_layout was Some) but no repo
+                        // resolved. report_unusable_marker downgrades only
+                        // provably-stale shapes and fails closed otherwise.
+                        self.report_unusable_marker(&directory, diagnostic);
                     }
+                    Ok(ExactDiscovery::Nothing) => {}
                     Err(error) => self.error(&directory, format!("{error:#}")),
                 }
             }
@@ -496,27 +552,35 @@ impl Discovery {
         }
     }
 
-    fn discover_exact_repository(
-        &self,
-        directory: &Path,
-    ) -> Result<Option<(GitRepo, PathBuf, GitLayout)>> {
+    /// Result of probing a directory that carries a `.git` marker.
+    fn discover_exact_repository(&mut self, directory: &Path) -> Result<ExactDiscovery> {
         let Some(layout) = git_layout(directory) else {
-            return Ok(None);
+            return Ok(ExactDiscovery::Nothing);
         };
-        let Some(repo) = GitRepo::discover(directory)? else {
-            return Ok(None);
-        };
-        let canonical_directory = directory
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", directory.display()))?;
-        let canonical_root = repo
-            .root()
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
-        if canonical_root != canonical_directory {
-            return Ok(None);
+        match GitRepo::inspect(directory)? {
+            Some(DiscoveryOutcome::Repo(repo)) => {
+                let canonical_directory = directory
+                    .canonicalize()
+                    .with_context(|| format!("cannot resolve {}", directory.display()))?;
+                let canonical_root = repo
+                    .root()
+                    .canonicalize()
+                    .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
+                if canonical_root != canonical_directory {
+                    // The marker resolves to a repository rooted elsewhere
+                    // (handled when that root is visited); not an exact match.
+                    return Ok(ExactDiscovery::Nothing);
+                }
+                Ok(ExactDiscovery::Repository(repo, canonical_root, layout))
+            }
+            // Git ran but a repository could not be resolved here. The marker
+            // shape, not Git's stderr wording, decides stale-marker vs
+            // corrupt-repo; retain Git's diagnostic for the hard-error case.
+            Some(DiscoveryOutcome::Rejected { message }) => Ok(ExactDiscovery::NotUsable {
+                diagnostic: Some(message),
+            }),
+            None => Ok(ExactDiscovery::NotUsable { diagnostic: None }),
         }
-        Ok(Some((repo, canonical_root, layout)))
     }
 
     fn add_candidate(
@@ -779,6 +843,33 @@ impl Discovery {
         });
     }
 
+    /// Record a non-fatal, skippable condition. Kept separate from
+    /// [`Self::error`] so stale/invalid Git markers do not raise the red
+    /// repository-error signal.
+    fn warning(&mut self, path: impl AsRef<Path>, message: impl Into<String>) {
+        self.report.warnings.push(DiscoveryError {
+            path: path.as_ref().to_path_buf(),
+            message: message.into(),
+        });
+    }
+
+    /// Classify a directory that carries a `.git` marker Git could not use.
+    /// Provably-stale marker shapes become soft warnings; structurally
+    /// complete-but-rejected repositories (and any IO/permission failure in
+    /// the structural probe) stay hard errors carrying Git's diagnostic.
+    /// Used by both the downward walk and the containing-repository probe so
+    /// the classification is identical regardless of where discovery enters.
+    fn report_unusable_marker(&mut self, marker_dir: &Path, diagnostic: Option<String>) {
+        if stale_marker_shape(marker_dir) {
+            self.warning(marker_dir, "Git marker is not a valid worktree");
+        } else {
+            let message = diagnostic
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| "Git marker is present but not usable".to_owned());
+            self.error(marker_dir, message);
+        }
+    }
+
     fn push_truncation(&mut self, truncation: DiscoveryTruncation) {
         if !self.report.truncations.contains(&truncation) {
             self.report.truncations.push(truncation);
@@ -927,6 +1018,16 @@ fn has_git_marker(directory: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Nearest strict ancestor of `directory` (walking upward to the filesystem
+/// root) that carries a non-symlink `.git` marker, if any.
+fn nearest_ancestor_marker(directory: &Path) -> Option<PathBuf> {
+    directory
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| has_git_marker(ancestor))
+        .map(Path::to_path_buf)
+}
+
 fn git_layout(directory: &Path) -> Option<GitLayout> {
     let metadata = fs::symlink_metadata(directory.join(".git")).ok()?;
     if metadata.file_type().is_symlink() {
@@ -938,6 +1039,62 @@ fn git_layout(directory: &Path) -> Option<GitLayout> {
     } else {
         None
     }
+}
+
+/// Whether a present-but-unusable `.git` marker has the shape of a harmless
+/// leftover rather than a structurally complete (but corrupt) repository.
+///
+/// This is deliberately conservative: only markers that provably cannot hold
+/// repository data qualify. A `.git` directory must be missing `HEAD` *and*
+/// have neither an `objects` store nor a linked-worktree `commondir`; a `.git`
+/// file must be a `gitdir:` pointer whose target no longer exists. Anything
+/// carrying the skeleton of a real repository (for example an unsupported
+/// `core.repositoryformatversion`) stays a hard error so corruption is never
+/// hidden behind a soft "skipped" row.
+///
+/// Absence is established with [`Path::try_exists`], not [`Path::exists`]:
+/// an IO or permission error must fail closed as a hard error rather than look
+/// like a missing file.
+fn stale_marker_shape(directory: &Path) -> bool {
+    let marker = directory.join(".git");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => stale_gitdir_pointer(&marker),
+        Ok(metadata) if metadata.is_dir() => {
+            absent(&marker.join("HEAD"))
+                && absent(&marker.join("objects"))
+                && absent(&marker.join("commondir"))
+        }
+        _ => false,
+    }
+}
+
+/// True only when `path` is provably absent (`Ok(false)`). Any IO/permission
+/// error yields false so callers fail closed instead of treating an
+/// unreadable entry as a removable stale marker.
+fn absent(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
+/// A `.git` file is a stale worktree/submodule pointer only when it contains a
+/// `gitdir:` line resolving to a path that is provably absent.
+fn stale_gitdir_pointer(marker: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(marker) else {
+        return false;
+    };
+    let Some(target) = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+    else {
+        return false;
+    };
+    let target = Path::new(target.trim());
+    let base = marker.parent().unwrap_or_else(|| Path::new("."));
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    };
+    absent(&resolved)
 }
 
 fn safe_relative_path(path: &Path) -> bool {

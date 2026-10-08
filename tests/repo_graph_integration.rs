@@ -567,11 +567,254 @@ fn discovery_limits_and_invalid_git_markers_are_explicit() {
     assert!(
         invalid_graph
             .report()
-            .errors
+            .warnings
             .iter()
             .any(|error| error.path == invalid.canonicalize().unwrap()),
-        "errors: {:?}",
+        "warnings: {:?}",
+        invalid_graph.report().warnings
+    );
+    assert!(
+        invalid_graph
+            .report()
+            .errors
+            .iter()
+            .all(|error| error.path != invalid.canonicalize().unwrap()),
+        "an empty .git directory must be a soft warning, not a hard error: {:?}",
         invalid_graph.report().errors
+    );
+}
+
+#[test]
+fn stale_or_broken_git_markers_are_soft_warnings_not_errors() {
+    let workspace = tempfile::tempdir().unwrap();
+    init(&workspace.path().join("healthy"));
+
+    // A leftover `.git` directory holding only the default exclude file, like
+    // a half-finished `git init` (the real-world HOME fixture).
+    let leftover_dir = workspace.path().join("leftover-dir");
+    fs::create_dir_all(leftover_dir.join(".git").join("info")).unwrap();
+    fs::write(
+        leftover_dir.join(".git").join("info").join("exclude"),
+        "# leftover\n",
+    )
+    .unwrap();
+
+    // A worktree/submodule `.git` file pointing at a Git directory that no
+    // longer exists.
+    let stale_pointer = workspace.path().join("stale-pointer");
+    fs::create_dir_all(&stale_pointer).unwrap();
+    fs::write(
+        stale_pointer.join(".git"),
+        "gitdir: /nonexistent/git/directory\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(workspace.path()).unwrap();
+
+    assert_eq!(graph.report().repositories_discovered, 1);
+    assert!(
+        graph.report().errors.is_empty(),
+        "stale markers must not be hard errors: {:?}",
+        graph.report().errors
+    );
+    let warning_paths: Vec<PathBuf> = graph
+        .report()
+        .warnings
+        .iter()
+        .map(|error| error.path.clone())
+        .collect();
+    assert!(
+        warning_paths.contains(&leftover_dir.canonicalize().unwrap()),
+        "warnings: {warning_paths:?}"
+    );
+    assert!(
+        warning_paths.contains(&stale_pointer.canonicalize().unwrap()),
+        "warnings: {warning_paths:?}"
+    );
+}
+
+#[test]
+fn structurally_complete_but_corrupt_repository_is_a_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    init(&workspace.path().join("healthy"));
+
+    // A structurally complete repository (HEAD, config, objects, refs all
+    // present) that Git explicitly refuses via an unsupported
+    // core.repositoryformatversion. This must stay a hard error carrying Git's
+    // diagnostic; it must never be downgraded to a skippable stale marker.
+    let corrupt = workspace.path().join("corrupt");
+    init(&corrupt);
+    fs::write(
+        corrupt.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(workspace.path()).unwrap();
+
+    assert_eq!(graph.report().repositories_discovered, 1);
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != corrupt.canonicalize().unwrap()),
+        "a corrupt but complete repository must not be a soft warning: {:?}",
+        graph.report().warnings
+    );
+    let error = graph
+        .report()
+        .errors
+        .iter()
+        .find(|error| error.path == corrupt.canonicalize().unwrap())
+        .expect("the corrupt repository must be a hard discovery error");
+    assert!(
+        !error.message.trim().is_empty(),
+        "the hard error must carry Git's diagnostic"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_git_directory_fails_closed_as_a_hard_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("locked");
+    init(&repo);
+    let git_dir = repo.join(".git");
+    fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Skip (and restore) when running as root, where mode 000 is not enforced.
+    let permission_denied = git_dir.join("HEAD").try_exists().is_err();
+    if !permission_denied {
+        fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let graph = RepoGraph::discover(&repo).unwrap();
+
+    // Restore before the tempdir is torn down.
+    fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != repo.canonicalize().unwrap()),
+        "an unreadable .git is an access failure, not a skippable marker: {:?}",
+        graph.report().warnings
+    );
+    assert!(
+        graph
+            .report()
+            .errors
+            .iter()
+            .any(|error| error.path == repo.canonicalize().unwrap()),
+        "an unreadable .git must be a hard error: {:?}",
+        graph.report().errors
+    );
+}
+
+#[test]
+fn stale_marker_opened_from_a_child_is_still_a_soft_warning() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stale = workspace.path().join("stale-marker");
+    fs::create_dir_all(stale.join(".git")).unwrap();
+    let child = stale.join("child");
+    fs::create_dir_all(&child).unwrap();
+    let graph = RepoGraph::discover(&child).unwrap();
+    let sp = stale.canonicalize().unwrap();
+    let errs: Vec<_> = graph
+        .report()
+        .errors
+        .iter()
+        .filter(|e| e.path == sp)
+        .collect();
+    let warns: Vec<_> = graph
+        .report()
+        .warnings
+        .iter()
+        .filter(|e| e.path == sp)
+        .collect();
+    assert!(
+        errs.is_empty(),
+        "a stale ancestor seen from a child must not be a hard error: {:?}",
+        errs
+    );
+    assert_eq!(
+        warns.len(),
+        1,
+        "a stale ancestor marker seen from a child stays a warning: {:?}",
+        warns
+    );
+}
+
+#[test]
+fn corrupt_repo_root_discovered_directly_is_one_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("corrupt");
+    init(&repo);
+    fs::write(
+        repo.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(&repo).unwrap();
+    let repo_path = repo.canonicalize().unwrap();
+    let errors: Vec<_> = graph
+        .report()
+        .errors
+        .iter()
+        .filter(|error| error.path == repo_path)
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "the root must be reported exactly once: {:?}",
+        graph.report().errors
+    );
+    assert!(graph.report().warnings.is_empty());
+}
+
+#[test]
+fn corrupt_containing_repository_opened_from_a_child_is_a_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("corrupt");
+    init(&repo);
+    fs::write(
+        repo.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+    let child = repo.join("child");
+    fs::create_dir_all(&child).unwrap();
+
+    // Opening a descendant of a corrupt repository: the downward walk only sees
+    // `child` (no marker), so the containing repository's refusal must still be
+    // surfaced from the containing-discovery probe.
+    let graph = RepoGraph::discover(&child).unwrap();
+
+    let repo_path = repo.canonicalize().unwrap();
+    assert!(
+        graph
+            .report()
+            .errors
+            .iter()
+            .any(|error| error.path == repo_path),
+        "the corrupt containing repository must be a hard error: {:?}",
+        graph.report().errors
+    );
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != repo_path),
+        "a corrupt containing repository must not be downgraded: {:?}",
+        graph.report().warnings
     );
 }
 
