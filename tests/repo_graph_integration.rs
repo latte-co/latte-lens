@@ -718,6 +718,40 @@ fn unreadable_git_directory_fails_closed_as_a_hard_error() {
 }
 
 #[test]
+fn stale_marker_opened_from_a_child_is_still_a_soft_warning() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stale = workspace.path().join("stale-marker");
+    fs::create_dir_all(stale.join(".git")).unwrap();
+    let child = stale.join("child");
+    fs::create_dir_all(&child).unwrap();
+    let graph = RepoGraph::discover(&child).unwrap();
+    let sp = stale.canonicalize().unwrap();
+    let errs: Vec<_> = graph
+        .report()
+        .errors
+        .iter()
+        .filter(|e| e.path == sp)
+        .collect();
+    let warns: Vec<_> = graph
+        .report()
+        .warnings
+        .iter()
+        .filter(|e| e.path == sp)
+        .collect();
+    assert!(
+        errs.is_empty(),
+        "a stale ancestor seen from a child must not be a hard error: {:?}",
+        errs
+    );
+    assert_eq!(
+        warns.len(),
+        1,
+        "a stale ancestor marker seen from a child stays a warning: {:?}",
+        warns
+    );
+}
+
+#[test]
 fn corrupt_repo_root_discovered_directly_is_one_hard_error() {
     let workspace = tempfile::tempdir().unwrap();
     let repo = workspace.path().join("corrupt");

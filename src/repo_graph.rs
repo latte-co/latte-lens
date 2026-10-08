@@ -379,17 +379,24 @@ impl Discovery {
             Some(DiscoveryOutcome::Rejected { .. }) | None => {
                 // When the selected directory carries its own marker,
                 // walk_workspace classifies it directly. Otherwise Git may
-                // have failed on a *containing* repository the downward walk
-                // can never reach (e.g. opening a child of a corrupt repo).
-                // Locate that ancestor marker and ask Git directly, so a
-                // genuine refusal is reported without guessing from stderr.
+                // have stopped at a containing marker the downward walk cannot
+                // reach (opening a child). Locate it, ask Git directly, and
+                // apply the same stale-vs-corrupt classification so a stale
+                // ancestor seen from a child is still a soft warning.
                 let root = self.workspace_root.clone();
                 if !has_git_marker(&root)
                     && let Some(ancestor) = nearest_ancestor_marker(&root)
-                    && let Ok(Some(DiscoveryOutcome::Rejected { message })) =
-                        GitRepo::inspect(&ancestor)
                 {
-                    self.error(&ancestor, message);
+                    match GitRepo::inspect(&ancestor) {
+                        Ok(Some(DiscoveryOutcome::Rejected { message })) => {
+                            self.report_unusable_marker(&ancestor, Some(message));
+                        }
+                        Ok(None) => self.report_unusable_marker(&ancestor, None),
+                        // A healthy containing repo is handled by the Repo arm;
+                        // a spawn/IO failure is a hard error.
+                        Ok(Some(DiscoveryOutcome::Repo(_))) => {}
+                        Err(error) => self.error(&ancestor, format!("{error:#}")),
+                    }
                 }
             }
         }
@@ -427,17 +434,9 @@ impl Discovery {
                     }
                     Ok(ExactDiscovery::NotUsable { diagnostic }) => {
                         // A marker is present (git_layout was Some) but no repo
-                        // resolved. Downgrade only provably-stale marker shapes;
-                        // a structurally complete repo that Git rejected is a
-                        // real failure the user must see and fix.
-                        if stale_marker_shape(&directory) {
-                            self.warning(&directory, "Git marker is not a valid worktree");
-                        } else {
-                            let message = diagnostic
-                                .filter(|text| !text.trim().is_empty())
-                                .unwrap_or_else(|| "Git marker is present but not usable".into());
-                            self.error(&directory, message);
-                        }
+                        // resolved. report_unusable_marker downgrades only
+                        // provably-stale shapes and fails closed otherwise.
+                        self.report_unusable_marker(&directory, diagnostic);
                     }
                     Ok(ExactDiscovery::Nothing) => {}
                     Err(error) => self.error(&directory, format!("{error:#}")),
@@ -852,6 +851,23 @@ impl Discovery {
             path: path.as_ref().to_path_buf(),
             message: message.into(),
         });
+    }
+
+    /// Classify a directory that carries a `.git` marker Git could not use.
+    /// Provably-stale marker shapes become soft warnings; structurally
+    /// complete-but-rejected repositories (and any IO/permission failure in
+    /// the structural probe) stay hard errors carrying Git's diagnostic.
+    /// Used by both the downward walk and the containing-repository probe so
+    /// the classification is identical regardless of where discovery enters.
+    fn report_unusable_marker(&mut self, marker_dir: &Path, diagnostic: Option<String>) {
+        if stale_marker_shape(marker_dir) {
+            self.warning(marker_dir, "Git marker is not a valid worktree");
+        } else {
+            let message = diagnostic
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| "Git marker is present but not usable".to_owned());
+            self.error(marker_dir, message);
+        }
     }
 
     fn push_truncation(&mut self, truncation: DiscoveryTruncation) {
