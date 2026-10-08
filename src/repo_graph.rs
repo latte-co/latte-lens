@@ -359,16 +359,39 @@ impl Discovery {
     }
 
     fn discover_containing_repository(&mut self) -> Result<()> {
-        let Some(repo) = GitRepo::discover(&self.workspace_root)? else {
-            return Ok(());
-        };
-        let canonical_root = repo
-            .root()
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
-        if canonical_root != self.workspace_root {
-            let layout = git_layout(&canonical_root).unwrap_or(GitLayout::GitDirectory);
-            self.add_candidate(repo, canonical_root.clone(), layout, &canonical_root, false);
+        match GitRepo::inspect(&self.workspace_root)? {
+            Some(DiscoveryOutcome::Repo(repo)) => {
+                let canonical_root = repo
+                    .root()
+                    .canonicalize()
+                    .with_context(|| format!("cannot resolve {}", repo.root().display()))?;
+                if canonical_root != self.workspace_root {
+                    let layout = git_layout(&canonical_root).unwrap_or(GitLayout::GitDirectory);
+                    self.add_candidate(
+                        repo,
+                        canonical_root.clone(),
+                        layout,
+                        &canonical_root,
+                        false,
+                    );
+                }
+            }
+            Some(DiscoveryOutcome::Rejected { .. }) | None => {
+                // When the selected directory carries its own marker,
+                // walk_workspace classifies it directly. Otherwise Git may
+                // have failed on a *containing* repository the downward walk
+                // can never reach (e.g. opening a child of a corrupt repo).
+                // Locate that ancestor marker and ask Git directly, so a
+                // genuine refusal is reported without guessing from stderr.
+                let root = self.workspace_root.clone();
+                if !has_git_marker(&root)
+                    && let Some(ancestor) = nearest_ancestor_marker(&root)
+                    && let Ok(Some(DiscoveryOutcome::Rejected { message })) =
+                        GitRepo::inspect(&ancestor)
+                {
+                    self.error(&ancestor, message);
+                }
+            }
         }
         Ok(())
     }
@@ -979,6 +1002,16 @@ fn has_git_marker(directory: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Nearest strict ancestor of `directory` (walking upward to the filesystem
+/// root) that carries a non-symlink `.git` marker, if any.
+fn nearest_ancestor_marker(directory: &Path) -> Option<PathBuf> {
+    directory
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| has_git_marker(ancestor))
+        .map(Path::to_path_buf)
+}
+
 fn git_layout(directory: &Path) -> Option<GitLayout> {
     let metadata = fs::symlink_metadata(directory.join(".git")).ok()?;
     if metadata.file_type().is_symlink() {
@@ -1002,21 +1035,32 @@ fn git_layout(directory: &Path) -> Option<GitLayout> {
 /// carrying the skeleton of a real repository (for example an unsupported
 /// `core.repositoryformatversion`) stays a hard error so corruption is never
 /// hidden behind a soft "skipped" row.
+///
+/// Absence is established with [`Path::try_exists`], not [`Path::exists`]:
+/// an IO or permission error must fail closed as a hard error rather than look
+/// like a missing file.
 fn stale_marker_shape(directory: &Path) -> bool {
     let marker = directory.join(".git");
     match fs::symlink_metadata(&marker) {
         Ok(metadata) if metadata.is_file() => stale_gitdir_pointer(&marker),
         Ok(metadata) if metadata.is_dir() => {
-            !marker.join("HEAD").exists()
-                && !marker.join("objects").exists()
-                && !marker.join("commondir").exists()
+            absent(&marker.join("HEAD"))
+                && absent(&marker.join("objects"))
+                && absent(&marker.join("commondir"))
         }
         _ => false,
     }
 }
 
+/// True only when `path` is provably absent (`Ok(false)`). Any IO/permission
+/// error yields false so callers fail closed instead of treating an
+/// unreadable entry as a removable stale marker.
+fn absent(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
 /// A `.git` file is a stale worktree/submodule pointer only when it contains a
-/// `gitdir:` line resolving to a path that no longer exists.
+/// `gitdir:` line resolving to a path that is provably absent.
 fn stale_gitdir_pointer(marker: &Path) -> bool {
     let Ok(content) = fs::read_to_string(marker) else {
         return false;
@@ -1034,7 +1078,7 @@ fn stale_gitdir_pointer(marker: &Path) -> bool {
     } else {
         base.join(target)
     };
-    !resolved.exists()
+    absent(&resolved)
 }
 
 fn safe_relative_path(path: &Path) -> bool {

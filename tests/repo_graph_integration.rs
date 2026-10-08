@@ -674,6 +674,116 @@ fn structurally_complete_but_corrupt_repository_is_a_hard_error() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unreadable_git_directory_fails_closed_as_a_hard_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("locked");
+    init(&repo);
+    let git_dir = repo.join(".git");
+    fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Skip (and restore) when running as root, where mode 000 is not enforced.
+    let permission_denied = git_dir.join("HEAD").try_exists().is_err();
+    if !permission_denied {
+        fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let graph = RepoGraph::discover(&repo).unwrap();
+
+    // Restore before the tempdir is torn down.
+    fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != repo.canonicalize().unwrap()),
+        "an unreadable .git is an access failure, not a skippable marker: {:?}",
+        graph.report().warnings
+    );
+    assert!(
+        graph
+            .report()
+            .errors
+            .iter()
+            .any(|error| error.path == repo.canonicalize().unwrap()),
+        "an unreadable .git must be a hard error: {:?}",
+        graph.report().errors
+    );
+}
+
+#[test]
+fn corrupt_repo_root_discovered_directly_is_one_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("corrupt");
+    init(&repo);
+    fs::write(
+        repo.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+
+    let graph = RepoGraph::discover(&repo).unwrap();
+    let repo_path = repo.canonicalize().unwrap();
+    let errors: Vec<_> = graph
+        .report()
+        .errors
+        .iter()
+        .filter(|error| error.path == repo_path)
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "the root must be reported exactly once: {:?}",
+        graph.report().errors
+    );
+    assert!(graph.report().warnings.is_empty());
+}
+
+#[test]
+fn corrupt_containing_repository_opened_from_a_child_is_a_hard_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("corrupt");
+    init(&repo);
+    fs::write(
+        repo.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 999\n",
+    )
+    .unwrap();
+    let child = repo.join("child");
+    fs::create_dir_all(&child).unwrap();
+
+    // Opening a descendant of a corrupt repository: the downward walk only sees
+    // `child` (no marker), so the containing repository's refusal must still be
+    // surfaced from the containing-discovery probe.
+    let graph = RepoGraph::discover(&child).unwrap();
+
+    let repo_path = repo.canonicalize().unwrap();
+    assert!(
+        graph
+            .report()
+            .errors
+            .iter()
+            .any(|error| error.path == repo_path),
+        "the corrupt containing repository must be a hard error: {:?}",
+        graph.report().errors
+    );
+    assert!(
+        graph
+            .report()
+            .warnings
+            .iter()
+            .all(|warning| warning.path != repo_path),
+        "a corrupt containing repository must not be downgraded: {:?}",
+        graph.report().warnings
+    );
+}
+
 #[test]
 fn repository_cap_is_explicit_and_git_internals_do_not_consume_the_entry_budget() {
     let workspace = tempfile::tempdir().unwrap();
